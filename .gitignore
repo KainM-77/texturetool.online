@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Node (not used, guards against accidental installs)
+node_modules/
+package-lock.json
+yarn.lock
+
+# Temp / archives
+*.log
+*.zip
+dist/
+build/

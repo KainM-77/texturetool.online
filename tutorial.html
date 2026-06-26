@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<!-- TextureTool — Copyright (C) 2026 KainM-77. Licensed under GPL-3.0-only. See LICENSE & THIRD-PARTY-NOTICES.md. -->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TRLE Atlas Tool — Tutorial</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body class="tut-body">
+
+<header class="app-header">
+    <div class="header-top">
+        <a class="logo" href="index.html" style="text-decoration:none;color:inherit;" title="Back to the Atlas Tool">
+            <svg class="logo-mark" viewBox="0 0 32 32" width="20" height="20" aria-hidden="true" focusable="false">
+                <rect width="32" height="32" rx="4" fill="#1e1e1e"/>
+                <path d="M16 4L27 16L16 28L5 16Z" fill="#e8852a"/>
+                <path d="M16 8L23 16L16 24L9 16Z" fill="#f09030" opacity="0.4"/>
+            </svg>
+            Atlas Tool <span class="logo-beta">(Beta)</span> — Tutorial
+        </a>
+        <div class="app-controls">
+            <a class="ctrl-btn tut-back-btn" href="index.html" style="text-decoration:none;">← Back to the tool</a>
+        </div>
+    </div>
+</header>
+
+<div class="tut-layout">
+    <nav class="tut-toc" id="tut-toc" aria-label="Tutorial contents"></nav>
+    <main class="tut-main" id="tut-main"></main>
+</div>
+
+<!-- Hidden GL canvas + engine for the interactive material-maps demo -->
+<canvas id="tut-gl" style="display:none;"></canvas>
+<script src="js/shaders.js"></script>
+<script src="js/presets.js"></script>
+<script src="js/engine.js"></script>
+<script src="js/preview3d.js"></script>
+<script src="js/tutorial.js"></script>
+</body>
+</html>
