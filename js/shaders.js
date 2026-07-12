@@ -1,10 +1,19 @@
 /* SPDX-License-Identifier: GPL-3.0-only
-   TextureTool — Copyright (C) 2026 KainM-77. Licensed under GPL-3.0. See LICENSE.
-   Contains shader code adapted from Materialize (BoundingBoxSoftware), GPL-3.0.
-   See THIRD-PARTY-NOTICES.md. */
+   TextureTool — Copyright (C) 2026 KainM-77.
+   MIXED LICENSE — read carefully:
+   • Two seamless-tiling passes below — `seamlessMaker` and `seamlessSplat`
+     (each marked inline "GPL-3.0 ONLY") — are ported (HLSL→GLSL) from Materialize
+     (BoundingBoxSoftware) and are available ONLY under GPL-3.0. They are the sole
+     reason the tool as a whole ships under GPL-3.0 (see LICENSE).
+   • EVERY OTHER shader in this file is the author's own independent implementation
+     of a standard image-processing technique and is ALSO available under the MIT
+     License (see LICENSE-MIT) when copied on its own.
+   • The file carries the GPL-3.0 SPDX tag because, as a whole unit, it contains
+     the two ported shaders.
+   See THIRD-PARTY-NOTICES.md and "Path to MIT.md" for the full per-shader audit. */
 /* ============================================================
    TRLE Texture Tools — GLSL Shaders (WebGL 2.0 / GLSL ES 3.0)
-   Adapted from Materialize (Unity) for web GPU processing.
+   Fragment shaders for the web GPU texture pipeline.
    ============================================================ */
 
 window.TRLE = window.TRLE || {};
@@ -52,7 +61,7 @@ TRLE.Shaders = {
        Two-pass: horizontal (u_direction = vec2(1/w, 0))
                  vertical  (u_direction = vec2(0, 1/h))
        Wrapping handled by GL_REPEAT on the texture.
-       Uses cosine-weighted kernel (matches Materialize).
+       Uses a separable cosine-weighted kernel (a standard blur primitive).
        ------------------------------------------------ */
     gaussianBlur: `#version 300 es
         precision highp float;
@@ -72,7 +81,7 @@ TRLE.Shaders = {
             for (int i = -64; i <= 64; i++) {
                 if (i < -r || i > r) continue;
                 float fi = float(i);
-                // Cosine-weighted kernel (like Materialize)
+                // Cosine-weighted separable kernel
                 float w = cos(fi / u_radius * 1.5707963) * (1.0 - abs(fi) / (u_radius + 1.0));
                 w = max(w, 0.0);
                 sum += texture(u_texture, v_uv + u_direction * fi) * w;
@@ -156,15 +165,16 @@ TRLE.Shaders = {
         }`,
 
     /* ---------- Normal Map from Height ----------
-       Finite-difference gradient + cross product.
-       Adapted from Materialize's normal shader.
+       Central-difference height gradient packed as a tangent-space normal.
+       Standard Sobel-style technique; independent implementation (differs from
+       Materialize, which uses forward differences + a tangent cross-product).
        --------------------------------------------- */
     normalFromHeight: `#version 300 es
         precision highp float;
         uniform sampler2D u_heightMap;
         uniform float u_texelSize;        // 1.0 / textureWidth
         uniform float u_strength;         // normal intensity multiplier
-        uniform float u_angularity;       // 0-1 blend toward lateral-tilted normal (Materialize-style)
+        uniform float u_angularity;       // 0-1 blend toward a lateral-tilted normal (steepens near-flat areas)
         uniform float u_angularIntensity; // 0-1 strength of the lateral tilt
         uniform float u_flipY;            // 0 = OpenGL (TombEngine), 1 = DirectX (invert green)
         in vec2 v_uv;
@@ -199,6 +209,67 @@ TRLE.Shaders = {
             fragColor = vec4(normal * 0.5 + 0.5, 1.0);
         }`,
 
+    /* ---------- Multi-level Normal (frequency-band blend) ----------
+       Multi-scale normal combine. Computes the height
+       slope at three blur scales (fine / base / coarse) and blends:
+
+         slope = sBase + wFine*(sFine - sBase) + wCoarse*(sCoarse - sBase)
+
+       With wFine = wCoarse = 0 the result collapses to sBase — i.e. it is
+       bit-identical to `normalFromHeight` on the base-blurred height, so the
+       single-pass path stays the default and presets keep their calibration.
+       - wFine  adds high-frequency surface detail on top of the base shape.
+       - wCoarse blends toward large-scale curvature only (softens mid/fine).
+       Angularity + FlipNormalY are applied identically to `normalFromHeight`.
+       --------------------------------------------------------------- */
+    normalFromHeightMulti: `#version 300 es
+        precision highp float;
+        uniform sampler2D u_hFine;        // less-blurred grayscale (high freq)
+        uniform sampler2D u_hBase;        // base-blurred grayscale (single-pass input)
+        uniform sampler2D u_hCoarse;      // more-blurred grayscale (low freq)
+        uniform float u_texelSize;
+        uniform float u_strength;
+        uniform float u_wFine;            // weight of the fine band added over base
+        uniform float u_wCoarse;          // weight pulling toward large-scale only
+        uniform float u_angularity;
+        uniform float u_angularIntensity;
+        uniform float u_flipY;
+        in vec2 v_uv;
+        out vec4 fragColor;
+
+        vec2 slopeOf(sampler2D h) {
+            float l = texture(h, v_uv + vec2(-u_texelSize, 0.0)).r;
+            float r = texture(h, v_uv + vec2( u_texelSize, 0.0)).r;
+            float d = texture(h, v_uv + vec2(0.0, -u_texelSize)).r;
+            float u = texture(h, v_uv + vec2(0.0,  u_texelSize)).r;
+            return vec2(l - r, d - u);
+        }
+
+        void main() {
+            vec2 sBase   = slopeOf(u_hBase);
+            vec2 sFine   = slopeOf(u_hFine);
+            vec2 sCoarse = slopeOf(u_hCoarse);
+            vec2 s = sBase + u_wFine * (sFine - sBase) + u_wCoarse * (sCoarse - sBase);
+
+            vec3 normal = normalize(vec3(s * u_strength, 1.0));
+
+            // Angularity: tilt near-flat normals toward the lateral hemisphere edge.
+            if (u_angularity > 0.0) {
+                float len = length(normal.xy);
+                if (len > 0.0001) {
+                    vec3 angularDir = normalize(vec3(
+                        (normal.xy / len) * u_angularIntensity,
+                        max(1.0 - u_angularIntensity, 0.001)
+                    ));
+                    normal = normalize(mix(normal, angularDir, u_angularity));
+                }
+            }
+
+            if (u_flipY > 0.5) normal.y = -normal.y;
+
+            fragColor = vec4(normal * 0.5 + 0.5, 1.0);
+        }`,
+
     /* ---------- Ambient Occlusion from Height ----------
        Horizon-based AO: for each of 16 directions find the
        MAXIMUM elevation angle within the sample radius, then
@@ -215,7 +286,7 @@ TRLE.Shaders = {
         uniform float u_texelSize;
         uniform float u_radius;         // sample radius in texels (1-30)
         uniform float u_intensity;      // darkness multiplier
-        uniform float u_normalBlend;    // 0 = height-field only, 1 = normal-field only (Materialize dual-channel)
+        uniform float u_normalBlend;    // 0 = height-field only, 1 = normal-field only (dual-channel AO)
         in vec2 v_uv;
         out vec4 fragColor;
 
@@ -265,7 +336,7 @@ TRLE.Shaders = {
         }`,
 
     /* ---------- Roughness Map ----------
-       Signed high-pass from diffuse luminance (Materialize-style).
+       Signed high-pass from diffuse luminance (standard technique).
 
        hp = lum - blurred_lum  (range ≈ -0.3 … +0.3 for typical textures)
        rough = baseValue + hp * contrast * 2.0
@@ -292,9 +363,12 @@ TRLE.Shaders = {
             fragColor = vec4(vec3(clamp(rough, 0.0, 1.0)), 1.0);
         }`,
 
-    /* ---------- Seamless Maker ----------
+    /* ---------- Seamless Maker ----------   ⚠ GPL-3.0 ONLY — NOT under MIT
        Makes a non-tiling texture tile seamlessly.
-       Ported from Materialize's Blit_Seamless_Texture_Maker.shader (frag pass).
+       Ported (HLSL→GLSL) from Materialize's Blit_Seamless_Texture_Maker.shader
+       (frag pass) — a derivative of GPL-3.0 code, so this shader is GPL-3.0 only.
+       (Replacing it independently is the last step to a fully-MIT tool; see
+       "Path to MIT.md" §4.1.)
 
        Algorithm per-pixel:
        1. Compute edge-blend mask across overlap zone at origin edges (x=0, y=0).
@@ -385,8 +459,8 @@ TRLE.Shaders = {
             fragColor = vec4(result.rgb, 1.0);
         }`,
 
-    /* ---------- Seamless: Splat (random stamps) ----------
-       Ported from Materialize's Blit_Seamless_Texture_Maker.shader
+    /* ---------- Seamless: Splat (random stamps) ----------   ⚠ GPL-3.0 ONLY — NOT under MIT
+       Ported (HLSL→GLSL) from Materialize's Blit_Seamless_Texture_Maker.shader
        (frag_splat pass). Rebuilds the texture from 4 rotated/wobbled
        stamps on a fixed square kernel, composited highest-height-wins
        so overlaps follow surface detail instead of cross-fading.
@@ -1133,6 +1207,8 @@ TRLE.Shaders = {
          u_style         0 fBm (clouds/smoke), 1 ridged (caustics/veins), 2 billow
          u_useRamp       1 = map value through u_ramp gradient, 0 = grayscale
          u_ramp          1D RGBA gradient (256×1) sampled at the noise value
+         u_equalize      0..1 (ramp only) flatten the value distribution so the
+                         gradient uses its full colour range; also relaxes contrast
        Output: RGBA — grayscale, or the palette colour (with the ramp's alpha). */
     animNoise: `#version 300 es
         precision highp float;
@@ -1148,6 +1224,7 @@ TRLE.Shaders = {
         uniform float u_style;
         uniform float u_useRamp;
         uniform sampler2D u_ramp;
+        uniform float u_equalize;   // 0..1 colour-spread (ramp only)
         in vec2 v_uv;
         out vec4 fragColor;
 
@@ -1230,6 +1307,16 @@ TRLE.Shaders = {
             return sum / max(norm, 1e-4);
         }
 
+        // Colour-spread: remap the style-skewed value toward a uniform 0..1 so a
+        // full-spectrum ramp isn't starved in the middle. Per-style, since fBm
+        // piles near 0.5, ridged near 1.0, billow near 0.0.
+        float flattenValue(float v, int style){
+            v = clamp(v, 0.0, 1.0);
+            if (style == 1) return v * v;                              // ridged: high pile → pull down
+            if (style == 2) { float w = 1.0 - v; return 1.0 - w * w; } // billow: low pile → lift
+            return smoothstep(0.0, 1.0, smoothstep(0.0, 1.0, v));      // fBm: stretch the centre out
+        }
+
         void main(){
             int style = int(u_style + 0.5);
             vec3 seedOff = floor(vec3(u_seed*16.0, u_seed*16.0 + 5.0, u_seed*16.0 + 11.0));
@@ -1243,7 +1330,12 @@ TRLE.Shaders = {
                 uv += u_warp * 2.0 * w / u_period;
             }
             float v = fbm(uv, u_time, seedOff, style);
-            v = clamp((v - 0.5) * u_contrast + 0.5, 0.0, 1.0);
+            // Colour-spread (opt-in, ramp only): flatten the distribution and relax
+            // contrast toward neutral so the gradient sweeps its whole range.
+            float eqAmt = (u_useRamp > 0.5) ? clamp(u_equalize, 0.0, 1.0) : 0.0;
+            if (eqAmt > 0.0) v = mix(v, flattenValue(v, style), eqAmt);
+            float c = mix(u_contrast, 1.0, eqAmt);
+            v = clamp((v - 0.5) * c + 0.5, 0.0, 1.0);
             fragColor = u_useRamp > 0.5 ? texture(u_ramp, vec2(v, 0.5)) : vec4(vec3(v), 1.0);
         }`
 };

@@ -1,5 +1,8 @@
-/* SPDX-License-Identifier: GPL-3.0-only
-   TextureTool — Copyright (C) 2026 KainM-77. Licensed under GPL-3.0. See LICENSE. */
+/* SPDX-License-Identifier: MIT
+   TextureTool — Copyright (C) 2026 KainM-77. This file is the author's own work,
+   available under the MIT License (see LICENSE-MIT). The tool as a whole ships
+   under GPL-3.0 (see LICENSE) only because it also bundles two GPL-3.0 seamless
+   shaders derived from Materialize; this file contains none of that code. */
 /* ============================================================
    TRLE Atlas Tool — Tutorial page
    Static, vertical-scroll reference. Each tool section shows an
@@ -80,7 +83,19 @@
             what: 'Blends two textures along an edge or corner so terrain types meet without a hard line.',
             how: ['<strong>Right-click</strong> tile A → <strong>Make Transition with Texture</strong>, then click tile B.', 'Choose <strong>Directions</strong> (or paint a <strong>Custom</strong> mask) and a <strong>Blend method</strong>.', 'Re-orient the overlay (B) with <strong>Rotate</strong> / <strong>Flip</strong> if needed, then click <strong>Add</strong> — one tile per direction.'],
             before: 'transition',
-            tip: 'Blend methods: <strong>Alpha</strong> (cross-fade), <strong>Height</strong> (organic interlock), <strong>Poisson</strong> (matches tone when the two differ in brightness).'
+            tip: 'Blend methods: <strong>Alpha</strong> (cross-fade), <strong>Height</strong> (organic interlock), <strong>Poisson</strong> (matches tone when the two differ in brightness). Or switch to the <strong>Full Set</strong> tab (below) to generate a whole patch at once.'
+        },
+        {
+            id: 'transition-sets', icon: '🧱', title: 'Transition sets (full patch)',
+            what: 'The <strong>Full Set</strong> tab of Make Transition builds a whole terrain patch in one step and lays it into the atlas <em>spatially</em> — so the arrangement itself shows how the pieces fit, and you can see exactly which tile you’re picking in Tomb Editor. Reach for it when you want a ready-made island, hole or complete set rather than hand-picking single edges.',
+            how: [
+                '<strong>Right-click</strong> tile A → <strong>Make Transition with Texture</strong>, click tile B, then switch to the <strong>🧩 Full Set</strong> tab.',
+                'Pick a <strong>Set layout</strong>: <strong>3×3 Island</strong> (a pocket of the overlay surrounded by the base), <strong>3×3 Hole</strong> (a window of the base inside the overlay), or <strong>5×3 Complete</strong> (island + hole + plain tiles together).',
+                'Choose a <strong>Corner style</strong> — <strong>Rounded</strong> (curved blend) or <strong>Sharp 45°</strong> (a clean slope cut) — then shape every edge with <strong>Pivot</strong>, <strong>Hardness</strong> and the <strong>Blend method</strong>. The preview updates as one connected patch.',
+                'Click <strong>Add … Tiles</strong>. If the atlas isn’t already the right width, it offers to <strong>resize the columns</strong> (padding the last row with blank spacers) so the block drops in keeping the exact preview shape.'
+            ],
+            figure: 'transition-set', figureCaption: 'A 3×3 Island set: full overlay (sand) in the centre, the four edges blending outward, and the corners pulling the overlay toward the middle — so the nine tiles read as one sand pocket in a grass field, exactly as they’re laid into the atlas.',
+            tip: 'Plain cells (the base/overlay fills in the Complete layout) stay <em>linked</em> to their source tiles, so they still inherit materials and refresh when you edit the source — they’re not flat copies. For an overlay that must flow in every direction at once, use a <strong>Wang set</strong> instead.'
         },
         {
             id: 'wang', icon: '🧩', title: 'Wang sets',
@@ -88,6 +103,19 @@
             how: ['<strong>Right-click</strong> tile A → <strong>Make Wang Set with Texture</strong>, then click tile B.', 'Set the <strong>Blend method</strong>, <strong>Pivot</strong> and <strong>Hardness</strong> — corners blend smoothly (no diagonal crease) and <strong>Hardness</strong> sets the seam width (0 = wide soft blend, 100 = crisp cut).', 'Click <strong>Add 16 Tiles</strong> — drop the whole set into your level’s palette.'],
             figure: 'wang-geo', figureCaption: 'A full grass→sand Wang set, laid out by where each edge sits: grass in the centre, sand creeping in from each side, and the corners blending two sides at once — so the 9 tiles form one coherent grass patch surrounded by sand.',
             tip: 'Wang tiles inherit materials from both sources, just like transitions.'
+        },
+        {
+            id: 'borderset', icon: '🧱', title: 'Borders & corners (border sets)',
+            what: 'Builds a <em>reusable border tile set</em> from just two textures: a <strong>fill</strong> (grass, gravel, carpet) and a <strong>trim</strong> that runs along the boundary — stone edging, rope, a door frame. You get every edge, corner and fill piece needed to outline rooms and areas of any rectilinear shape, laid into the atlas as a readable block. Where a <strong>Wang set</strong> blends two terrains into each other, a border set keeps the trim as a crisp, decorative band <em>on top of</em> the fill.',
+            how: [
+                '<strong>Right-click</strong> the fill tile → <strong>🧱 Add Borders &amp; Corners</strong>, then click the trim texture.',
+                'Pick a <strong>Set type</strong>: <strong>Frame</strong> (9 tiles — border around filled rectangles), <strong>Frame + inner corners</strong> (13 tiles — the border can also turn through concave corners, so <em>any</em> room shape works), or <strong>Lines</strong> (16 tiles — the trim runs <em>between</em> areas through tile centres, pipes/roads style, in every N/E/S/W combination).',
+                'Tune the <strong>Border width</strong> and <strong>Softness</strong>, and pick a <strong>Blend method</strong>. <strong>Trim follows direction</strong> rotates the trim texture along vertical runs and mitres the corners like a picture frame — untick it for isotropic trims (gravel, dirt).',
+                'The <strong>Sample wall</strong> shows the whole set assembled into a room so you can check the joins before adding. If a slot looks wrong — usually baked lighting fighting a rotated edge — <strong>click it</strong> to cycle how it’s made: own mask → rotated ↻ → mirrored ↔/↕ → hand-picked atlas tile 🖼.',
+                'Click <strong>Add … Tiles</strong> — the set drops in as a spatial block (with a column-resize offer so it lines up), ready to place in Tomb Editor.'
+            ],
+            figure: 'borderset-modal', figureCaption: 'A grass + sand border set (Frame + inner corners): the 13 slots on the left — edges, outer corners, fill and the four inner-corner patches — and the sample wall on the right showing the set assembled into an L-shaped room, the trim turning cleanly through the concave corner.',
+            tip: 'Border-set tiles are live transitions: they inherit materials from both sources and re-render when you edit either texture (make the fill seamless <em>first</em> for best results). The trim sits on the tile edges, so two bordered rooms placed side by side share a double-width band — exactly how classic TRLE border sets read.'
         },
         {
             id: 'anchored', icon: '📐', title: 'Anchored transitions',
@@ -184,11 +212,11 @@
         },
         {
             id: 'buildpattern', icon: '🏗️', title: 'Build Pattern',
-            what: 'Turns a plain material — stone, sand, metal, timber — into a <em>built surface</em>: a <strong>brick wall</strong>, <strong>tile floor</strong>, <strong>wood planks</strong> or <strong>metal pipes</strong>. It lays the source into cells split by recessed joints so the result is one fresh tile that <strong>tiles seamlessly</strong>, and because the dark joints sink in, the generated normal / AO / height maps get real depth for free.',
+            what: 'Turns a plain material — stone, sand, metal, timber — into a <em>built surface</em>: a <strong>brick wall</strong>, <strong>coursed</strong> or <strong>cobbled stone</strong>, a <strong>tile floor</strong>, a <strong>herringbone</strong> weave, <strong>wood planks</strong>, a staggered <strong>plank floor</strong>, roof <strong>shingles / scales</strong> or <strong>metal pipes</strong>. It lays the source into cells split by recessed joints so the result is one fresh tile that <strong>tiles seamlessly</strong>, and because the dark joints sink in, the generated normal / AO / height maps get real depth for free.',
             how: [
                 '<strong>Right-click</strong> a source tile → <strong>🏗️ Build Pattern</strong>.',
-                'Pick a <strong>Pattern</strong> (Brick / Tile / Planks / Pipes) and a <strong>Fill</strong>: <strong>Slice</strong> gives each cell a different random crop (most variation); <strong>Overlay</strong> lets the whole texture flow unbroken with just the joints carved over it; <strong>Random from atlas tiles</strong> gives each brick a random <em>different</em> tile from your atlas (mix stone &amp; grass bricks, say).',
-                'Set the cell count and joint <strong>width</strong>. For brick, tune the <strong>aspect</strong> and <strong>row offset</strong> (50% = running bond, 0% = stacked); planks &amp; pipes get a <strong>direction</strong>, pipes a <strong>cylinder-shading</strong> amount.',
+                'Pick a <strong>Pattern</strong> — regular <strong>Brick</strong>, random <strong>Coursed stone</strong> (varied course heights &amp; stone widths, like ashlar rubble), <strong>Cobblestone</strong> (rounded Voronoi stones with mortar), <strong>Tile</strong>, <strong>Herringbone</strong>, <strong>Planks</strong>, <strong>Plank floor</strong> (boards with staggered butt-joints), <strong>Shingles / scales</strong>, or <strong>Pipes</strong> — and a <strong>Fill</strong>: <strong>Slice</strong> gives each cell a different random crop (most variation); <strong>Overlay</strong> lets the whole texture flow unbroken with just the joints carved over it; <strong>Random from atlas tiles</strong> gives each brick a random <em>different</em> tile from your atlas (mix stone &amp; grass bricks, say).',
+                'Set the cell count and joint <strong>width</strong>. Per pattern you also get: brick <strong>aspect</strong> &amp; <strong>row offset</strong> (50% = running bond, 0% = stacked); coursed <strong>course flatness</strong>; cobble <strong>stone roundness</strong>; shingle <strong>overlap</strong>; plank-floor <strong>board length</strong>; a <strong>direction</strong> for planks / floor / herringbone / pipes; and a pipe <strong>cylinder-shading</strong> amount.',
                 'Open <strong>🧱 Mortar / joint colour</strong> to set the mortar by <strong>Hue / Saturation / Lightness</strong>, <strong>🎨 Sample from texture</strong> to pull a darker tint of the source’s own colour, and add <strong>Noise</strong> (Speckle / Grain / Clouds) so the joints aren’t flat.',
                 'Add <strong>hue</strong> / <strong>brightness jitter</strong> so cells vary, reroll the <strong>Seed</strong> (<strong>🎲</strong>) until you like it — the preview updates live — then leave <strong>Assign … material preset</strong> ticked and click <strong>➕ Add Tile</strong>.'
             ],
@@ -197,10 +225,10 @@
         },
         {
             id: 'animated', icon: '🎞️', title: 'Animated textures',
-            what: 'Generates a procedural, seamlessly-<em>looping</em> animation — water, lava, clouds, smoke, energy, plus directional effects like <strong>fire, waterfalls and rivers</strong> — as a group of frames you drop straight into the atlas. Every frame also tiles on its own, so you can emit a <strong>single seamless tile</strong> for UV-rotate instead of a sequence.',
+            what: 'Generates a procedural, seamlessly-<em>looping</em> animation — water, lava, clouds, smoke, energy, plus directional effects like <strong>fire, waterfalls and rivers</strong> — as a group of frames you drop straight into the atlas. There’s a wide preset library (caustic/deep/boiling water, lava &amp; molten metal, blood, ice, mercury, honey, poison gas, steam, electric plasma, aurora sky…). Every frame also tiles on its own, so you can emit a <strong>single seamless tile</strong> for UV-rotate instead of a sequence.',
             how: [
                 'Click <strong>🎞️ Add Animated…</strong> in the grid header.',
-                'Pick a <strong>Preset</strong> (Caustic Water, Lava, Clouds…). The live preview loops while the 2×2 panel shows it tiling, and a <strong>Suggested material</strong> is applied automatically (emissive presets also switch the <strong>Emissive</strong> export map on).',
+                'Pick a <strong>Preset</strong> (Caustic Water, Lava, Clouds, Blood Pool, Frozen Ice, Steam, Electric Plasma, Aurora Sky…). The live preview loops while the 2×2 panel shows it tiling, and a <strong>Suggested material</strong> is applied automatically (emissive presets also switch the <strong>Emissive</strong> export map on).',
                 'On the <strong>🌀 Shape &amp; motion</strong> tab choose the <strong>Output</strong>: an <strong>Animated sequence</strong> (set <strong>Frames</strong>, 2–64) or a <strong>Single seamless tile</strong> for UV-rotate. Shape the look with <strong>Style</strong>, <strong>Pattern scale</strong>, <strong>Churn speed</strong>, <strong>Detail</strong>, <strong>Roughness</strong>, <strong>Swirl</strong>, <strong>Contrast</strong> and the <strong>Seed</strong> (<strong>🎲</strong> rerolls).',
                 'For things that <em>travel</em> rather than churn in place, set a <strong>Flow direction</strong> (↑↓←→ or diagonals) and <strong>Flow speed</strong> — the field scrolls that way while staying perfectly seamless and looping. <strong>Stretch ↕</strong> elongates the pattern into vertical streaks; together they make fire, waterfalls, rivers, rising smoke and blowing sand (see those presets).',
                 'On the <strong>🎨 Colour</strong> tab pick a <strong>Gradient</strong> (mix any palette onto any structure — clouds shape with a lava palette, say), then micro-edit it: <strong>click the bar</strong> to add a colour stop, <strong>drag</strong> handles to move them, and click a stop to set its colour &amp; <strong>alpha</strong> (for transparent smoke/dust). The <strong>Hue / Saturation / Brightness / Contrast / Gamma / Posterize</strong> sliders and <strong>Invert</strong> re-grade the whole ramp.',
@@ -320,7 +348,7 @@
                    <p>The tool started as an attempt to recreate something simmilar to Materialize, but instead using WebGL over Unity, as the tool seems to be more or less abandoned.</p>
                    <p><a href="https://github.com/JohnnyJF10/TgaBuilder" target="_blank" rel="noopener"><strong>TGA BUILDER</strong> by JohnnyJF10</a></p>
                    <p>Originally I have drawn SVG masks for transitions which worked well for diffuse maps, but started creating problems for material transitions. The transition feature of TGA Builder alleviated this issue and preserved seamlessness.</p>
-                   <p style="font-size:0.85rem;opacity:0.85;">Atlas Tool is free software under the <strong>GPL-3.0</strong> (it includes shader code adapted from Materialize, which is GPL-3.0). TgaBuilder's reused code is MIT. Full notices ship in the repo's <code>LICENSE</code> and <code>THIRD-PARTY-NOTICES.md</code>.</p>`
+                   <p style="font-size:0.85rem;opacity:0.85;">Atlas Tool is <strong>dual-licensed</strong>: the tool as a whole is <strong>GPL-3.0</strong> (see <code>LICENSE</code>) because it bundles two seamless-tiling shaders (<code>seamlessMaker</code>, <code>seamlessSplat</code>) ported from Materialize (GPL-3.0). All of the author's own code is <em>also</em> offered under the <strong>MIT License</strong> (see <code>LICENSE-MIT</code>) — those two shaders are the only GPL-only parts. TgaBuilder's reused code is MIT. Full notices ship in <code>THIRD-PARTY-NOTICES.md</code> and <code>Path to MIT.md</code>.</p>`
         },
         {
             id: 'about-contrib', icon: '🤝', title: 'Contributions',

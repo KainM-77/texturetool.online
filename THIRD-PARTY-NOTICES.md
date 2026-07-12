@@ -2,14 +2,25 @@
 
 **TRLE Tools / Atlas Tool** — Copyright (C) 2026 KainM-77.
 
-This program is free software: you can redistribute it and/or modify it under
-the terms of the **GNU General Public License, version 3** as published by the
-Free Software Foundation. See [LICENSE](LICENSE) for the full text. This program
-is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY.
+## Licensing summary (dual)
 
-The project is licensed under the GPL-3.0 because it contains shader code ported
-and adapted from **Materialize** (see below), which is GPL-3.0. GPL-3.0 is a
-copyleft license, so the combined work must also be distributed under GPL-3.0.
+This project is **dual-licensed**:
+
+- **The tool as a whole is distributed under GPL-3.0** — see [LICENSE](LICENSE).
+  It has to be: the program bundles two seamless-tiling shaders derived from
+  **Materialize** (GPL-3.0), and GPL-3.0 is copyleft, so the combined/running
+  program is governed by GPL-3.0. Distributed WITHOUT ANY WARRANTY.
+- **All original code by KainM-77 is ALSO available under the MIT License** — see
+  [LICENSE-MIT](LICENSE-MIT). Every source file that is the author's own work
+  carries an `SPDX-License-Identifier: MIT` header and may be extracted and reused
+  under MIT. This is a genuine additional grant, not a downgrade of the GPL.
+- **The only GPL-only parts** are the two seamless-tiling shaders `seamlessMaker`
+  and `seamlessSplat` in `AtlasTool/js/shaders.js` (marked inline; plus their
+  equivalents in the frozen root `js/shaders.js`). They stay GPL-3.0 because they
+  are derived from Materialize.
+
+In short: **copy an MIT-marked file → MIT terms; use the seamless maker/splat, or
+the whole bundled tool → GPL-3.0 terms.**
 
 ---
 
@@ -19,11 +30,19 @@ copyleft license, so the combined work must also be distributed under GPL-3.0.
 - Source: https://github.com/BoundingBoxSoftware/Materialize
 - License: GNU General Public License v3.0
 
-Several WebGL shaders in `js/shaders.js` (and the AtlasTool copy) are **ported /
-adapted** from Materialize's `Blit_Seamless_Texture_Maker.shader` and related
-passes — including the Seamless Texture Maker, the "Splat" seamless method, and
-the normal / high-pass derivation passes. Because this is derivative of GPL-3.0
-code, the whole project is distributed under GPL-3.0.
+**Exactly two** WebGL shaders in `AtlasTool/js/shaders.js` are **ported (HLSL→GLSL)**
+from Materialize's `Blit_Seamless_Texture_Maker.shader`:
+
+- `seamlessMaker` — from the `frag` pass (the Seamless Texture Maker).
+- `seamlessSplat` — from the `frag_splat` pass (the "Splat" seamless method).
+
+These are line-by-line translations and are therefore derivative of GPL-3.0 code,
+which is why the combined work is GPL-3.0. The tool's other map-generation shaders
+(normal-from-height, Gaussian blur, ambient occlusion, roughness/high-pass, height
+combine) are **independent** implementations of standard techniques — they are
+**not** derived from Materialize and are MIT-licensed. (An earlier version of this
+notice over-stated the borrowing by also listing the normal / high-pass passes;
+see `Path to MIT.md` for the full per-shader audit.)
 
 ---
 

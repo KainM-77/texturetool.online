@@ -465,15 +465,23 @@ select:focus, input[type="number"]:focus, input[type="text"]:focus {
 select { cursor: pointer; padding-right: 24px; }
 input[type="number"] { width: 80px; }
 
-/* Range slider */
+/* Range slider — the input box must be tall enough to CONTAIN the thumb.
+   The old 4px-high input with an 18px thumb let the thumb overhang the box,
+   which inflated ancestors' scrollHeight and produced phantom scrollbars in
+   modals whose last element was a slider row (e.g. Make Transition). The
+   track is now drawn by the ::-…-track pseudo instead of the input itself. */
 input[type="range"] {
     -webkit-appearance: none;
     appearance: none;
+    height: 18px;
+    background: transparent;
+    outline: none;
+    cursor: pointer;
+}
+input[type="range"]::-webkit-slider-runnable-track {
     height: 4px;
     background: var(--bg-input);
     border-radius: 2px;
-    outline: none;
-    cursor: pointer;
 }
 input[type="range"]::-webkit-slider-thumb {
     -webkit-appearance: none;
@@ -482,6 +490,12 @@ input[type="range"]::-webkit-slider-thumb {
     background: var(--accent);
     cursor: pointer;
     border: 2px solid var(--bg-primary);
+    margin-top: -7px;   /* centre the 18px thumb on the 4px track */
+}
+input[type="range"]::-moz-range-track {
+    height: 4px;
+    background: var(--bg-input);
+    border-radius: 2px;
 }
 input[type="range"]::-moz-range-thumb {
     width: 14px; height: 14px;
@@ -489,6 +503,7 @@ input[type="range"]::-moz-range-thumb {
     background: var(--accent);
     cursor: pointer;
     border: 2px solid var(--bg-primary);
+    box-sizing: border-box;
 }
 
 /* Checkboxes */
@@ -763,6 +778,92 @@ input[type="range"]::-moz-range-thumb {
     width: 0%;
     transition: width 0.3s ease;
 }
+
+/* ---- Header "Learn" buttons (tutorial + materials guide) ---- */
+.header-blurb { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
+.header-blurb-text { color: var(--text-secondary); font-size: 0.8rem; }
+.learn-btns { display: inline-flex; flex-wrap: wrap; gap: 8px; }
+.learn-btn {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 5px 12px; font-size: 0.8rem; font-weight: 600;
+    color: #fff; background: var(--accent);
+    border: 1px solid var(--accent); border-radius: var(--radius-sm);
+    text-decoration: none; white-space: nowrap;
+    transition: background 0.15s ease, border-color 0.15s ease;
+}
+.learn-btn:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.learn-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.learn-btn-alt {
+    color: var(--accent); background: transparent;
+}
+.learn-btn-alt:hover { color: #fff; background: var(--accent); }
+
+/* ---- Live "material tuner" widget (materials guide) ---- */
+.mat-tuner { margin: 14px 0; padding: 14px; border: 1px solid var(--border);
+    border-radius: var(--radius-sm); background: var(--bg-secondary, rgba(255,255,255,0.02)); }
+.mt-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin-bottom: 10px; }
+.mt-row label { font-size: 0.82rem; color: var(--text-secondary); }
+.mt-tex-btns { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.mt-tex-btn {
+    padding: 4px 10px; font-size: 0.78rem; cursor: pointer;
+    color: var(--text-secondary); background: transparent;
+    border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.mt-tex-btn:hover { color: var(--accent); background: var(--accent-bg); }
+.mt-tex-btn.active { color: #fff; background: var(--accent); border-color: var(--accent); }
+.mt-tuner select {
+    padding: 4px 8px; font-size: 0.82rem; color: var(--text-primary, inherit);
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+.mt-sliders { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 6px 18px; margin: 10px 0; }
+.mt-slider { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px 8px; font-size: 0.78rem; color: var(--text-secondary); }
+.mt-slider input[type=range] { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); }
+.mt-slider .mt-val { color: var(--accent); font-variant-numeric: tabular-nums; font-weight: 600; }
+.mt-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.mt-desc { font-size: 0.82rem; color: var(--text-secondary); font-style: italic; margin: 2px 0 8px; }
+
+/* ---- Material archetype recipe table (materials guide) ---- */
+.mat-table-wrap { overflow-x: auto; margin: 14px 0; }
+.mat-table { border-collapse: collapse; width: 100%; font-size: 0.82rem; min-width: 560px; }
+.mat-table th, .mat-table td { border: 1px solid var(--border); padding: 6px 9px; text-align: left; vertical-align: top; }
+.mat-table th { background: var(--accent-bg); color: var(--accent); font-weight: 600; white-space: nowrap; }
+.mat-table td:first-child { font-weight: 600; color: var(--text-primary, inherit); white-space: nowrap; }
+.mat-table tbody tr:nth-child(even) td, .mat-table tr:nth-child(even) td { background: rgba(127,127,127,0.05); }
+.mat-table .mt-note { color: var(--text-secondary); }
+
+/* Suffix / naming key */
+.mat-keys { display: flex; flex-wrap: wrap; gap: 6px 10px; margin: 10px 0; }
+.mat-key { font-size: 0.78rem; padding: 3px 8px; border: 1px solid var(--border);
+    border-radius: 999px; color: var(--text-secondary); background: var(--bg-secondary); }
+.mat-key code { color: var(--accent); font-weight: 600; }
+
+/* ---- Export "conveyor belt" animation ---- */
+.export-stage {
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    margin: 14px 0 4px;
+}
+.export-stage.active { display: flex; }
+.export-anim {
+    width: 100%;
+    max-width: 320px;
+    height: auto;
+    aspect-ratio: 2 / 1;
+    display: block;
+}
+.export-quip {
+    font-size: 0.9rem;
+    color: var(--text-secondary, #aaa);
+    font-style: italic;
+    text-align: center;
+    min-height: 1.2em;
+    opacity: 0;
+    transition: opacity 0.4s ease;
+    letter-spacing: 0.2px;
+}
+.export-quip.show { opacity: 1; }
 
 /* ---- Map Checkboxes Row ---- */
 .map-checks {
@@ -1686,7 +1787,7 @@ input[type="range"]::-moz-range-thumb {
 
 /* Animated-texture modal: Shape / Colour tab bar */
 .at-anim-tabs {
-    display: flex; gap: 4px; margin: 4px 0 10px;
+    display: flex; gap: 4px; margin: 8px 0 10px;
     border-bottom: 1px solid var(--border);
 }
 .at-anim-tab {
@@ -1914,8 +2015,16 @@ body.at-modal-open { overflow: hidden; }
 .at-modal-title {
     font-size: 1rem;
     font-weight: 600;
-    margin-bottom: 14px;
+    margin-bottom: 16px;
 }
+/* ---- Vertical text rhythm inside modals (8px factor: 4 label→control,
+   8 around hints/notes, 16 after the title). gap-driven containers
+   (.at-modal-cols) keep their own rhythm via more-specific resets. ---- */
+.at-modal label {
+    display: inline-block;
+    margin-bottom: 4px;
+}
+.at-modal .sm-hint { margin: 8px 0; }
 .at-modal-actions {
     display: flex;
     justify-content: flex-end;

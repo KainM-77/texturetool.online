@@ -30,8 +30,12 @@
             </svg>
             TRLE Atlas Tool <span class="logo-beta">(Beta)</span>
         </div>
-        <span style="color:var(--text-secondary);font-size:0.8rem;">
-            All-in-one atlas workbench. <a href="tutorial.html" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:underline;font-weight:600;">📖 Click here to learn how to use it!</a>
+        <span class="header-blurb">
+            <span class="header-blurb-text">All-in-one atlas workbench.</span>
+            <span class="learn-btns">
+                <a href="tutorial.html" target="_blank" rel="noopener" class="learn-btn">📖 Learn how to use the tool</a>
+                <a href="materials.html" target="_blank" rel="noopener" class="learn-btn learn-btn-alt">🎨 Learn about materials</a>
+            </span>
         </span>
         <div class="app-controls">
             <span class="controls-label">Font size</span>
@@ -71,19 +75,25 @@
         <div class="upload-area" id="at-upload">
             <div class="upload-icon">📁</div>
             <div class="upload-text">Drop atlas here or <span>browse</span></div>
-            <input type="file" accept="image/*" id="at-file">
+            <div class="upload-hint" style="color:var(--text-secondary);font-size:0.78rem;margin-top:4px;">PNG · JPG · BMP · WebP · TGA</div>
+            <input type="file" accept="image/*,.tga" id="at-file">
         </div>
 
         <div class="form-row" style="margin-top:14px;align-items:flex-end;">
             <div class="form-group">
                 <label>Texture (tile) size</label>
                 <select id="at-tile-size">
+                    <option value="32">32 × 32</option>
                     <option value="64">64 × 64</option>
                     <option value="128">128 × 128</option>
                     <option value="256" selected>256 × 256</option>
                     <option value="512">512 × 512</option>
                     <option value="1024">1024 × 1024</option>
+                    <option value="2048">2048 × 2048</option>
+                    <option value="custom">Custom…</option>
                 </select>
+                <input type="number" id="at-tile-size-custom" min="16" max="2048" step="1" value="256"
+                       placeholder="px" title="Custom tile size 16–2048" style="display:none;width:110px;margin-top:6px;">
             </div>
             <div class="form-group">
                 <button class="btn btn-primary" id="at-slice-btn" disabled>✂️ Slice Atlas</button>
@@ -94,6 +104,11 @@
         </div>
         <p style="color:var(--text-secondary);font-size:0.8rem;margin-top:6px;">
             <strong>Slice Atlas</strong> cuts the whole image on a uniform grid. <strong>Pick tiles…</strong> lets you set the grid and choose which cells to import — great for ripping one texture or stitching from several atlases.
+        </p>
+        <p style="color:var(--text-secondary);font-size:0.8rem;margin-top:6px;">
+            📐 <strong>Pick your tile size deliberately.</strong> Every map atlas for a texture set must share the same
+            dimensions — if you’ll export some maps now and others in a later pass, use the <strong>same tile size and
+            layout</strong> each time so Tomb Engine can line them up.
         </p>
 
         <div class="at-or-sep">or</div>
@@ -132,6 +147,7 @@
         </div>
         <div id="at-pick-banner" class="at-pick-banner" style="display:none;">
             🔒 Base texture locked — now <strong>click a second element</strong> to <span id="at-pick-text">build the transition</span>
+            <button class="btn btn-secondary btn-sm" id="at-pick-same" style="margin-left:10px;display:none;" title="Build the set from this one texture, folded/mirrored origami-style">🪞 Use same texture</button>
             <button class="btn btn-secondary btn-sm" id="at-pick-cancel" style="margin-left:10px;">Cancel (Esc)</button>
         </div>
         <div id="at-bulk-bar" class="at-pick-banner at-bulk-bar" style="display:none;">
@@ -180,6 +196,14 @@
                    title="Blur the height map toward continuity in a border band so a tiling texture doesn't show a parallax 'cliff' at the repeat seam. Interior detail is preserved.">
                 <input type="checkbox" id="at-export-height-seamless" checked> Seamless height edges — blur the border so parallax doesn’t cliff at the seam
             </label>
+            <div class="notice notice-info" style="margin-top:12px;">
+                <span class="notice-icon">📐</span>
+                <span><strong>Every map atlas must share the same dimensions.</strong>
+                    Texturetool guarantees this automatically when you export all maps together here.
+                    But if you export maps in separate passes — e.g. just the normal map now, other maps
+                    elsewhere or later — make sure the <strong>tile size and layout match every time</strong>,
+                    or Tomb Engine will throw an error and not load your material maps!</span>
+            </div>
         </div>
         <label class="checkbox-row" style="margin:8px 0;" title="OFF = OpenGL convention (TombEngine). ON = DirectX convention — inverts the normal map's green channel. Applies to the whole atlas.">
             <input type="checkbox" id="at-export-flipy"> Flip normal Y (DirectX convention)
@@ -209,6 +233,10 @@
         <label class="checkbox-row" style="margin:8px 0;">
             <input type="checkbox" id="at-export-magenta"> Magenta color-key — flatten transparent pixels to magenta (Tomb Editor invisible)
         </label>
+        <div class="export-stage" id="at-export-stage" aria-hidden="true">
+            <canvas id="at-export-anim" class="export-anim" width="256" height="128"></canvas>
+            <div class="export-quip" id="at-export-quip"></div>
+        </div>
         <div class="progress-bar-container" id="at-progress">
             <div class="progress-bar-fill" id="at-progress-fill"></div>
         </div>
@@ -239,17 +267,21 @@
     <button data-action="seamless" role="menuitem" data-animhide>🔄 Make Seamless…</button>
     <button data-action="transition" role="menuitem" data-animhide>🔀 Make Transition with Texture…</button>
     <button data-action="wang" role="menuitem" data-animhide>🧩 Make Wang Set with Texture…</button>
+    <button data-action="borderset" role="menuitem" data-animhide>🧱 Add Borders &amp; Corners…</button>
     <button data-action="anchor" role="menuitem" data-animhide>📐 Make Anchored Transition…</button>
     <button data-action="transgrid" role="menuitem" data-animhide>🗺️ Make Transition Grid…</button>
     <button data-action="organic" role="menuitem" data-animhide>🌿 Make Organic Transition…</button>
     <button data-action="heighttrans" role="menuitem" data-animhide>🏔️ Make Height Transition…</button>
     <button data-action="material" role="menuitem">🎨 Set Material…</button>
+    <button data-action="gotobase" role="menuitem" data-transonly>🧭 Go to Base Texture</button>
+    <button data-action="gotooverlay" role="menuitem" data-transonly>🧭 Go to Overlay Texture</button>
     <button data-action="heal" role="menuitem" data-tileonly>🩹 Heal / Fill…</button>
     <button data-action="fade" role="menuitem" data-tileonly>🫥 Fade to Transparent…</button>
     <button data-action="emissive" role="menuitem" data-tileonly>✨ Make Emissive…</button>
     <hr data-tileonly>
     <button data-action="variations" role="menuitem" data-tileonly>✨ Generate Variations…</button>
     <button data-action="buildpattern" role="menuitem" data-tileonly>🏗️ Build Pattern…</button>
+    <button data-action="origami" role="menuitem" data-tileonly>🪞 Origami Frame (fold to rings)</button>
     <hr data-tileonly>
     <button data-action="rotate" role="menuitem" data-tileonly>↻ Rotate 90°</button>
     <button data-action="fliph"  role="menuitem" data-tileonly>↔ Flip Horizontal</button>
@@ -352,14 +384,18 @@
                 </div>
             </div>
         </div>
-        <div class="form-group" style="margin-top:10px;">
+        <div class="at-anim-tabs" role="tablist" aria-label="Transition mode">
+            <button type="button" class="at-anim-tab active" data-tr-tab="single" role="tab" aria-selected="true">🖌️ Single Tiles</button>
+            <button type="button" class="at-anim-tab" data-tr-tab="set" role="tab" aria-selected="false">🧩 Full Set (spatial grid)</button>
+        </div>
+        <div class="form-group" data-tr-panel="single" style="margin-top:10px;">
             <label>Mask Source</label>
             <select id="at-tr-mask-source">
                 <option value="dir" selected>Directions (presets)</option>
                 <option value="custom">Custom (paint your own)</option>
             </select>
         </div>
-        <div class="form-group" id="at-tr-dir-group">
+        <div class="form-group" id="at-tr-dir-group" data-tr-panel="single">
             <label>Directions <span style="color:var(--text-secondary);font-size:0.75rem;">(each selected direction adds one tile)</span></label>
             <div class="at-tr-dirs" id="at-tr-dirs"></div>
             <div style="margin-top:6px;">
@@ -386,7 +422,7 @@
                 <input type="range" id="at-tr-hardness" min="0" max="100" value="0" style="width:100%;">
             </div>
         </div>
-        <div id="at-tr-custom-controls" style="display:none;">
+        <div id="at-tr-custom-controls" data-tr-panel="single" style="display:none;">
             <div class="form-row" style="align-items:flex-end;">
                 <div class="form-group" style="flex:1;min-width:140px;">
                     <label>Brush Size — <span id="at-tr-brush-val">32</span>px</label>
@@ -398,12 +434,34 @@
             </div>
             <div class="sm-hint">Paint <strong>white</strong> where the overlay (B) should show through. The mask is softened automatically. One tile is added.</div>
         </div>
+        <div class="form-row" data-tr-panel="set" style="display:none;gap:10px;flex-wrap:wrap;">
+            <div class="form-group" style="flex:1;min-width:210px;">
+                <label>Set layout</label>
+                <select id="at-tr-set-layout">
+                    <option value="island3" selected>3×3 Island — overlay pocket in base (9 tiles)</option>
+                    <option value="hole3">3×3 Hole — base window in overlay (9 tiles)</option>
+                    <option value="complete5">5×3 Complete — island + hole + plain tiles (15)</option>
+                </select>
+            </div>
+            <div class="form-group" style="flex:1;min-width:170px;">
+                <label>Corner style</label>
+                <select id="at-tr-set-corners">
+                    <option value="round" selected>Rounded (curved blend)</option>
+                    <option value="sharp">Sharp 45° (slope cut)</option>
+                </select>
+            </div>
+        </div>
+        <div class="sm-hint" data-tr-panel="set" style="display:none;">The whole arrangement is added to the atlas laid out <strong>exactly like the preview</strong>, so it reads as one connected terrain patch when picking in Tomb Editor. Pivot &amp; Hardness above shape every edge; plain cells stay linked to their source tiles.</div>
         </div><!-- /.at-modal-main -->
         <div class="at-modal-side">
-        <div class="form-group" style="margin:0;">
+        <div class="form-group" data-tr-panel="single" style="margin:0;">
             <label id="at-tr-preview-label">Preview (last clicked direction)</label>
             <canvas id="at-tr-preview" width="256" height="256"
                 style="width:100%;max-width:430px;border-radius:6px;border:1px solid var(--border);display:block;image-rendering:pixelated;touch-action:none;"></canvas>
+        </div>
+        <div class="form-group" data-tr-panel="set" style="display:none;margin:0;">
+            <label>Set preview <span style="color:var(--text-secondary);font-size:0.75rem;">(<span id="at-tr-set-count">9</span> tiles, added in this exact arrangement)</span></label>
+            <div id="at-tr-set-previews" style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;"></div>
         </div>
         </div><!-- /.at-modal-side -->
         </div></div><!-- /.at-modal-cols /.at-modal-body -->
@@ -1176,6 +1234,13 @@
                             <input type="range" id="at-anim-col-posterize" min="0" max="16" value="0" style="width:100%;">
                         </div>
                     </div>
+                    <div class="form-row" style="gap:10px;flex-wrap:wrap;">
+                        <div class="form-group" style="flex:1;min-width:130px;">
+                            <label>Colour spread — <span id="at-anim-col-spread-val">Off</span></label>
+                            <input type="range" id="at-anim-col-spread" min="0" max="100" value="0" style="width:100%;">
+                            <small style="opacity:0.6;font-size:0.72rem;display:block;margin-top:2px;">Evens out the noise so a gradient uses all its colours (best for Rainbow / Aurora). Relaxes contrast as it rises.</small>
+                        </div>
+                    </div>
                     <div class="form-row" style="gap:10px;align-items:center;">
                         <label style="display:flex;align-items:center;gap:6px;font-size:0.82rem;cursor:pointer;">
                             <input type="checkbox" id="at-anim-col-invert"> Invert / reverse gradient
@@ -1279,11 +1344,11 @@
         <div class="form-row" style="align-items:flex-end;">
             <div class="form-group" style="width:84px;">
                 <label>Columns</label>
-                <input type="number" id="at-import-cols" min="1" max="32" value="1">
+                <input type="number" id="at-import-cols" min="1" max="128" value="1">
             </div>
             <div class="form-group" style="width:84px;">
                 <label>Rows</label>
-                <input type="number" id="at-import-rows" min="1" max="32" value="1">
+                <input type="number" id="at-import-rows" min="1" max="128" value="1">
             </div>
             <div class="form-group" style="min-width:120px;">
                 <label>Cell size</label>
@@ -1296,7 +1361,9 @@
         <div id="at-import-warn" class="at-inline-warning" style="display:none;"></div>
         <div class="form-group">
             <label>Source <span style="color:var(--text-secondary);font-size:0.75rem;">(<span id="at-import-count">0</span> selected — click cells to toggle)</span></label>
-            <canvas id="at-import-canvas" width="480" height="360" style="width:100%;max-width:560px;display:block;margin:0 auto;border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer;background:#111;"></canvas>
+            <div id="at-import-scroll" style="max-height:62vh;overflow:auto;border:1px solid var(--border);border-radius:var(--radius-sm);background:#111;">
+                <canvas id="at-import-canvas" width="480" height="360" style="display:block;cursor:pointer;"></canvas>
+            </div>
         </div>
         <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
@@ -1317,13 +1384,21 @@
     <!-- ── Wang set modal (Phase 9) ─────────────────── -->
     <div class="at-modal" id="at-modal-wang" role="dialog" aria-modal="true" aria-label="Make Wang Set" style="display:none;">
         <div class="at-modal-title">🧩 Wang Set — Tile <span id="at-wang-base-no"></span> → Tile <span id="at-wang-overlay-no"></span></div>
-        <div class="sm-hint">Generates the 16-tile edge set so the overlay terrain connects in every up/down/left/right combination. Tiles inherit materials from the two sources.</div>
+        <div class="sm-hint">Generates an edge set so the overlay terrain connects on every side. Pick how the tiles are <strong>arranged in the atlas</strong> below — a readable grid makes them easy to place in the editor. Tiles inherit materials from the two sources.</div>
         <div class="form-group">
             <label>Blend Method <span style="color:var(--text-secondary);font-size:0.75rem;">(diffuse)</span></label>
             <select id="at-wang-method">
                 <option value="alpha" selected>Alpha topology (default)</option>
                 <option value="height">Height-blended (organic edge)</option>
                 <option value="poisson">Poisson (tone-match seam)</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>Layout <span style="color:var(--text-secondary);font-size:0.75rem;">(atlas arrangement)</span></label>
+            <select id="at-wang-layout">
+                <option value="4x4" selected>4×4 grid — all 16 tiles, readable</option>
+                <option value="3x3">3×3 blob — 9 tiles, overlay in centre</option>
+                <option value="rows">Rows — 16 tiles, flat (original)</option>
             </select>
         </div>
         <div class="form-row">
@@ -1337,12 +1412,68 @@
             </div>
         </div>
         <div class="form-group">
-            <label>Preview (16 tiles)</label>
+            <label>Preview (<span id="at-wang-count">16</span> tiles)</label>
             <div id="at-wang-previews" style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;"></div>
         </div>
         <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
-            <button class="btn btn-primary" id="at-wang-add">➕ Add 16 Tiles</button>
+            <button class="btn btn-primary" id="at-wang-add">➕ Add <span id="at-wang-addcount">16</span> Tiles</button>
+        </div>
+    </div>
+
+    <!-- ── Borders & Corners modal (border set) ─────── -->
+    <div class="at-modal at-modal-xl" id="at-modal-bset" role="dialog" aria-modal="true" aria-label="Add Borders and Corners" style="display:none;">
+        <div class="at-modal-title">🧱 Borders &amp; Corners — <span id="at-bset-title-src">Tile <span id="at-bset-base-no"></span> + trim Tile <span id="at-bset-overlay-no"></span></span></div>
+        <div class="sm-hint" id="at-bset-origami-hint" style="display:none;background:rgba(232,133,42,.12);border-radius:4px;padding:6px 8px;margin-bottom:6px;">🪞 <strong>Origami mode</strong> — one texture only. The trim is the same texture rotated so its detail runs <em>parallel to each edge</em> and folds through the corners, so a ridge/plank texture reads as a continuous concentric frame.</div>
+        <div class="sm-hint">Builds a <strong>reusable border tile set</strong>: the trim texture runs along the boundary of areas filled with the base texture. Place the tiles in the editor like a frame — edges, corners and fill all connect. <strong>Click any slot</strong> in the preview to change how it's made (own mask → rotated ↻ → mirrored ↔/↕ → an atlas tile 🖼) — handy when baked lighting makes a rotated edge look wrong. Tiles inherit materials from the two sources and stay editable (change a source tile and the set follows).</div>
+        <div class="form-row">
+            <div class="form-group" style="flex:1.4;min-width:200px;">
+                <label>Set type</label>
+                <select id="at-bset-topo">
+                    <option value="frame9" selected>Frame — border around filled areas (9 tiles)</option>
+                    <option value="frame13">Frame + inner corners — any room shape (13 tiles)</option>
+                    <option value="lines">Lines — trim runs between areas, pipes/roads (16 tiles)</option>
+                </select>
+            </div>
+            <div class="form-group" style="flex:1;min-width:150px;">
+                <label>Blend Method</label>
+                <select id="at-bset-method">
+                    <option value="alpha" selected>Alpha topology (default)</option>
+                    <option value="height">Height-blended (organic edge)</option>
+                    <option value="poisson">Poisson (tone-match seam)</option>
+                </select>
+            </div>
+        </div>
+        <div class="form-row" style="align-items:flex-end;">
+            <div class="form-group" style="flex:1;min-width:130px;">
+                <label>Border width — <span id="at-bset-width-val">20</span>%</label>
+                <input type="range" id="at-bset-width" min="5" max="45" value="20" style="width:100%;">
+            </div>
+            <div class="form-group" style="flex:1;min-width:130px;">
+                <label>Softness — <span id="at-bset-soft-val">15</span>%</label>
+                <input type="range" id="at-bset-soft" min="0" max="100" value="15" style="width:100%;">
+            </div>
+            <div class="form-group" style="min-width:180px;">
+                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                    <input type="checkbox" id="at-bset-follow" checked>
+                    Trim follows direction
+                </label>
+                <div style="color:var(--text-secondary);font-size:0.72rem;">Rotates the trim texture along vertical borders (mitred corners).</div>
+            </div>
+        </div>
+        <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start;">
+            <div class="form-group" style="flex:1.3;min-width:280px;">
+                <label>Tile set (<span id="at-bset-count">9</span> tiles — click a slot to change how it's made)</label>
+                <div id="at-bset-previews" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;"></div>
+            </div>
+            <div class="form-group" style="flex:1;min-width:240px;">
+                <label>Sample wall — the set assembled</label>
+                <canvas id="at-bset-demo" width="220" height="132" style="width:100%;border:1px solid var(--border);border-radius:3px;image-rendering:pixelated;background:#111;"></canvas>
+            </div>
+        </div>
+        <div class="at-modal-actions">
+            <button class="btn btn-secondary" data-close>Cancel</button>
+            <button class="btn btn-primary" id="at-bset-add">➕ Add <span id="at-bset-addcount">9</span> Tiles</button>
         </div>
     </div>
 
@@ -1380,17 +1511,60 @@
         </div>
     </div>
 
+    <!-- ── Origami Frame modal (fold texture into concentric rings) ── -->
+    <div class="at-modal" id="at-modal-origami" role="dialog" aria-modal="true" aria-label="Origami Frame" style="display:none;">
+        <div class="at-modal-title">🪞 Origami Frame — Tile <span id="at-origami-tileno"></span></div>
+        <div class="sm-hint">Folds the texture into a concentric frame — a ridge or stripe texture becomes nested rings, as if the strip were folded around all four edges. The fold is symmetric and seams continuously through the corners.</div>
+        <div class="form-row" style="align-items:flex-end;">
+            <div class="form-group" style="flex:1.2;min-width:170px;">
+                <label>Ring shape</label>
+                <select id="at-origami-shape">
+                    <option value="square" selected>Square — nested rectangles</option>
+                    <option value="diamond">Diamond — rotated squares</option>
+                    <option value="circle">Circle — concentric rings</option>
+                </select>
+            </div>
+            <div class="form-group" style="flex:1.2;min-width:170px;">
+                <label>Detail axis</label>
+                <select id="at-origami-axis" title="Which direction the source's ridges/stripes run. Auto detects it from the image.">
+                    <option value="auto" selected>Auto-detect</option>
+                    <option value="v">Vertical ridges</option>
+                    <option value="h">Horizontal ridges</option>
+                </select>
+            </div>
+            <div class="form-group" style="flex:1;min-width:130px;">
+                <label>Repeats — <span id="at-origami-repeats-val">1</span></label>
+                <input type="range" id="at-origami-repeats" min="1" max="4" value="1" style="width:100%;"
+                       title="Mirror the source into this many nested copies (seamless).">
+            </div>
+        </div>
+        <div class="form-group">
+            <label>Preview</label>
+            <canvas id="at-origami-preview" width="256" height="256"
+                    style="width:256px;max-width:100%;border:1px solid var(--border);border-radius:3px;image-rendering:pixelated;background:#111;"></canvas>
+        </div>
+        <div class="at-modal-actions">
+            <button class="btn btn-secondary" data-close>Cancel</button>
+            <button class="btn btn-primary" id="at-origami-add">➕ Add Folded Tile</button>
+        </div>
+    </div>
+
     <!-- ── Build Pattern modal (texture-from-texture structure synthesis) ── -->
     <div class="at-modal at-modal-wide" id="at-modal-build" role="dialog" aria-modal="true" aria-label="Build Pattern" style="display:none;">
         <div class="at-modal-title">🏗️ Build Pattern — Tile <span id="at-bp-tileno"></span></div>
-        <div class="sm-hint">Arranges this texture into a built surface — brick, tile, planks or pipes — by laying it into cells split by recessed joints, each cell a jittered sample so it doesn't read as repeats. The result is a fresh, seamlessly tiling tile; the dark joints become real depth in the material maps.</div>
+        <div class="sm-hint">Arranges this texture into a built surface — brick, coursed / cobbled stone, tile, herringbone, planks, a plank floor, shingles or pipes — by laying it into cells split by recessed joints, each cell a jittered sample so it doesn't read as repeats. The result is a fresh, seamlessly tiling tile; the dark joints become real depth in the material maps.</div>
         <div class="form-row" style="align-items:flex-end;">
             <div class="form-group" style="flex:1;min-width:130px;">
                 <label>Pattern</label>
                 <select id="at-bp-pattern">
                     <option value="brick" selected>🧱 Brick wall</option>
+                    <option value="coursed">🪨 Coursed stone</option>
+                    <option value="cobble">⬤ Cobblestone</option>
                     <option value="tile">🔲 Tile floor</option>
+                    <option value="herringbone">📐 Herringbone</option>
                     <option value="planks">🪵 Wood planks</option>
+                    <option value="floor">🪵 Plank floor</option>
+                    <option value="shingles">🐟 Shingles / scales</option>
                     <option value="pipes">⚙️ Metal pipes</option>
                 </select>
             </div>
@@ -1406,7 +1580,7 @@
                     <option value="tiles">Random from atlas tiles</option>
                 </select>
             </div>
-            <div class="form-group" data-bp="planks pipes" style="width:120px;">
+            <div class="form-group" data-bp="planks pipes floor herringbone" style="width:120px;">
                 <label>Direction</label>
                 <select id="at-bp-orient">
                     <option value="v" selected>Vertical</option>
@@ -1415,13 +1589,25 @@
             </div>
         </div>
         <div class="form-row" style="align-items:flex-end;">
-            <div class="form-group" data-bp="brick" style="flex:1;min-width:120px;">
-                <label>Brick aspect (w:h) — <span id="at-bp-aspect-val">2.2</span></label>
+            <div class="form-group" data-bp="brick coursed herringbone" style="flex:1;min-width:120px;">
+                <label><span id="at-bp-aspect-label">Brick aspect</span> (w:h) — <span id="at-bp-aspect-val">2.2</span></label>
                 <input type="range" id="at-bp-aspect" min="10" max="40" value="22" style="width:100%;">
             </div>
             <div class="form-group" data-bp="brick" style="flex:1;min-width:120px;">
                 <label>Row offset — <span id="at-bp-offset-val">50</span>%</label>
                 <input type="range" id="at-bp-offset" min="0" max="50" value="50" style="width:100%;">
+            </div>
+            <div class="form-group" data-bp="cobble" style="flex:1;min-width:120px;">
+                <label>Stone roundness — <span id="at-bp-irregular-val">50</span>%</label>
+                <input type="range" id="at-bp-irregular" min="0" max="100" value="50" style="width:100%;">
+            </div>
+            <div class="form-group" data-bp="shingles" style="flex:1;min-width:120px;">
+                <label>Overlap — <span id="at-bp-overlap-val">40</span>%</label>
+                <input type="range" id="at-bp-overlap" min="0" max="100" value="40" style="width:100%;">
+            </div>
+            <div class="form-group" data-bp="floor" style="flex:1;min-width:120px;">
+                <label>Board length — <span id="at-bp-boardlen-val">55</span>%</label>
+                <input type="range" id="at-bp-boardlen" min="25" max="100" value="55" style="width:100%;">
             </div>
             <div class="form-group" data-bp="pipes" style="flex:1;min-width:120px;">
                 <label>Cylinder shading — <span id="at-bp-highlight-val">60</span>%</label>

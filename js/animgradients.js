@@ -1,5 +1,8 @@
-/* SPDX-License-Identifier: GPL-3.0-only
-   TextureTool — Copyright (C) 2026 KainM-77. Licensed under GPL-3.0. See LICENSE. */
+/* SPDX-License-Identifier: MIT
+   TextureTool — Copyright (C) 2026 KainM-77. This file is the author's own work,
+   available under the MIT License (see LICENSE-MIT). The tool as a whole ships
+   under GPL-3.0 (see LICENSE) only because it also bundles two GPL-3.0 seamless
+   shaders derived from Materialize; this file contains none of that code. */
 /* ============================================================
    TRLE Atlas Tool — Animated Texture Gradient Library
    Named colour gradients, decoupled from the noise presets, so
@@ -36,6 +39,8 @@ TRLE.AnimGradients = {
     rainbow:    { label: 'Rainbow',    stops: [[0,[255,0,0]], [0.17,[255,200,0]], [0.34,[0,200,0]], [0.5,[0,200,200]], [0.67,[0,80,255]], [0.84,[160,0,255]], [1,[255,0,160]]] },
     sepia:      { label: 'Sepia',      stops: [[0,[30,20,10]], [0.5,[140,100,60]], [1,[245,225,190]]] },
     neon_pink:  { label: 'Neon Pink',  stops: [[0,[20,0,20]], [0.5,[200,20,160]], [1,[255,180,240]]] },
+    steam_white:{ label: 'Steam',      stops: [[0,[210,215,222,0]], [0.4,[228,232,238,120]], [0.75,[244,247,250,215]], [1,[255,255,255,255]]] },
+    electric:   { label: 'Electric',   stops: [[0,[4,6,26]], [0.45,[24,70,180]], [0.72,[90,170,255]], [0.9,[190,230,255]], [1,[255,255,255]]] },
     mono_grey:  { label: 'Mono (B→W)', stops: [[0,[0,0,0]], [1,[255,255,255]]] }
 };
 
@@ -44,7 +49,7 @@ TRLE.AnimGradientOrder = [
     'caustic_blue', 'water_deep', 'swamp_green', 'oil_dark', 'lava_hot', 'molten',
     'ember_fire', 'toxic_green', 'cloud_white', 'smoke_grey', 'dust_tan',
     'magic_violet', 'portal_cyan', 'ice_blue', 'blood_red', 'mercury',
-    'aurora', 'rainbow', 'sepia', 'neon_pink', 'mono_grey'
+    'aurora', 'rainbow', 'sepia', 'neon_pink', 'steam_white', 'electric', 'mono_grey'
 ];
 
 /* Normalised stops ({pos,color}) for a gradient name (falls back to mono). */

@@ -1,7 +1,10 @@
-/* SPDX-License-Identifier: GPL-3.0-only
-   TextureTool — Copyright (C) 2026 KainM-77. Licensed under GPL-3.0. See LICENSE.
-   Pipeline adapted from Materialize (BoundingBoxSoftware), GPL-3.0.
-   See THIRD-PARTY-NOTICES.md. */
+/* SPDX-License-Identifier: MIT
+   TextureTool — Copyright (C) 2026 KainM-77. Available under the MIT License
+   (see LICENSE-MIT). This is independent WebGL 2.0 code — no Materialize code is
+   used here; the multi-pass design was merely informed by Materialize's
+   Graphics.Blit pipeline. The tool as a whole ships under GPL-3.0 (see LICENSE)
+   because it bundles two GPL-3.0 seamless shaders in shaders.js, not this file.
+   See THIRD-PARTY-NOTICES.md and "Path to MIT.md". */
 /* ============================================================
    TRLE Texture Tools — WebGL 2.0 Processing Engine
    GPU-accelerated texture processing via fragment shaders.
@@ -409,26 +412,57 @@ TRLE.Engine = (function() {
 
         // Step 5: Normal map from height
         if (enabledMaps.normal) {
-            // First create a better height for normals
-            const normalHeightFBO = createFBO(width, height);
-            blit('simpleHeight', {
-                u_texture: normalBlurred.texture,
-                u_strength: 1.0,
-                u_bias: 0.0,
-                u_invert: 0.0
-            }, normalHeightFBO);
+            const fineW   = preset.normalFineDetail ?? 0;   // high-freq band weight
+            const coarseW = preset.normalLargeScale ?? 0;   // large-scale band weight
 
-            const normalFBO = createFBO(width, height);
-            blit('normalFromHeight', {
-                u_heightMap: normalHeightFBO.texture,
-                u_texelSize: texel,
-                u_strength: preset.normalStrength / 10.0,
-                u_angularity: (preset.normalAngularity ?? 0),
-                u_angularIntensity: (preset.normalAngularIntensity ?? 0.5),
-                u_flipY: preset.flipNormalY ? 1.0 : 0.0
-            }, normalFBO);
-            results.normal = normalFBO;
-            deleteFBO(normalHeightFBO);
+            if (fineW > 0 || coarseW > 0) {
+                // Multi-level path: blend the height slope at three blur scales.
+                // The base scale matches the single-pass input (normalBlurred), so
+                // weights of 0 reproduce the single-pass output exactly.
+                const baseBlur     = preset.normalBlur ?? 0;
+                const fineRadius   = Math.max(0, baseBlur * 0.34);
+                const coarseRadius = baseBlur * 3 + 5;
+                const fineBlurred   = gaussianBlur(grayFBO.texture, width, height, fineRadius);
+                const coarseBlurred = gaussianBlur(grayFBO.texture, width, height, coarseRadius);
+
+                const normalFBO = createFBO(width, height);
+                blit('normalFromHeightMulti', {
+                    u_hFine:   fineBlurred.texture,
+                    u_hBase:   normalBlurred.texture,
+                    u_hCoarse: coarseBlurred.texture,
+                    u_texelSize: texel,
+                    u_strength: preset.normalStrength / 10.0,
+                    u_wFine:   fineW,
+                    u_wCoarse: coarseW,
+                    u_angularity: (preset.normalAngularity ?? 0),
+                    u_angularIntensity: (preset.normalAngularIntensity ?? 0.5),
+                    u_flipY: preset.flipNormalY ? 1.0 : 0.0
+                }, normalFBO);
+                results.normal = normalFBO;
+                deleteFBO(fineBlurred);
+                deleteFBO(coarseBlurred);
+            } else {
+                // Single-pass path (default, unchanged).
+                const normalHeightFBO = createFBO(width, height);
+                blit('simpleHeight', {
+                    u_texture: normalBlurred.texture,
+                    u_strength: 1.0,
+                    u_bias: 0.0,
+                    u_invert: 0.0
+                }, normalHeightFBO);
+
+                const normalFBO = createFBO(width, height);
+                blit('normalFromHeight', {
+                    u_heightMap: normalHeightFBO.texture,
+                    u_texelSize: texel,
+                    u_strength: preset.normalStrength / 10.0,
+                    u_angularity: (preset.normalAngularity ?? 0),
+                    u_angularIntensity: (preset.normalAngularIntensity ?? 0.5),
+                    u_flipY: preset.flipNormalY ? 1.0 : 0.0
+                }, normalFBO);
+                results.normal = normalFBO;
+                deleteFBO(normalHeightFBO);
+            }
         }
 
         // Step 6: AO from height
@@ -443,7 +477,7 @@ TRLE.Engine = (function() {
                 u_invert: 0.0
             }, aoHeightFBO);
 
-            // Optional normal-field AO channel (Materialize dual-channel blend).
+            // Optional normal-field AO channel (dual-channel AO: height-field + normal-field).
             // Build a normal map from the AO height only when the user asks to blend.
             const aoNormalBlend = preset.aoNormalBlend ?? 0;
             let aoNormalFBO = null;
@@ -563,6 +597,94 @@ TRLE.Engine = (function() {
         return new Blob([header, body], { type: 'image/x-tga' });
     }
 
+    /* ---- Utility: decode a TGA file into a canvas ----
+       Browsers can't render TGA via <img>, so we parse it by hand. Handles the
+       formats a TRLE artist actually ships: uncompressed true-colour (type 2)
+       and RLE true-colour (type 10), at 24 or 32 bits, either vertical origin.
+       Grayscale (type 3 / 11) is included for completeness. Colour-mapped TGAs
+       (type 1 / 9) are rare for textures and are rejected with a clear throw.
+       Returns a canvas (same shape as the <img> path elsewhere). */
+    function decodeTGA(arrayBuffer) {
+        const bytes = new Uint8Array(arrayBuffer);
+        if (bytes.length < 18) throw new Error('File is too small to be a TGA.');
+        const idLength   = bytes[0];
+        const colorMapT  = bytes[1];
+        const imageType  = bytes[2];
+        const w = bytes[12] | (bytes[13] << 8);
+        const h = bytes[14] | (bytes[15] << 8);
+        const bpp = bytes[16];
+        const descriptor = bytes[17];
+        if (!w || !h) throw new Error('TGA has zero dimensions.');
+        if (colorMapT !== 0 || imageType === 1 || imageType === 9)
+            throw new Error('Colour-mapped (indexed) TGAs are not supported — re-export as 24/32-bit true-colour.');
+
+        const isRLE  = imageType === 10 || imageType === 11;
+        const isGray = imageType === 3  || imageType === 11;
+        const rawType = imageType & 0x07;   // 2 = true-colour, 3 = grayscale
+        if (rawType !== 2 && rawType !== 3)
+            throw new Error('Unsupported TGA image type (' + imageType + ').');
+        if (bpp !== 24 && bpp !== 32 && !(isGray && bpp === 8))
+            throw new Error('Unsupported TGA bit depth (' + bpp + ').');
+
+        const bytesPerPixel = bpp >> 3;
+        let p = 18 + idLength;              // skip header + image ID field
+        if (colorMapT !== 0) { /* skipped above via throw */ }
+
+        const total = w * h;
+        const rgba = new Uint8ClampedArray(total * 4);
+
+        // Read one source pixel at buffer offset `off` into rgba[dst*4..].
+        function put(dst, off) {
+            if (isGray) {
+                const g = bytes[off];
+                rgba[dst] = g; rgba[dst + 1] = g; rgba[dst + 2] = g; rgba[dst + 3] = 255;
+            } else {
+                rgba[dst]     = bytes[off + 2];               // R (from B)
+                rgba[dst + 1] = bytes[off + 1];               // G
+                rgba[dst + 2] = bytes[off];                   // B (from R)
+                rgba[dst + 3] = bytesPerPixel === 4 ? bytes[off + 3] : 255;
+            }
+        }
+
+        if (!isRLE) {
+            if (p + total * bytesPerPixel > bytes.length)
+                throw new Error('TGA pixel data is truncated.');
+            for (let i = 0; i < total; i++) put(i * 4, p + i * bytesPerPixel);
+        } else {
+            let i = 0;
+            while (i < total) {
+                if (p >= bytes.length) throw new Error('TGA RLE data is truncated.');
+                const packet = bytes[p++];
+                const count = (packet & 0x7f) + 1;
+                if (packet & 0x80) {                          // RLE run
+                    for (let k = 0; k < count && i < total; k++, i++) put(i * 4, p);
+                    p += bytesPerPixel;
+                } else {                                      // raw packet
+                    for (let k = 0; k < count && i < total; k++, i++, p += bytesPerPixel) put(i * 4, p);
+                }
+            }
+        }
+
+        // Apply origin: descriptor bit 5 set = top-left, clear = bottom-left.
+        const topLeft = (descriptor & 0x20) !== 0;
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        const imgData = ctx.createImageData(w, h);
+        if (topLeft) {
+            imgData.data.set(rgba);
+        } else {
+            // Flip rows into the destination (TGA default is bottom-up).
+            const rowBytes = w * 4;
+            for (let y = 0; y < h; y++) {
+                const src = (h - 1 - y) * rowBytes;
+                imgData.data.set(rgba.subarray(src, src + rowBytes), y * rowBytes);
+            }
+        }
+        ctx.putImageData(imgData, 0, 0);
+        return canvas;
+    }
+
     /* ---- Authored emissive map from a diffuse canvas ----
        Builds a selection mask (brightness / colour / hue), optionally feathers
        it for a soft bloom, then colours it (diffuse colours or a flat tint).
@@ -659,6 +781,7 @@ TRLE.Engine = (function() {
         loadImageAsTexture,
         canvasToBlob,
         encodeTGA,
+        decodeTGA,
         programs: () => programs
     };
 })();

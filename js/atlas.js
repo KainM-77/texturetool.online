@@ -1,5 +1,8 @@
-/* SPDX-License-Identifier: GPL-3.0-only
-   TextureTool — Copyright (C) 2026 KainM-77. Licensed under GPL-3.0. See LICENSE. */
+/* SPDX-License-Identifier: MIT
+   TextureTool — Copyright (C) 2026 KainM-77. This file is the author's own work,
+   available under the MIT License (see LICENSE-MIT). The tool as a whole ships
+   under GPL-3.0 (see LICENSE) only because it also bundles two GPL-3.0 seamless
+   shaders derived from Materialize; this file contains none of that code. */
 /* ============================================================
    TRLE Atlas Tool — all-in-one atlas workbench
    Slice an atlas into elements, then per element: make seamless,
@@ -729,23 +732,58 @@ window.TRLE = window.TRLE || {};
         });
     }
 
-    function loadImageFile(file, area, callback) {
-        const reader = new FileReader();
-        reader.onload = e => {
-            const img = new Image();
-            img.onload = () => {
-                area.querySelectorAll('.preview-img').forEach(el => el.remove());
-                const preview = document.createElement('img');
-                preview.className = 'preview-img';
-                preview.src = e.target.result;
-                area.appendChild(preview);
-                area.querySelector('.upload-text').textContent =
-                    `${file.name} (${img.naturalWidth}×${img.naturalHeight})`;
-                callback(img, file.name);
+    /* Is this file a TGA? Browsers can't decode TGA in <img>, so we sniff it by
+       extension (its MIME type is unreliable — often empty or image/x-tga). */
+    function isTGAFile(file) {
+        return /\.tga$/i.test(file.name || '') ||
+               /tga/i.test(file.type || '');
+    }
+
+    /* Read any supported image file into a real <img> element, so every caller
+       downstream gets a uniform HTMLImageElement (naturalWidth/Height etc.).
+       PNG/JPEG/GIF/WebP/BMP go straight through the browser; TGA is decoded by
+       hand (TRLE.Engine.decodeTGA) then re-encoded to a PNG data-URL. Returns a
+       Promise that rejects with a human-readable Error on any failure. */
+    function readImageFile(file) {
+        if (isTGAFile(file)) {
+            return file.arrayBuffer().then(buf => {
+                let canvas;
+                try {
+                    canvas = TRLE.Engine.decodeTGA(buf);
+                } catch (err) {
+                    throw new Error(`Couldn’t read “${file.name}”: ${err.message}`);
+                }
+                return loadImageURL(canvas.toDataURL('image/png')).then(img => {
+                    if (!img) throw new Error(`Couldn’t decode “${file.name}”.`);
+                    return img;
+                });
+            });
+        }
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = e => {
+                const img = new Image();
+                img.onload = () => resolve(img);
+                img.onerror = () => reject(new Error(
+                    `Couldn’t read “${file.name}”. Unsupported or corrupt image — try PNG or TGA.`));
+                img.src = e.target.result;
             };
-            img.src = e.target.result;
-        };
-        reader.readAsDataURL(file);
+            reader.onerror = () => reject(new Error(`Couldn’t read “${file.name}”.`));
+            reader.readAsDataURL(file);
+        });
+    }
+
+    function loadImageFile(file, area, callback) {
+        readImageFile(file).then(img => {
+            area.querySelectorAll('.preview-img').forEach(el => el.remove());
+            const preview = document.createElement('img');
+            preview.className = 'preview-img';
+            preview.src = img.src;
+            area.appendChild(preview);
+            area.querySelector('.upload-text').textContent =
+                `${file.name} (${img.naturalWidth}×${img.naturalHeight})`;
+            callback(img, file.name);
+        }).catch(err => showToast(err.message, 'error'));
     }
 
     /* ============ MATERIALS ============ */
@@ -1000,11 +1038,64 @@ window.TRLE = window.TRLE || {};
         pushHistory(`Rows: ${Math.ceil(N / n)}`);
     }
 
+    /* Effective tile size from the picker: a preset value, or the Custom field,
+       clamped to 16–2048. Default 256. */
+    function getTileSize() {
+        const sel = $('at-tile-size');
+        let v = (sel && sel.value === 'custom')
+            ? parseInt($('at-tile-size-custom').value)
+            : parseInt(sel ? sel.value : '256');
+        if (!Number.isFinite(v) || v <= 0) v = 256;
+        return Math.max(16, Math.min(2048, v));
+    }
+
+    /* Grey filler tile (same look as "Add Blank"), used to pad the atlas to a
+       row boundary so a grid-shaped block starts at column 0 and keeps its shape. */
+    function makeSpacerTile() {
+        const S = state.tileSize;
+        const canvas = document.createElement('canvas');
+        canvas.width = S; canvas.height = S;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#808080'; ctx.fillRect(0, 0, S, S);
+        return { id: state.nextId++, kind: 'tile', canvas, original: cloneCanvas(canvas),
+                 seamless: false, edited: false, material: null };
+    }
+
+    /* Add a grid-shaped block of tiles that reads best at `width` columns. If the
+       atlas already holds tiles in a different column count, ask whether to reflow
+       it to `width` so the block lines up. The last row is padded with blank
+       spacer tiles when needed so the block starts on a fresh row (otherwise the
+       arrangement would shear). Falsy width = just add (no reflow, no padding). */
+    function confirmResizeCols(width, addFn) {
+        const padThenAdd = () => {
+            if (width) while (state.elements.length % width) state.elements.push(makeSpacerTile());
+            addFn();
+        };
+        if (!width || state.cols === width || state.elements.length === 0) {
+            if (width && state.elements.length === 0) state.cols = width;
+            padThenAdd();
+            return;
+        }
+        const pads = (width - (state.elements.length % width)) % width;
+        openConfirm(
+            '🧩 Arrange as a grid?',
+            `This set reads best as a ${width}-column block, but the atlas is ${state.cols} columns. ` +
+            `Resize the atlas to ${width} columns so the tiles line up? Existing tiles reflow into ${width} columns.` +
+            (pads ? ` ${pads} blank spacer tile${pads > 1 ? 's' : ''} will pad the last row so the block starts on a fresh row.` : ''),
+            `Resize to ${width} columns & add`,
+            () => { state.cols = width; padThenAdd(); },
+            { danger: false, cancelLabel: 'Cancel' }
+        );
+    }
+
     function onCellClick(id, e) {
         if (state.pickBaseId !== null) {
-            if (id === state.pickBaseId) return;  // can't pair with itself
             const base = state.pickBaseId, mode = state.pickMode;
+            // Can't pair with itself — except a border set, which can be built
+            // from one texture (origami: same texture folded/mirrored for trim).
+            if (id === base && mode !== 'borderset') return;
             if (mode === 'wang') openWangModal(base, id);
+            else if (mode === 'borderset') openBsetModal(base, id);
             else if (mode === 'anchor') openAnchorModal(base, id);
             else if (mode === 'transgrid') openTransGridModal(base, id);
             else if (mode === 'organic') openOrganicModal(base, id);
@@ -1066,6 +1157,20 @@ window.TRLE = window.TRLE || {};
     function selectAll() {
         setSelection(state.elements.map(e => e.id), false);
         renderGrid(); updateBulkBar();
+    }
+    /* Jump to a transition's source tile: select it, focus it, scroll to it. */
+    function gotoSourceTile(srcId) {
+        const src = byId(srcId);
+        if (!src) { showToast('Source tile not found — was it deleted?', 'error'); return; }
+        selectSingle(srcId);
+        state.focusedId = srcId;
+        renderGrid(); updateBulkBar();
+        const cell = cellById(srcId);
+        if (cell) {
+            cell.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            cell.focus({ preventScroll: true });
+        }
+        showToast(`Jumped to tile ${indexOf(srcId) + 1} — set its material here`, 'info', 2500);
     }
     /* Selected ids in atlas order (so bulk ops preserve relative order). */
     function selectedIdsInOrder() {
@@ -1340,16 +1445,21 @@ window.TRLE = window.TRLE || {};
         state.pickMode = mode;
         const txt = $('at-pick-text');
         if (txt) txt.textContent = mode === 'wang' ? 'build the Wang set'
+            : mode === 'borderset' ? 'be the border / trim texture'
             : mode === 'organic' ? 'build the organic transition'
             : mode === 'heighttrans' ? 'settle into its crevices'
             : mode === 'recolor' ? 'sample its colours'
             : 'build the transition';
+        const same = $('at-pick-same');
+        if (same) same.style.display = mode === 'borderset' ? '' : 'none';
         $('at-pick-banner').style.display = 'block';
         renderGrid();
     }
 
     function exitPickMode() {
         state.pickBaseId = null;
+        const same = $('at-pick-same');
+        if (same) same.style.display = 'none';
         $('at-pick-banner').style.display = 'none';
         renderGrid();
     }
@@ -1394,6 +1504,7 @@ window.TRLE = window.TRLE || {};
                 mode: el.mode, pivot: el.pivot, hardness: el.hardness,
                 blendMethod: el.blendMethod,
                 wangBits: el.wangBits,
+                bset: el.bset ? JSON.parse(JSON.stringify(el.bset)) : null,  // border-set recipe
                 customMask: el.customMask || null,                     // immutable ref (set once at add)
                 overlayGeom: el.overlayGeom ? { ...el.overlayGeom } : null, // transition overlay re-orient
                 emissive: el.emissive ? cloneCanvas(el.emissive) : null, // authored glow (mutable)
@@ -1439,6 +1550,7 @@ window.TRLE = window.TRLE || {};
                 mode: s.mode, pivot: s.pivot, hardness: s.hardness,
                 blendMethod: s.blendMethod,
                 wangBits: s.wangBits,
+                bset: s.bset ? JSON.parse(JSON.stringify(s.bset)) : null,
                 customMask: s.customMask || null,
                 overlayGeom: s.overlayGeom ? { ...s.overlayGeom } : null,
                 emissive: s.emissive ? cloneCanvas(s.emissive) : null,
@@ -1537,6 +1649,7 @@ window.TRLE = window.TRLE || {};
         if (l.includes('seamless')) return '♾️';
         if (l.includes('transition')) return '🌗';
         if (l.includes('wang')) return '🧩';
+        if (l.includes('border set')) return '🧱';
         if (l.includes('material')) return '🎨';
         if (l.includes('heal')) return '🩹';
         if (l.includes('fade')) return '👻';
@@ -1605,7 +1718,15 @@ window.TRLE = window.TRLE || {};
 
         menu.querySelector('[data-action="material"]').disabled = el.kind === 'transition';
         menu.querySelector('[data-action="material"]').title =
-            el.kind === 'transition' ? 'Transition tiles inherit materials from their source tiles' : '';
+            el.kind === 'transition'
+                ? 'Transition tiles pick up their materials automatically from the two tiles they blend. '
+                  + 'Set the material on the base or overlay texture instead — this tile will follow along. '
+                  + 'Use “Go to Base / Overlay Texture” below to jump straight to them.'
+                : '';
+        // Transition-only helpers: jump to the tiles this transition was built from.
+        menu.querySelectorAll('[data-transonly]').forEach(b => {
+            b.style.display = (el.kind === 'transition' && el.base != null) ? '' : 'none';
+        });
         menu.querySelectorAll('[data-tileonly]').forEach(b => {
             b.style.display = el.kind === 'tile' ? '' : 'none';
         });
@@ -1658,6 +1779,11 @@ window.TRLE = window.TRLE || {};
             case 'seamless':   openSeamlessModal(id); break;
             case 'transition': enterPickMode(id, 'transition'); showToast('Now click the second texture', 'info'); break;
             case 'wang': enterPickMode(id, 'wang'); showToast('Now click the second texture for the Wang set', 'info'); break;
+            case 'borderset': enterPickMode(id, 'borderset'); showToast('Click a second texture for the trim — or “Use same texture” for an origami fold', 'info'); break;
+            case 'origami':
+                if (el.kind !== 'tile') { showToast('Origami Frame works on source tiles only', 'info'); return; }
+                openOrigamiModal(id);
+                break;
             case 'anchor': enterPickMode(id, 'anchor'); showToast('Now click the second texture for the anchored transition', 'info'); break;
             case 'transgrid': enterPickMode(id, 'transgrid'); showToast('Now click the second texture for the transition grid', 'info'); break;
             case 'organic': enterPickMode(id, 'organic'); showToast('Now click the second texture for the organic transition', 'info'); break;
@@ -1668,9 +1794,11 @@ window.TRLE = window.TRLE || {};
                 openAnimModal(el.anim.group);
                 break;
             case 'material':
-                if (el.kind === 'transition') showToast('Transition tiles inherit materials from their sources', 'info');
+                if (el.kind === 'transition') showToast('Transitions inherit materials — set them on the base/overlay texture instead', 'info');
                 else openMatModal(id);
                 break;
+            case 'gotobase':    gotoSourceTile(el.base);    break;
+            case 'gotooverlay': gotoSourceTile(el.overlay); break;
             case 'heal':
                 if (el.kind !== 'tile') { showToast('Heal works on source tiles only', 'info'); return; }
                 openHealModal(id);
@@ -1767,6 +1895,15 @@ window.TRLE = window.TRLE || {};
         const S = state.tileSize;
         state.elements.forEach(el => {
             if (el.kind !== 'transition') return;
+            if (el.bset) {   // border-set slot — rebuilt from its recipe
+                const c = buildBsetTile(el, S);
+                if (c) {
+                    const tctx = el.canvas.getContext('2d');
+                    tctx.clearRect(0, 0, S, S);
+                    tctx.drawImage(c, 0, 0);
+                }
+                return;
+            }
             const base = byId(el.base), overlay = byId(el.overlay);
             if (!base || !overlay) return;
             const mask = el.customMask
@@ -1783,7 +1920,7 @@ window.TRLE = window.TRLE || {};
     }
 
     /* ============ MODAL INFRASTRUCTURE ============ */
-    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'fade', 'emissive', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'delight', 'import', 'confirm'];
+    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'bset', 'fade', 'emissive', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'delight', 'import', 'origami', 'confirm'];
 
     function visibleModal() {
         return MODAL_NAMES
@@ -1846,6 +1983,7 @@ window.TRLE = window.TRLE || {};
         fadeCleanup();
         emissiveCleanup();
         anchorCleanup();
+        bsetCleanup();
         htCleanup();
         tgCleanup();
         orgCleanup();
@@ -2233,6 +2371,8 @@ window.TRLE = window.TRLE || {};
         $('at-anim-col-gamma-val').textContent    = (+$('at-anim-col-gamma').value / 100).toFixed(2);
         const pv = +$('at-anim-col-posterize').value;
         $('at-anim-col-posterize-val').textContent = pv >= 2 ? pv + ' levels' : 'Off';
+        const sp = +$('at-anim-col-spread').value;
+        $('at-anim-col-spread-val').textContent = sp > 0 ? sp + '%' : 'Off';
     }
 
     /* Push an.color.adjust → the sliders/checkbox (+ gradient dropdown). */
@@ -2267,6 +2407,7 @@ window.TRLE = window.TRLE || {};
         const gname = TRLE.AnimPresets_gradient(key);
         an.color = { gradient: gname, stops: TRLE.AnimGradients_stops(gname), adjust: anColorIdentity() };
         an.selStop = null;
+        $('at-anim-col-spread').value = 0;   // colour-spread is opt-in per preset
         anColorSyncControls();
         anStopSyncControls();
         anRenderStops();
@@ -2397,7 +2538,8 @@ window.TRLE = window.TRLE || {};
             gain: +$('at-anim-gain').value / 100,
             warp: +$('at-anim-warp').value / 100,
             contrast: +$('at-anim-contrast').value / 100,
-            stretch: +$('at-anim-stretch').value
+            stretch: +$('at-anim-stretch').value,
+            equalize: +$('at-anim-col-spread').value / 100
         };
         Object.assign(overrides, anFlowFromControls());
         // Colour comes from the Colour tab (gradient stops + adjustments).
@@ -2579,6 +2721,7 @@ window.TRLE = window.TRLE || {};
                 : TRLE.AnimGradients_stops(gname || TRLE.AnimPresets_gradient(m.preset));
             an.color = { gradient: gname, stops, adjust: Object.assign(anColorIdentity(), m.params.colorAdjust || {}) };
             an.selStop = null;
+            $('at-anim-col-spread').value = Math.round((m.params.equalize || 0) * 100);
             anColorSyncControls();
             anStopSyncControls();
             anRenderStops();
@@ -2613,6 +2756,7 @@ window.TRLE = window.TRLE || {};
          'at-anim-col-gamma', 'at-anim-col-posterize'].forEach(id =>
             $(id).addEventListener('input', () => { anColorSyncLabels(); anColorReadAdjust(); anDrawRamp(); anScheduleRegen(); }));
         $('at-anim-col-invert').addEventListener('change', () => { anColorReadAdjust(); anDrawRamp(); anScheduleRegen(); });
+        $('at-anim-col-spread').addEventListener('input', () => { anColorSyncLabels(); anScheduleRegen(); });
         $('at-anim-col-reset').addEventListener('click', () => { anColorFromPreset($('at-anim-preset').value); anScheduleRegen(); });
 
         // Stop editor
@@ -2670,8 +2814,109 @@ window.TRLE = window.TRLE || {};
 
     /* ============ TRANSITION MODAL ============ */
     const tr = { baseId: null, overlayId: null, activeMode: 'Top',
-                 maskMode: 'dir', customMask: null, brushErase: false,
+                 maskMode: 'dir', customMask: null, brushErase: false, tab: 'single',
                  overlayGeom: { rot: 0, flipH: false, flipV: false } };
+
+    /* Solid mask for the Full Set's plain cells — kept as customMask transitions
+       (not pixel copies) so they track edits to, and inherit materials from,
+       their source tile. */
+    function solidMask(S, white) {
+        const c = document.createElement('canvas'); c.width = S; c.height = S;
+        const x = c.getContext('2d'); x.fillStyle = white ? '#fff' : '#000';
+        x.fillRect(0, 0, S, S);
+        return c;
+    }
+
+    /* Full-set layouts: topology masks arranged spatially so the added block
+       reads as one connected terrain patch (the island's NW tile has the overlay
+       poking into its lower-right corner, etc.). '@BASE' / '@OVERLAY' = plain
+       cells. Corner style swaps rounded (Diagonal/corner-Full) for sharp 45°
+       slope cuts. */
+    /* Full-set layout table — pure (no DOM), so the modal and the Learn-page
+       capture hook share one source of truth. `@BASE`/`@OVERLAY` = plain cells;
+       `sharp` swaps rounded corners for 45° slope cuts. */
+    function transSetCells(layout, sharp) {
+        const C = { NW: sharp ? 'SlopeBR' : 'DiagonalBottomRight',   // island (outer) corners
+                    NE: sharp ? 'SlopeBL' : 'DiagonalBottomLeft',
+                    SW: sharp ? 'SlopeTR' : 'DiagonalTopRight',
+                    SE: sharp ? 'SlopeTL' : 'DiagonalTopLeft' };
+        const H = { NW: sharp ? 'SlopeTL' : 'BottomRightFull',       // hole (inner) corners
+                    NE: sharp ? 'SlopeTR' : 'BottomLeftFull',
+                    SW: sharp ? 'SlopeBL' : 'TopRightFull',
+                    SE: sharp ? 'SlopeBR' : 'TopLeftFull' };
+        switch (layout) {
+            case 'hole3': return { width: 3, cells: [
+                H.NW,       'TopFull',    H.NE,
+                'LeftFull', '@BASE',      'RightFull',
+                H.SW,       'BottomFull', H.SE] };
+            case 'complete5': return { width: 5, cells: [
+                C.NW,        'BottomFull', C.NE,       H.NW,    H.NE,
+                'RightFull', '@OVERLAY',   'LeftFull', H.SW,    H.SE,
+                C.SW,        'TopFull',    C.SE,       '@BASE', '@OVERLAY'] };
+            default: return { width: 3, cells: [                 // island3
+                C.NW,        'BottomFull', C.NE,
+                'RightFull', '@OVERLAY',   'LeftFull',
+                C.SW,        'TopFull',    C.SE] };
+        }
+    }
+    function trSetLayout() {
+        return transSetCells($('at-tr-set-layout').value, $('at-tr-set-corners').value === 'sharp');
+    }
+
+    /* Tab + mask-source combined visibility (they interact: pivot/hardness is
+       hidden only for single+custom, panels swap wholesale per tab). */
+    function trApplyVisibility() {
+        const set = tr.tab === 'set';
+        const custom = tr.maskMode === 'custom';
+        document.querySelectorAll('#at-modal-trans [data-tr-panel]').forEach(p => {
+            p.style.display = (p.dataset.trPanel === tr.tab) ? '' : 'none';
+        });
+        if (!set) {
+            $('at-tr-dir-group').style.display       = custom ? 'none' : '';
+            $('at-tr-custom-controls').style.display = custom ? '' : 'none';
+        }
+        $('at-tr-pivot-row').style.display = (!set && custom) ? 'none' : '';
+        $('at-tr-add').textContent = set ? `➕ Add ${trSetLayout().cells.length} Tiles` : '➕ Add to Atlas';
+    }
+
+    function trSetTab(name) {
+        tr.tab = name;
+        document.querySelectorAll('#at-modal-trans .at-anim-tab').forEach(b => {
+            const on = b.dataset.trTab === name;
+            b.classList.toggle('active', on);
+            b.setAttribute('aria-selected', on ? 'true' : 'false');
+        });
+        trApplyVisibility();
+        trPreview();
+    }
+
+    /* Compose + render the full-set preview grid at the layout's width. */
+    function trSetPreview() {
+        if (tr.baseId === null) return;
+        const P = 192;
+        const method   = $('at-tr-method').value;
+        const pivot    = parseInt($('at-tr-pivot').value) / 100;
+        const hardness = parseInt($('at-tr-hardness').value) / 100;
+        const L = trSetLayout();
+        const base    = resizeCanvas(byId(tr.baseId).canvas, P, P);
+        const overlay = resizeCanvas(trOverlayCanvas(), P, P);
+        const wrap = $('at-tr-set-previews');
+        wrap.style.gridTemplateColumns = `repeat(${L.width},1fr)`;
+        wrap.innerHTML = '';
+        for (const cell of L.cells) {
+            const c = document.createElement('canvas'); c.width = P; c.height = P;
+            c.style.cssText = 'width:100%;border:1px solid var(--border);border-radius:3px;image-rendering:pixelated;';
+            const x = c.getContext('2d');
+            if (cell === '@BASE') x.drawImage(base, 0, 0);
+            else if (cell === '@OVERLAY') x.drawImage(overlay, 0, 0);
+            else x.drawImage(composeTransitionDiffuse(base, overlay,
+                buildTopologyMask(P, cell, pivot, hardness), P, method,
+                method === 'poisson' ? 120 : undefined), 0, 0);
+            wrap.appendChild(c);
+        }
+        $('at-tr-set-count').textContent = L.cells.length;
+        $('at-tr-add').textContent = `➕ Add ${L.cells.length} Tiles`;
+    }
 
     /* The overlay (B) canvas re-oriented by the modal's rotate/flip buttons. */
     function trOverlayCanvas() {
@@ -2694,9 +2939,9 @@ window.TRLE = window.TRLE || {};
         mctx.fillStyle = '#000';
         mctx.fillRect(0, 0, tr.customMask.width, tr.customMask.height);
         $('at-tr-mask-source').value = 'dir';
-        trSetMaskSource('dir');
-
+        tr.maskMode = 'dir';
         openModal('trans');
+        trSetTab(tr.tab || 'single');   // restores last-used tab, refreshes the right preview
     }
 
     function trActiveDirs() {
@@ -2715,9 +2960,7 @@ window.TRLE = window.TRLE || {};
     function trSetMaskSource(mode) {
         tr.maskMode = mode;
         const custom = mode === 'custom';
-        $('at-tr-dir-group').style.display      = custom ? 'none' : '';
-        $('at-tr-pivot-row').style.display      = custom ? 'none' : '';
-        $('at-tr-custom-controls').style.display = custom ? '' : 'none';
+        trApplyVisibility();
         $('at-tr-preview-label').textContent =
             custom ? 'Paint mask — white = overlay (B) shows through' : 'Preview (last clicked direction)';
         $('at-tr-preview').style.cursor = custom ? 'crosshair' : 'default';
@@ -2738,6 +2981,7 @@ window.TRLE = window.TRLE || {};
 
     function trPreview() {
         if (tr.baseId === null) return;
+        if (tr.tab === 'set') { trSetPreview(); return; }   // all refresh paths route here
         const P = 256;
         const method   = $('at-tr-method').value;
         const base    = resizeCanvas(byId(tr.baseId).canvas, P, P);
@@ -2749,6 +2993,10 @@ window.TRLE = window.TRLE || {};
     }
 
     function setupTransModal() {
+        document.querySelectorAll('#at-modal-trans .at-anim-tab').forEach(b =>
+            b.addEventListener('click', () => trSetTab(b.dataset.trTab)));
+        ['at-tr-set-layout', 'at-tr-set-corners'].forEach(id =>
+            $(id).addEventListener('change', () => { trApplyVisibility(); trPreview(); }));
         const dirs = $('at-tr-dirs');
         TRANS_MODES.forEach(({ mode, label }) => {
             const btn = document.createElement('button');
@@ -2818,6 +3066,35 @@ window.TRLE = window.TRLE || {};
         $('at-tr-add').addEventListener('click', () => {
             const S = state.tileSize;
             const method = methodSel.value;
+
+            // --- Full Set tab → the whole spatial arrangement ---
+            if (tr.tab === 'set') {
+                const L = trSetLayout();
+                const pivot    = parseInt($('at-tr-pivot').value) / 100;
+                const hardness = parseInt($('at-tr-hardness').value) / 100;
+                const geom = geomIsIdentity(tr.overlayGeom) ? null : { ...tr.overlayGeom };
+                const baseId = tr.baseId, overlayId = tr.overlayId;
+                // Build now, then (optionally) reflow the atlas so the block lines up.
+                const els = L.cells.map(cell => {
+                    const common = {
+                        id: 0, kind: 'transition', canvas: blankCanvas(S), original: null,
+                        seamless: false, material: null, base: baseId, overlay: overlayId,
+                        blendMethod: method, overlayGeom: geom
+                    };
+                    if (cell === '@BASE')    return { ...common, mode: 'custom', pivot: 0, hardness: 0, customMask: solidMask(S, false) };
+                    if (cell === '@OVERLAY') return { ...common, mode: 'custom', pivot: 0, hardness: 0, customMask: solidMask(S, true) };
+                    return { ...common, mode: cell, pivot, hardness };
+                });
+                confirmResizeCols(L.width, () => {
+                    for (const el of els) { el.id = state.nextId++; state.elements.push(el); }
+                    closeModal();
+                    renderGrid();
+                    refreshTransitions();
+                    pushHistory(`Transition set (${els.length})`);
+                    showToast(`Added ${els.length}-tile transition set to the atlas`, 'success');
+                });
+                return;
+            }
 
             // --- Custom hand-painted mask → one tile ---
             if (tr.maskMode === 'custom') {
@@ -2889,15 +3166,33 @@ window.TRLE = window.TRLE || {};
         wangPreview();
     }
 
+    /* Spatial Wang layouts. Bits: N=1 E=2 S=4 W=8; overlay ("sand") fills toward
+       the block centre so a placed grid reads as an island of overlay.
+       width = the atlas column count the block wants (null = don't reflow). */
+    const WANG_LAYOUTS = {
+        // Full 16 in a Gray-coded 4×4 so neighbours share edges (overlay blob → SE).
+        '4x4':  { width: 4, bits: [0, 2, 10, 8,  4, 6, 14, 12,  5, 7, 15, 13,  1, 3, 11, 9] },
+        // 3×3 overlay-in-centre blob (9 tiles); centre = 15 (surrounded → full overlay).
+        '3x3':  { width: 3, bits: [6, 4, 12,  2, 15, 8,  3, 1, 9] },
+        // Flat 16 in bit order (original behaviour); no reflow.
+        'rows': { width: null, bits: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] }
+    };
+    function wangCurrentLayout() {
+        const el = $('at-wang-layout');
+        return WANG_LAYOUTS[el ? el.value : '4x4'] || WANG_LAYOUTS['4x4'];
+    }
+
     function wangPreview() {
         if (wang.baseId === null) return;
         const P = 256;
         const { method, pivot, hardness } = wangParams();
         const base    = resizeCanvas(byId(wang.baseId).canvas, P, P);
         const overlay = resizeCanvas(byId(wang.overlayId).canvas, P, P);
+        const L = wangCurrentLayout();
         const wrap = $('at-wang-previews');
+        wrap.style.gridTemplateColumns = `repeat(${L.width || 4},1fr)`;
         wrap.innerHTML = '';
-        for (let bits = 0; bits < 16; bits++) {
+        for (const bits of L.bits) {
             const mask = buildWangMask(P, bits, pivot, hardness);
             const comp = composeTransitionDiffuse(base, overlay, mask, P, method, method === 'poisson' ? 120 : undefined);
             const c = document.createElement('canvas');
@@ -2906,10 +3201,14 @@ window.TRLE = window.TRLE || {};
             c.getContext('2d').drawImage(comp, 0, 0);
             wrap.appendChild(c);
         }
+        const n = L.bits.length;
+        if ($('at-wang-count'))    $('at-wang-count').textContent = n;
+        if ($('at-wang-addcount')) $('at-wang-addcount').textContent = n;
     }
 
     function setupWangModal() {
         $('at-wang-method').addEventListener('change', wangPreview);
+        $('at-wang-layout').addEventListener('change', wangPreview);
         ['at-wang-pivot', 'at-wang-hardness'].forEach(id => {
             $(id).addEventListener('input', function () {
                 $(id + '-val').textContent = this.value;
@@ -2920,23 +3219,528 @@ window.TRLE = window.TRLE || {};
             if (wang.baseId === null) return;
             const S = state.tileSize;
             const { method, pivot, hardness } = wangParams();
-            for (let bits = 0; bits < 16; bits++) {
-                state.elements.push({
-                    id: state.nextId++,
-                    kind: 'transition',
-                    canvas: blankCanvas(S),
-                    original: null,
-                    seamless: false,
-                    material: null,
-                    base: wang.baseId, overlay: wang.overlayId,
-                    mode: 'wang', wangBits: bits, pivot, hardness, blendMethod: method
-                });
+            const L = wangCurrentLayout();
+            const baseId = wang.baseId, overlayId = wang.overlayId;
+            // Build the tiles now, then (optionally) reflow the atlas so the block lines up.
+            const els = L.bits.map(bits => ({
+                id: 0, kind: 'transition', canvas: blankCanvas(S), original: null,
+                seamless: false, material: null, base: baseId, overlay: overlayId,
+                mode: 'wang', wangBits: bits, pivot, hardness, blendMethod: method
+            }));
+            confirmResizeCols(L.width, () => {
+                for (const el of els) { el.id = state.nextId++; state.elements.push(el); }
+                closeModal();
+                renderGrid();
+                refreshTransitions();   // paint into the now-attached canvases (forces repaint)
+                pushHistory(`Wang set (${els.length})`);
+                showToast(`Added ${els.length}-tile Wang set to the atlas`, 'success');
+            });
+        });
+    }
+
+    /* ============ BORDER SET — "Add Borders & Corners" ============
+       Builds a reusable connectivity tile set from ONE fill texture plus a trim
+       texture: the trim runs along the boundary of areas painted with the fill.
+       Two topologies:
+         'frame' — trim hugs the tile edges (9-slice; +4 inner corners = any
+                   rectilinear room shape). Roles: TL T TR / L C R / BL B BR
+                   + ITL ITR IBL IBR (quarter patch where the border turns
+                   through a concave corner).
+         'lines' — trim runs through the tile centre connecting edge midpoints
+                   (pipes/roads). Same NESW bits as Wang: N=1 E=2 S=4 W=8.
+       Each generated element is a kind:'transition' with an `el.bset` recipe,
+       so it re-renders from its parents (refreshTransitions) and inherits
+       materials via a union mask (deriveMaps), exactly like Wang tiles.
+       Per-slot override: a slot can be produced from its own mask ('auto'),
+       by rotating/mirroring the canonical family member ('rot'/'mirh'/'mirv' —
+       the escape hatch for directional trim), or by copying an atlas tile
+       ('tile' + srcId, for hand-authored slots). */
+
+    /* -- geometry tables -- */
+    const BSET_ROLE_EDGES = {
+        T: ['N'], R: ['E'], B: ['S'], L: ['W'],
+        TL: ['N', 'W'], TR: ['N', 'E'], BL: ['S', 'W'], BR: ['S', 'E'],
+        ITL: 'NW', ITR: 'NE', IBL: 'SW', IBR: 'SE',   // inner corners (string = corner patch)
+        C: []
+    };
+    /* rotateTile90 turns clockwise, so k steps CW from the canonical member. */
+    const BSET_ROT = {
+        T: ['T', 0], R: ['T', 1], B: ['T', 2], L: ['T', 3],
+        TL: ['TL', 0], TR: ['TL', 1], BR: ['TL', 2], BL: ['TL', 3],
+        ITL: ['ITL', 0], ITR: ['ITL', 1], IBR: ['ITL', 2], IBL: ['ITL', 3],
+        C: ['C', 0]
+    };
+    const BSET_MIRH = { L: 'R', R: 'L', TL: 'TR', TR: 'TL', BL: 'BR', BR: 'BL',
+                        ITL: 'ITR', ITR: 'ITL', IBL: 'IBR', IBR: 'IBL', T: 'T', B: 'B', C: 'C' };
+    const BSET_MIRV = { T: 'B', B: 'T', TL: 'BL', BL: 'TL', TR: 'BR', BR: 'TR',
+                        ITL: 'IBL', IBL: 'ITL', ITR: 'IBR', IBR: 'ITR', L: 'L', R: 'R', C: 'C' };
+
+    /* NESW bit helpers (lines topology). CW rotation maps N→E→S→W→N. */
+    const bsetRotBitsCW = b => ((b << 1) | (b >> 3)) & 15;
+    const bsetMirBitsH  = b => (b & 5)  | ((b & 2) ? 8 : 0) | ((b & 8) ? 2 : 0);
+    const bsetMirBitsV  = b => (b & 10) | ((b & 1) ? 4 : 0) | ((b & 4) ? 1 : 0);
+    /* Canonical rotation family member + CW steps back to `bits`. */
+    function bsetCanonicalBits(bits) {
+        let best = bits, k = 0, cur = bits;
+        for (let i = 1; i < 4; i++) {
+            cur = bsetRotBitsCW(cur);
+            if (cur < best) { best = cur; k = i; }
+        }
+        return { from: best, steps: (4 - k) % 4 };
+    }
+
+    /* -- mask math. w = trim width px, f = feather px. -- */
+    function bsetMakeMask(S, fn) {
+        const canvas = document.createElement('canvas');
+        canvas.width = S; canvas.height = S;
+        const ctx = canvas.getContext('2d');
+        const img = ctx.createImageData(S, S);
+        const d = img.data;
+        for (let y = 0; y < S; y++) {
+            for (let x = 0; x < S; x++) {
+                const byte = Math.round(Math.max(0, Math.min(1, fn(x, y))) * 255);
+                const i = (y * S + x) * 4;
+                d[i] = byte; d[i + 1] = byte; d[i + 2] = byte; d[i + 3] = 255;
             }
-            closeModal();
-            renderGrid();
-            refreshTransitions();   // paint into the now-attached canvases (forces repaint)
-            pushHistory('Wang set (16)');
-            showToast('Added 16-tile Wang set to the atlas', 'success');
+        }
+        ctx.putImageData(img, 0, 0);
+        return canvas;
+    }
+    const bsetEdgeDist = (dir, x, y, S) =>
+        dir === 'N' ? y : dir === 'S' ? S - 1 - y : dir === 'W' ? x : S - 1 - x;
+    /* Coverage of an edge band at distance d from its edge. */
+    const bsetEdgeVal = (d, w, f) => (w + f / 2 - d) / f;
+    /* Distance to a centre-to-edge-midpoint segment (lines topology). */
+    function bsetLineDist(dir, x, y, S) {
+        const c = (S - 1) / 2;
+        switch (dir) {
+            case 'N': return Math.hypot(x - c, Math.max(0, y - c));
+            case 'S': return Math.hypot(x - c, Math.max(0, c - y));
+            case 'W': return Math.hypot(Math.max(0, x - c), y - c);
+            default:  return Math.hypot(Math.max(0, c - x), y - c); // E
+        }
+    }
+    const bsetLineVal = (d, w, f) => (w / 2 + f / 2 - d) / f;
+    const bsetBitDirs = bits => ['N', 'E', 'S', 'W'].filter((_, i) => bits & (1 << i));
+
+    /* Union mask of every trim region for a slot (white = trim). Used for the
+       non-directional single-pass composite and for material-map compositing —
+       the region is the same however the diffuse pixels were derived. */
+    function bsetUnionMask(S, topo, spec, w, f) {
+        if (topo === 'lines') {
+            const dirs = bsetBitDirs(spec);
+            if (!dirs.length) return bsetMakeMask(S, () => 0);
+            return bsetMakeMask(S, (x, y) =>
+                Math.max(...dirs.map(d => bsetLineVal(bsetLineDist(d, x, y, S), w, f))));
+        }
+        const e = BSET_ROLE_EDGES[spec];
+        if (typeof e === 'string') {   // inner corner: intersection of the two edge bands
+            const [a, b] = e.split('');
+            return bsetMakeMask(S, (x, y) => Math.min(
+                bsetEdgeVal(bsetEdgeDist(a, x, y, S), w, f),
+                bsetEdgeVal(bsetEdgeDist(b, x, y, S), w, f)));
+        }
+        if (!e || !e.length) return bsetMakeMask(S, () => 0);
+        return bsetMakeMask(S, (x, y) =>
+            Math.max(...e.map(d => bsetEdgeVal(bsetEdgeDist(d, x, y, S), w, f))));
+    }
+
+    /* Composite passes for one slot. When the trim "follows direction",
+       vertical runs get the trim texture rotated 90°, and two-edge corners are
+       split along a mitre diagonal (picture-frame joint) so each half keeps
+       its own trim orientation. `vertical` marks passes wanting rotated trim. */
+    function bsetPasses(S, topo, spec, w, f, follow) {
+        if (!follow) {
+            const mask = bsetUnionMask(S, topo, spec, w, f);
+            const empty = (topo === 'lines') ? spec === 0 : !BSET_ROLE_EDGES[spec] || BSET_ROLE_EDGES[spec].length === 0;
+            return (empty && typeof BSET_ROLE_EDGES[spec] !== 'string') ? [] : [{ mask, vertical: false }];
+        }
+        if (topo === 'lines') {
+            return bsetBitDirs(spec).map(d => ({
+                mask: bsetMakeMask(S, (x, y) => bsetLineVal(bsetLineDist(d, x, y, S), w, f)),
+                vertical: d === 'N' || d === 'S'
+            }));
+        }
+        const e = BSET_ROLE_EDGES[spec];
+        if (typeof e === 'string') {   // inner corner patch — one pass, horizontal trim
+            const [a, b] = e.split('');
+            return [{ mask: bsetMakeMask(S, (x, y) => Math.min(
+                bsetEdgeVal(bsetEdgeDist(a, x, y, S), w, f),
+                bsetEdgeVal(bsetEdgeDist(b, x, y, S), w, f))), vertical: false }];
+        }
+        if (!e || !e.length) return [];
+        if (e.length === 1) {
+            const d = e[0];
+            return [{ mask: bsetMakeMask(S, (x, y) => bsetEdgeVal(bsetEdgeDist(d, x, y, S), w, f)),
+                      vertical: d === 'E' || d === 'W' }];
+        }
+        // Outer corner: two bands, cross-faded along the mitre diagonal.
+        const fm = Math.max(2, f);
+        return e.map((d, i) => {
+            const other = e[1 - i];
+            return {
+                mask: bsetMakeMask(S, (x, y) => {
+                    const dt = bsetEdgeDist(d, x, y, S), doth = bsetEdgeDist(other, x, y, S);
+                    const c = Math.max(0, Math.min(1, 0.5 + (doth - dt) / (2 * fm)));
+                    return bsetEdgeVal(dt, w, f) * c;
+                }),
+                vertical: d === 'E' || d === 'W'
+            };
+        });
+    }
+
+    /* Render one slot's diffuse. `b` = { topo, role|bits, width (0..0.5 of S),
+       soft (0..1 of width), follow, slotMode }. Rot/mirror slots re-render the
+       canonical/partner slot's mask version, then transform the whole tile. */
+    function renderBsetVariant(b, fillC, trimC, S, method) {
+        let spec = b.topo === 'lines' ? b.bits : b.role;
+        let post = null;
+        const rotN = (cv, k) => { for (let i = 0; i < k; i++) cv = rotateTile90(cv); return cv; };
+        if (b.slotMode === 'rot') {
+            if (b.topo === 'lines') {
+                const c = bsetCanonicalBits(b.bits);
+                spec = c.from;
+                if (c.steps) post = cv => rotN(cv, c.steps);
+            } else {
+                const [from, k] = BSET_ROT[b.role] || [b.role, 0];
+                spec = from;
+                if (k) post = cv => rotN(cv, k);
+            }
+        } else if (b.slotMode === 'mirh') {
+            spec = b.topo === 'lines' ? bsetMirBitsH(b.bits) : (BSET_MIRH[b.role] || b.role);
+            post = cv => flipTile(cv, true);
+        } else if (b.slotMode === 'mirv') {
+            spec = b.topo === 'lines' ? bsetMirBitsV(b.bits) : (BSET_MIRV[b.role] || b.role);
+            post = cv => flipTile(cv, false);
+        }
+        const w = Math.max(2, Math.round(b.width * S));
+        const f = Math.max(1, b.soft * w);
+        const fill = (fillC.width === S && fillC.height === S) ? fillC : resizeCanvas(fillC, S, S);
+        let out = document.createElement('canvas');
+        out.width = S; out.height = S;
+        out.getContext('2d').drawImage(fill, 0, 0);
+        const passes = bsetPasses(S, b.topo, spec, w, f, !!b.follow);
+        if (passes.length) {
+            // Origami (single-texture) sets: the trim IS the fill, rotated 90° so
+            // its detail runs parallel to each edge. With "follow" on, vertical
+            // runs rotate again (→180°), so ridges/planks stay parallel to every
+            // edge and fold through the corners — a continuous concentric frame.
+            const trim = b.origami
+                ? rotateTile90(fill)
+                : ((trimC.width === S && trimC.height === S) ? trimC : resizeCanvas(trimC, S, S));
+            let trimV = null;   // trim rotated for vertical runs, built on demand
+            for (const p of passes) {
+                const t = p.vertical ? (trimV = trimV || rotateTile90(trim)) : trim;
+                out = composeTransitionDiffuse(out, t, p.mask, S, method, method === 'poisson' ? 120 : undefined);
+            }
+        }
+        return post ? post(out) : out;
+    }
+
+    /* Rebuild a placed border-set element's diffuse from its recipe (called by
+       refreshTransitions). Returns null when a parent is missing. */
+    function buildBsetTile(el, S) {
+        const b = el.bset;
+        if (b.slotMode === 'tile') {
+            const src = byId(b.srcId);
+            if (src) return resizeCanvas(src.canvas, S, S);
+            // fall through to 'auto' if the source tile was deleted
+        }
+        const fill = byId(el.base), trim = byId(el.overlay);
+        if (!fill || !trim) return null;
+        const mode = (b.slotMode === 'tile') ? 'auto' : b.slotMode;
+        return renderBsetVariant(Object.assign({}, b, { slotMode: mode }),
+            fill.canvas, trim.canvas, S, el.blendMethod);
+    }
+
+    /* Auto-detect whether the source's dominant detail runs vertically (varies
+       by column → 'v') or horizontally (varies by row → 'h'), by comparing the
+       variance of column-means vs row-means of luminance. Picks the axis whose
+       profile carries the ridges so the fold turns them into rings. */
+    function origamiDetectAxis(data, S) {
+        const colMean = new Float64Array(S), rowMean = new Float64Array(S);
+        for (let y = 0; y < S; y++) {
+            for (let x = 0; x < S; x++) {
+                const i = (y * S + x) * 4;
+                const l = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+                colMean[x] += l; rowMean[y] += l;
+            }
+        }
+        const varOf = arr => {
+            let m = 0; for (const v of arr) m += v; m /= arr.length;
+            let s = 0; for (const v of arr) { const d = v - m; s += d * d; }
+            return s / arr.length;
+        };
+        return varOf(colMean) >= varOf(rowMean) ? 'v' : 'h';
+    }
+
+    /* Fold a texture into a concentric "origami" frame. opts:
+         shape   'square'|'diamond'|'circle' — ring geometry (Chebyshev / Manhattan
+                 / Euclidean distance from the centre)
+         repeats 1..N  — mirrored nested copies of the source (seamless, via a
+                 triangle wave on the radius so ring boundaries reflect)
+         axis    'auto'|'v'|'h' — which source axis carries the detail (radius
+                 samples that axis; the perpendicular axis is the along-ring coord)
+       The along-ring coordinate is a symmetric min/max of the folded distances,
+       so detail wraps continuously through the corners (no diagonal seam) and the
+       result is 8-fold symmetric. Source alpha is preserved. */
+    function makeOrigamiFrame(srcCanvas, S, opts = {}) {
+        const shape = opts.shape || 'square';
+        const repeats = Math.max(1, opts.repeats || 1);
+        const src = (srcCanvas.width === S && srcCanvas.height === S)
+            ? srcCanvas : resizeCanvas(srcCanvas, S, S);
+        const sd = src.getContext('2d').getImageData(0, 0, S, S).data;
+        const axis = (opts.axis && opts.axis !== 'auto') ? opts.axis : origamiDetectAxis(sd, S);
+        const out = document.createElement('canvas');
+        out.width = S; out.height = S;
+        const octx = out.getContext('2d');
+        const od = octx.createImageData(S, S);
+        const dd = od.data;
+        const c = (S - 1) / 2 || 1;
+        const tri = t => { let p = (t * repeats) % 2; if (p < 0) p += 2; return p > 1 ? 2 - p : p; };
+        for (let y = 0; y < S; y++) {
+            for (let x = 0; x < S; x++) {
+                const a = Math.abs(x - c), b = Math.abs(y - c);
+                const hi = Math.max(a, b), lo = Math.min(a, b);
+                let rn, tn;   // radius + along-ring, normalized 0..1, both symmetric
+                if (shape === 'diamond') {
+                    rn = (a + b) / (2 * c);
+                    tn = Math.abs(a - b) / (2 * c);
+                } else if (shape === 'circle') {
+                    rn = Math.hypot(a, b) / (Math.SQRT2 * c);
+                    tn = (hi ? Math.atan2(lo, hi) : 0) / (Math.PI / 4);
+                } else {   // square
+                    rn = hi / c;
+                    tn = lo / c;
+                }
+                if (rn > 1) rn = 1; if (tn > 1) tn = 1;
+                let u = Math.round(tri(rn) * (S - 1));   // radius → one source axis
+                let v = Math.round(tn * (S - 1));        // along-ring → the other axis
+                if (u < 0) u = 0; else if (u > S - 1) u = S - 1;
+                if (v < 0) v = 0; else if (v > S - 1) v = S - 1;
+                const sx = axis === 'h' ? v : u;         // 'v' ridges vary by column
+                const sy = axis === 'h' ? u : v;
+                const si = (sy * S + sx) * 4, di = (y * S + x) * 4;
+                dd[di] = sd[si]; dd[di + 1] = sd[si + 1];
+                dd[di + 2] = sd[si + 2]; dd[di + 3] = sd[si + 3];
+            }
+        }
+        octx.putImageData(od, 0, 0);
+        return out;
+    }
+
+    /* ============ BORDER SET MODAL ============ */
+    const bset = { baseId: null, overlayId: null, slots: {}, canvases: {}, regenTimer: null };
+    function bsetCleanup() {
+        bset.baseId = null; bset.overlayId = null; bset.slots = {}; bset.canvases = {};
+        if (bset.regenTimer) { clearTimeout(bset.regenTimer); bset.regenTimer = null; }
+    }
+
+    /* Atlas layouts per set type (null = grey spacer so the block stays square).
+       frame13 reads as the 3×3 frame block + a 2×2 inner-corner block. */
+    const BSET_LAYOUTS = {
+        frame9:  { width: 3, topo: 'frame', slots: ['TL', 'T', 'TR', 'L', 'C', 'R', 'BL', 'B', 'BR'] },
+        frame13: { width: 5, topo: 'frame', slots: ['TL', 'T', 'TR', 'ITL', 'ITR',
+                                                    'L',  'C', 'R',  'IBL', 'IBR',
+                                                    'BL', 'B', 'BR', null,  null] },
+        // Gray-coded 4×4 like the Wang layout so neighbours share edges.
+        lines:   { width: 4, topo: 'lines', slots: [0, 2, 10, 8, 4, 6, 14, 12, 5, 7, 15, 13, 1, 3, 11, 9] }
+    };
+
+    /* Demo-wall maps: which slot goes in each cell (null = outside the region). */
+    const BSET_DEMOS = {
+        frame9: [['TL', 'T', 'T', 'T', 'TR'],
+                 ['L',  'C', 'C', 'C', 'R'],
+                 ['BL', 'B', 'B', 'B', 'BR']],
+        frame13: [['TL', 'T', 'TR',  null, null],
+                  ['L',  'C', 'R',   null, null],
+                  ['L',  'C', 'ITR', 'T',  'TR'],
+                  ['BL', 'B', 'B',   'B',  'BR']],
+        lines: [[6, 10, 10, 14, 12],
+                [5, 0,  0,  5,  5],
+                [3, 10, 10, 15, 9]]
+    };
+
+    const BSET_MODES = ['auto', 'rot', 'mirh', 'mirv', 'tile'];
+    const BSET_MODE_META = {
+        auto: { badge: '⚙',  name: 'Generated from its own mask' },
+        rot:  { badge: '↻',  name: 'Rotated copy of the canonical slot' },
+        mirh: { badge: '↔',  name: 'Horizontal mirror of the partner slot' },
+        mirv: { badge: '↕',  name: 'Vertical mirror of the partner slot' },
+        tile: { badge: '🖼', name: 'Uses an atlas tile as-is' }
+    };
+
+    function bsetTopoKey() { return $('at-bset-topo').value; }
+    function bsetParams() {
+        return {
+            method: $('at-bset-method').value,
+            width:  parseInt($('at-bset-width').value) / 100,
+            soft:   parseInt($('at-bset-soft').value) / 100,
+            follow: $('at-bset-follow').checked
+        };
+    }
+    function bsetSlotState(key) {
+        return bset.slots[key] || (bset.slots[key] = { mode: 'auto', srcId: null });
+    }
+    function bsetRecipeFor(key, L, p) {
+        const s = bsetSlotState(key);
+        const b = { topo: L.topo, width: p.width, soft: p.soft, follow: p.follow,
+                    slotMode: s.mode, srcId: s.srcId,
+                    origami: bset.baseId === bset.overlayId };
+        if (L.topo === 'lines') b.bits = key; else b.role = key;
+        return b;
+    }
+
+    function openBsetModal(baseId, overlayId) {
+        exitPickMode();
+        bset.baseId = baseId;
+        bset.overlayId = overlayId;
+        bset.slots = {};
+        const origami = baseId === overlayId;
+        const titleSrc = $('at-bset-title-src'), origamiHint = $('at-bset-origami-hint');
+        if (origami) {
+            if (titleSrc) titleSrc.textContent = `Tile ${indexOf(baseId) + 1} (origami — one texture)`;
+            if (origamiHint) origamiHint.style.display = '';
+        } else {
+            if (titleSrc) titleSrc.innerHTML =
+                `Tile <span id="at-bset-base-no">${indexOf(baseId) + 1}</span> + trim Tile <span id="at-bset-overlay-no">${indexOf(overlayId) + 1}</span>`;
+            if (origamiHint) origamiHint.style.display = 'none';
+        }
+        openModal('bset');
+        bsetPreview();
+    }
+
+    function bsetPreview() {
+        if (bset.baseId === null) return;
+        const P = 96;
+        const p = bsetParams();
+        const L = BSET_LAYOUTS[bsetTopoKey()];
+        const fillEl = byId(bset.baseId), trimEl = byId(bset.overlayId);
+        if (!fillEl || !trimEl) return;
+        const fill = resizeCanvas(fillEl.canvas, P, P);
+        const trim = resizeCanvas(trimEl.canvas, P, P);
+        bset.canvases = {};
+
+        const wrap = $('at-bset-previews');
+        wrap.style.gridTemplateColumns = `repeat(${L.width},1fr)`;
+        wrap.innerHTML = '';
+        const keys = [...new Set(L.slots.filter(k => k !== null))];
+        for (const key of keys) {
+            const s = bsetSlotState(key);
+            let tile;
+            if (s.mode === 'tile' && byId(s.srcId)) tile = resizeCanvas(byId(s.srcId).canvas, P, P);
+            else tile = renderBsetVariant(bsetRecipeFor(key, L, p), fill, trim, P, p.method);
+            bset.canvases[key] = tile;
+        }
+        // Slot grid in layout order (spacers render as empty cells).
+        for (const key of L.slots) {
+            const cell = document.createElement('div');
+            cell.style.cssText = 'position:relative;';
+            if (key === null) {
+                cell.style.cssText += 'border:1px dashed var(--border);border-radius:3px;opacity:.35;';
+                wrap.appendChild(cell);
+                continue;
+            }
+            const s = bsetSlotState(key);
+            const c = document.createElement('canvas');
+            c.width = P; c.height = P;
+            c.style.cssText = 'width:100%;display:block;border:1px solid var(--border);border-radius:3px;image-rendering:pixelated;cursor:pointer;';
+            c.getContext('2d').drawImage(bset.canvases[key], 0, 0);
+            const meta = BSET_MODE_META[s.mode];
+            c.title = `${key} — ${meta.name}. Click to cycle how this slot is made.`;
+            const badge = document.createElement('span');
+            badge.textContent = meta.badge;
+            badge.style.cssText = 'position:absolute;top:2px;right:4px;font-size:0.7rem;color:#fff;background:rgba(0,0,0,.55);border-radius:3px;padding:0 3px;pointer-events:none;' + (s.mode === 'auto' ? 'opacity:.35;' : '');
+            cell.appendChild(c);
+            cell.appendChild(badge);
+            if (s.mode === 'tile') {
+                const sel = document.createElement('select');
+                sel.style.cssText = 'width:100%;margin-top:2px;font-size:0.7rem;';
+                state.elements.forEach((e2, i2) => {
+                    const o = document.createElement('option');
+                    o.value = e2.id; o.textContent = `Tile ${i2 + 1}`;
+                    sel.appendChild(o);
+                });
+                if (s.srcId != null) sel.value = String(s.srcId);
+                else { s.srcId = state.elements[0] ? state.elements[0].id : null; }
+                sel.addEventListener('change', () => { s.srcId = parseInt(sel.value); bsetPreview(); });
+                sel.addEventListener('click', e => e.stopPropagation());
+                cell.appendChild(sel);
+            }
+            c.addEventListener('click', () => {
+                // 'C' (frame) and bits 0 (lines) have no trim — only auto/tile make sense.
+                const modes = (key === 'C' || key === 0) ? ['auto', 'tile'] : BSET_MODES;
+                s.mode = modes[(modes.indexOf(s.mode) + 1) % modes.length];
+                if (s.mode === 'tile' && s.srcId == null && state.elements[0]) s.srcId = state.elements[0].id;
+                bsetPreview();
+            });
+            wrap.appendChild(cell);
+        }
+
+        // Demo wall — the set assembled into a sample room / pipe run.
+        const demo = BSET_DEMOS[bsetTopoKey()];
+        const D = 44;
+        const dc = $('at-bset-demo');
+        dc.width = demo[0].length * D; dc.height = demo.length * D;
+        const dctx = dc.getContext('2d');
+        demo.forEach((row, r) => row.forEach((key, cix) => {
+            if (key === null) {   // outside the region — dark checker
+                dctx.fillStyle = '#181818'; dctx.fillRect(cix * D, r * D, D, D);
+                dctx.fillStyle = '#222';
+                dctx.fillRect(cix * D, r * D, D / 2, D / 2);
+                dctx.fillRect(cix * D + D / 2, r * D + D / 2, D / 2, D / 2);
+                return;
+            }
+            const t = bset.canvases[key];
+            if (t) dctx.drawImage(t, cix * D, r * D, D, D);
+        }));
+
+        const n = L.slots.filter(k => k !== null).length;
+        if ($('at-bset-count'))    $('at-bset-count').textContent = n;
+        if ($('at-bset-addcount')) $('at-bset-addcount').textContent = n;
+    }
+
+    function bsetPreviewSoon() {
+        if (bset.regenTimer) clearTimeout(bset.regenTimer);
+        bset.regenTimer = setTimeout(bsetPreview, 90);
+    }
+
+    function setupBsetModal() {
+        $('at-bset-topo').addEventListener('change', () => { bset.slots = {}; bsetPreview(); });
+        $('at-bset-method').addEventListener('change', bsetPreview);
+        $('at-bset-follow').addEventListener('change', bsetPreview);
+        ['at-bset-width', 'at-bset-soft'].forEach(id => {
+            $(id).addEventListener('input', function () {
+                $(id + '-val').textContent = this.value;
+                bsetPreviewSoon();
+            });
+        });
+        $('at-bset-add').addEventListener('click', () => {
+            if (bset.baseId === null) return;
+            const S = state.tileSize;
+            const p = bsetParams();
+            const L = BSET_LAYOUTS[bsetTopoKey()];
+            const baseId = bset.baseId, overlayId = bset.overlayId;
+            const slots = L.slots.map(key => key === null ? null
+                : { key, recipe: bsetRecipeFor(key, L, p) });
+            confirmResizeCols(L.width, () => {
+                let n = 0;
+                for (const slot of slots) {
+                    if (slot === null) { state.elements.push(makeSpacerTile()); continue; }
+                    state.elements.push({
+                        id: state.nextId++, kind: 'transition', canvas: blankCanvas(S),
+                        original: null, seamless: false, material: null,
+                        base: baseId, overlay: overlayId, blendMethod: p.method,
+                        bset: slot.recipe
+                    });
+                    n++;
+                }
+                closeModal();
+                renderGrid();
+                refreshTransitions();   // paint into the now-attached canvases
+                pushHistory(`Border set (${n})`);
+                showToast(`Added ${n}-tile border set to the atlas`, 'success');
+            });
         });
     }
 
@@ -3196,6 +4000,8 @@ window.TRLE = window.TRLE || {};
         ['normalBlur',             'Normal Blur',          0, 10],
         ['normalAngularity',       'Normal Angularity',    0, 1,   0.05],
         ['normalAngularIntensity', 'Normal Tilt',          0, 1,   0.05],
+        ['normalFineDetail',       'Normal Fine Detail',   0, 1,   0.05],
+        ['normalLargeScale',       'Normal Large Scale',   0, 1,   0.05],
         ['aoRadius',               'AO Radius',            1, 30],
         ['aoIntensity',            'AO Intensity',         1, 30],
         ['aoNormalBlend',          'AO Normal Mix',        0, 1,   0.05],
@@ -3209,7 +4015,7 @@ window.TRLE = window.TRLE || {};
         ['emissiveThreshold',      'Emissive Threshold',   0, 255]
     ];
     // Params measured on a 0–1 float scale (need parseFloat, not parseInt).
-    const MAT_FLOAT_PARAMS = new Set(['normalAngularity', 'normalAngularIntensity', 'aoNormalBlend']);
+    const MAT_FLOAT_PARAMS = new Set(['normalAngularity', 'normalAngularIntensity', 'aoNormalBlend', 'normalFineDetail', 'normalLargeScale']);
     const MAT_PREVIEW_MAPS = ['normal', 'ao', 'specular', 'roughness', 'height'];
 
     const mat = { id: null, batchIds: null, dirty: false, previewTimer: null,
@@ -5528,23 +6334,30 @@ window.TRLE = window.TRLE || {};
             const hardness = parseInt($('at-tg-hardness').value) / 100;
             const noBoundary = $('at-tg-noboundary').checked;
             const organic = { amount: parseInt($('at-tg-organic').value) / 100, seed: tg.organicSeed || 1 };
+            const baseId = tg.baseId, overlayId = tg.overlayId;
+            // Build the cell tiles now (tg.* is cleared on close), then optionally
+            // reflow the atlas to `cols` so the grid lines up before adding them.
             const global = buildGridMask(cols * S, rows * S, tg.anchors, tg.axis, tg.swap, hardness, S, tg.shapes, noBoundary, organic);
+            const els = [];
             for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
                 const cellMask = document.createElement('canvas'); cellMask.width = S; cellMask.height = S;
                 cellMask.getContext('2d').drawImage(global, c * S, r * S, S, S, 0, 0, S, S);
-                state.elements.push({
-                    id: state.nextId++, kind: 'transition', canvas: blankCanvas(S),
+                els.push({
+                    id: 0, kind: 'transition', canvas: blankCanvas(S),
                     original: null, seamless: false, material: null,
-                    base: tg.baseId, overlay: tg.overlayId,
+                    base: baseId, overlay: overlayId,
                     mode: 'custom', pivot: 0, hardness: 0, blendMethod: method,
                     customMask: cellMask
                 });
             }
-            closeModal();
-            renderGrid();
-            refreshTransitions();
-            pushHistory(`Transition grid ${cols}×${rows}`);
-            showToast(`Added ${cols * rows} transition tiles (${cols}×${rows} grid)`, 'success');
+            confirmResizeCols(cols, () => {
+                for (const el of els) { el.id = state.nextId++; state.elements.push(el); }
+                closeModal();
+                renderGrid();
+                refreshTransitions();
+                pushHistory(`Transition grid ${cols}×${rows}`);
+                showToast(`Added ${cols * rows} transition tiles (${cols}×${rows} grid)`, 'success');
+            });
         });
     }
 
@@ -5597,29 +6410,23 @@ window.TRLE = window.TRLE || {};
         if (!el || el.kind !== 'tile') return;
         const input = document.createElement('input');
         input.type = 'file';
-        input.accept = 'image/*';
+        input.accept = 'image/*,.tga';
         input.addEventListener('change', e => {
             const file = e.target.files[0];
             if (!file) return;
-            const reader = new FileReader();
-            reader.onload = ev => {
-                const img = new Image();
-                img.onload = () => {
-                    const S = state.tileSize;
-                    const ctx = el.canvas.getContext('2d');
-                    ctx.clearRect(0, 0, S, S);
-                    ctx.drawImage(img, 0, 0, S, S);
-                    el.original = cloneCanvas(el.canvas);
-                    el.seamless = false;
-                    el.edited = false;
-                    refreshTransitions();
-                    renderGrid();
-                    pushHistory('Replace image');
-                    showToast('Tile image replaced', 'success');
-                };
-                img.src = ev.target.result;
-            };
-            reader.readAsDataURL(file);
+            readImageFile(file).then(img => {
+                const S = state.tileSize;
+                const ctx = el.canvas.getContext('2d');
+                ctx.clearRect(0, 0, S, S);
+                ctx.drawImage(img, 0, 0, S, S);
+                el.original = cloneCanvas(el.canvas);
+                el.seamless = false;
+                el.edited = false;
+                refreshTransitions();
+                renderGrid();
+                pushHistory('Replace image');
+                showToast('Tile image replaced', 'success');
+            }).catch(err => showToast(err.message, 'error'));
         });
         input.click();
     }
@@ -5972,6 +6779,59 @@ window.TRLE = window.TRLE || {};
         varRegen();
     }
 
+    /* ============ ORIGAMI FRAME MODAL ============
+       Folds a source tile into a concentric frame (square / diamond / circle
+       rings) with a live preview, then appends the result as a new tile. */
+    const origamiState = { id: null, canvas: null };
+    function origamiOpts() {
+        return {
+            shape: $('at-origami-shape').value,
+            axis: $('at-origami-axis').value,
+            repeats: parseInt($('at-origami-repeats').value, 10)
+        };
+    }
+    function origamiPreview() {
+        const el = byId(origamiState.id);
+        if (!el) return;
+        const S = state.tileSize;
+        origamiState.canvas = makeOrigamiFrame(el.canvas, S, origamiOpts());
+        const cv = $('at-origami-preview');
+        cv.width = S; cv.height = S;
+        cv.getContext('2d').drawImage(origamiState.canvas, 0, 0);
+    }
+    function openOrigamiModal(id) {
+        const el = byId(id);
+        if (!el || el.kind !== 'tile') return;
+        origamiState.id = id;
+        $('at-origami-tileno').textContent = indexOf(id) + 1;
+        openModal('origami');
+        origamiPreview();
+    }
+    function setupOrigamiModal() {
+        $('at-origami-shape').addEventListener('change', origamiPreview);
+        $('at-origami-axis').addEventListener('change', origamiPreview);
+        $('at-origami-repeats').addEventListener('input', function () {
+            $('at-origami-repeats-val').textContent = this.value;
+            origamiPreview();
+        });
+        $('at-origami-add').addEventListener('click', () => {
+            const el = byId(origamiState.id);
+            if (!el || !origamiState.canvas) return;
+            const canvas = cloneCanvas(origamiState.canvas);
+            const tile = {
+                id: state.nextId++, kind: 'tile', canvas, original: cloneCanvas(canvas),
+                seamless: false, edited: true, material: deepCopyMaterial(el.material)
+            };
+            state.elements.splice(indexOf(origamiState.id) + 1, 0, tile);
+            state.selectedId = tile.id;
+            closeModal();
+            renderGrid();
+            refreshTransitions();
+            pushHistory('Origami frame');
+            showToast('Added origami frame tile', 'success');
+        });
+    }
+
     function setupVarModal() {
         $('at-var-hue').addEventListener('input', function () { $('at-var-hue-val').textContent = this.value; varRegen(); });
         $('at-var-val').addEventListener('input', function () { $('at-var-val-val').textContent = this.value; varRegen(); });
@@ -6009,7 +6869,10 @@ window.TRLE = window.TRLE || {};
     const buildState = { id: null, canvas: null, seed: 1 };
 
     // Which material preset each pattern suggests (for the assign checkbox).
-    const BP_PRESET = { brick: 'brick', tile: 'tile', planks: 'wood', pipes: 'metal' };
+    const BP_PRESET = {
+        brick: 'brick', tile: 'tile', planks: 'wood', pipes: 'metal',
+        coursed: 'stone', herringbone: 'brick', cobble: 'stone', shingles: 'slate', floor: 'wood'
+    };
 
     /* Small deterministic PRNG so a seed reproduces a pattern exactly. */
     function mulberry32(a) {
@@ -6179,11 +7042,28 @@ window.TRLE = window.TRLE || {};
     }
 
     /* Wood planks: full-height strips split by vertical grooves (seamless top↔bottom
-       because planks run the whole height). Orientation handled by a final rotate. */
+       because planks run the whole height). Relief is a *width-wise* edge-darkening
+       (uniform down the plank → stays vertically seamless, unlike the top/bottom
+       bevel which would put a light row at y=0 and a dark row at y=S). Orientation
+       handled by a final rotate. */
     function bpPlanks(ctx, src, S, p, rng) {
         const n = p.across, pw = S / n, m = p.joint * pw;
         for (let k = 0; k < n; k++) {
-            bpCell(ctx, src, k * pw + m / 2, 0, pw - m, S, S, p, rng);
+            const x = k * pw + m / 2, w = pw - m;
+            bpCell(ctx, src, x, 0, w, S, S, p, rng);   // p.bevel is false for planks
+            if (w > 0) {
+                ctx.save();
+                ctx.beginPath(); ctx.rect(x, 0, w, S); ctx.clip();
+                const edge = 200;                        // rgb of the darkened plank edges
+                const g = ctx.createLinearGradient(x, 0, x + w, 0);
+                g.addColorStop(0, `rgb(${edge},${edge},${edge})`);
+                g.addColorStop(0.12, '#ffffff');
+                g.addColorStop(0.88, '#ffffff');
+                g.addColorStop(1, `rgb(${edge},${edge},${edge})`);
+                ctx.globalCompositeOperation = 'multiply';
+                ctx.fillStyle = g; ctx.fillRect(x, 0, w, S);
+                ctx.restore();
+            }
         }
     }
 
@@ -6216,6 +7096,218 @@ window.TRLE = window.TRLE || {};
         }
     }
 
+    /* Fully-toroidal cell draw: like bpCell but wraps on BOTH axes (patterns whose
+       cells can straddle either seam — herringbone, coursed stone, plank floor).
+       Pulls a stable 6-value rng sequence, then blits the sample at every ±S offset
+       that intersects the tile so a cell crossing any edge reappears on the far side. */
+    function bpCellTor(ctx, src, dx, dy, dw, dh, S, p, rng) {
+        const r1 = rng(), r2 = rng(), r3 = rng(), r4 = rng(), r5 = rng(), r6 = rng();
+        if (dw <= 0 || dh <= 0) return;
+        const overlay = p.fill === 'overlay';
+        if (p.fill === 'tiles' && p.pool && p.pool.length) src = p.pool[Math.floor(r6 * p.pool.length)];
+        const maxsx = Math.max(0, src.width - Math.ceil(dw));
+        const maxsy = Math.max(0, src.height - Math.ceil(dh));
+        const s = {
+            hue: (r1 * 2 - 1) * p.hue,
+            val: 1 + (r2 * 2 - 1) * (p.val / 100),
+            fx: (p.flip && !overlay && r3 < 0.5) ? -1 : 1,
+            sx: Math.floor(r4 * maxsx),
+            sy: Math.floor(r5 * maxsy),
+            bevel: p.bevel,
+            overlay
+        };
+        for (let oy = -S; oy <= S; oy += S)
+            for (let ox = -S; ox <= S; ox += S) {
+                if (dx + ox + dw <= 0 || dx + ox >= S || dy + oy + dh <= 0 || dy + oy >= S) continue;
+                bpDrawSample(ctx, src, dx + ox, dy + oy, dw, dh, s);
+            }
+    }
+
+    /* Straight (axis-aligned) herringbone. Cells are u-wide; bricks are 2u×u. The
+       rule key=(i+j)%4 → 0:horizontal brick, 2:vertical brick is a perfect toroidal
+       partition when the cell count is a multiple of 4, so the tile stays seamless
+       (verified: it reproduces the classic ┃━━┃┃━━┃ weave). */
+    function bpHerringbone(ctx, src, S, p, rng) {
+        const k = Math.max(1, Math.round(p.across / 2));  // "bricks across" → 2k, cells = 4k
+        const C = 4 * k, u = S / C, m = p.joint * u;
+        for (let j = 0; j < C; j++)
+            for (let i = 0; i < C; i++) {
+                const key = ((i + j) % 4 + 4) % 4;
+                if (key === 0)                              // horizontal brick (i,j)-(i+1,j)
+                    bpCellTor(ctx, src, i * u + m / 2, j * u + m / 2, 2 * u - m, u - m, S, p, rng);
+                else if (key === 2)                         // vertical brick (i,j)-(i,j+1)
+                    bpCellTor(ctx, src, i * u + m / 2, j * u + m / 2, u - m, 2 * u - m, S, p, rng);
+            }
+    }
+
+    /* Random coursed / ashlar stone: rows of jittered height (normalised to fill S
+       exactly → the y=0/y=S seam is always a mortar joint) each split into stones of
+       jittered width (normalised to sum S) with a random per-row shift so the vertical
+       joints never line up. Horizontal wrap of the straddling stone via bpCellTor. */
+    function bpCoursed(ctx, src, S, p, rng) {
+        const avgw = S / p.across;
+        const baseH = avgw / p.aspect;
+        const rows = Math.max(1, Math.round(S / baseH));
+        const hs = []; let htot = 0;
+        for (let r = 0; r < rows; r++) { const h = baseH * (0.65 + rng() * 0.7); hs.push(h); htot += h; }
+        for (let r = 0; r < rows; r++) hs[r] = hs[r] / htot * S;
+        let y = 0;
+        for (let r = 0; r < rows; r++) {
+            const rh = hs[r];
+            const widths = []; let wtot = 0;
+            while (wtot < S * 0.999) { const w = avgw * (0.55 + rng() * 0.95); widths.push(w); wtot += w; }
+            for (let i = 0; i < widths.length; i++) widths[i] = widths[i] / wtot * S;
+            const mm = p.joint * Math.min(avgw, rh);
+            let x = rng() * S;
+            for (let i = 0; i < widths.length; i++) {
+                const w = widths[i];
+                bpCellTor(ctx, src, x + mm / 2, y + mm / 2, w - mm, rh - mm, S, p, rng);
+                x += w;
+            }
+            y += rh;
+        }
+    }
+
+    /* Staggered plank floor: full-width plank columns, each broken along its length
+       into boards whose lengths are normalised to sum S (so the tile wraps) with a
+       random rotation per column → staggered butt joints, like a real wood floor.
+       (Built vertical; the orient='h' rotate in bpGenerate turns it horizontal.) */
+    function bpFloor(ctx, src, S, p, rng) {
+        const n = p.across, pw = S / n, m = p.joint * pw;
+        const avgL = Math.max(0.15, p.boardlen) * S;
+        for (let k = 0; k < n; k++) {
+            const x = k * pw;
+            const lens = []; let ltot = 0;
+            while (ltot < S * 0.999) { const l = avgL * (0.6 + rng() * 0.8); lens.push(l); ltot += l; }
+            for (let i = 0; i < lens.length; i++) lens[i] = lens[i] / ltot * S;
+            let y = rng() * S;
+            for (let i = 0; i < lens.length; i++) {
+                const l = lens[i];
+                bpCellTor(ctx, src, x + m / 2, y + m / 2, pw - m, l - m, S, p, rng);
+                y += l;
+            }
+        }
+    }
+
+    /* Read a source canvas's pixels (via a scratch 2D canvas so WebGL-backed sources
+       still work). Cached on the element between regens by the caller. */
+    function bpCanvasData(cv) {
+        const t = document.createElement('canvas'); t.width = cv.width; t.height = cv.height;
+        const tx = t.getContext('2d'); tx.drawImage(cv, 0, 0);
+        return { data: tx.getImageData(0, 0, cv.width, cv.height).data, w: cv.width, h: cv.height };
+    }
+
+    /* "#rrggbb"/"rgb()" → [r,g,b]. Uses the mortar HSL helper's rgb() output. */
+    function bpRgb(css) {
+        const m = css.match(/(\d+),\s*(\d+),\s*(\d+)/);
+        return m ? [+m[1], +m[2], +m[3]] : [40, 40, 40];
+    }
+
+    /* Cobblestone / flagstone: a jittered-grid (Worley) Voronoi tessellation. Each
+       pixel finds its nearest of 9 neighbouring sites (toroidal → seamless), samples
+       the source through that cell's random offset (so every stone looks different),
+       shades it as a rounded mound (bright centre → dark edge = real relief) and drops
+       to mortar in the F2−F1 boundary grooves. Rendered to an offscreen with groove
+       transparency so the mortar fill (and its noise) shows through the joints. */
+    function bpCobble(ctx, src, S, p, rng) {
+        const G = Math.max(2, p.across), cw = S / G;
+        const sites = [];
+        for (let gy = 0; gy < G; gy++) { sites[gy] = []; for (let gx = 0; gx < G; gx++) {
+            sites[gy][gx] = {
+                jx: 0.5 + (rng() * 2 - 1) * 0.36, jy: 0.5 + (rng() * 2 - 1) * 0.36,
+                val: 1 + (rng() * 2 - 1) * (p.val / 100),
+                ox: Math.floor(rng() * S), oy: Math.floor(rng() * S)
+            };
+        } }
+        const src2 = (p.fill === 'tiles' && p.pool && p.pool.length) ? p.pool[Math.floor(rng() * p.pool.length)] : src;
+        const S2 = bpCanvasData(src2), sw = S2.w, sh = S2.h, sd = S2.data;
+        const mort = bpRgb(bpHslCss(p.mh, p.ms, p.ml));
+        const gap = Math.max(0.5, p.joint) * cw * 0.5;      // groove half-width
+        const round = 0.35 + 0.9 * (p.irregular / 100);      // mound steepness
+        const oc = document.createElement('canvas'); oc.width = oc.height = S;
+        const out = oc.getContext('2d').createImageData(S, S), od = out.data;
+        for (let y = 0; y < S; y++) {
+            const gy0 = Math.floor(y / cw);
+            for (let x = 0; x < S; x++) {
+                const gx0 = Math.floor(x / cw);
+                let f1 = 1e18, f2 = 1e18, best = null;
+                for (let dy = -1; dy <= 1; dy++)
+                    for (let dx = -1; dx <= 1; dx++) {
+                        const st = sites[((gy0 + dy) % G + G) % G][((gx0 + dx) % G + G) % G];
+                        const px = (gx0 + dx + st.jx) * cw, py = (gy0 + dy + st.jy) * cw;
+                        const d = (x - px) * (x - px) + (y - py) * (y - py);
+                        if (d < f1) { f2 = f1; f1 = d; best = st; } else if (d < f2) { f2 = d; }
+                    }
+                const d1 = Math.sqrt(f1), edge = Math.sqrt(f2) - d1;
+                const rr = d1 / (cw * 0.72);
+                const mound = Math.max(0, 1 - rr * rr * round);
+                const shade = 0.5 + 0.5 * mound;
+                const sx = ((x + best.ox) % sw + sw) % sw, sy = ((y + best.oy) % sh + sh) % sh;
+                const si = (sy * sw + sx) * 4;
+                let mF = edge < gap ? 1 - edge / gap : 0; mF = Math.min(1, mF * mF * 1.3);
+                const o = (y * S + x) * 4, sc = shade * best.val;
+                od[o]     = sd[si]     * sc * (1 - mF) + mort[0] * mF;
+                od[o + 1] = sd[si + 1] * sc * (1 - mF) + mort[1] * mF;
+                od[o + 2] = sd[si + 2] * sc * (1 - mF) + mort[2] * mF;
+                od[o + 3] = Math.round(255 * (1 - mF * 0.85));   // grooves let mortar bg show
+            }
+        }
+        oc.getContext('2d').putImageData(out, 0, 0);
+        ctx.drawImage(oc, 0, 0);
+    }
+
+    /* Roof shingles / scales: brick-offset rows of round-bottomed tabs. Tabs sit
+       strictly inside each row band (top shadow strip + bottom groove both fall on the
+       mortar bg) so the y-seam is always bg-to-bg → seamless; horizontal wrap via the
+       ±S tab copies. The 'Overlap' slider grows the top shadow so upper rows look like
+       they cover the row below. */
+    function bpShingles(ctx, src, S, p, rng) {
+        const across = p.across, sw = S / across;
+        let rows = Math.max(2, Math.round(S / (sw * 0.62)));
+        rows += rows % 2;                                    // even → brick offset tiles vertically
+        const rh = S / rows, sr = sw * 0.42;                 // corner radius
+        const shadow = (0.18 + 0.4 * (p.overlap / 100)) * rh; // top shadow strip height
+        const tw = sw * 0.88, tworder = p.fill === 'overlay';
+        for (let r = 0; r < rows; r++) {
+            const y = r * rh, rowShift = (r % 2) ? sw * 0.5 : 0;
+            const ty = y + shadow, th = rh - shadow - 0.12 * rh;
+            for (let k = -1; k <= across; k++) {
+                // one sample per tab, reused for every seam-wrapped copy so they match
+                const r1 = rng(), r2 = rng(), r3 = rng(), r4 = rng();
+                if (th <= 0) continue;
+                const s = {
+                    hue: (r1 * 2 - 1) * p.hue, val: 1 + (r2 * 2 - 1) * (p.val / 100), fx: 1,
+                    sx: Math.floor(r3 * Math.max(0, src.width - tw)),
+                    sy: Math.floor(r4 * Math.max(0, src.height - th)), bevel: false, overlay: tworder
+                };
+                const cx = rowShift + k * sw;
+                const rad = Math.min(sr, tw / 2, th * 0.7);
+                for (let ox = -S; ox <= S; ox += S) {
+                    const tx = cx + ox + 0.06 * sw;
+                    if (tx + tw <= 0 || tx >= S) continue;
+                    ctx.save();
+                    ctx.beginPath();
+                    ctx.moveTo(tx, ty);
+                    ctx.lineTo(tx + tw, ty);
+                    ctx.lineTo(tx + tw, ty + th - rad);
+                    ctx.arcTo(tx + tw, ty + th, tx + tw - rad, ty + th, rad);
+                    ctx.lineTo(tx + rad, ty + th);
+                    ctx.arcTo(tx, ty + th, tx, ty + th - rad, rad);
+                    ctx.closePath(); ctx.clip();
+                    bpDrawSample(ctx, src, tx, ty, tw, th, s);
+                    // top-inner shadow + bottom sheen so each scale reads as domed relief
+                    const g = ctx.createLinearGradient(0, ty, 0, ty + th);
+                    g.addColorStop(0, 'rgba(0,0,0,0.34)');
+                    g.addColorStop(0.35, 'rgba(0,0,0,0)');
+                    g.addColorStop(0.82, 'rgba(255,255,255,0)');
+                    g.addColorStop(1, 'rgba(0,0,0,0.22)');
+                    ctx.fillStyle = g; ctx.fillRect(tx, ty, tw, th);
+                    ctx.restore();
+                }
+            }
+        }
+    }
+
     /* Read the modal controls into a params object. */
     function bpParams() {
         const pat = $('at-bp-pattern').value;
@@ -6235,8 +7327,11 @@ window.TRLE = window.TRLE || {};
             hue:       parseInt($('at-bp-hue').value),
             val:       parseInt($('at-bp-val').value),
             highlight: parseInt($('at-bp-highlight').value) / 100,
+            irregular: parseInt($('at-bp-irregular').value),      // cobble mound steepness
+            overlap:   parseInt($('at-bp-overlap').value),        // shingle coverage
+            boardlen:  parseInt($('at-bp-boardlen').value) / 100, // plank-floor board length
             flip:  true,
-            bevel: pat !== 'pipes'
+            bevel: !['pipes', 'cobble', 'shingles', 'planks'].includes(pat)  // these fake their own relief
         };
     }
 
@@ -6256,13 +7351,18 @@ window.TRLE = window.TRLE || {};
         ctx.clearRect(0, 0, S, S);
         bpMortarFill(ctx, S, p);                  // mortar colour + noise shows through the joint gaps
 
-        if      (p.pattern === 'brick')  bpBrick(ctx, src, S, p, rng, false);
-        else if (p.pattern === 'tile')   bpBrick(ctx, src, S, p, rng, true);
-        else if (p.pattern === 'planks') bpPlanks(ctx, src, S, p, rng);
-        else if (p.pattern === 'pipes')  bpPipes(ctx, src, S, p, rng);
+        if      (p.pattern === 'brick')       bpBrick(ctx, src, S, p, rng, false);
+        else if (p.pattern === 'tile')        bpBrick(ctx, src, S, p, rng, true);
+        else if (p.pattern === 'coursed')     bpCoursed(ctx, src, S, p, rng);
+        else if (p.pattern === 'herringbone') bpHerringbone(ctx, src, S, p, rng);
+        else if (p.pattern === 'cobble')      bpCobble(ctx, src, S, p, rng);
+        else if (p.pattern === 'shingles')    bpShingles(ctx, src, S, p, rng);
+        else if (p.pattern === 'planks')      bpPlanks(ctx, src, S, p, rng);
+        else if (p.pattern === 'floor')       bpFloor(ctx, src, S, p, rng);
+        else if (p.pattern === 'pipes')       bpPipes(ctx, src, S, p, rng);
 
-        // Planks/pipes are built vertical; rotate the finished (still-seamless) tile for horizontal.
-        if ((p.pattern === 'planks' || p.pattern === 'pipes') && p.orient === 'h') {
+        // Vertically-built patterns are rotated for the horizontal option (stays seamless).
+        if (['planks', 'pipes', 'floor', 'herringbone'].includes(p.pattern) && p.orient === 'h') {
             const tmp = document.createElement('canvas'); tmp.width = S; tmp.height = S;
             const tc = tmp.getContext('2d');
             tc.translate(S / 2, S / 2); tc.rotate(Math.PI / 2); tc.drawImage(out, -S / 2, -S / 2);
@@ -6284,7 +7384,11 @@ window.TRLE = window.TRLE || {};
             g.style.display = g.getAttribute('data-bp').split(' ').includes(pat) ? '' : 'none';
         });
         $('at-bp-across-label').textContent =
-            { brick: 'Bricks across', tile: 'Tiles across', planks: 'Planks', pipes: 'Pipes' }[pat];
+            { brick: 'Bricks across', tile: 'Tiles across', planks: 'Planks', pipes: 'Pipes',
+              coursed: 'Stones across', herringbone: 'Bricks across', cobble: 'Stones across',
+              shingles: 'Shingles across', floor: 'Planks across' }[pat];
+        const al = $('at-bp-aspect-label');
+        if (al) al.textContent = pat === 'coursed' ? 'Course flatness' : 'Brick aspect';
         const preset = TRLE.SolidPresets[BP_PRESET[pat]];
         $('at-bp-assign-label').textContent = `Assign ${preset ? preset.label : BP_PRESET[pat]} material preset`;
     }
@@ -6303,7 +7407,9 @@ window.TRLE = window.TRLE || {};
          ['at-bp-offset', 'at-bp-offset-val'], ['at-bp-joint', 'at-bp-joint-val'],
          ['at-bp-mh', 'at-bp-mh-val'], ['at-bp-ms', 'at-bp-ms-val'], ['at-bp-ml', 'at-bp-ml-val'],
          ['at-bp-noise', 'at-bp-noise-val'], ['at-bp-hue', 'at-bp-hue-val'],
-         ['at-bp-val', 'at-bp-val-val'], ['at-bp-highlight', 'at-bp-highlight-val']
+         ['at-bp-val', 'at-bp-val-val'], ['at-bp-highlight', 'at-bp-highlight-val'],
+         ['at-bp-irregular', 'at-bp-irregular-val'], ['at-bp-overlap', 'at-bp-overlap-val'],
+         ['at-bp-boardlen', 'at-bp-boardlen-val']
         ].forEach(([rid, lid, fmt]) => {
             $(rid).addEventListener('input', function () {
                 $(lid).textContent = fmt ? fmt(this.value) : this.value;
@@ -6362,7 +7468,28 @@ window.TRLE = window.TRLE || {};
         const S = state.tileSize;
         let result = {};
 
-        if (el.kind === 'transition') {
+        if (el.kind === 'transition' && el.bset) {
+            const b = el.bset;
+            if (b.slotMode === 'tile' && byId(b.srcId)) {
+                // Authored slot — its maps ARE the source tile's maps.
+                result = deriveMaps(byId(b.srcId), enabledMaps, cache);
+                cache[el.id] = result;
+                return result;
+            }
+            const base    = deriveMaps(byId(el.base), enabledMaps, cache);
+            const overlay = deriveMaps(byId(el.overlay), enabledMaps, cache);
+            // The trim region is identical however the diffuse was derived
+            // (rot/mirror land the trim in the same place), so the union mask
+            // of the slot's own role/bits composites the material maps.
+            const w = Math.max(2, Math.round(b.width * S));
+            const f = Math.max(1, b.soft * w);
+            const mask = bsetUnionMask(S, b.topo, b.topo === 'lines' ? b.bits : b.role, w, f);
+            for (const mt of TRLE.MapOrder) {
+                if (enabledMaps[mt] && base[mt] && overlay[mt]) {
+                    result[mt] = compositeTransition(base[mt], overlay[mt], mask, S);
+                }
+            }
+        } else if (el.kind === 'transition') {
             const base    = deriveMaps(byId(el.base), enabledMaps, cache);
             const overlay = deriveMaps(byId(el.overlay), enabledMaps, cache);
             const mask    = el.customMask
@@ -6411,6 +7538,168 @@ window.TRLE = window.TRLE || {};
         return safe || 'atlas';
     }
 
+    /* ---- Export "conveyor belt" flavour animation --------------------------
+       Purely cosmetic: while an export runs we play a little square-slicing
+       conveyor on a canvas above the progress bar, plus a rotating quip. Never
+       touches the pipeline — it's just there so the wait feels alive. */
+    const EXPORT_QUIPS = [
+        'Fighting gladiators in the Colosseum.',
+        'Locking Winston in the freezer.',
+        'Banishing demons in Ireland.',
+        'Smashing windows in Venice.',
+        'Using the Scion as a frisbee.',
+        'Finding the Library of Alexandria.',
+        'Reducing the monkey population of India.',
+        'Polluting Antarctica with bullet casings.',
+        'Giving a girl a break.'
+    ];
+    const EXPORT_PALETTE = ['#3ec46d', '#e8852a', '#3a9ff5', '#a45cff', '#f24b7d',
+                            '#f7c948', '#2dd4bf', '#ff6b3d', '#8b5cf6', '#22c55e'];
+    let _exportAnim = null;
+    let _exportAnimToken = 0;
+
+    function _hexToRgb(h) {
+        const n = parseInt(h.slice(1), 16);
+        return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+    }
+    function _mix(a, b, t) {
+        return `rgb(${Math.round(a[0] + (b[0] - a[0]) * t)},${Math.round(a[1] + (b[1] - a[1]) * t)},${Math.round(a[2] + (b[2] - a[2]) * t)})`;
+    }
+    function _shuffle(arr) {
+        const p = arr.slice();
+        for (let i = p.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [p[i], p[j]] = [p[j], p[i]]; }
+        return p;
+    }
+    function _roundRect(ctx, x, y, w, h, r) {
+        r = Math.min(r, w / 2, h / 2);
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.arcTo(x + w, y, x + w, y + h, r);
+        ctx.arcTo(x + w, y + h, x, y + h, r);
+        ctx.arcTo(x, y + h, x, y, r);
+        ctx.arcTo(x, y, x + w, y, r);
+        ctx.closePath();
+    }
+
+    function startExportAnim() {
+        stopExportAnim();
+        const stage = $('at-export-stage'), canvas = $('at-export-anim'), quipEl = $('at-export-quip');
+        if (!stage || !canvas || !canvas.getContext) return;
+        const ctx = canvas.getContext('2d');
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const token = ++_exportAnimToken;
+        stage.classList.add('active');
+
+        const CYCLE = 2600;               // ms per square lifecycle
+        const NEUTRAL = _hexToRgb('#37373c');
+        let colors = _shuffle(EXPORT_PALETTE).slice(0, 4).map(_hexToRgb);
+        let cycleStart = performance.now();
+        const easeInOut = x => x < 0.5 ? 2 * x * x : 1 - Math.pow(-2 * x + 2, 2) / 2;
+        const clamp01 = x => x < 0 ? 0 : x > 1 ? 1 : x;
+
+        function draw(t) {
+            // Keep backing store matched to the responsive display size.
+            const cw = Math.max(1, Math.round((canvas.clientWidth || 320) * dpr));
+            const ch = Math.max(1, Math.round((canvas.clientHeight || 160) * dpr));
+            if (canvas.width !== cw) canvas.width = cw;
+            if (canvas.height !== ch) canvas.height = ch;
+            const W = canvas.width, H = canvas.height;
+            ctx.clearRect(0, 0, W, H);
+
+            const size = Math.min(H * 0.78, W * 0.42);
+            const cy = H / 2, centerX = W / 2;
+            const P = { enter: 0.22, slice: 0.42, color: 0.58 };
+
+            let x, sliceP = 0, colorP = 0;
+            if (t < P.enter) {                       // slide in from the left
+                x = -size + (centerX + size) * easeInOut(t / P.enter);
+            } else if (t < P.color) {                // sit centre: slice, then colour
+                x = centerX;
+                if (t < P.slice) sliceP = (t - P.enter) / (P.slice - P.enter);
+                else { sliceP = 1; colorP = (t - P.slice) / (P.color - P.slice); }
+            } else {                                 // ride off to the right
+                sliceP = 1; colorP = 1;
+                x = centerX + (W + size - centerX) * easeInOut((t - P.color) / (1 - P.color));
+            }
+
+            const gap = easeInOut(colorP) * size * 0.05;
+            const q = (size - gap) / 2;
+            const left = x - size / 2, top = cy - size / 2;
+            const cells = [
+                [left, top], [left + q + gap, top],
+                [left, top + q + gap], [left + q + gap, top + q + gap]
+            ];
+
+            ctx.save();
+            ctx.shadowColor = 'rgba(0,0,0,0.35)';
+            ctx.shadowBlur = size * 0.06;
+            ctx.shadowOffsetY = size * 0.02;
+            for (let i = 0; i < 4; i++) {
+                const lp = clamp01(colorP * 1.55 - i * 0.16);   // staggered colour pop
+                ctx.fillStyle = _mix(NEUTRAL, colors[i], lp);
+                _roundRect(ctx, cells[i][0], cells[i][1], q, q, size * 0.06);
+                ctx.fill();
+                ctx.shadowColor = 'transparent';                // shadow only under first pass
+            }
+            ctx.restore();
+
+            // Slicing stroke: a vertical then horizontal cut, fading as colours bloom.
+            if (sliceP > 0 && colorP < 1) {
+                ctx.save();
+                ctx.globalAlpha = 1 - easeInOut(colorP);
+                ctx.strokeStyle = '#ffd9a3';
+                ctx.lineCap = 'round';
+                ctx.lineWidth = size * 0.035;
+                ctx.shadowColor = '#e8852a';
+                ctx.shadowBlur = size * 0.12;
+                const vP = clamp01(sliceP * 2), hP = clamp01(sliceP * 2 - 1);
+                if (vP > 0) { ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, top + size * vP); ctx.stroke(); }
+                if (hP > 0) { ctx.beginPath(); ctx.moveTo(left, cy); ctx.lineTo(left + size * hP, cy); ctx.stroke(); }
+                ctx.restore();
+            }
+        }
+
+        function frame(now) {
+            if (_exportAnimToken !== token) return;
+            let t = (now - cycleStart) / CYCLE;
+            if (t >= 1) { cycleStart = now; colors = _shuffle(EXPORT_PALETTE).slice(0, 4).map(_hexToRgb); t = 0; }
+            draw(t);
+            _exportAnim.raf = requestAnimationFrame(frame);
+        }
+
+        // Rotating quip, ~3s each with a fade.
+        let order = _shuffle(EXPORT_QUIPS), qi = 0;
+        if (quipEl) {
+            quipEl.textContent = order[0];
+            requestAnimationFrame(() => quipEl.classList.add('show'));
+            _exportAnim = _exportAnim || {};
+            _exportAnim.quipTimer = setInterval(() => {
+                quipEl.classList.remove('show');
+                setTimeout(() => {
+                    if (_exportAnimToken !== token) return;
+                    qi = (qi + 1) % order.length;
+                    quipEl.textContent = order[qi];
+                    quipEl.classList.add('show');
+                }, 400);
+            }, 3200);
+        }
+
+        _exportAnim = _exportAnim || {};
+        _exportAnim.raf = requestAnimationFrame(frame);
+    }
+
+    function stopExportAnim() {
+        _exportAnimToken++;                 // invalidate any in-flight loop/timer
+        if (_exportAnim) {
+            cancelAnimationFrame(_exportAnim.raf);
+            clearInterval(_exportAnim.quipTimer);
+            _exportAnim = null;
+        }
+        const stage = $('at-export-stage'), quipEl = $('at-export-quip');
+        if (stage) stage.classList.remove('active');
+        if (quipEl) quipEl.classList.remove('show');
+    }
+
     async function exportAtlas() {
         if (!state.elements.length) { showToast('Slice an atlas first!', 'error'); return; }
 
@@ -6425,6 +7714,7 @@ window.TRLE = window.TRLE || {};
         setBusy(btn, true, 'Exporting…');
         progress.classList.add('active');
         fill.style.width = '0%';
+        startExportAnim();
 
         try {
             const S = state.tileSize;
@@ -6542,7 +7832,7 @@ window.TRLE = window.TRLE || {};
             showToast('Export failed — see console for details', 'error');
         } finally {
             setBusy(btn, false);
-            setTimeout(() => progress.classList.remove('active'), 600);
+            setTimeout(() => { progress.classList.remove('active'); stopExportAnim(); }, 600);
         }
     }
 
@@ -6632,6 +7922,7 @@ window.TRLE = window.TRLE || {};
                     mode: el.mode ?? null, pivot: el.pivot ?? null, hardness: el.hardness ?? null,
                     blendMethod: el.blendMethod ?? null, wangBits: el.wangBits ?? null
                 };
+                if (el.bset) e.bset = el.bset;   // border-set recipe (re-rendered on load)
                 if (el.kind === 'tile') {
                     e.original = el.original.toDataURL('image/png');
                     if (el.seamless || el.edited) e.canvas = el.canvas.toDataURL('image/png');
@@ -6672,6 +7963,7 @@ window.TRLE = window.TRLE || {};
                 mode: e.mode ?? undefined, pivot: e.pivot ?? undefined, hardness: e.hardness ?? undefined,
                 blendMethod: e.blendMethod ?? undefined,
                 wangBits: e.wangBits == null ? undefined : e.wangBits,
+                bset: e.bset || null,
                 overlayGeom: e.overlayGeom || null,
                 anim: e.anim || null,
                 htParams: e.htParams || null,
@@ -6748,26 +8040,30 @@ window.TRLE = window.TRLE || {};
     function impRender() {
         if (!imp.img) return;
         const cv = $('at-import-canvas');
+        const box = cv.parentElement;   // scroll container
         const iw = imp.img.naturalWidth, ih = imp.img.naturalHeight;
-        // Fill the display box (CSS px). Small atlases are scaled UP so the
-        // pick grid is large enough to see which cell is which — when zooming a
-        // small source up we switch to crisp nearest-neighbour so it stays sharp
-        // instead of turning into a blurry blob.
-        const scale = Math.min(700 / iw, 560 / ih);
-        const W = Math.max(1, Math.round(iw * scale)), H = Math.max(1, Math.round(ih * scale));
-        // Render at device pixel ratio so the preview stays sharp, then pin the
-        // CSS size to W×H so the browser never re-scales it (the double-scale
-        // was what blurred the image and bloated the border).
-        const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+        const cols = imp.cols, rows = imp.rows;
+        // Show each cell at a legible fixed size and let the container scroll —
+        // the way the main atlas grid does — instead of squashing the whole sheet
+        // into one box (which made huge/tall atlases unreadably tiny). Fit the
+        // width to the column count, clamp to a sensible per-cell range, then
+        // guard against exceeding the browser's max canvas dimension (~16384px).
+        const availW = Math.max(320, (box.clientWidth || 700) - 2);
+        let cell = Math.max(44, Math.min(120, Math.round(availW / cols)));
+        const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+        const MAXPX = 16000;
+        if (cell * rows * dpr > MAXPX) cell = Math.max(12, Math.floor(MAXPX / (rows * dpr)));
+        const W = cell * cols, H = cell * rows, cw = cell, ch = cell;
         cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
-        cv.style.width = W + 'px'; cv.style.height = H + 'px'; cv.style.maxWidth = 'none';
+        cv.style.width = W + 'px'; cv.style.height = H + 'px';
         const ctx = cv.getContext('2d');
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.imageSmoothingEnabled = scale < 1;   // crisp when zooming small atlases up
+        ctx.imageSmoothingEnabled = true;
         ctx.imageSmoothingQuality = 'high';
         ctx.clearRect(0, 0, W, H);
+        // One uniform draw maps each source cell into its square display cell
+        // (matches the square resize done on import), keeping a clean grid.
         ctx.drawImage(imp.img, 0, 0, W, H);
-        const cols = imp.cols, rows = imp.rows, cw = W / cols, ch = H / rows;
         // dim unselected cells
         for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
             if (!imp.sel.has(impKey(r, c))) {
@@ -6815,7 +8111,7 @@ window.TRLE = window.TRLE || {};
 
     function setupImportModal() {
         ['at-import-cols', 'at-import-rows'].forEach(id => $(id).addEventListener('input', function () {
-            const v = Math.max(1, Math.min(32, parseInt(this.value) || 1));
+            const v = Math.max(1, Math.min(128, parseInt(this.value) || 1));
             if (id === 'at-import-cols') imp.cols = v; else imp.rows = v;
             impSelectAll();   // cell layout changed → reselect everything
             impRender();
@@ -6888,7 +8184,7 @@ window.TRLE = window.TRLE || {};
             img.onload = () => {
                 URL.revokeObjectURL(url);
                 const isFirst = !state.elements.length;
-                const size = state.tileSize || parseInt($('at-tile-size').value) || 256;
+                const size = state.tileSize || getTileSize() || 256;
                 const square = img.naturalWidth === img.naturalHeight;
                 openConfirm('📋 Paste image from clipboard',
                     `Add the copied image (${img.naturalWidth}×${img.naturalHeight}px${square ? '' : ' — not square'}) to your atlas? You’ll choose how to slice it into tiles next.`,
@@ -6901,7 +8197,7 @@ window.TRLE = window.TRLE || {};
     }
 
     function createBlankAtlas() {
-        const S = parseInt($('at-tile-size').value);
+        const S = getTileSize();
         const cols = Math.max(1, Math.min(12, parseInt($('at-blank-cols').value) || 4));
         state.tileSize = S;
         state.cols = cols;
@@ -6932,19 +8228,23 @@ window.TRLE = window.TRLE || {};
        than one texture? Returns a human reason, or null. Used to nudge the user
        toward the atlas importer instead of squishing the sheet into one tile. */
     function atlasLikeReason(img) {
-        const w = img.naturalWidth, h = img.naturalHeight, S = state.tileSize || parseInt($('at-tile-size').value) || 256;
+        const w = img.naturalWidth, h = img.naturalHeight, S = state.tileSize || getTileSize() || 256;
         if (Math.abs(w / h - 1) > 0.12) return 'it isn’t square — atlas sheets usually aren’t';
         if (Math.max(w, h) >= 3 * S) return 'it’s much larger than a single tile';
         return null;
     }
 
     function addImageTiles(files) {
-        const list = [...files].filter(f => f.type && f.type.startsWith('image/'));
+        // Accept anything that reports an image MIME type OR is a .tga (whose
+        // type is often empty), so TGA files aren't silently dropped here.
+        const list = [...files].filter(f =>
+            (f.type && f.type.startsWith('image/')) || isTGAFile(f));
         if (!list.length) return;
         if (!state.elements) state.elements = [];
         const slots = new Array(list.length).fill(null);
-        let pending = list.length;
+        let pending = list.length, failed = 0;
         const done = () => {
+            if (failed) showToast(`${failed} file${failed > 1 ? 's' : ''} couldn’t be read (unsupported or corrupt).`, 'error');
             const imgs = slots.filter(Boolean);
             if (!imgs.length) return;
             // A single atlas-looking image → offer the tile picker instead of
@@ -6953,7 +8253,7 @@ window.TRLE = window.TRLE || {};
             if (imgs.length === 1) {
                 const why = atlasLikeReason(imgs[0]);
                 if (why) {
-                    const S = state.tileSize || parseInt($('at-tile-size').value);
+                    const S = state.tileSize || getTileSize();
                     openConfirm('🗺️ Looks like an atlas',
                         `This image is ${imgs[0].naturalWidth}×${imgs[0].naturalHeight} — ${why}. Adding it as one tile resizes the whole sheet down to ${S}². Pick tiles from it as an atlas instead?`,
                         '🗺️ Import from Atlas…',
@@ -6965,22 +8265,17 @@ window.TRLE = window.TRLE || {};
             commitImageTiles(imgs);
         };
         list.forEach((file, idx) => {
-            const reader = new FileReader();
-            reader.onload = ev => {
-                const img = new Image();
-                img.onload = () => { slots[idx] = img; if (--pending === 0) done(); };
-                img.onerror = () => { if (--pending === 0) done(); };
-                img.src = ev.target.result;
-            };
-            reader.onerror = () => { if (--pending === 0) done(); };
-            reader.readAsDataURL(file);
+            readImageFile(file)
+                .then(img => { slots[idx] = img; })
+                .catch(() => { failed++; })
+                .finally(() => { if (--pending === 0) done(); });
         });
     }
 
     function triggerAddImages() {
         if (!state.tileSize) return;
         const inp = document.createElement('input');
-        inp.type = 'file'; inp.accept = 'image/*'; inp.multiple = true;
+        inp.type = 'file'; inp.accept = 'image/*,.tga'; inp.multiple = true;
         inp.addEventListener('change', e => { if (e.target.files.length) addImageTiles(e.target.files); });
         inp.click();
     }
@@ -7010,7 +8305,7 @@ window.TRLE = window.TRLE || {};
 
     async function sliceAtlas() {
         if (!state.image) return;
-        const S = parseInt($('at-tile-size').value);
+        const S = getTileSize();
         const img = state.image;
         const cols = Math.floor(img.naturalWidth / S);
         const rows = Math.floor(img.naturalHeight / S);
@@ -7079,21 +8374,17 @@ window.TRLE = window.TRLE || {};
         });
         $('at-slice-btn').addEventListener('click', sliceAtlas);
         $('at-pick-btn').addEventListener('click', () => {
-            if (state.image) openImportModal(state.image, parseInt($('at-tile-size').value), !state.elements.length);
+            if (state.image) openImportModal(state.image, getTileSize(), !state.elements.length);
         });
         $('at-import-atlas').addEventListener('click', () => {
             const inp = document.createElement('input');
-            inp.type = 'file'; inp.accept = 'image/*';
+            inp.type = 'file'; inp.accept = 'image/*,.tga';
             inp.addEventListener('change', e => {
                 const file = e.target.files[0];
                 if (!file) return;
-                const reader = new FileReader();
-                reader.onload = ev => {
-                    const img = new Image();
-                    img.onload = () => openImportModal(img, state.tileSize || parseInt($('at-tile-size').value), !state.elements.length);
-                    img.src = ev.target.result;
-                };
-                reader.readAsDataURL(file);
+                readImageFile(file)
+                    .then(img => openImportModal(img, state.tileSize || getTileSize(), !state.elements.length))
+                    .catch(err => showToast(err.message, 'error'));
             });
             inp.click();
         });
@@ -7102,6 +8393,10 @@ window.TRLE = window.TRLE || {};
         $('at-add-blank').addEventListener('click', addBlankTile);
         $('at-add-anim').addEventListener('click', () => openAnimModal());
         $('at-pick-cancel').addEventListener('click', exitPickMode);
+        $('at-pick-same').addEventListener('click', () => {
+            if (state.pickBaseId !== null && state.pickMode === 'borderset')
+                openBsetModal(state.pickBaseId, state.pickBaseId);
+        });
         $('at-export-btn').addEventListener('click', exportAtlas);
         $('at-export-tiles').addEventListener('click', exportTilesIndividually);
         $('at-export-flipy').addEventListener('change', e => {
@@ -7153,8 +8448,10 @@ window.TRLE = window.TRLE || {};
         setupMultiMaterial();
         setupHealModal();
         setupVarModal();
+        setupOrigamiModal();
         setupBuildModal();
         setupWangModal();
+        setupBsetModal();
         setupFadeModal();
         setupEmissiveModal();
         setupAnchorModal();
@@ -7305,6 +8602,27 @@ window.TRLE = window.TRLE || {};
                 }
                 return url(o);
             },
+            // Full-set montage: the same spatial layouts the Make Transition "Full
+            // Set" tab adds, stitched into one figure with grid lines. base (A) /
+            // overlay (B); layout = island3 | hole3 | complete5; sharp = 45° cuts.
+            async transSet(aSrc, bSrc, S, layout, sharp, cell, line) {
+                const A = toC(await loadImg(aSrc), S), B = toC(await loadImg(bSrc), S);
+                const { width, cells } = transSetCells(layout, !!sharp);
+                const rows = cells.length / width;
+                const L = line || 0;
+                const o = document.createElement('canvas');
+                o.width = cell * width + L * (width + 1);
+                o.height = cell * rows + L * (rows + 1);
+                const x = o.getContext('2d');
+                x.fillStyle = '#3c3c3c'; x.fillRect(0, 0, o.width, o.height);
+                cells.forEach((mode, i) => {
+                    const r = (i / width) | 0, cidx = i % width;
+                    const comp = mode === '@BASE' ? A : mode === '@OVERLAY' ? B
+                        : composeTransitionDiffuse(A, B, buildTopologyMask(S, mode, 0.5, 0.0), S, 'alpha');
+                    x.drawImage(comp, L + cidx * (cell + L), L + r * (cell + L), cell, cell);
+                });
+                return url(o);
+            },
             // Recolour base to adopt the reference's palette (mean/std colour transfer).
             async recolor(baseSrc, refSrc, S, strength) {
                 const E = TRLE.Engine;
@@ -7335,6 +8653,8 @@ window.TRLE = window.TRLE || {};
                 return true;
             },
             openAnchor() { openAnchorModal(1, 2); return true; },
+            openTrans() { openTransModal(1, 2); return true; },
+            openCtx(id) { openCtxMenuForCell(id); return true; },
             openGrid() { openTransGridModal(1, 2); return true; },
             openOrganic() { openOrganicModal(1, 2); return true; },
             seamToggle(side, seg) { if (org.seam) org.seam[side][seg] = !org.seam[side][seg]; orgDrawSeamBox(); return org.seam ? org.seam[side][seg] : null; },
@@ -7381,11 +8701,15 @@ window.TRLE = window.TRLE || {};
     /* Restore persisted UI choices and keep them in sync. */
     function applyPrefs() {
         // Tile size
-        const sizeSel = $('at-tile-size');
+        const sizeSel = $('at-tile-size'), sizeCustom = $('at-tile-size-custom');
         if (prefs.tileSize && [...sizeSel.options].some(o => o.value === prefs.tileSize)) {
             sizeSel.value = prefs.tileSize;
         }
-        sizeSel.addEventListener('change', () => savePref('tileSize', sizeSel.value));
+        if (prefs.tileSizeCustom) sizeCustom.value = prefs.tileSizeCustom;
+        const syncSizeCustom = () => { sizeCustom.style.display = sizeSel.value === 'custom' ? '' : 'none'; };
+        syncSizeCustom();
+        sizeSel.addEventListener('change', () => { syncSizeCustom(); savePref('tileSize', sizeSel.value); });
+        sizeCustom.addEventListener('change', () => savePref('tileSizeCustom', sizeCustom.value));
 
         // Map checkboxes
         document.querySelectorAll('#at-map-checks input[data-map]').forEach(cb => {

@@ -1,5 +1,8 @@
-/* SPDX-License-Identifier: GPL-3.0-only
-   TextureTool — Copyright (C) 2026 KainM-77. Licensed under GPL-3.0. See LICENSE. */
+/* SPDX-License-Identifier: MIT
+   TextureTool — Copyright (C) 2026 KainM-77. This file is the author's own work,
+   available under the MIT License (see LICENSE-MIT). The tool as a whole ships
+   under GPL-3.0 (see LICENSE) only because it also bundles two GPL-3.0 seamless
+   shaders derived from Materialize; this file contains none of that code. */
 /* ============================================================
    TRLE Texture Tools — Material Presets & Map Descriptions
    Contains 43 solid + 8 liquid material definitions with

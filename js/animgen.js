@@ -1,5 +1,8 @@
-/* SPDX-License-Identifier: GPL-3.0-only
-   TextureTool — Copyright (C) 2026 KainM-77. Licensed under GPL-3.0. See LICENSE. */
+/* SPDX-License-Identifier: MIT
+   TextureTool — Copyright (C) 2026 KainM-77. This file is the author's own work,
+   available under the MIT License (see LICENSE-MIT). The tool as a whole ships
+   under GPL-3.0 (see LICENSE) only because it also bundles two GPL-3.0 seamless
+   shaders derived from Materialize; this file contains none of that code. */
 /* ============================================================
    TRLE Atlas Tool — Animated Texture Generator (Phase 1 core)
    Bakes a deterministic, seamlessly-looping sequence of frames
@@ -41,6 +44,7 @@ TRLE.AnimGen = (function () {
         contrast: 1,
         seed: 0,
         style: 0,           // 0 fBm, 1 ridged, 2 billow
+        equalize: 0,        // 0..1 colour-spread: flatten value distribution (ramp only)
         palette: null,      // [{ pos:0..1, color:[r,g,b] | [r,g,b,a] (0-255) }]
         colorAdjust: null   // { hue°, sat, val, contrast, gamma, invert, posterize } over the ramp
     };
@@ -160,7 +164,8 @@ TRLE.AnimGen = (function () {
             u_warp: p.warp,
             u_contrast: p.contrast,
             u_seed: p.seed,
-            u_style: p.style
+            u_style: p.style,
+            u_equalize: p.equalize || 0
         };
     }
 
