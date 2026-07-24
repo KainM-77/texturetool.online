@@ -208,7 +208,7 @@
                 ['Slime / acid / poison / magic liquid', 'gentle Strength (20 to 60) for an eerie sheen.'],
                 ['Everything else', 'leave it at 0.']
             ],
-            tip: `The preview sits on black on purpose, because emissive is exactly what you’d still see with the lights off. If a whole material is glowing, your <strong>Threshold</strong> is set too low.`
+            tip: `The preview sits on black on purpose, because emissive is exactly what you’d still see with the lights off. If a whole material is glowing, your <strong>Threshold</strong> is set too low. <strong>Set Material</strong> shows the emissive alongside the other maps in its preview sheet, and the lit preview lights up with it, so a glow you painted with <strong>Make Emissive</strong> is visible before you export. Emissive can <em>animate</em>: an animated texture is a stack of tiles, and its glow exports as a matching per-frame atlas, so a lava range’s cracks glow as they shift (the animated-texture <strong>✨ Glow</strong> tab, with an optional pulse).`
         },
         {
             id: 'cookbook', icon: '📋', title: 'Quick-reference recipe table',
@@ -219,8 +219,8 @@
         {
             id: 'where', icon: '🎛️', title: 'Where to tune this in the tool',
             what: `Everything above lives in one place: right-click a tile and hit <strong>Set Material</strong>. Pick a <strong>type</strong> (Solid or Liquid), an <strong>aesthetic</strong> (Realistic, Fantasy, Decal or your ⭐ saved presets) and a <strong>preset</strong>, then open the <strong>Advanced editor</strong>. The sliders there map one-to-one to the names on this page.`,
-            derive: `Drag the lit preview to move the light around and see how it reads, or flip the <strong>🧊 3D</strong> toggle to watch the height map displace a real mesh. Once you’ve dialled it in, hit <strong>⭐ Save as preset…</strong> to reuse that exact recipe on any tile, in this project or the next. In the <strong>Export</strong> panel you choose which maps actually get generated.`,
-            tip: `Transition, Wang and border tiles inherit their materials from their source tiles, so you tune the sources rather than the blended tiles. If one texture mixes surfaces (a brick wall with a wooden door and a metal knob), use <strong>🎭 Multiple materials</strong> to paint a different material onto each region.`
+            derive: `Drag the lit preview to move the light around and see how it reads, or flip the <strong>🧊 3D</strong> toggle to watch the height map displace a real mesh. Once you’ve dialled it in, hit <strong>⭐ Save as preset…</strong> to reuse that exact recipe on any tile, in this project or the next. Saved presets stay in your browser between sessions and appear as one-click chips along the top of <strong>Set Material</strong>, so a “my rock” or “my sand” is always one click away (<strong>⬇ Export</strong> writes them to a JSON file for backup or sharing). In the <strong>Export</strong> panel you choose which maps actually get generated.`,
+            tip: `Transition, Wang and border tiles inherit their materials from their source tiles, so you tune the sources rather than the blended tiles. If one texture mixes surfaces (a brick wall with a wooden door and a metal knob), use <strong>🎭 Multiple materials</strong> to paint a different material onto each region. To put the same material on many tiles, select them and use <strong>🎨 Apply Material</strong>, or right-click any of them: the menu acts on the whole selection. <strong>🎨 Apply Last Material</strong> repeats your previous choice with no modal at all.`
         }
     ];
 

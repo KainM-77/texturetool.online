@@ -35,7 +35,10 @@ window.TRLE = window.TRLE || {};
         pickMode: 'transition', // what the second click builds: 'transition' | 'wang'
         dragId: null,       // element being drag-reordered
         modalReturnFocus: null,  // element to restore focus to when a modal closes
-        flipNormalY: false  // global: export normals in DirectX (flipped green) vs OpenGL/TombEngine
+        flipNormalY: false, // global: export normals in DirectX (flipped green) vs OpenGL/TombEngine
+        lastMaterial: null,      // last assigned material descriptor (for "Apply Last Material")
+        lastMatLayers: null,     // …and its layer stack, when the last assign was multi-material
+        dirty: false             // unsaved edits since the last save / load
     };
 
     /* element: {
@@ -480,6 +483,87 @@ window.TRLE = window.TRLE || {};
         return out;
     }
 
+    /* Value noise whose integer lattice wraps every `period` cells, so sampling
+       x,y ∈ [0..period) is exactly toroidal. Used for seamless domain warps
+       (warpMaskOrganic's noise is NOT periodic, so it can't wrap a single tile). */
+    function makePeriodicNoise(seed, period) {
+        const rnd = mulberry32(seed >>> 0);
+        const P = Math.max(1, period | 0);
+        const grad = new Float32Array(P * P);
+        for (let i = 0; i < grad.length; i++) grad[i] = rnd();
+        const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+        const lerp = (a, b, t) => a + (b - a) * t;
+        const hash = (xi, yi) => grad[((yi % P + P) % P) * P + ((xi % P + P) % P)];
+        return (x, y) => {
+            const xi = Math.floor(x), yi = Math.floor(y);
+            const u = fade(x - xi), v = fade(y - yi);
+            return lerp(lerp(hash(xi, yi), hash(xi + 1, yi), u),
+                        lerp(hash(xi, yi + 1), hash(xi + 1, yi + 1), u), v);
+        };
+    }
+
+    /* Domain-warp a full RGBA canvas with periodic noise, sampling the source
+       toroidally — edges of the warped result still wrap. Warping a cell layer
+       (pixels + alpha together) is how Build Pattern gets irregular joint edges
+       without touching any per-pattern drawing code. amount 0..1. */
+    function warpLayerToroidal(layer, S, amount, seed) {
+        if (!amount || amount <= 0) return layer;
+        const freq = 4;
+        const nX = makePeriodicNoise(seed >>> 0, freq);
+        const nY = makePeriodicNoise((seed ^ 0x85ebca6b) >>> 0, freq);
+        const maxD = amount * S * 0.10;
+        const sdata = layer.getContext('2d').getImageData(0, 0, S, S).data;
+        const out = document.createElement('canvas'); out.width = S; out.height = S;
+        const octx = out.getContext('2d');
+        const img = octx.createImageData(S, S), d = img.data;
+        for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+            const u = (x / S) * freq, v = (y / S) * freq;
+            // Math.floor, not |0: truncation toward zero isn't translation-
+            // invariant, which would shift samples by 1px where x+dx < 0 and
+            // open a visible band along the wrap seam.
+            const sx = (Math.floor(x + (nX(u, v) - 0.5) * 2 * maxD) % S + S) % S;
+            const sy = (Math.floor(y + (nY(u + 1.7, v + 2.3) - 0.5) * 2 * maxD) % S + S) % S;
+            const si = (sy * S + sx) * 4, di = (y * S + x) * 4;
+            d[di] = sdata[si]; d[di + 1] = sdata[si + 1]; d[di + 2] = sdata[si + 2]; d[di + 3] = sdata[si + 3];
+        }
+        octx.putImageData(img, 0, 0);
+        return out;
+    }
+
+    /* Seamless (wrap-aware) blur: surround the tile with a wrapped apron wide
+       enough for the blur kernel, blur, crop the centre back out. */
+    function wrapBlur(src, S, radiusPx) {
+        const r = Math.max(1, Math.ceil(radiusPx));
+        const ap = Math.min(S, r * 3);                 // apron ≥ ~3σ covers the kernel tail
+        const W = S + ap * 2;
+        const big = document.createElement('canvas'); big.width = big.height = W;
+        const bctx = big.getContext('2d');
+        for (let ty = -1; ty <= 1; ty++)
+            for (let tx = -1; tx <= 1; tx++) bctx.drawImage(src, ap + tx * S, ap + ty * S);
+        const out = document.createElement('canvas'); out.width = out.height = S;
+        const octx = out.getContext('2d');
+        octx.filter = `blur(${radiusPx}px)`;
+        octx.drawImage(big, -ap, -ap);
+        octx.filter = 'none';
+        return out;
+    }
+
+    /* RGB (0-255) → {h,s,l} in HSL(0-360, 0-100, 0-100). */
+    function hslOfRgb(r255, g255, b255) {
+        const r = r255 / 255, g = g255 / 255, b = b255 / 255;
+        const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2;
+        let h = 0, s = 0;
+        if (mx !== mn) {
+            const dd = mx - mn;
+            s = l > 0.5 ? dd / (2 - mx - mn) : dd / (mx + mn);
+            if (mx === r) h = (g - b) / dd + (g < b ? 6 : 0);
+            else if (mx === g) h = (b - r) / dd + 2;
+            else h = (r - g) / dd + 4;
+            h *= 60;
+        }
+        return { h: Math.round(h), s: Math.round(s * 100), l: Math.round(l * 100) };
+    }
+
     /* ============ GENERIC UTILITIES ============ */
     const TOAST_ICONS = { success: '✅', error: '⛔', warning: '⚠️', info: '💡' };
     let toastTimer = null;
@@ -912,15 +996,20 @@ window.TRLE = window.TRLE || {};
             cell.addEventListener('dragstart', e => {
                 state.dragId = el.id;
                 e.dataTransfer.effectAllowed = 'move';
-                cell.classList.add('at-dragging');
+                // Dim the whole block when dragging inside a multi-selection, so
+                // it's clear that all of it is coming along.
+                (ctxActsOnSelection(el.id) ? selectedIdsInOrder() : [el.id])
+                    .forEach(id => { const c = cellById(id); if (c) c.classList.add('at-dragging'); });
             });
             cell.addEventListener('dragend', () => {
                 state.dragId = null;
-                cell.classList.remove('at-dragging');
+                grid.querySelectorAll('.at-dragging').forEach(c => c.classList.remove('at-dragging'));
                 grid.querySelectorAll('.at-drop-target').forEach(c => c.classList.remove('at-drop-target'));
             });
             cell.addEventListener('dragover', e => {
                 if (state.dragId == null || state.dragId === el.id) return;
+                // No drop target inside the block being moved — it would be a no-op.
+                if (ctxActsOnSelection(state.dragId) && state.selSet.has(el.id)) return;
                 e.preventDefault();
                 cell.classList.add('at-drop-target');
             });
@@ -1183,11 +1272,17 @@ window.TRLE = window.TRLE || {};
         const n = state.selSet.size;
         bar.style.display = n >= 2 ? 'flex' : 'none';
         const cnt = $('at-bulk-count'); if (cnt) cnt.textContent = n;
+        const last = $('at-bulk-lastmaterial');
+        if (last) {
+            last.style.display = state.lastMaterial ? '' : 'none';
+            last.textContent = `↺ Repeat: ${lastMaterialLabel()}`;
+        }
     }
     function setupBulkBar() {
         $('at-bulk-clear').addEventListener('click', () => { clearSelection(); renderGrid(); });
         $('at-bulk-delete').addEventListener('click', () => { const ids = selectedIdsInOrder(); if (ids.length) confirmDelete(ids); });
         $('at-bulk-material').addEventListener('click', bulkApplyMaterial);
+        $('at-bulk-lastmaterial').addEventListener('click', () => applyLastMaterial(selectedIdsInOrder()));
         $('at-bulk-gather').addEventListener('click', gatherSelection);
         $('at-bulk-front').addEventListener('click', () => moveSelection(true));
         $('at-bulk-back').addEventListener('click', () => moveSelection(false));
@@ -1233,6 +1328,64 @@ window.TRLE = window.TRLE || {};
         if (!ids.length) { showToast('Transition tiles inherit materials — select some plain/animated tiles', 'info'); return; }
         if (skipped > 0) showToast(`${skipped} transition tile${skipped !== 1 ? 's' : ''} will keep their inherited material`, 'info', 3500);
         openMatModalBatch(ids);
+    }
+
+    /* ---- Material assignment (shared by the modal and "Apply Last Material") ----
+       Writes a flat material — or a multi-material layer stack — onto every target,
+       propagating to the rest of an animation group so its frames stay consistent. */
+    function assignMaterialTo(targets, material, layers) {
+        targets.forEach(el => {
+            el.material  = deepCopyMaterial(material);
+            el.matLayers = layers ? cloneMatLayers(layers) : null;
+            if (el.kind === 'anim' && el.anim && el.anim.total > 1) {
+                state.elements.forEach(s => {
+                    if (s !== el && s.kind === 'anim' && s.anim && s.anim.group === el.anim.group) {
+                        s.material  = deepCopyMaterial(el.material);
+                        s.matLayers = el.matLayers ? cloneMatLayers(el.matLayers) : null;
+                    }
+                });
+            }
+        });
+    }
+
+    /* Remember what was just assigned so it can be repeated without the editor. */
+    function rememberLastMaterial(material, layers) {
+        state.lastMaterial  = deepCopyMaterial(material);
+        state.lastMatLayers = layers ? cloneMatLayers(layers) : null;
+    }
+
+    /* Display name for the remembered material (mirrors materialLabel's wording).
+       The "*" marks a tweaked built-in; a saved preset's name already *is* the
+       tweak, so it doesn't get one. */
+    function lastMaterialLabel() {
+        if (!state.lastMaterial) return '';
+        if (state.lastMatLayers) return `Multi-material, ${state.lastMatLayers.length} layers`;
+        const m = state.lastMaterial;
+        const p = presetFromMaterial(m);
+        const tweaked = m.custom && m.aesthetic !== 'saved';
+        return (p && p.label ? p.label : m.key) + (tweaked ? ' *' : '');
+    }
+
+    /* Re-apply the remembered material to `ids` — no modal, no re-picking. */
+    function applyLastMaterial(ids) {
+        if (!state.lastMaterial) { showToast('Assign a material once first, then this repeats it', 'info'); return; }
+        const targets = ids.map(byId).filter(el => el && el.kind !== 'transition');
+        const skipped = ids.length - targets.length;
+        if (!targets.length) { showToast('Transition tiles inherit materials — pick plain/animated tiles', 'info'); return; }
+        // A layer stack is masked per tile, so it only makes sense on a single target.
+        const layers = (state.lastMatLayers && targets.length === 1) ? state.lastMatLayers : null;
+        assignMaterialTo(targets, state.lastMaterial, layers);
+        renderGrid();
+        const label = lastMaterialLabel();
+        pushHistory(targets.length > 1 ? `Material → ${targets.length} tiles` : `Material: ${label}`);
+        if (state.lastMatLayers && !layers) {
+            showToast(`Applied the base material of “${label}” to ${targets.length} tiles — layer masks are per-tile 🎨`, 'info', 4000);
+        } else {
+            showToast(targets.length > 1
+                ? `Applied “${label}” to ${targets.length} tiles 🎨`
+                : `Applied “${label}” 🎨`, 'success');
+        }
+        if (skipped > 0) showToast(`${skipped} transition tile${skipped !== 1 ? 's' : ''} skipped`, 'info', 3000);
     }
 
     /* ---- Rubber-band marquee selection over the grid background ---- */
@@ -1341,19 +1494,48 @@ window.TRLE = window.TRLE || {};
         return changed;
     }
 
+    /* Drop X on Y = X takes Y's slot, in both directions.
+       The target index must be read BEFORE the removal. Reading it after made
+       backward drags work but silently shortened forward ones by a slot: pulling
+       the dragged element out shifts every later element left by one, so a
+       re-read target sat one place early and the element landed in front of it.
+       For neighbours that put it straight back where it started, which looked
+       like "you can drag 36 onto 35 but not 35 onto 36".
+       Taken before removal, `to` works out for both directions: dragging forward
+       the target slides left and inserting at `to` lands just after it; dragging
+       backward the target is untouched and inserting at `to` displaces it. */
     function reorderElements(dragId, targetId) {
         if (dragId == null || dragId === targetId) return;
-        const from = indexOf(dragId);
-        if (from < 0) return;
-        const [moved] = state.elements.splice(from, 1);
-        const insertAt = indexOf(targetId);   // target index after removal → insert before target
-        state.elements.splice(insertAt, 0, moved);
+        const to = indexOf(targetId);
+        if (to < 0) return;
+
+        /* Dragging any tile of a multi-selection moves the whole selection, the
+           same way right-clicking inside one acts on all of it (ctxActsOnSelection).
+           The block keeps its internal order and lands together at the target. */
+        const ids = ctxActsOnSelection(dragId) ? selectedIdsInOrder() : [dragId];
+        if (ids.includes(targetId)) return;      // dropped inside the block itself
+        const moving = ids.map(byId).filter(Boolean);
+        if (!moving.length) return;
+
+        const firstFrom = indexOf(ids[0]);
+        const rest = state.elements.filter(e => !ids.includes(e.id));
+        let at = rest.indexOf(byId(targetId));
+        if (at < 0) return;
+        // Same rule as a single tile: coming from earlier in the atlas the block
+        // lands after the target, coming from later it displaces it.
+        if (firstFrom < to) at += 1;
+        rest.splice(at, 0, ...moving);
+        state.elements = rest;
+
         enforceAnimOrder();
         const repaired = enforceTransitionOrder();
         state.focusedId = dragId;
         renderGrid();
-        pushHistory('Reorder');
-        showToast(repaired ? 'Reordered (transitions kept after their sources)' : 'Reordered', 'success');
+        pushHistory(moving.length > 1 ? `Reorder ${moving.length} tiles` : 'Reorder');
+        showToast(
+            repaired ? 'Reordered (transitions kept after their sources)'
+            : moving.length > 1 ? `Reordered ${moving.length} tiles` : 'Reordered',
+            'success');
     }
 
     /* Keyboard reorder: move the focused element one slot (Ctrl/Cmd+Arrow). */
@@ -1512,6 +1694,7 @@ window.TRLE = window.TRLE || {};
                 // restore (like transitions), so no pixels are snapshotted.
                 anim: el.anim ? JSON.parse(JSON.stringify(el.anim)) : null,
                 htParams: el.htParams ? JSON.parse(JSON.stringify(el.htParams)) : null, // height-transition recipe (re-editable)
+                sgParams: el.sgParams ? JSON.parse(JSON.stringify(el.sgParams)) : null, // stained-glass recipe (re-editable)
                 original: el.original || null,                          // immutable ref (tiles)
                 // Snapshot the canvas whenever it diverges from `original`
                 // (seamless or healed/transformed); otherwise rebuild from original.
@@ -1556,6 +1739,7 @@ window.TRLE = window.TRLE || {};
                 emissive: s.emissive ? cloneCanvas(s.emissive) : null,
                 anim: s.anim ? JSON.parse(JSON.stringify(s.anim)) : null,
                 htParams: s.htParams ? JSON.parse(JSON.stringify(s.htParams)) : null,
+                sgParams: s.sgParams ? JSON.parse(JSON.stringify(s.sgParams)) : null,
                 edited: s.edited
             };
         });
@@ -1585,6 +1769,7 @@ window.TRLE = window.TRLE || {};
                 const ctx = el.canvas.getContext('2d');
                 ctx.clearRect(0, 0, el.canvas.width, el.canvas.height);
                 if (src) ctx.drawImage(src, 0, 0, el.canvas.width, el.canvas.height);
+                anBakeMemberGlow(el);   // re-derive the glow from the recipe + fresh frame
             });
         }
     }
@@ -1593,8 +1778,40 @@ window.TRLE = window.TRLE || {};
         history.stack = [snapshotState()];
         history.labels = [label || 'Start'];
         history.index = 0;
+        markSaved();            // a fresh / just-loaded atlas has nothing unsaved yet
+        // A new atlas or a just-loaded project is worth protecting immediately —
+        // waiting for the first edit meant that after a manual "Clear stored
+        // session" the rail's Session block stayed gone until you touched
+        // something, which read as the block having vanished for good.
+        scheduleAutosave();
+        renderStorageInfo();
         updateHistoryButtons();
         renderHistory();
+    }
+
+    /* ---- Unsaved-work tracking ----------------------------------------------
+       Every edit goes through pushHistory, so that's the one place that has to
+       mark the work dirty. Saving (or starting over) clears it. The flag drives
+       the "unsaved" marker next to Save Project and the beforeunload guard — the
+       browser's own dialog, which is why it can't be styled or given a hotkey. */
+    /* Every edit path already routes through here, which makes it the one place
+       the autosave needs to hook — note the schedule fires on every edit, not
+       just the false→true transition, or only the first edit would be kept. */
+    function markDirty() {
+        if (!state.dirty) { state.dirty = true; renderSavedState(); }
+        scheduleAutosave();
+    }
+    function markSaved() { if (state.dirty !== false) { state.dirty = false; renderSavedState(); } }
+    function renderSavedState() {
+        const dot = $('at-unsaved');
+        if (dot) dot.style.display = state.dirty ? '' : 'none';
+    }
+    function setupUnloadGuard() {
+        window.addEventListener('beforeunload', e => {
+            if (!state.dirty || !state.elements.length) return;
+            e.preventDefault();
+            e.returnValue = '';   // legacy browsers still want a truthy return value
+        });
     }
 
     function pushHistory(label) {
@@ -1605,6 +1822,7 @@ window.TRLE = window.TRLE || {};
         history.labels.push(label || 'Edit');
         if (history.stack.length > history.limit) { history.stack.shift(); history.labels.shift(); }
         history.index = history.stack.length - 1;
+        markDirty();
         updateHistoryButtons();
         renderHistory();
     }
@@ -1613,6 +1831,7 @@ window.TRLE = window.TRLE || {};
         if (history.index <= 0) return;
         history.index--;
         restoreState(history.stack[history.index]);
+        markDirty();
         updateHistoryButtons();
         renderHistory();
         showToast('Undo', 'info');
@@ -1622,6 +1841,7 @@ window.TRLE = window.TRLE || {};
         if (history.index >= history.stack.length - 1) return;
         history.index++;
         restoreState(history.stack[history.index]);
+        markDirty();
         updateHistoryButtons();
         renderHistory();
         showToast('Redo', 'info');
@@ -1632,6 +1852,7 @@ window.TRLE = window.TRLE || {};
         if (i < 0 || i >= history.stack.length || i === history.index) return;
         history.index = i;
         restoreState(history.stack[i]);
+        markDirty();
         updateHistoryButtons();
         renderHistory();
     }
@@ -1709,20 +1930,47 @@ window.TRLE = window.TRLE || {};
             .filter(b => !b.disabled && b.offsetParent !== null);
     }
 
+    /* True when the right-clicked tile is part of a ≥2 multi-selection, i.e. the
+       material actions should act on every selected tile, not just this one. */
+    function ctxActsOnSelection(id) {
+        return state.selSet.size >= 2 && state.selSet.has(id);
+    }
+
     function openCtxMenu(id, x, y) {
         const el = byId(id);
         if (!el) return;
         state.ctxTargetId = id;
         const menu = $('at-ctx');
-        menu.style.display = 'block';
+        // 'flex', not 'block' — the inline style wins over the stylesheet, and
+        // 'block' would stack the groups vertically again.
+        menu.style.display = 'flex';
+        // Always reopen at the top. The element is reused, so it otherwise keeps
+        // the scroll offset from last time — which both reads as a broken menu
+        // and makes the focus() below scroll it (see the scroll listener).
+        menu.scrollTop = 0;
 
-        menu.querySelector('[data-action="material"]').disabled = el.kind === 'transition';
-        menu.querySelector('[data-action="material"]').title =
-            el.kind === 'transition'
+        // Material entries act on the whole selection when one is active — say so
+        // on the label, so it's clear before clicking.
+        const many = ctxActsOnSelection(id);
+        const matBtn = menu.querySelector('[data-action="material"]');
+        matBtn.disabled = !many && el.kind === 'transition';
+        matBtn.textContent = many ? `🎨 Set Material — ${state.selSet.size} tiles…` : '🎨 Set Material…';
+        matBtn.title =
+            (!many && el.kind === 'transition')
                 ? 'Transition tiles pick up their materials automatically from the two tiles they blend. '
                   + 'Set the material on the base or overlay texture instead — this tile will follow along. '
                   + 'Use “Go to Base / Overlay Texture” below to jump straight to them.'
                 : '';
+
+        // "Apply last material" — only once something has been assigned this session.
+        const lastBtn = menu.querySelector('[data-action="lastmaterial"]');
+        const canLast = !!state.lastMaterial && (many || el.kind !== 'transition');
+        lastBtn.style.display = canLast ? '' : 'none';
+        if (canLast) {
+            lastBtn.textContent = `🎨 Apply Last Material (${lastMaterialLabel()})`
+                + (many ? ` — ${state.selSet.size} tiles` : '');
+            lastBtn.title = 'Re-apply the last material you assigned, without opening the editor';
+        }
         // Transition-only helpers: jump to the tiles this transition was built from.
         menu.querySelectorAll('[data-transonly]').forEach(b => {
             b.style.display = (el.kind === 'transition' && el.base != null) ? '' : 'none';
@@ -1742,11 +1990,26 @@ window.TRLE = window.TRLE || {};
         menu.querySelectorAll('[data-httonly]').forEach(b => {
             b.style.display = el.htParams ? '' : 'none';
         });
+        // Edit Stained Glass — only on tiles that carry a stored stained-glass recipe.
+        menu.querySelectorAll('[data-sgonly]').forEach(b => {
+            b.style.display = el.sgParams ? '' : 'none';
+        });
 
-        // Clamp to viewport
+        // A column with nothing visible left in it is just a stray heading, so
+        // drop it — that's what makes an anim frame or a transition show only
+        // the groups that apply to it.
+        menu.querySelectorAll('.at-ctx-col').forEach(col => {
+            const live = [...col.querySelectorAll('button')].some(b => b.style.display !== 'none');
+            col.style.display = live ? '' : 'none';
+        });
+
+        // Clamp to viewport. Measured after the hiding above, since that changes
+        // both dimensions. Math.max floors it at 8: the menu is wide now, and on
+        // a narrow window the old upper-bound-only clamp went negative and put
+        // the menu off the left edge.
         const mw = menu.offsetWidth, mh = menu.offsetHeight;
-        menu.style.left = Math.min(x, window.innerWidth - mw - 8) + 'px';
-        menu.style.top  = Math.min(y, window.innerHeight - mh - 8) + 'px';
+        menu.style.left = Math.max(8, Math.min(x, window.innerWidth - mw - 8)) + 'px';
+        menu.style.top  = Math.max(8, Math.min(y, window.innerHeight - mh - 8)) + 'px';
 
         const first = ctxVisibleItems()[0];
         if (first) first.focus();
@@ -1794,9 +2057,13 @@ window.TRLE = window.TRLE || {};
                 openAnimModal(el.anim.group);
                 break;
             case 'material':
-                if (el.kind === 'transition') showToast('Transitions inherit materials — set them on the base/overlay texture instead', 'info');
+                // A right-click inside a multi-selection acts on the whole selection,
+                // so Ctrl+click → Set Material matches the bulk bar's Apply Material.
+                if (ctxActsOnSelection(id)) bulkApplyMaterial();
+                else if (el.kind === 'transition') showToast('Transitions inherit materials — set them on the base/overlay texture instead', 'info');
                 else openMatModal(id);
                 break;
+            case 'lastmaterial': applyLastMaterial(ctxActsOnSelection(id) ? selectedIdsInOrder() : [id]); break;
             case 'gotobase':    gotoSourceTile(el.base);    break;
             case 'gotooverlay': gotoSourceTile(el.overlay); break;
             case 'heal':
@@ -1835,6 +2102,11 @@ window.TRLE = window.TRLE || {};
                 if (el.kind !== 'tile') { showToast('Build Pattern works on source tiles only', 'info'); return; }
                 openBuildModal(id);
                 break;
+            case 'stainedglass':
+                if (el.kind !== 'tile') { showToast('Stained Glass works on source tiles only', 'info'); return; }
+                openStainedGlassModal(id);
+                break;
+            case 'editstainedglass': if (el.sgParams) editStainedGlassModal(el); break;
             case 'replace':
                 if (el.kind !== 'tile') { showToast('Replace works on source tiles only', 'info'); return; }
                 replaceTileImage(id);
@@ -1885,7 +2157,21 @@ window.TRLE = window.TRLE || {};
         document.addEventListener('click', e => {
             if (!e.target.closest('.at-ctx')) closeCtxMenu();
         });
-        window.addEventListener('scroll', closeCtxMenu, true);
+        /* Close when the page scrolls out from under the menu — but NOT when the
+           menu scrolls itself. The listener is capture-phase on window so it sees
+           scrolls from every element, and the menu is `overflow-y:auto`, so its
+           own scrolling used to close it. That made right-click look dead in
+           Firefox: reopening a menu that still held a scroll offset made the
+           focus() at the end of openCtxMenu scroll it back to the top, which
+           fired scroll, which closed it in the same tick — menu never appeared,
+           and preventDefault had already suppressed the native menu, so nothing
+           happened at all. Chrome doesn't fire that scroll, which is why this
+           only ever showed up in Firefox. */
+        window.addEventListener('scroll', e => {
+            const t = e.target;
+            if (t && t.nodeType === 1 && t.closest && t.closest('.at-ctx')) return;
+            closeCtxMenu();
+        }, true);
     }
 
     /* ============ TRANSITION PROPAGATION ============
@@ -1920,7 +2206,7 @@ window.TRLE = window.TRLE || {};
     }
 
     /* ============ MODAL INFRASTRUCTURE ============ */
-    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'bset', 'fade', 'emissive', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'delight', 'import', 'origami', 'confirm'];
+    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'bset', 'fade', 'emissive', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'delight', 'import', 'origami', 'stainedglass', 'confirm'];
 
     function visibleModal() {
         return MODAL_NAMES
@@ -1955,7 +2241,9 @@ window.TRLE = window.TRLE || {};
     /* Generic confirm dialog. `onYes` runs after the dialog closes. `opts` may
        carry { onNo, cancelLabel, danger } — onNo fires when the user cancels or
        dismisses (so the cancel button can be a real alternative action, not just
-       "abort"); danger defaults true (red OK) to keep the delete styling. */
+       "abort"); danger defaults true (red OK) to keep the delete styling.
+       With { input: {...} } the dialog grows a text field and `onYes` receives
+       its trimmed value; OK stays disabled while it's empty. */
     let confirmCb = null, confirmNoCb = null;
     function openConfirm(title, msg, okLabel, onYes, opts) {
         opts = opts || {};
@@ -1967,7 +2255,31 @@ window.TRLE = window.TRLE || {};
         $('at-confirm-ok').classList.toggle('at-btn-danger', opts.danger !== false);
         const cancel = document.querySelector('#at-modal-confirm [data-close]');
         if (cancel) cancel.textContent = opts.cancelLabel || 'Cancel';
+
+        const wrap = $('at-confirm-input-wrap'), inp = $('at-confirm-input');
+        const cfg = opts.input;
+        wrap.style.display = cfg ? '' : 'none';
+        if (cfg) {
+            $('at-confirm-input-label').textContent = cfg.label || 'Name';
+            inp.value = cfg.value || '';
+            inp.placeholder = cfg.placeholder || '';
+            inp.maxLength = cfg.maxLength || 64;
+            confirmInputOn();
+        } else {
+            $('at-confirm-ok').disabled = false;
+        }
         openModal('confirm');
+        // openModal focuses the first focusable; for a prompt the field should win.
+        if (cfg) setTimeout(() => { inp.focus(); inp.select(); }, 0);
+    }
+    /* Keep OK in step with the prompt field (empty name = nothing to save). */
+    function confirmInputOn() {
+        $('at-confirm-ok').disabled = !$('at-confirm-input').value.trim();
+    }
+    /* The value handed to onYes — null when the dialog had no input. */
+    function confirmInputValue() {
+        return $('at-confirm-input-wrap').style.display === 'none'
+            ? null : $('at-confirm-input').value.trim();
     }
 
     function closeModal() {
@@ -2223,6 +2535,7 @@ window.TRLE = window.TRLE || {};
        emits one seamless tile for UV-rotate. */
     const PREVIEW_CAP = 256;
     const an = { frames: [], playId: null, playIdx: 0, lastTs: 0, regenTimer: null, editGroup: null,
+                 glowFrames: null, glowTimer: null,   // baked emissive strip for the preview
                  color: null,      // { gradient, stops:[{pos,color}], adjust:{...} }
                  selStop: null };  // currently-selected gradient stop (object ref)
 
@@ -2252,7 +2565,9 @@ window.TRLE = window.TRLE || {};
     function anCleanup() {
         if (an.playId) { cancelAnimationFrame(an.playId); an.playId = null; }
         if (an.regenTimer) { clearTimeout(an.regenTimer); an.regenTimer = null; }
+        if (an.glowTimer) { clearTimeout(an.glowTimer); an.glowTimer = null; }
         an.frames = [];
+        an.glowFrames = null;
         an.editGroup = null;
     }
 
@@ -2520,6 +2835,130 @@ window.TRLE = window.TRLE || {};
         anRenderStops(); anDrawRamp(); anScheduleRegen();
     }
 
+    /* ---- Glow (emissive) tab ----
+       Bakes a per-frame emissive from each frame's own diffuse, so the glow
+       animates with the motion. An optional Pulse dims the glow on a sine over
+       the loop (seamless). Reuses the Engine's emissiveFromDiffuse path. */
+    const GLOW_DEFAULT = {
+        enabled: false, mode: 'brightness', colortype: 'texture', tint: '#ff6a00',
+        threshold: 55, hue: 30, huewidth: 40, strength: 100, softness: 30, feather: 4,
+        pulse: false, pulseCycles: 1, pulseDepth: 70
+    };
+
+    function anGlowSyncLabels() {
+        $('at-anim-glow-threshold-val').textContent    = $('at-anim-glow-threshold').value;
+        $('at-anim-glow-hue-val').textContent          = $('at-anim-glow-hue').value;
+        $('at-anim-glow-huewidth-val').textContent     = $('at-anim-glow-huewidth').value;
+        $('at-anim-glow-strength-val').textContent     = $('at-anim-glow-strength').value;
+        $('at-anim-glow-softness-val').textContent     = $('at-anim-glow-softness').value;
+        $('at-anim-glow-feather-val').textContent      = $('at-anim-glow-feather').value;
+        $('at-anim-glow-pulse-cycles-val').textContent = $('at-anim-glow-pulse-cycles').value;
+        $('at-anim-glow-pulse-depth-val').textContent  = $('at-anim-glow-pulse-depth').value;
+    }
+
+    /* Show/hide the mode-specific groups + the disabled-body state. */
+    function anGlowSyncVisibility() {
+        $('at-anim-glow-body').style.display = $('at-anim-glow-enable').checked ? '' : 'none';
+        const mode = $('at-anim-glow-mode').value;
+        $('at-anim-glow-grp-brightness').style.display = mode === 'brightness' ? '' : 'none';
+        $('at-anim-glow-grp-hue').style.display        = mode === 'hue' ? '' : 'none';
+        $('at-anim-glow-tint-wrap').style.display      = $('at-anim-glow-colortype').value === 'tint' ? '' : 'none';
+        $('at-anim-glow-pulse-grp').style.display      = $('at-anim-glow-pulse').checked ? '' : 'none';
+    }
+
+    /* Read the Glow-tab controls → a stored glow recipe object. */
+    function anReadGlow() {
+        return {
+            enabled:     $('at-anim-glow-enable').checked,
+            mode:        $('at-anim-glow-mode').value,
+            colortype:   $('at-anim-glow-colortype').value,
+            tint:        $('at-anim-glow-tint').value,
+            threshold:   +$('at-anim-glow-threshold').value,
+            hue:         +$('at-anim-glow-hue').value,
+            huewidth:    +$('at-anim-glow-huewidth').value,
+            strength:    +$('at-anim-glow-strength').value,
+            softness:    +$('at-anim-glow-softness').value,
+            feather:     +$('at-anim-glow-feather').value,
+            pulse:       $('at-anim-glow-pulse').checked,
+            pulseCycles: +$('at-anim-glow-pulse-cycles').value,
+            pulseDepth:  +$('at-anim-glow-pulse-depth').value
+        };
+    }
+
+    /* Push a stored glow recipe → the Glow-tab controls. */
+    function anWriteGlow(g) {
+        g = Object.assign({}, GLOW_DEFAULT, g || {});
+        $('at-anim-glow-enable').checked     = !!g.enabled;
+        $('at-anim-glow-mode').value         = g.mode;
+        $('at-anim-glow-colortype').value    = g.colortype;
+        $('at-anim-glow-tint').value         = g.tint;
+        $('at-anim-glow-threshold').value    = g.threshold;
+        $('at-anim-glow-hue').value          = g.hue;
+        $('at-anim-glow-huewidth').value     = g.huewidth;
+        $('at-anim-glow-strength').value     = g.strength;
+        $('at-anim-glow-softness').value     = g.softness;
+        $('at-anim-glow-feather').value      = g.feather;
+        $('at-anim-glow-pulse').checked      = !!g.pulse;
+        $('at-anim-glow-pulse-cycles').value = g.pulseCycles;
+        $('at-anim-glow-pulse-depth').value  = g.pulseDepth;
+        anGlowSyncLabels();
+        anGlowSyncVisibility();
+    }
+
+    /* Pulse multiplier for frame k of N — a raised cosine over the loop. Peaks
+       (1.0) at k=0, dips to (1 - depth) at the trough. Periodic in k → seamless. */
+    function anGlowPulseFactor(g, k, N) {
+        if (!g.pulse || N < 2) return 1;
+        const depth = clamp01(g.pulseDepth / 100);
+        const cycles = Math.max(1, Math.round(g.pulseCycles));
+        const s = (Math.cos(2 * Math.PI * cycles * k / N) + 1) / 2;   // 1 at k=0 → 0 at trough
+        return (1 - depth) + depth * s;
+    }
+
+    /* Build emissiveFromDiffuse opts for frame k of N at pixel size `dim`. */
+    function anGlowOpts(g, k, N, dim) {
+        const opts = {
+            strength: (g.strength / 100) * anGlowPulseFactor(g, k, N),
+            feather:  g.feather * (dim / 256),
+            softness: g.softness / 100,
+            useTint:  g.colortype === 'tint',
+            tint:     emHexToRgb01(g.tint)
+        };
+        if (g.mode === 'hue') {
+            opts.mode = 2;
+            opts.hueCenter = g.hue / 360;
+            opts.hueWidth  = g.huewidth / 360;
+            opts.satMin = 0.12; opts.valMin = 0.12;
+        } else {
+            opts.mode = 0;
+            opts.threshold = g.threshold / 100;
+        }
+        return opts;
+    }
+
+    /* Re-derive one anim member's emissive from its stored glow recipe + its own
+       diffuse frame. Shared by anAdd (immediate) and refreshAnims (undo/load). */
+    function anBakeMemberGlow(el) {
+        const g = el.anim && el.anim.glow;
+        if (!g || !g.enabled) { el.emissive = null; return; }
+        el.emissive = TRLE.Engine.emissiveFromDiffuse(
+            el.canvas, anGlowOpts(g, el.anim.index || 0, el.anim.total || 1, el.canvas.width));
+    }
+
+    /* Re-bake the preview glow strip (an.glowFrames) from the current frames +
+       Glow controls. Cheap enough to run on a glow-slider drag on its own. */
+    function anRegenGlow() {
+        const g = anReadGlow();
+        if (!g.enabled || !an.frames.length) { an.glowFrames = null; return; }
+        const N = an.frames.length, dim = an.frames[0].width;
+        an.glowFrames = an.frames.map((f, k) => TRLE.Engine.emissiveFromDiffuse(f, anGlowOpts(g, k, N, dim)));
+    }
+
+    function anScheduleGlowRegen() {
+        if (an.glowTimer) clearTimeout(an.glowTimer);
+        an.glowTimer = setTimeout(anRegenGlow, 90);
+    }
+
     /* Build a params bag from the controls. `full` uses the real tile size;
        otherwise the preview is capped for responsiveness. */
     function anBuildParams(full) {
@@ -2567,6 +3006,7 @@ window.TRLE = window.TRLE || {};
             console.error(e); showToast('Generation failed — see console', 'error'); return;
         }
         an.playIdx = 0;
+        anRegenGlow();   // keep the preview glow strip in sync with the new frames
         $('at-anim-status').textContent = info.single
             ? '1 seamless tile · set UV-rotate on it in Tomb Editor'
             : `${an.frames.length} frames · loops seamlessly (last → first)`;
@@ -2591,12 +3031,21 @@ window.TRLE = window.TRLE || {};
                 const fps = +$('at-anim-fps').value || 12;
                 if (ts - an.lastTs > 1000 / fps) {
                     an.lastTs = ts;
-                    const f = an.frames[an.playIdx % an.frames.length];
+                    const idx = an.playIdx % an.frames.length;
+                    const f = an.frames[idx];
+                    const gf = an.glowFrames ? an.glowFrames[idx % an.glowFrames.length] : null;
                     pctx.clearRect(0, 0, D, D);
                     pctx.drawImage(f, 0, 0, D, D);
+                    if (gf) { pctx.globalCompositeOperation = 'lighter'; pctx.drawImage(gf, 0, 0, D, D); pctx.globalCompositeOperation = 'source-over'; }
                     tctx.clearRect(0, 0, D, D);
                     for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++)
                         tctx.drawImage(f, x * (D / 2), y * (D / 2), D / 2, D / 2);
+                    if (gf) {
+                        tctx.globalCompositeOperation = 'lighter';
+                        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++)
+                            tctx.drawImage(gf, x * (D / 2), y * (D / 2), D / 2, D / 2);
+                        tctx.globalCompositeOperation = 'source-over';
+                    }
                     an.playIdx++;
                 }
             }
@@ -2638,10 +3087,11 @@ window.TRLE = window.TRLE || {};
         canvas.getContext('2d').drawImage(src, 0, 0, S, S);
         return {
             id: state.nextId++, kind: 'anim', canvas, original: null,
-            seamless: true, edited: false, material: meta.material,
+            seamless: true, edited: false, material: meta.material, emissive: null,
             anim: { group: meta.group, index: meta.index, total: meta.total,
                     preset: meta.preset, single: meta.single, seed: meta.seed,
-                    fps: meta.fps, gradient: meta.gradient, params: meta.params }
+                    fps: meta.fps, gradient: meta.gradient, params: meta.params,
+                    glow: meta.glow || null }
         };
     }
 
@@ -2657,9 +3107,11 @@ window.TRLE = window.TRLE || {};
         const S = state.tileSize, total = frames.length;
         const seed = +$('at-anim-seed').value || 0, fps = +$('at-anim-fps').value || 12;
         const gradient = an.color ? an.color.gradient : null;
+        const glow = anReadGlow();
 
-        // Emissive presets need the Emissive export map on to actually glow.
-        if (TRLE.AnimPresets[info.key] && TRLE.AnimPresets[info.key].emissive) {
+        // Emissive presets, or an explicit Glow, need the Emissive export map on.
+        const wantsGlow = glow.enabled || (TRLE.AnimPresets[info.key] && TRLE.AnimPresets[info.key].emissive);
+        if (wantsGlow) {
             const cb = document.querySelector('#at-map-checks input[data-map="emissive"]');
             if (cb && !cb.checked) { cb.checked = true; showToast('Emissive export map enabled for the glow ✨', 'info', 2500); }
         }
@@ -2674,7 +3126,8 @@ window.TRLE = window.TRLE || {};
             const group = an.editGroup;
             state.elements = state.elements.filter(e => !(e.kind === 'anim' && e.anim && e.anim.group === group));
             const newEls = frames.map((src, i) => makeAnimElement(src, S,
-                { group, index: i, total, preset: info.key, single: info.single, seed, fps, gradient, params: info.params, material }));
+                { group, index: i, total, preset: info.key, single: info.single, seed, fps, gradient, params: info.params, material, glow }));
+            newEls.forEach(anBakeMemberGlow);   // bake per-frame emissive from the recipe
             state.elements.splice(pos, 0, ...newEls);
             closeModal();
             renderGrid();
@@ -2686,7 +3139,8 @@ window.TRLE = window.TRLE || {};
         const group = 'anim-' + state.nextId;       // stable token shared by the group
         const material = anDefaultMaterial(info.key);
         const newEls = frames.map((src, i) => makeAnimElement(src, S,
-            { group, index: i, total, preset: info.key, single: info.single, seed, fps, gradient, params: info.params, material }));
+            { group, index: i, total, preset: info.key, single: info.single, seed, fps, gradient, params: info.params, material, glow }));
+        newEls.forEach(anBakeMemberGlow);   // bake per-frame emissive from the recipe
         state.elements.push(...newEls);
         closeModal();
         renderGrid();
@@ -2726,11 +3180,13 @@ window.TRLE = window.TRLE || {};
             anStopSyncControls();
             anRenderStops();
             anDrawRamp();
+            anWriteGlow(m.glow);   // restore the group's stored glow recipe
         } else {
             an.editGroup = null;
             $('at-anim-title').textContent = 'Animated Texture';
             if (!$('at-anim-preset').value) $('at-anim-preset').value = TRLE.AnimPresetOrder[0];
             anApplyPreset($('at-anim-preset').value);
+            anWriteGlow(null);   // default: glow off
         }
         anFramesVisibility();
         anSetTab('shape');
@@ -2809,6 +3265,17 @@ window.TRLE = window.TRLE || {};
             $('at-anim-seed').value = Math.floor(Math.random() * 9999);
             anRegenerate();
         });
+
+        // Glow tab — sliders/selects re-bake only the emissive strip (not frames).
+        ['at-anim-glow-enable', 'at-anim-glow-pulse'].forEach(id =>
+            $(id).addEventListener('change', () => { anGlowSyncVisibility(); anScheduleGlowRegen(); }));
+        ['at-anim-glow-mode', 'at-anim-glow-colortype'].forEach(id =>
+            $(id).addEventListener('change', () => { anGlowSyncVisibility(); anScheduleGlowRegen(); }));
+        $('at-anim-glow-tint').addEventListener('input', anScheduleGlowRegen);
+        ['at-anim-glow-threshold', 'at-anim-glow-hue', 'at-anim-glow-huewidth', 'at-anim-glow-strength',
+         'at-anim-glow-softness', 'at-anim-glow-feather', 'at-anim-glow-pulse-cycles', 'at-anim-glow-pulse-depth'].forEach(id =>
+            $(id).addEventListener('input', () => { anGlowSyncLabels(); anScheduleGlowRegen(); }));
+
         $('at-anim-add').addEventListener('click', anAdd);
     }
 
@@ -3481,12 +3948,19 @@ window.TRLE = window.TRLE || {};
                  triangle wave on the radius so ring boundaries reflect)
          axis    'auto'|'v'|'h' — which source axis carries the detail (radius
                  samples that axis; the perpendicular axis is the along-ring coord)
+         gamma   radius bias (default 1): <1 widens outer rings, >1 widens inner
+         cx,cy   fold origin 0..1 (default 0.5); distances are normalized per
+                 side so the frame still reaches all four edges when off-centre
+         shape2  'square'|'diamond'|'circle' — optional outer shape; the inner
+                 shape morphs into it over the radius
        The along-ring coordinate is a symmetric min/max of the folded distances,
        so detail wraps continuously through the corners (no diagonal seam) and the
        result is 8-fold symmetric. Source alpha is preserved. */
     function makeOrigamiFrame(srcCanvas, S, opts = {}) {
         const shape = opts.shape || 'square';
         const repeats = Math.max(1, opts.repeats || 1);
+        const gamma = opts.gamma > 0 ? opts.gamma : 1;
+        const shape2 = (opts.shape2 && opts.shape2 !== 'same' && opts.shape2 !== shape) ? opts.shape2 : null;
         const src = (srcCanvas.width === S && srcCanvas.height === S)
             ? srcCanvas : resizeCanvas(srcCanvas, S, S);
         const sd = src.getContext('2d').getImageData(0, 0, S, S).data;
@@ -3496,24 +3970,31 @@ window.TRLE = window.TRLE || {};
         const octx = out.getContext('2d');
         const od = octx.createImageData(S, S);
         const dd = od.data;
-        const c = (S - 1) / 2 || 1;
+        const Cx = (opts.cx == null ? 0.5 : Math.min(1, Math.max(0, opts.cx))) * (S - 1);
+        const Cy = (opts.cy == null ? 0.5 : Math.min(1, Math.max(0, opts.cy))) * (S - 1);
         const tri = t => { let p = (t * repeats) % 2; if (p < 0) p += 2; return p > 1 ? 2 - p : p; };
+        // (rn, tn) for a shape from per-side-normalized distances a,b ∈ 0..1.
+        const shapeCoords = (sh, a, b) => {
+            const hi = Math.max(a, b), lo = Math.min(a, b);
+            if (sh === 'diamond') return [(a + b) / 2, Math.abs(a - b) / 2];
+            if (sh === 'circle')  return [Math.hypot(a, b) / Math.SQRT2, (hi ? Math.atan2(lo, hi) : 0) / (Math.PI / 4)];
+            return [hi, lo];   // square
+        };
         for (let y = 0; y < S; y++) {
             for (let x = 0; x < S; x++) {
-                const a = Math.abs(x - c), b = Math.abs(y - c);
-                const hi = Math.max(a, b), lo = Math.min(a, b);
-                let rn, tn;   // radius + along-ring, normalized 0..1, both symmetric
-                if (shape === 'diamond') {
-                    rn = (a + b) / (2 * c);
-                    tn = Math.abs(a - b) / (2 * c);
-                } else if (shape === 'circle') {
-                    rn = Math.hypot(a, b) / (Math.SQRT2 * c);
-                    tn = (hi ? Math.atan2(lo, hi) : 0) / (Math.PI / 4);
-                } else {   // square
-                    rn = hi / c;
-                    tn = lo / c;
+                // Normalize each axis against its own side of the origin so
+                // rn hits 1 at every border even when the origin is off-centre.
+                const a = Math.abs(x - Cx) / Math.max(1, x < Cx ? Cx : (S - 1 - Cx));
+                const b = Math.abs(y - Cy) / Math.max(1, y < Cy ? Cy : (S - 1 - Cy));
+                let [rn, tn] = shapeCoords(shape, a, b);
+                if (shape2) {   // morph inner shape → outer shape over the radius
+                    const [rn2, tn2] = shapeCoords(shape2, a, b);
+                    let m = Math.min(1, Math.max(0, (rn + rn2) / 2));
+                    m = m * m * (3 - 2 * m);
+                    rn += (rn2 - rn) * m; tn += (tn2 - tn) * m;
                 }
                 if (rn > 1) rn = 1; if (tn > 1) tn = 1;
+                if (gamma !== 1) rn = Math.pow(rn, gamma);
                 let u = Math.round(tri(rn) * (S - 1));   // radius → one source axis
                 let v = Math.round(tn * (S - 1));        // along-ring → the other axis
                 if (u < 0) u = 0; else if (u > S - 1) u = S - 1;
@@ -4016,7 +4497,7 @@ window.TRLE = window.TRLE || {};
     ];
     // Params measured on a 0–1 float scale (need parseFloat, not parseInt).
     const MAT_FLOAT_PARAMS = new Set(['normalAngularity', 'normalAngularIntensity', 'aoNormalBlend', 'normalFineDetail', 'normalLargeScale']);
-    const MAT_PREVIEW_MAPS = ['normal', 'ao', 'specular', 'roughness', 'height'];
+    const MAT_PREVIEW_MAPS = ['normal', 'ao', 'specular', 'roughness', 'emissive', 'height'];
 
     const mat = { id: null, batchIds: null, dirty: false, previewTimer: null,
                   gl: null, lightDir: [-0.35, 0.4, 0.85] };
@@ -4064,6 +4545,32 @@ window.TRLE = window.TRLE || {};
                     ? DEFAULTS[type] : sel.options[0] && sel.options[0].value);
         }
         updatePresetBarButtons();
+        matRenderPresetChips();
+    }
+
+    /* Saved presets as one-click chips at the top of the modal. They live under the
+       "⭐ My presets" aesthetic, which is easy to never find — the chips put them in
+       front of you, and hide entirely until you've saved one. */
+    function matRenderPresetChips() {
+        const wrap = $('at-mat-chips'), row = $('at-mat-chips-row');
+        if (!wrap || !row) return;
+        wrap.style.display = userPresets.length ? '' : 'none';
+        if (!userPresets.length) { row.innerHTML = ''; return; }
+        const activeId = $('at-mat-aesthetic').value === 'saved' ? $('at-mat-preset').value : null;
+        row.innerHTML = '';
+        userPresets.forEach(p => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'at-mat-chip' + (p.id === activeId ? ' active' : '');
+            b.textContent = p.name;
+            b.title = `Apply your saved preset “${p.name}”`;
+            b.addEventListener('click', () => {
+                $('at-mat-aesthetic').value = 'saved';
+                matPopulatePresets(p.id);
+                matOnPresetChange();
+            });
+            row.appendChild(b);
+        });
     }
 
     function matLoadParams(params) {
@@ -4220,6 +4727,16 @@ window.TRLE = window.TRLE || {};
         wrap.appendChild(d);
     }
 
+    /* Upload a map canvas into an FBO so the lit preview can sample it. */
+    function matCanvasToFBO(canvas, S) {
+        const E = TRLE.Engine;
+        const t = E.createTextureFromImage(canvas);
+        const fbo = E.createFBO(S, S);
+        E.blit('copy', { u_texture: t }, fbo);
+        E.deleteTexture(t);
+        return fbo;
+    }
+
     function matRenderPreview() {
         if (mat.id === null) return;
         matCleanupGL();
@@ -4237,13 +4754,7 @@ window.TRLE = window.TRLE || {};
             const E = TRLE.Engine;
             const tex = E.createTextureFromImage(el.canvas);
             const maps = {};
-            for (const mt of MAT_PREVIEW_MAPS) if (composed[mt]) {
-                const t = E.createTextureFromImage(composed[mt]);
-                const fbo = E.createFBO(S, S);
-                E.blit('copy', { u_texture: t }, fbo);
-                E.deleteTexture(t);
-                maps[mt] = fbo;
-            }
+            for (const mt of MAT_PREVIEW_MAPS) if (composed[mt]) maps[mt] = matCanvasToFBO(composed[mt], S);
             mat.gl = { tex, maps };
             mmRenderCanvas();
         } else {
@@ -4258,6 +4769,14 @@ window.TRLE = window.TRLE || {};
             mat.gl = { tex, maps };
             composed = {};
             for (const m of MAT_PREVIEW_MAPS) if (maps[m]) composed[m] = TRLE.Engine.fboToCanvas(maps[m]);
+        }
+
+        // Authored glow (Emissive modal) overrides the preset-derived emissive,
+        // exactly as deriveMaps does on export — so what you see here is shipped.
+        if (el.emissive) {
+            composed.emissive = el.emissive;
+            if (mat.gl.maps.emissive) TRLE.Engine.deleteFBO(mat.gl.maps.emissive);
+            mat.gl.maps.emissive = matCanvasToFBO(el.emissive, S);
         }
 
         wrap.innerHTML = '';
@@ -4283,10 +4802,10 @@ window.TRLE = window.TRLE || {};
             u_ao:        m.ao        ? m.ao.texture        : fallback,
             u_specular:  m.specular  ? m.specular.texture  : fallback,
             u_roughness: m.roughness ? m.roughness.texture : fallback,
-            u_emissive:  fallback,
+            u_emissive:  m.emissive  ? m.emissive.texture  : fallback,
             u_hasNormal: has('normal'), u_hasAO: has('ao'),
             u_hasSpecular: has('specular'), u_hasRoughness: has('roughness'),
-            u_hasEmissive: 0.0,
+            u_hasEmissive: has('emissive'),
             u_lightDir: mat.lightDir
         }, fbo);
         const lit = $('at-mat-lit');
@@ -4351,6 +4870,7 @@ window.TRLE = window.TRLE || {};
             Object.values(maps).forEach(f => f && TRLE.Engine.deleteFBO(f));
             TRLE.Engine.deleteTexture(tex);
         }
+        if (el.emissive) canv.emissive = el.emissive;   // authored glow wins (matches deriveMaps)
 
         const ctrl = mat3dCtrl();
         ctrl.setRelief(mat3dReliefFromSlider(), false);  // store; setMaps rebuilds once
@@ -4920,6 +5440,7 @@ window.TRLE = window.TRLE || {};
                     el.matLayers = null;                                       // collapsed to a single material
                     el.material = deepCopyMaterial(matMulti.layers[0].material);
                 }
+                rememberLastMaterial(el.material, el.matLayers);
                 closeModal();
                 renderGrid();
                 pushHistory(`Material: ${materialLabel(el)}`);
@@ -4939,17 +5460,8 @@ window.TRLE = window.TRLE || {};
             // Single tile, or the whole batch when applying to a multi-selection.
             const targets = (mat.batchIds && mat.batchIds.length ? mat.batchIds : [mat.id])
                 .map(byId).filter(el => el && el.kind !== 'transition');
-            targets.forEach(el => {
-                el.material = deepCopyMaterial(material);
-                el.matLayers = null;   // a flat material clears any prior layer stack
-                // An animation's frames share one material — propagate to the group.
-                if (el.kind === 'anim' && el.anim && el.anim.total > 1) {
-                    state.elements.forEach(s => {
-                        if (s !== el && s.kind === 'anim' && s.anim && s.anim.group === el.anim.group)
-                            s.material = deepCopyMaterial(el.material);
-                    });
-                }
-            });
+            assignMaterialTo(targets, material, null);
+            rememberLastMaterial(material, null);
             const batch = targets.length > 1;
             closeModal();
             renderGrid();
@@ -5509,10 +6021,48 @@ window.TRLE = window.TRLE || {};
             render();
         };
     }
+    /* ---- Whole-boundary dragging ------------------------------------------
+       Grabbing the line between the anchors slides the entire boundary instead of
+       editing one point — the quickest way to say "same shape, a bit lower". Both
+       boundary editors share these three helpers. */
+    const LINE_GRAB = 10;      // px around the drawn spline that counts as "on the line"
+    const LINE_SLOP = 3;       // px of movement before a press becomes a drag, not a click
+
+    /* Is (px,py) on the boundary curve itself (as opposed to an anchor)? Built from
+       the same traceCurve path the editor draws, so the grab zone always matches
+       what's on screen. Path2D takes the same bezierCurveTo calls a context does. */
+    function boundaryLineHit(canvas, anchors, axis, px, py) {
+        if (!anchors || anchors.length < 2) return false;
+        const pts = sortedAnchors(anchors, axis);
+        const path = new Path2D();
+        path.moveTo(pts[0].x * canvas.width, pts[0].y * canvas.height);
+        traceCurve(path, pts, axis, canvas.width, canvas.height);
+        const ctx = canvas.getContext('2d');
+        ctx.save();
+        ctx.lineWidth = LINE_GRAB * 2;
+        const on = ctx.isPointInStroke(path, px, py);
+        ctx.restore();
+        return on;
+    }
+    /* Shift every anchor by `d` along the cross-axis (y for a horizontal boundary),
+       from the positions recorded when the drag started. The shift is clamped as a
+       group, so the boundary keeps its shape and no anchor leaves the tile. */
+    function applyBoundaryTranslate(anchors, axis, origin, d) {
+        const key = axis === 'h' ? 'y' : 'x';
+        let lo = 1, hi = 0;
+        origin.forEach(v => { lo = Math.min(lo, v); hi = Math.max(hi, v); });
+        const dd = Math.max(-lo, Math.min(1 - hi, d));
+        anchors.forEach((a, i) => { a[key] = clamp01(origin[i] + dd); });
+    }
+    const boundaryOrigin = (anchors, axis) => anchors.map(a => (axis === 'h' ? a.y : a.x));
+    const lineCursor = axis => (axis === 'h' ? 'ns-resize' : 'ew-resize');
+
     /* Reusable A→B boundary editor. Wires all the pointer interactions onto a canvas
        against a host state object ({ anchors[], axis, dragIdx }):
-         left-drag = move anchor · left-click empty = add · right-click = remove
-         middle-click / wheel = cycle smoothness (corner→smooth→rounder) · dbl-click = toggle.
+         left-drag on an anchor = move it · left-drag on the line = move the whole
+         boundary · left-click empty (or a click on the line that doesn't move) = add
+         an anchor · right-click = remove · middle-click / wheel = cycle smoothness
+         (corner→smooth→rounder) · dbl-click = toggle.
        `getState()` returns the host state, `isActive()` gates editing (e.g. base chosen &&
        not in preview), `render()` repaints. Shared by the Anchored Transition + Height
        Transition tools (Transition Grid keeps its own handler — it mixes in stamps). */
@@ -5542,20 +6092,59 @@ window.TRLE = window.TRLE || {};
             }
             if (e.button !== 0) return;
             let h = hit(p.px, p.py);
-            if (h < 0) { S.anchors.push({ x: p.x, y: p.y }); h = S.anchors.length - 1; }  // add + grab
+            if (h < 0) {
+                // Off the anchors: pressing the line starts a whole-boundary drag,
+                // but a press that never moves still means "add an anchor here".
+                if (boundaryLineHit(canvas, S.anchors, S.axis, p.px, p.py)) {
+                    lineDrag = { start: p, moved: false, origin: boundaryOrigin(S.anchors, S.axis) };
+                    try { canvas.setPointerCapture(e.pointerId); } catch { /* noop */ }
+                    return;
+                }
+                S.anchors.push({ x: p.x, y: p.y }); h = S.anchors.length - 1;   // add + grab
+            }
             S.dragIdx = h;
             try { canvas.setPointerCapture(e.pointerId); } catch { /* noop */ }
             render();
         });
+        let lineDrag = null;
         canvas.addEventListener('pointermove', e => {
             const S = getState();
-            if (S.dragIdx < 0) return;
+            if (lineDrag) {
+                e.preventDefault();
+                const p = pos(e);
+                const dPx = S.axis === 'h'
+                    ? (p.py - lineDrag.start.py) : (p.px - lineDrag.start.px);
+                if (!lineDrag.moved && Math.abs(dPx) < LINE_SLOP) return;
+                lineDrag.moved = true;
+                const d = S.axis === 'h' ? (p.y - lineDrag.start.y) : (p.x - lineDrag.start.x);
+                applyBoundaryTranslate(S.anchors, S.axis, lineDrag.origin, d);
+                render();
+                return;
+            }
+            if (S.dragIdx < 0) {
+                // Idle hover: advertise that the line itself can be grabbed.
+                if (!isActive()) return;
+                const p = pos(e);
+                canvas.style.cursor = (hit(p.px, p.py) < 0 && boundaryLineHit(canvas, S.anchors, S.axis, p.px, p.py))
+                    ? lineCursor(S.axis) : '';
+                return;
+            }
             e.preventDefault();
             const p = pos(e), a = S.anchors[S.dragIdx];
             a.x = p.x; a.y = p.y;
             render();
         });
-        const end = () => { const S = getState(); if (S.dragIdx >= 0) { S.dragIdx = -1; render(); } };
+        const end = () => {
+            const S = getState();
+            if (lineDrag) {
+                // A click on the line that never moved falls back to "add anchor".
+                if (!lineDrag.moved) S.anchors.push({ x: lineDrag.start.x, y: lineDrag.start.y });
+                lineDrag = null;
+                render();
+                return;
+            }
+            if (S.dragIdx >= 0) { S.dragIdx = -1; render(); }
+        };
         canvas.addEventListener('pointerup', end);
         canvas.addEventListener('pointercancel', end);
         canvas.addEventListener('auxclick', e => { if (e.button === 1) e.preventDefault(); });
@@ -6266,11 +6855,21 @@ window.TRLE = window.TRLE || {};
             }
             if (e.button !== 0) return;
             let hit = tgHit(p.px, p.py);
-            if (hit < 0) { tg.anchors.push({ x: p.x, y: p.y }); hit = tg.anchors.length - 1; }
+            if (hit < 0) {
+                // Same as the shared editor: the line drags the whole boundary, a
+                // press that never moves still adds an anchor.
+                if (boundaryLineHit(cv, tg.anchors, tg.axis, p.px, p.py)) {
+                    tgLineDrag = { start: p, moved: false, origin: boundaryOrigin(tg.anchors, tg.axis) };
+                    try { cv.setPointerCapture(e.pointerId); } catch { /* noop */ }
+                    return;
+                }
+                tg.anchors.push({ x: p.x, y: p.y }); hit = tg.anchors.length - 1;
+            }
             tg.dragIdx = hit;
             try { cv.setPointerCapture(e.pointerId); } catch { /* noop */ }
             tgRender();
         });
+        let tgLineDrag = null;
         cv.addEventListener('pointermove', e => {
             const p = tgEventPos(e);
             if (tg.stampIdx >= 0) {              // drag from centre to size the stamp
@@ -6279,7 +6878,22 @@ window.TRLE = window.TRLE || {};
                 tgRender();
                 return;
             }
-            if (tg.dragIdx < 0) return;
+            if (tgLineDrag) {
+                e.preventDefault();
+                const dPx = tg.axis === 'h' ? (p.py - tgLineDrag.start.py) : (p.px - tgLineDrag.start.px);
+                if (!tgLineDrag.moved && Math.abs(dPx) < LINE_SLOP) return;
+                tgLineDrag.moved = true;
+                const d = tg.axis === 'h' ? (p.y - tgLineDrag.start.y) : (p.x - tgLineDrag.start.x);
+                applyBoundaryTranslate(tg.anchors, tg.axis, tgLineDrag.origin, d);
+                tgRender();
+                return;
+            }
+            if (tg.dragIdx < 0) {
+                if (tg.baseId === null || $('at-tg-hide').checked || tg.tool !== 'boundary') return;
+                cv.style.cursor = (tgHit(p.px, p.py) < 0 && boundaryLineHit(cv, tg.anchors, tg.axis, p.px, p.py))
+                    ? lineCursor(tg.axis) : '';
+                return;
+            }
             e.preventDefault();
             const a = tg.anchors[tg.dragIdx];
             a.x = p.x; a.y = p.y;
@@ -6287,6 +6901,12 @@ window.TRLE = window.TRLE || {};
         });
         const endDrag = () => {
             if (tg.stampIdx >= 0) { tg.stampIdx = -1; tgRender(); return; }
+            if (tgLineDrag) {
+                if (!tgLineDrag.moved) tg.anchors.push({ x: tgLineDrag.start.x, y: tgLineDrag.start.y });
+                tgLineDrag = null;
+                tgRender();
+                return;
+            }
             if (tg.dragIdx >= 0) { tg.dragIdx = -1; tgRender(); }
         };
         cv.addEventListener('pointerup', endDrag);
@@ -6730,23 +7350,53 @@ window.TRLE = window.TRLE || {};
         });
     }
 
-    /* ============ VARIATIONS MODAL (Phase 7) ============ */
-    const varState = { id: null, variants: [] };
+    /* ============ VARIATIONS MODAL (Phase 7) ============
+       Seeded: the same seed + controls always reproduce the same variants
+       (Shuffle just re-rolls the seed). Every jitter op preserves tileability
+       (filters, 90° rotations, wrap-around shift, per-pixel grain), so variants
+       of a seamless source keep the seamless badge. */
+    const varState = { id: null, variants: [], seed: 1 };
 
-    function makeVariant(src, hueAmt, valAmt, allowRot) {
+    function makeVariant(src, p, rng) {
         const S = src.width;
+        let base = src;
+        if (p.shift) {                                 // wrap-around offset — breaks repeat alignment
+            const dx = Math.floor(rng() * S), dy = Math.floor(rng() * S);
+            const sh = document.createElement('canvas'); sh.width = S; sh.height = S;
+            const sctx = sh.getContext('2d');
+            sctx.drawImage(src, -dx, -dy);     sctx.drawImage(src, S - dx, -dy);
+            sctx.drawImage(src, -dx, S - dy);  sctx.drawImage(src, S - dx, S - dy);
+            base = sh;
+        }
         const t = document.createElement('canvas'); t.width = S; t.height = S;
         const x = t.getContext('2d');
-        const hue = (Math.random() * 2 - 1) * hueAmt;
-        const val = 1 + (Math.random() * 2 - 1) * (valAmt / 100);
-        x.filter = `hue-rotate(${hue.toFixed(1)}deg) brightness(${val.toFixed(3)})`;
-        if (allowRot && Math.random() < 0.6) {
-            const r = 1 + Math.floor(Math.random() * 3);
-            x.translate(S / 2, S / 2); x.rotate(r * Math.PI / 2); x.drawImage(src, -S / 2, -S / 2);
+        const hue = (rng() * 2 - 1) * p.hue;
+        const val = 1 + (rng() * 2 - 1) * (p.val / 100);
+        let filter = `hue-rotate(${hue.toFixed(1)}deg) brightness(${val.toFixed(3)})`;
+        if (p.sat > 0) filter += ` saturate(${(1 + (rng() * 2 - 1) * p.sat / 100).toFixed(3)})`;
+        if (p.con > 0) filter += ` contrast(${(1 + (rng() * 2 - 1) * p.con / 100).toFixed(3)})`;
+        x.filter = filter;
+        if (p.allowRot && rng() < 0.6) {
+            const r = 1 + Math.floor(rng() * 3);
+            x.translate(S / 2, S / 2); x.rotate(r * Math.PI / 2); x.drawImage(base, -S / 2, -S / 2);
         } else {
-            x.drawImage(src, 0, 0);
+            x.drawImage(base, 0, 0);
         }
         x.filter = 'none';
+        if (p.noise > 0) {                             // seeded grain, softened wrap-safe
+            const raw = document.createElement('canvas'); raw.width = raw.height = S;
+            const rctx = raw.getContext('2d'), id = rctx.createImageData(S, S);
+            for (let i = 0; i < id.data.length; i += 4) {
+                const v = 128 + (rng() * 2 - 1) * 90;
+                id.data[i] = id.data[i + 1] = id.data[i + 2] = v; id.data[i + 3] = 255;
+            }
+            rctx.putImageData(id, 0, 0);
+            x.save();
+            x.globalAlpha = p.noise / 100;
+            x.globalCompositeOperation = 'soft-light';
+            x.drawImage(wrapBlur(raw, S, Math.max(0.5, S / 256)), 0, 0);
+            x.restore();
+        }
         return t;
     }
 
@@ -6754,12 +7404,19 @@ window.TRLE = window.TRLE || {};
         const el = byId(varState.id);
         if (!el) return;
         const count = parseInt($('at-var-count').value);
-        const hueAmt = parseInt($('at-var-hue').value);
-        const valAmt = parseInt($('at-var-val').value);
-        const allowRot = $('at-var-rotate').checked;
+        const p = {
+            hue: parseInt($('at-var-hue').value),
+            val: parseInt($('at-var-val').value),
+            sat: parseInt($('at-var-sat').value),
+            con: parseInt($('at-var-con').value),
+            noise: parseInt($('at-var-noise').value),
+            shift: $('at-var-shift').checked,
+            allowRot: $('at-var-rotate').checked
+        };
+        const rng = mulberry32(varState.seed >>> 0);
         varState.variants = [];
         for (let i = 0; i < count; i++) {
-            varState.variants.push(makeVariant(el.canvas, hueAmt, valAmt, allowRot));
+            varState.variants.push(makeVariant(el.canvas, p, rng));
         }
         const wrap = $('at-var-previews');
         wrap.innerHTML = '';
@@ -6775,6 +7432,7 @@ window.TRLE = window.TRLE || {};
     function openVarModal(id) {
         varState.id = id;
         $('at-var-tileno').textContent = indexOf(id) + 1;
+        $('at-var-seed').value = varState.seed;
         openModal('var');
         varRegen();
     }
@@ -6786,8 +7444,12 @@ window.TRLE = window.TRLE || {};
     function origamiOpts() {
         return {
             shape: $('at-origami-shape').value,
+            shape2: $('at-origami-shape2').value,
             axis: $('at-origami-axis').value,
-            repeats: parseInt($('at-origami-repeats').value, 10)
+            repeats: parseInt($('at-origami-repeats').value, 10),
+            gamma: parseInt($('at-origami-thick').value, 10) / 100,
+            cx: parseInt($('at-origami-cx').value, 10) / 100,
+            cy: parseInt($('at-origami-cy').value, 10) / 100
         };
     }
     function origamiPreview() {
@@ -6809,11 +7471,15 @@ window.TRLE = window.TRLE || {};
     }
     function setupOrigamiModal() {
         $('at-origami-shape').addEventListener('change', origamiPreview);
+        $('at-origami-shape2').addEventListener('change', origamiPreview);
         $('at-origami-axis').addEventListener('change', origamiPreview);
-        $('at-origami-repeats').addEventListener('input', function () {
-            $('at-origami-repeats-val').textContent = this.value;
-            origamiPreview();
-        });
+        for (const [id, fmt] of [['at-origami-repeats', v => v], ['at-origami-thick', v => (v / 100).toFixed(2)],
+                                 ['at-origami-cx', v => v + '%'], ['at-origami-cy', v => v + '%']]) {
+            $(id).addEventListener('input', function () {
+                $(id + '-val').textContent = fmt(parseInt(this.value, 10));
+                origamiPreview();
+            });
+        }
         $('at-origami-add').addEventListener('click', () => {
             const el = byId(origamiState.id);
             if (!el || !origamiState.canvas) return;
@@ -6833,20 +7499,31 @@ window.TRLE = window.TRLE || {};
     }
 
     function setupVarModal() {
-        $('at-var-hue').addEventListener('input', function () { $('at-var-hue-val').textContent = this.value; varRegen(); });
-        $('at-var-val').addEventListener('input', function () { $('at-var-val-val').textContent = this.value; varRegen(); });
+        for (const id of ['at-var-hue', 'at-var-val', 'at-var-sat', 'at-var-con', 'at-var-noise']) {
+            $(id).addEventListener('input', function () { $(id + '-val').textContent = this.value; varRegen(); });
+        }
         $('at-var-count').addEventListener('change', varRegen);
         $('at-var-rotate').addEventListener('change', varRegen);
-        $('at-var-shuffle').addEventListener('click', varRegen);
+        $('at-var-shift').addEventListener('change', varRegen);
+        $('at-var-seed').addEventListener('change', function () {
+            varState.seed = (parseInt(this.value, 10) || 1) >>> 0;
+            varRegen();
+        });
+        $('at-var-shuffle').addEventListener('click', () => {
+            varState.seed = (Math.random() * 1e9) >>> 0;
+            $('at-var-seed').value = varState.seed;
+            varRegen();
+        });
         $('at-var-generate').addEventListener('click', () => {
             if (varState.id === null || !varState.variants.length) return;
+            const srcEl = byId(varState.id);
             varState.variants.forEach(v => {
                 state.elements.push({
                     id: state.nextId++,
                     kind: 'tile',
                     canvas: cloneCanvas(v),
                     original: cloneCanvas(v),
-                    seamless: false,
+                    seamless: srcEl ? !!srcEl.seamless : false,
                     edited: false,
                     material: null
                 });
@@ -6874,16 +7551,6 @@ window.TRLE = window.TRLE || {};
         coursed: 'stone', herringbone: 'brick', cobble: 'stone', shingles: 'slate', floor: 'wood'
     };
 
-    /* Small deterministic PRNG so a seed reproduces a pattern exactly. */
-    function mulberry32(a) {
-        return function () {
-            a |= 0; a = a + 0x6D2B79F5 | 0;
-            let t = Math.imul(a ^ a >>> 15, 1 | a);
-            t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
-            return ((t ^ t >>> 14) >>> 0) / 4294967296;
-        };
-    }
-
     /* HSL(0-360,0-100,0-100) → CSS rgb() string, for the mortar colour sliders. */
     function bpHslCss(h, s, l) {
         s /= 100; l /= 100;
@@ -6899,44 +7566,38 @@ window.TRLE = window.TRLE || {};
         const c = document.createElement('canvas'); c.width = c.height = 1;
         const x = c.getContext('2d'); x.drawImage(src, 0, 0, 1, 1);
         const d = x.getImageData(0, 0, 1, 1).data;
-        const r = d[0] / 255, g = d[1] / 255, b = d[2] / 255;
-        const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2;
-        let h = 0, s = 0;
-        if (mx !== mn) {
-            const dd = mx - mn;
-            s = l > 0.5 ? dd / (2 - mx - mn) : dd / (mx + mn);
-            if (mx === r) h = (g - b) / dd + (g < b ? 6 : 0);
-            else if (mx === g) h = (b - r) / dd + 2;
-            else h = (r - g) / dd + 4;
-            h *= 60;
-        }
-        return { h: Math.round(h), s: Math.round(s * 100), l: Math.round(l * 100) };
+        return hslOfRgb(d[0], d[1], d[2]);
     }
 
-    /* Lay noise over the mortar (only the joint gaps survive, since cells draw on top). */
-    function bpMortarNoise(ctx, S, type, amt) {
+    /* Lay noise over the mortar (only the joint gaps survive, since cells draw on
+       top). Seeded via the passed rng so a seed reproduces the grain exactly. */
+    function bpMortarNoise(ctx, S, type, amt, rng) {
         const off = document.createElement('canvas'); off.width = S; off.height = S;
         const octx = off.getContext('2d');
         if (type === 'clouds') {                       // low-freq blotches: random small → smooth upscale
             const ls = Math.max(2, Math.round(S / 16));
             const low = document.createElement('canvas'); low.width = low.height = ls;
             const lctx = low.getContext('2d'), id = lctx.createImageData(ls, ls);
-            for (let i = 0; i < id.data.length; i += 4) { const v = Math.random() * 255; id.data[i] = id.data[i + 1] = id.data[i + 2] = v; id.data[i + 3] = 255; }
+            for (let i = 0; i < id.data.length; i += 4) { const v = rng() * 255; id.data[i] = id.data[i + 1] = id.data[i + 2] = v; id.data[i + 3] = 255; }
             lctx.putImageData(id, 0, 0);
-            octx.imageSmoothingEnabled = true; octx.drawImage(low, 0, 0, S, S);
+            // Tile 3×3 before the smooth upscale so the bilinear filter wraps at
+            // the borders (upscaling the bare tile clamps → visible seam).
+            const t3 = document.createElement('canvas'); t3.width = t3.height = ls * 3;
+            const t3x = t3.getContext('2d');
+            for (let ty = 0; ty < 3; ty++) for (let tx = 0; tx < 3; tx++) t3x.drawImage(low, tx * ls, ty * ls);
+            octx.imageSmoothingEnabled = true;
+            octx.drawImage(t3, 0, 0, ls * 3, ls * 3, -S, -S, S * 3, S * 3);
         } else {                                       // per-pixel: speckle = hard salt/pepper, grain = soft
             const raw = document.createElement('canvas'); raw.width = S; raw.height = S;
             const rctx = raw.getContext('2d'), id = rctx.createImageData(S, S);
             for (let i = 0; i < id.data.length; i += 4) {
-                const v = type === 'speckle' ? (Math.random() < 0.5 ? 0 : 255) : 128 + (Math.random() * 2 - 1) * 90;
+                const v = type === 'speckle' ? (rng() < 0.5 ? 0 : 255) : 128 + (rng() * 2 - 1) * 90;
                 id.data[i] = id.data[i + 1] = id.data[i + 2] = v; id.data[i + 3] = 255;
             }
             rctx.putImageData(id, 0, 0);
-            // Blur the hard per-pixel noise so it reads as soft mortar grain, not sharp static
-            // (scaled by tile size so the look is consistent at 256 / 512 / 1024).
-            octx.filter = `blur(${((type === 'speckle' ? 0.6 : 1) * S / 256).toFixed(2)}px)`;
-            octx.drawImage(raw, 0, 0);
-            octx.filter = 'none';
+            // Soften the hard per-pixel noise wrap-safely so it reads as mortar
+            // grain, not sharp static (scaled by tile size for a consistent look).
+            octx.drawImage(wrapBlur(raw, S, (type === 'speckle' ? 0.6 : 1) * S / 256), 0, 0);
         }
         ctx.save();
         ctx.globalAlpha = amt / 100;
@@ -6945,12 +7606,39 @@ window.TRLE = window.TRLE || {};
         ctx.restore();
     }
 
-    /* Fill the whole tile with the mortar colour (+ optional noise); this is what
-       shows through the joint gaps once cells are drawn over it. */
-    function bpMortarFill(ctx, S, p) {
-        ctx.fillStyle = bpHslCss(p.mh, p.ms, p.ml);
-        ctx.fillRect(0, 0, S, S);
-        if (p.noiseAmt > 0 && p.noiseType !== 'none') bpMortarNoise(ctx, S, p.noiseType, p.noiseAmt);
+    /* Fill the whole tile with mortar; this is what shows through the joint gaps
+       once cells are drawn over it. 'natural' derives the fill from a blurred,
+       tinted copy of the source texture (mortar shares the texture's character);
+       'flat' is the plain colour fill. */
+    function bpMortarFill(ctx, S, p, src, seed) {
+        if (p.mstyle === 'natural' && src) {
+            const base = wrapBlur(src.width === S && src.height === S ? src : resizeCanvas(src, S, S),
+                                  S, Math.max(2, S / 24));
+            ctx.save();
+            ctx.filter = `hue-rotate(${p.mh}deg) saturate(${p.ms}%) brightness(${p.ml}%)`;
+            ctx.drawImage(base, 0, 0);
+            ctx.restore();
+        } else {
+            ctx.fillStyle = bpHslCss(p.mh, p.ms, p.ml);
+            ctx.fillRect(0, 0, S, S);
+        }
+        if (p.noiseAmt > 0 && p.noiseType !== 'none')
+            bpMortarNoise(ctx, S, p.noiseType, p.noiseAmt, mulberry32((seed ^ 0xa53a9e1) >>> 0));
+    }
+
+    /* Cheap joint AO: darken the mortar gaps (and a soft rim just inside each
+       cell) so the derived height/AO maps read the joints as recessed. The joint
+       mask is the inverse of the cell layer's alpha, blurred wrap-safely. */
+    function bpJointAO(ctx, cellLayer, S, strength) {
+        const mask = document.createElement('canvas'); mask.width = mask.height = S;
+        const mctx = mask.getContext('2d');
+        mctx.fillStyle = '#000'; mctx.fillRect(0, 0, S, S);
+        mctx.globalCompositeOperation = 'destination-out';
+        mctx.drawImage(cellLayer, 0, 0);
+        ctx.save();
+        ctx.globalAlpha = strength;
+        ctx.drawImage(wrapBlur(mask, S, Math.max(1, S / 64)), 0, 0);
+        ctx.restore();
     }
 
     /* Subtle top-light / bottom-dark bevel inside a cell — fakes rounded relief so
@@ -7221,7 +7909,11 @@ window.TRLE = window.TRLE || {};
         } }
         const src2 = (p.fill === 'tiles' && p.pool && p.pool.length) ? p.pool[Math.floor(rng() * p.pool.length)] : src;
         const S2 = bpCanvasData(src2), sw = S2.w, sh = S2.h, sd = S2.data;
-        const mort = bpRgb(bpHslCss(p.mh, p.ms, p.ml));
+        // Natural mortar mode: groove tint comes from the texture itself (darkened
+        // average), not the flat-colour sliders.
+        const mort = p.mstyle === 'natural'
+            ? (() => { const a = bpAvgHsl(src2); return bpRgb(bpHslCss(a.h, a.s, Math.round(a.l * 0.55))); })()
+            : bpRgb(bpHslCss(p.mh, p.ms, p.ml));
         const gap = Math.max(0.5, p.joint) * cw * 0.5;      // groove half-width
         const round = 0.35 + 0.9 * (p.irregular / 100);      // mound steepness
         const oc = document.createElement('canvas'); oc.width = oc.height = S;
@@ -7319,8 +8011,10 @@ window.TRLE = window.TRLE || {};
             offset:    parseInt($('at-bp-offset').value) / 100,
             orient:    $('at-bp-orient').value,
             joint:     parseInt($('at-bp-joint').value) / 100,
-            mh:        parseInt($('at-bp-mh').value),    // mortar hue / sat / lightness
-            ms:        parseInt($('at-bp-ms').value),
+            warp:      parseInt($('at-bp-warp').value) / 100,  // joint-edge irregularity
+            mstyle:    $('at-bp-mstyle').value,          // natural (from texture) | flat colour
+            mh:        parseInt($('at-bp-mh').value),    // mortar hue / sat / lightness (flat)
+            ms:        parseInt($('at-bp-ms').value),    //   or hue-shift / sat / brightness (natural)
             ml:        parseInt($('at-bp-ml').value),
             noiseAmt:  parseInt($('at-bp-noise').value),
             noiseType: $('at-bp-noisetype').value,
@@ -7349,17 +8043,30 @@ window.TRLE = window.TRLE || {};
         const rng = mulberry32(buildState.seed >>> 0);
 
         ctx.clearRect(0, 0, S, S);
-        bpMortarFill(ctx, S, p);                  // mortar colour + noise shows through the joint gaps
+        bpMortarFill(ctx, S, p, src, buildState.seed);   // mortar shows through the joint gaps
 
-        if      (p.pattern === 'brick')       bpBrick(ctx, src, S, p, rng, false);
-        else if (p.pattern === 'tile')        bpBrick(ctx, src, S, p, rng, true);
-        else if (p.pattern === 'coursed')     bpCoursed(ctx, src, S, p, rng);
-        else if (p.pattern === 'herringbone') bpHerringbone(ctx, src, S, p, rng);
-        else if (p.pattern === 'cobble')      bpCobble(ctx, src, S, p, rng);
-        else if (p.pattern === 'shingles')    bpShingles(ctx, src, S, p, rng);
-        else if (p.pattern === 'planks')      bpPlanks(ctx, src, S, p, rng);
-        else if (p.pattern === 'floor')       bpFloor(ctx, src, S, p, rng);
-        else if (p.pattern === 'pipes')       bpPipes(ctx, src, S, p, rng);
+        // Cells render into a transparent layer so the joint edges can be
+        // roughened (toroidal domain warp) and shadowed (joint AO) as one mask,
+        // without touching any per-pattern drawing code. Cobble is exempt — its
+        // Worley grooves are already organic and its groove alpha is tuned.
+        let cellLayer = document.createElement('canvas'); cellLayer.width = cellLayer.height = S;
+        const cctx = cellLayer.getContext('2d');
+        const organic = p.pattern !== 'cobble';
+
+        if      (p.pattern === 'brick')       bpBrick(cctx, src, S, p, rng, false);
+        else if (p.pattern === 'tile')        bpBrick(cctx, src, S, p, rng, true);
+        else if (p.pattern === 'coursed')     bpCoursed(cctx, src, S, p, rng);
+        else if (p.pattern === 'herringbone') bpHerringbone(cctx, src, S, p, rng);
+        else if (p.pattern === 'cobble')      bpCobble(cctx, src, S, p, rng);
+        else if (p.pattern === 'shingles')    bpShingles(cctx, src, S, p, rng);
+        else if (p.pattern === 'planks')      bpPlanks(cctx, src, S, p, rng);
+        else if (p.pattern === 'floor')       bpFloor(cctx, src, S, p, rng);
+        else if (p.pattern === 'pipes')       bpPipes(cctx, src, S, p, rng);
+
+        if (organic && p.warp > 0)
+            cellLayer = warpLayerToroidal(cellLayer, S, p.warp, (buildState.seed ^ 0x51ed270b) >>> 0);
+        ctx.drawImage(cellLayer, 0, 0);
+        if (organic && p.joint > 0) bpJointAO(ctx, cellLayer, S, 0.30);
 
         // Vertically-built patterns are rotated for the horizontal option (stays seamless).
         if (['planks', 'pipes', 'floor', 'herringbone'].includes(p.pattern) && p.orient === 'h') {
@@ -7377,6 +8084,13 @@ window.TRLE = window.TRLE || {};
     let bpTimer = null;
     function bpScheduleRegen() { clearTimeout(bpTimer); bpTimer = setTimeout(bpGenerate, 80); }
 
+    /* Per-pattern default joint-edge irregularity: masonry wobbles, sawn wood
+       barely (planks/floor run a full-length joint along the tile seam, so big
+       wobble there reads as a kink when tiled), machined pipes not at all
+       (cobble has its own organic grooves). */
+    const BP_WARP_DEF = { brick: 30, tile: 25, coursed: 35, herringbone: 25,
+                          shingles: 20, planks: 10, floor: 8, pipes: 0, cobble: 0 };
+
     /* Show only the controls that apply to the chosen pattern + update labels. */
     function bpSyncControls() {
         const pat = $('at-bp-pattern').value;
@@ -7391,6 +8105,24 @@ window.TRLE = window.TRLE || {};
         if (al) al.textContent = pat === 'coursed' ? 'Course flatness' : 'Brick aspect';
         const preset = TRLE.SolidPresets[BP_PRESET[pat]];
         $('at-bp-assign-label').textContent = `Assign ${preset ? preset.label : BP_PRESET[pat]} material preset`;
+        // Mortar style: the flat-colour sliders double as tint filters in natural
+        // mode; the sample button only makes sense for flat colour.
+        const natural = $('at-bp-mstyle').value === 'natural';
+        $('at-bp-sample').style.display = natural ? 'none' : '';
+        $('at-bp-mh-label').textContent = natural ? 'Hue shift' : 'Hue';
+        $('at-bp-ms-label').textContent = 'Saturation';
+        $('at-bp-ml-label').textContent = natural ? 'Brightness' : 'Lightness';
+    }
+
+    /* Reset the mortar sliders to the chosen style's defaults. */
+    function bpApplyMortarDefaults(style) {
+        const d = style === 'natural'
+            ? { mh: 0, ms: 40, ml: 65, noise: 35, noisetype: 'grain' }
+            : { mh: 0, ms: 0, ml: 22, noise: 0, noisetype: 'none' };
+        for (const [id, v] of [['at-bp-mh', d.mh], ['at-bp-ms', d.ms], ['at-bp-ml', d.ml], ['at-bp-noise', d.noise]]) {
+            $(id).value = v; $(id + '-val').textContent = v;
+        }
+        $('at-bp-noisetype').value = d.noisetype;
     }
 
     function openBuildModal(id) {
@@ -7405,6 +8137,7 @@ window.TRLE = window.TRLE || {};
         // Live-regen on every slider; mirror the value into its label span.
         [['at-bp-across', 'at-bp-across-val'], ['at-bp-aspect', 'at-bp-aspect-val', v => (v / 10).toFixed(1)],
          ['at-bp-offset', 'at-bp-offset-val'], ['at-bp-joint', 'at-bp-joint-val'],
+         ['at-bp-warp', 'at-bp-warp-val'],
          ['at-bp-mh', 'at-bp-mh-val'], ['at-bp-ms', 'at-bp-ms-val'], ['at-bp-ml', 'at-bp-ml-val'],
          ['at-bp-noise', 'at-bp-noise-val'], ['at-bp-hue', 'at-bp-hue-val'],
          ['at-bp-val', 'at-bp-val-val'], ['at-bp-highlight', 'at-bp-highlight-val'],
@@ -7416,7 +8149,17 @@ window.TRLE = window.TRLE || {};
                 bpScheduleRegen();
             });
         });
-        $('at-bp-pattern').addEventListener('change', () => { bpSyncControls(); bpGenerate(); });
+        $('at-bp-pattern').addEventListener('change', function () {
+            const w = BP_WARP_DEF[this.value];
+            if (w != null) { $('at-bp-warp').value = w; $('at-bp-warp-val').textContent = w; }
+            bpSyncControls();
+            bpGenerate();
+        });
+        $('at-bp-mstyle').addEventListener('change', function () {
+            bpApplyMortarDefaults(this.value);
+            bpSyncControls();
+            bpGenerate();
+        });
         $('at-bp-fill').addEventListener('change', bpGenerate);
         $('at-bp-noisetype').addEventListener('change', bpGenerate);
         $('at-bp-orient').addEventListener('change', bpGenerate);
@@ -7457,6 +8200,540 @@ window.TRLE = window.TRLE || {};
             pushHistory(`Build ${pat} pattern`);
             showToast(`Added ${pat} pattern tile`, 'success');
         });
+    }
+
+    /* ============ STAINED GLASS MODAL (Phase 14) ============
+       Turns a tile into leaded stained glass ("stainedglassify": cell colours
+       averaged from the texture) or generates a window from a built-in palette.
+       Cell structures: seamless Worley blobs / rect / diamond / hex quarries
+       (all toroidal), a centred rose window (not tileable), or image-guided
+       cells (k-means colour regions, so boundaries follow the picture).
+       The committed tile carries:
+         - matLayers: glass preset over the whole tile + a metal preset through
+           the lead mask (composeLayerMaps gives each region its own PBR maps)
+         - el.emissive: the glass cells glowing in their own colour (lead black)
+         - el.sgParams: the full recipe, re-editable via the context menu. */
+    const sgState = { id: null, canvas: null, leadMask: null, emissiveCv: null, seed: 1, editId: null };
+
+    const SG_PALETTES = {
+        jewel:    ['#8f1d2c', '#1d3f8f', '#1d6e3a', '#c9921e', '#5b2d8f', '#1d7f8f'],
+        medieval: ['#1a2f6e', '#26418c', '#7d1620', '#a02231', '#c9a227', '#cfc9b8', '#274a2d'],
+        amber:    ['#c98a1e', '#a86a14', '#8a4d10', '#dcae4a', '#6e3c10', '#e8d9a8'],
+        emerald:  ['#14532a', '#1d6e3a', '#2a8f4d', '#0f3f3a', '#1d7f72', '#a8c98a'],
+        ruby:     ['#6e1020', '#8f1d2c', '#b02a3c', '#c25a68', '#3f0c14', '#8f6a72']
+    };
+    const SG_LEAD_RGB    = { lead: [30, 30, 33], pewter: [60, 60, 66], copper: [76, 52, 40], gold: [110, 88, 34] };
+    const SG_LEAD_PRESET = { lead: 'iron', pewter: 'metal', copper: 'metal_bronze', gold: 'metal_gold' };
+
+    function sgParams() {
+        return {
+            pattern:  $('at-sg-pattern').value,
+            cells:    parseInt($('at-sg-cells').value),
+            jitter:   parseInt($('at-sg-jitter').value),
+            lead:     parseInt($('at-sg-lead').value),
+            leadtint: $('at-sg-leadtint').value,
+            colorsrc: $('at-sg-colorsrc').value,
+            mottle:   parseInt($('at-sg-mottle').value),
+            detail:   parseInt($('at-sg-detail').value),
+            emissive: parseInt($('at-sg-emissive').value),
+            frame:    $('at-sg-frame').checked
+        };
+    }
+
+    /* hex string → [r,g,b] */
+    function sgHexRgb(h) {
+        return [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+    }
+
+    /* Toroidal jittered-grid Worley cells (same family as bpCobble). `hex` puts
+       the sites on a brick-offset lattice → honeycomb cells at jitter 0. */
+    function sgWorley(S, G, jitterAmp, rng, hex) {
+        if (hex && G % 2) G++;                       // odd G would break row-parity wrap
+        const cw = S / G;
+        const sites = [];
+        for (let gy = 0; gy < G; gy++) {
+            sites[gy] = [];
+            for (let gx = 0; gx < G; gx++)
+                sites[gy][gx] = { jx: (rng() * 2 - 1) * jitterAmp, jy: (rng() * 2 - 1) * jitterAmp };
+        }
+        const label = new Int32Array(S * S), edge = new Float32Array(S * S);
+        const xr = hex ? 2 : 1;
+        for (let y = 0; y < S; y++) {
+            const gy0 = Math.floor(y / cw);
+            for (let x = 0; x < S; x++) {
+                const gx0 = Math.floor(x / cw);
+                let f1 = 1e18, f2 = 1e18, bl = 0;
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dx = -xr; dx <= xr; dx++) {
+                        const wy = ((gy0 + dy) % G + G) % G, wx = ((gx0 + dx) % G + G) % G;
+                        const st = sites[wy][wx];
+                        const off = hex ? (wy % 2 ? 0.5 : 0) : 0;
+                        // Sites sit ON the lattice lines (not cell centres) so the
+                        // cell boundaries land mid-cell — half a cell away from the
+                        // tile seam instead of meandering along it.
+                        const px = (gx0 + dx + 1 + off + st.jx) * cw;
+                        const py = (gy0 + dy + 1 + st.jy) * cw;
+                        const d = (x - px) * (x - px) + (y - py) * (y - py);
+                        if (d < f1) { f2 = f1; f1 = d; bl = wy * G + wx; }
+                        else if (d < f2) { f2 = d; }
+                    }
+                }
+                const i = y * S + x;
+                label[i] = bl;
+                edge[i] = (Math.sqrt(f2) - Math.sqrt(f1)) / 2;   // ≈ distance to the cell border
+            }
+        }
+        return { label, edge, cellCount: G * G, cellSize: cw };
+    }
+
+    /* Rect / diamond quarry lattices. Jitter pre-warps the sampling coordinate
+       with periodic noise, so the lattice wobbles but still wraps. */
+    function sgGridCells(S, p, seed, diamond) {
+        const G = Math.max(2, p.cells), cw = S / G;
+        const nX = makePeriodicNoise((seed ^ 0x3c6ef372) >>> 0, 4);
+        const nY = makePeriodicNoise((seed ^ 0xbb67ae85) >>> 0, 4);
+        const jamp = (p.jitter / 100) * cw * 0.35;
+        const label = new Int32Array(S * S), edge = new Float32Array(S * S);
+        const P = 2 * G;                              // diamond label period (see below)
+        for (let y = 0; y < S; y++) {
+            for (let x = 0; x < S; x++) {
+                const u = (x / S) * 4, v = (y / S) * 4;
+                const wx = x + (nX(u, v) - 0.5) * 2 * jamp;
+                const wy = y + (nY(u + 1.3, v + 2.9) - 0.5) * 2 * jamp;
+                const i = y * S + x;
+                if (diamond) {
+                    // 45°-rotated lattice: cells indexed by (⌊(x+y)/d⌋, ⌊(x−y)/d⌋).
+                    // x→x+S or y→y+S shifts (i,j) by (±G,±G), and (i+j, i−j) mod 2G
+                    // is invariant under both — so labels wrap.
+                    const a = wx + wy, b = wx - wy;
+                    const ii = Math.floor(a / cw), jj = Math.floor(b / cw);
+                    const ai = ((ii + jj) % P + P) % P, bj = ((ii - jj) % P + P) % P;
+                    label[i] = ai * P + bj;
+                    const fa = a - ii * cw, fb = b - jj * cw;
+                    edge[i] = Math.min(fa, cw - fa, fb, cw - fb) / Math.SQRT2;
+                } else {
+                    // Half-cell shift keeps the quarry lines off the tile seam.
+                    const sx = wx - cw / 2, sy2 = wy - cw / 2;
+                    const cxi = Math.floor(sx / cw), cyi = Math.floor(sy2 / cw);
+                    label[i] = ((cyi % G + G) % G) * G + ((cxi % G + G) % G);
+                    const fx = sx - cxi * cw, fy = sy2 - cyi * cw;
+                    edge[i] = Math.min(fx, cw - fx, fy, cw - fy);
+                }
+            }
+        }
+        return { label, edge, cellCount: diamond ? P * P : G * G, cellSize: cw };
+    }
+
+    /* Rose window: concentric rings split into arc sectors (per-ring counts sized
+       for roughly square cells, per-ring rotation from the seed). Optional square
+       frame band. Centred — the result is NOT tileable. */
+    function sgRoseCells(S, p, rng, seed) {
+        const C = (S - 1) / 2, R = S / 2;
+        const rings = Math.max(2, p.cells);
+        const ringW = R / rings;
+        const rot = [], secs = [], base = [];
+        let acc = 0;
+        for (let r = 0; r < rings; r++) {
+            rot.push(rng() * Math.PI * 2);
+            secs.push(r === 0 ? 1 : Math.max(6, Math.round((2 * Math.PI * (r + 0.5) * ringW) / (ringW * 1.5))));
+            base.push(acc); acc += secs[r];
+        }
+        const frameR = R * 0.86;
+        const nJ = makeValueNoise((seed ^ 0x1f83d9ab) >>> 0);
+        const jamp = (p.jitter / 100) * ringW * 0.25;
+        const label = new Int32Array(S * S), edge = new Float32Array(S * S);
+        const ringOf = [];                            // label → ring (palette cycling)
+        for (let r = 0; r < rings; r++) for (let s = 0; s < secs[r]; s++) ringOf[base[r] + s] = r;
+        for (let o = 0; o < 8; o++) ringOf[acc + o] = rings;   // frame cells
+        for (let y = 0; y < S; y++) {
+            for (let x = 0; x < S; x++) {
+                const dx = x - C, dy = y - C;
+                let r = Math.hypot(dx, dy) + (nJ((x / S) * 5 + 3.1, (y / S) * 5 + 7.7) - 0.5) * 2 * jamp;
+                const th = Math.atan2(dy, dx);
+                const i = y * S + x;
+                if (p.frame && r > frameR) {
+                    // 8 frame cells by octant; lead at the inner boundary, the
+                    // octant splits and the tile perimeter.
+                    const oct = Math.floor(((th + Math.PI) / (Math.PI / 4))) % 8;
+                    label[i] = acc + oct;
+                    const af = ((th + Math.PI) / (Math.PI / 4)) % 1;
+                    const arcD = Math.min(af, 1 - af) * (Math.PI / 4) * Math.max(1, r);
+                    edge[i] = Math.min(r - frameR, arcD, x, y, S - 1 - x, S - 1 - y);
+                    continue;
+                }
+                const ri = Math.max(0, Math.min(rings - 1, Math.floor(r / ringW)));
+                const n = secs[ri];
+                let ed;
+                const a = ((th + rot[ri]) / (2 * Math.PI));
+                const si = Math.floor(((a % 1) + 1) % 1 * n) % n;
+                const af = (((a % 1) + 1) % 1 * n) % 1;
+                const arcD = n > 1 ? Math.min(af, 1 - af) * (2 * Math.PI * Math.max(1, r) / n) : 1e9;
+                const inD = ri === 0 ? 1e9 : r - ri * ringW;   // the medallion has no inner boundary
+                const outR = (ri + 1) * ringW;
+                const outerLimit = p.frame ? frameR : 1e9;
+                const outD = (ri === rings - 1 && !p.frame) ? 1e9 : Math.min(outR, outerLimit) - r;
+                ed = Math.min(inD, outD, arcD);
+                label[i] = base[ri] + si;
+                edge[i] = Math.max(0, ed);
+            }
+        }
+        return { label, edge, cellCount: acc + (p.frame ? 8 : 0), cellSize: ringW, ringOf };
+    }
+
+    /* Image-guided cells: k-means (on a 64×64 downscale) clusters the tile's
+       colours; every full-res pixel joins its nearest cluster, so cell borders
+       follow the picture. Edge distances via a toroidal chamfer transform. */
+    function sgImageCells(S, p, rng, sd) {
+        const K = Math.max(2, Math.min(16, p.cells));
+        // -- k-means on the downscale --
+        const DS = 64, step = S / DS;
+        const px = [];
+        for (let y = 0; y < DS; y++) for (let x = 0; x < DS; x++) {
+            const si = ((Math.floor(y * step) * S) + Math.floor(x * step)) * 4;
+            px.push([sd[si], sd[si + 1], sd[si + 2]]);
+        }
+        let cent = [];
+        for (let k = 0; k < K; k++) cent.push([...px[Math.floor(rng() * px.length)]]);
+        for (let it = 0; it < 4; it++) {
+            const sum = cent.map(() => [0, 0, 0, 0]);
+            for (const c of px) {
+                let bi = 0, bd = 1e18;
+                for (let k = 0; k < K; k++) {
+                    const d = (c[0] - cent[k][0]) ** 2 + (c[1] - cent[k][1]) ** 2 + (c[2] - cent[k][2]) ** 2;
+                    if (d < bd) { bd = d; bi = k; }
+                }
+                sum[bi][0] += c[0]; sum[bi][1] += c[1]; sum[bi][2] += c[2]; sum[bi][3]++;
+            }
+            for (let k = 0; k < K; k++) if (sum[k][3]) cent[k] = [sum[k][0] / sum[k][3], sum[k][1] / sum[k][3], sum[k][2] / sum[k][3]];
+        }
+        // -- full-res labels --
+        const label = new Int32Array(S * S);
+        for (let i = 0, n = S * S; i < n; i++) {
+            const si = i * 4;
+            let bi = 0, bd = 1e18;
+            for (let k = 0; k < K; k++) {
+                const d = (sd[si] - cent[k][0]) ** 2 + (sd[si + 1] - cent[k][1]) ** 2 + (sd[si + 2] - cent[k][2]) ** 2;
+                if (d < bd) { bd = d; bi = k; }
+            }
+            label[i] = bi;
+        }
+        // -- 3×3 majority despeckle (2 passes): texture noise flickers between
+        //    similar clusters, which would shred the panes into lead worms --
+        const cnt = new Int32Array(K);
+        for (let pass = 0; pass < 2; pass++) {
+            const nl = new Int32Array(S * S);
+            for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+                cnt.fill(0);
+                for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++)
+                    cnt[label[((y + dy + S) % S) * S + (x + dx + S) % S]]++;
+                let bi = label[y * S + x];
+                for (let k = 0; k < K; k++) if (cnt[k] > cnt[bi]) bi = k;
+                nl[y * S + x] = bi;
+            }
+            label.set(nl);
+        }
+        // -- toroidal chamfer distance to the nearest label boundary --
+        const edge = new Float32Array(S * S).fill(1e9);
+        for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+            const i = y * S + x;
+            const r = y * S + (x + 1) % S, d = ((y + 1) % S) * S + x;
+            if (label[i] !== label[r] || label[i] !== label[d]) edge[i] = 0;
+        }
+        for (let round = 0; round < 2; round++) {
+            for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {      // forward
+                const i = y * S + x, ym = ((y - 1) % S + S) % S, xm = ((x - 1) % S + S) % S, xp = (x + 1) % S;
+                edge[i] = Math.min(edge[i], edge[y * S + xm] + 1, edge[ym * S + x] + 1,
+                                   edge[ym * S + xm] + 1.4, edge[ym * S + xp] + 1.4);
+            }
+            for (let y = S - 1; y >= 0; y--) for (let x = S - 1; x >= 0; x--) {  // backward
+                const i = y * S + x, yp = (y + 1) % S, xp = (x + 1) % S, xm = ((x - 1) % S + S) % S;
+                edge[i] = Math.min(edge[i], edge[y * S + xp] + 1, edge[yp * S + x] + 1,
+                                   edge[yp * S + xp] + 1.4, edge[yp * S + xm] + 1.4);
+            }
+        }
+        return { label, edge, cellCount: K, cellSize: S / 6 };
+    }
+
+    function sgComputeCells(S, p, rng, sd, seed) {
+        const G = Math.max(2, p.cells);
+        if (p.pattern === 'voronoi')      return sgWorley(S, G, 0.05 + (p.jitter / 100) * 0.31, rng, false);
+        if (p.pattern === 'grid-hex')     return sgWorley(S, G, (p.jitter / 100) * 0.22, rng, true);
+        if (p.pattern === 'grid-rect')    return sgGridCells(S, p, seed, false);
+        if (p.pattern === 'grid-diamond') return sgGridCells(S, p, seed, true);
+        if (p.pattern === 'rose')         return sgRoseCells(S, p, rng, seed);
+        return sgImageCells(S, p, rng, sd);
+    }
+
+    /* Per-cell glass colours. Texture mode averages the source under each cell
+       then "jewel-ifies" (saturate up, clamp lightness into the glass range);
+       palette mode picks from the chosen palette (per ring for rose windows). */
+    function sgCellColors(p, rng, sd, cells, S) {
+        const n = cells.cellCount;
+        const colors = new Array(n);
+        if (p.colorsrc === 'texture' && sd) {
+            const acc = new Float64Array(n * 4);
+            const { label } = cells;
+            for (let i = 0, m = S * S; i < m; i++) {
+                const l = label[i], si = i * 4;
+                acc[l * 4] += sd[si]; acc[l * 4 + 1] += sd[si + 1]; acc[l * 4 + 2] += sd[si + 2]; acc[l * 4 + 3]++;
+            }
+            for (let l = 0; l < n; l++) {
+                const c = acc[l * 4 + 3] || 1;
+                const h = hslOfRgb(acc[l * 4] / c, acc[l * 4 + 1] / c, acc[l * 4 + 2] / c);
+                // Per-cell hue/lightness jitter: a monochrome source still yields
+                // panes in a family of tones instead of one flat wall of colour.
+                const hj = (h.h + (rng() * 2 - 1) * 16 + 360) % 360;
+                const lj = Math.round((rng() * 2 - 1) * 9);
+                colors[l] = bpRgb(bpHslCss(hj, Math.min(95, Math.round(h.s * 1.5 + 15)),
+                                           Math.max(26, Math.min(60, h.l + lj))));
+            }
+        } else {
+            const pal = (SG_PALETTES[p.colorsrc] || SG_PALETTES.jewel).map(sgHexRgb);
+            for (let l = 0; l < n; l++) {
+                if (cells.ringOf) {                    // rose: colour by ring, alternate sectors
+                    const ring = cells.ringOf[l] ?? 0;
+                    const c = pal[ring % pal.length];
+                    const f = (l % 2) ? 0.86 : 1.06;
+                    colors[l] = [Math.min(255, c[0] * f), Math.min(255, c[1] * f), Math.min(255, c[2] * f)];
+                } else {
+                    colors[l] = pal[Math.floor(rng() * pal.length)];
+                }
+            }
+        }
+        return colors;
+    }
+
+    /* Render diffuse + lead mask + emissive from the current controls into
+       sgState. One per-pixel pass over the cell structure. */
+    function sgRender() {
+        const el = byId(sgState.id);
+        if (!el) return;
+        const S = state.tileSize;
+        const p = sgParams();
+        const seed = sgState.seed >>> 0;
+        const rng = mulberry32(seed);
+        const src = (el.canvas.width === S && el.canvas.height === S) ? el.canvas : resizeCanvas(el.canvas, S, S);
+        const needSrc = p.colorsrc === 'texture' || p.pattern === 'image' || p.detail > 0;
+        const sd = needSrc ? bpCanvasData(src).data : null;
+
+        // Image mode assigns labels from a blurred copy — raw per-pixel noise
+        // would flicker between similar clusters and turn the tile into all-lead.
+        // Blur scales inversely with the requested region count, so asking for
+        // few regions merges fine structure into broad panes.
+        const sdAssign = p.pattern === 'image'
+            ? bpCanvasData(wrapBlur(src, S, Math.max(2, S / (Math.max(2, Math.min(16, p.cells)) * 4)))).data : sd;
+        const cells = sgComputeCells(S, p, rng, sdAssign, seed);
+        const { label, edge } = cells;
+        const colors = sgCellColors(p, rng, sd, cells, S);
+        const leadW = Math.max(1.25, (p.lead / 100) * cells.cellSize);
+        const lead = SG_LEAD_RGB[p.leadtint] || SG_LEAD_RGB.lead;
+
+        // Per-cell average luminance (for the low-contrast source-detail blend).
+        let avgL = null;
+        if (sd && p.detail > 0 && p.colorsrc === 'texture') {
+            avgL = new Float64Array(cells.cellCount * 2);
+            for (let i = 0, m = S * S; i < m; i++) {
+                const si = i * 4, l = label[i];
+                avgL[l * 2] += 0.299 * sd[si] + 0.587 * sd[si + 1] + 0.114 * sd[si + 2];
+                avgL[l * 2 + 1]++;
+            }
+            for (let l = 0; l < cells.cellCount; l++) avgL[l * 2] /= (avgL[l * 2 + 1] || 1);
+        }
+
+        // Periodic noise fields: glass mottling (per-cell offset) + lead grain.
+        const nM = makePeriodicNoise((seed ^ 0x9137afc2) >>> 0, 6);
+        const nG = makePeriodicNoise((seed ^ 0x51f7cb01) >>> 0, 48);
+        const mAmt = (p.mottle / 100) * 0.35;
+        const dAmt = (p.detail / 100) * 0.5;
+        const eAmt = p.emissive / 100;
+
+        const mk = () => { const c = document.createElement('canvas'); c.width = c.height = S; return c; };
+        sgState.canvas = mk(); sgState.leadMask = mk(); sgState.emissiveCv = mk();
+        const octx = sgState.canvas.getContext('2d');
+        const out = octx.createImageData(S, S), od = out.data;
+        const mctx = sgState.leadMask.getContext('2d');
+        const md = mctx.createImageData(S, S), mdd = md.data;
+        const ectx = sgState.emissiveCv.getContext('2d');
+        const em = ectx.createImageData(S, S), ed = em.data;
+
+        for (let y = 0; y < S; y++) {
+            for (let x = 0; x < S; x++) {
+                const i = y * S + x, o = i * 4;
+                const e = edge[i];
+                let r, g, b, isLead = 0;
+                if (e < leadW) {
+                    // Came bead: bright crown along the centre line, dark flanks —
+                    // the derived normal map reads it as a raised rounded ridge.
+                    const t = 1 - Math.abs(e - leadW / 2) / (leadW / 2);
+                    const bright = (0.55 + 0.75 * t * t) * (1 + (nG((x / S) * 48, (y / S) * 48) - 0.5) * 0.10);
+                    r = lead[0] * bright; g = lead[1] * bright; b = lead[2] * bright;
+                    isLead = 1;
+                } else {
+                    const l = label[i], c = colors[l] || [128, 128, 128];
+                    const ox = (l % 13) * 6 / 13, oy = ((l * 7) % 11) * 6 / 11;
+                    let f = 1 + (nM((x / S) * 6 + ox, (y / S) * 6 + oy) - 0.5) * 2 * mAmt;
+                    // Rim: glass darkens slightly as it approaches the came.
+                    if (e < leadW * 2.5) {
+                        const t = (e - leadW) / (leadW * 1.5);
+                        f *= 1 - 0.2 * (1 - Math.max(0, Math.min(1, t)));
+                    }
+                    r = c[0] * f; g = c[1] * f; b = c[2] * f;
+                    if (avgL) {
+                        const si = i * 4;
+                        const dl = (0.299 * sd[si] + 0.587 * sd[si + 1] + 0.114 * sd[si + 2]) - avgL[l * 2];
+                        r += dl * dAmt; g += dl * dAmt; b += dl * dAmt;
+                    }
+                }
+                od[o] = Math.max(0, Math.min(255, r));
+                od[o + 1] = Math.max(0, Math.min(255, g));
+                od[o + 2] = Math.max(0, Math.min(255, b));
+                od[o + 3] = 255;
+                mdd[o] = mdd[o + 1] = mdd[o + 2] = isLead ? 255 : 0; mdd[o + 3] = 255;
+                if (isLead) { ed[o] = ed[o + 1] = ed[o + 2] = 0; }
+                else {
+                    const c = colors[label[i]] || [0, 0, 0];   // flat cell colour — glow is even
+                    ed[o] = c[0] * eAmt; ed[o + 1] = c[1] * eAmt; ed[o + 2] = c[2] * eAmt;
+                }
+                ed[o + 3] = 255;
+            }
+        }
+        octx.putImageData(out, 0, 0);
+        mctx.putImageData(md, 0, 0);
+        ectx.putImageData(em, 0, 0);
+
+        const pv = $('at-sg-preview');
+        pv.getContext('2d').clearRect(0, 0, pv.width, pv.height);
+        pv.getContext('2d').drawImage(sgState.canvas, 0, 0, pv.width, pv.height);
+    }
+
+    let sgTimer = null;
+    function sgScheduleRegen() { clearTimeout(sgTimer); sgTimer = setTimeout(sgRender, 150); }
+
+    function sgSeamless(p, srcEl) {
+        if (p.pattern === 'rose') return false;
+        if (p.pattern === 'image') return srcEl ? !!srcEl.seamless : false;
+        return true;                                   // worley/grids are toroidal by construction
+    }
+
+    /* Show/hide per-pattern rows + adapt labels. */
+    function sgSyncControls() {
+        const pat = $('at-sg-pattern').value;
+        document.querySelectorAll('#at-modal-stainedglass [data-sg]').forEach(g => {
+            g.style.display = g.getAttribute('data-sg').split(' ').includes(pat) ? '' : 'none';
+        });
+        $('at-sg-cells-label').textContent =
+            pat === 'rose' ? 'Rings' : pat === 'image' ? 'Colour regions' : 'Cells across';
+        const texMode = $('at-sg-colorsrc').value === 'texture';
+        $('at-sg-detail-row').style.display = texMode ? '' : 'none';
+    }
+
+    function sgLoadParams(sp) {
+        $('at-sg-pattern').value = sp.pattern;
+        for (const [id, v] of [['at-sg-cells', sp.cells], ['at-sg-jitter', sp.jitter], ['at-sg-lead', sp.lead],
+                               ['at-sg-mottle', sp.mottle], ['at-sg-detail', sp.detail], ['at-sg-emissive', sp.emissive]]) {
+            $(id).value = v; $(id + '-val').textContent = v;
+        }
+        $('at-sg-leadtint').value = sp.leadtint;
+        $('at-sg-colorsrc').value = sp.colorsrc;
+        $('at-sg-frame').checked = !!sp.frame;
+        sgState.seed = (sp.seed || 1) >>> 0;
+        $('at-sg-seed').value = sgState.seed;
+    }
+
+    function openStainedGlassModal(id) {
+        const el = byId(id);
+        if (!el || el.kind !== 'tile') return;
+        sgState.id = id;
+        sgState.editId = null;
+        $('at-sg-tileno').textContent = indexOf(id) + 1;
+        $('at-sg-add').textContent = '➕ Add Stained Glass Tile';
+        $('at-sg-seed').value = sgState.seed;
+        openModal('stainedglass');
+        sgSyncControls();
+        sgRender();
+    }
+
+    /* Reopen the modal on a committed stained-glass tile with its stored recipe. */
+    function editStainedGlassModal(el) {
+        const sp = el.sgParams;
+        const srcEl = byId(sp.srcId);
+        sgState.id = srcEl ? sp.srcId : el.id;         // source gone → tile itself feeds texture modes
+        sgState.editId = el.id;
+        sgLoadParams(sp);
+        $('at-sg-tileno').textContent = indexOf(el.id) + 1;
+        $('at-sg-add').textContent = '💾 Save Changes';
+        openModal('stainedglass');
+        sgSyncControls();
+        sgRender();
+    }
+
+    function setupStainedGlassModal() {
+        for (const id of ['at-sg-cells', 'at-sg-jitter', 'at-sg-lead', 'at-sg-mottle', 'at-sg-detail', 'at-sg-emissive']) {
+            $(id).addEventListener('input', function () { $(id + '-val').textContent = this.value; sgScheduleRegen(); });
+        }
+        $('at-sg-pattern').addEventListener('change', () => { sgSyncControls(); sgRender(); });
+        $('at-sg-colorsrc').addEventListener('change', () => { sgSyncControls(); sgRender(); });
+        $('at-sg-leadtint').addEventListener('change', sgRender);
+        $('at-sg-frame').addEventListener('change', sgRender);
+        $('at-sg-seed').addEventListener('input', function () {
+            sgState.seed = (parseInt(this.value, 10) || 1) >>> 0;
+            sgScheduleRegen();
+        });
+        $('at-sg-random').addEventListener('click', () => {
+            sgState.seed = (Math.random() * 1e9) >>> 0;
+            $('at-sg-seed').value = sgState.seed;
+            sgRender();
+        });
+        $('at-sg-add').addEventListener('click', () => {
+            if (sgState.id === null || !sgState.canvas) return;
+            const p = sgParams();
+            const srcEl = byId(sgState.id);
+            const matLayers = [
+                { name: 'Glass', color: '#3a9ff5', feather: 0,
+                  material: { type: 'solid', key: 'glass', aesthetic: 'realistic' }, mask: null },
+                { name: 'Lead came', color: '#e8852a', feather: 1,
+                  material: { type: 'solid', key: SG_LEAD_PRESET[p.leadtint] || 'iron', aesthetic: 'realistic' },
+                  mask: cloneCanvas(sgState.leadMask) }
+            ];
+            const emissive = p.emissive > 0 ? cloneCanvas(sgState.emissiveCv) : null;
+            const sp = Object.assign({}, p, { srcId: sgState.id, seed: sgState.seed });
+            if (sgState.editId != null) {
+                const el = byId(sgState.editId);
+                if (!el) return;
+                el.canvas = cloneCanvas(sgState.canvas);
+                el.original = cloneCanvas(sgState.canvas);
+                el.seamless = sgSeamless(p, srcEl);
+                el.matLayers = matLayers;
+                el.emissive = emissive;
+                el.sgParams = sp;
+                if (emissive) sgEnableEmissiveExport();
+                closeModal(); renderGrid();
+                pushHistory('Edit stained glass');
+                showToast('Stained glass updated', 'success');
+                return;
+            }
+            const tile = {
+                id: state.nextId++, kind: 'tile',
+                canvas: cloneCanvas(sgState.canvas), original: cloneCanvas(sgState.canvas),
+                seamless: sgSeamless(p, srcEl), edited: false,
+                material: null, matLayers, emissive, sgParams: sp
+            };
+            state.elements.splice(indexOf(sgState.id) + 1, 0, tile);
+            state.selectedId = tile.id;
+            if (emissive) sgEnableEmissiveExport();
+            closeModal();
+            renderGrid();
+            pushHistory('Stained glass');
+            showToast(emissive
+                ? 'Added stained glass tile (Emissive export map enabled)'
+                : 'Added stained glass tile', 'success');
+        });
+    }
+
+    /* Auto-enable the Emissive export map so the glow actually ships. */
+    function sgEnableEmissiveExport() {
+        const cb = document.querySelector('#at-map-checks input[data-map="emissive"]');
+        if (cb && !cb.checked) cb.checked = true;
     }
 
     /* ============ MATERIAL MAP DERIVATION ============
@@ -7536,6 +8813,15 @@ window.TRLE = window.TRLE || {};
         const raw = ($('at-export-name')?.value || '').trim();
         const safe = raw.replace(/[^a-zA-Z0-9 _.-]/g, '').replace(/\s+/g, '_').replace(/^\.+/, '');
         return safe || 'atlas';
+    }
+
+    /* Drop the .atlasproj.json save file into an export ZIP (opt-out checkbox), so
+       a shipped export can be re-opened and edited instead of rebuilt. It carries
+       the tile PNGs as data-URLs, hence the size warning on the control. */
+    async function addProjectToZip(zip, prefix, baseName) {
+        const cb = $('at-export-project');
+        if (!cb || !cb.checked || !state.elements.length) return;
+        zip.file(`${prefix}${baseName}.atlasproj.json`, JSON.stringify(await buildProjectJSON()));
     }
 
     /* ---- Export "conveyor belt" flavour animation --------------------------
@@ -7820,6 +9106,7 @@ window.TRLE = window.TRLE || {};
                 tileSize: S, cols, rows, elements: manifest,
                 ...(animations.length ? { animations } : {})
             }, null, 2));
+            await addProjectToZip(zip, prefix, baseName);
 
             fill.style.width = '95%';
             const content = await zip.generateAsync({ type: 'blob' });
@@ -7878,6 +9165,7 @@ window.TRLE = window.TRLE || {};
                 tileSize: state.tileSize, cols, rows: Math.ceil(state.elements.length / cols),
                 count: state.elements.length, naming: 'tile_r{row}_c{col}'
             }, null, 2));
+            await addProjectToZip(zip, prefix, exportBaseName());
             const content = await zip.generateAsync({ type: 'blob' });
             downloadBlob(content, `${exportBaseName()}_tiles.zip`);
             fill.style.width = '100%';
@@ -7905,52 +9193,166 @@ window.TRLE = window.TRLE || {};
         const c = document.createElement('canvas'); c.width = S; c.height = S;
         return c;
     }
+    /* Decode a stored tile back to an <img>. Saved files hold data-URL strings;
+       the IndexedDB autosave holds Blobs, which need a temporary object URL. */
     function loadImageURL(src) {
+        if (src instanceof Blob) {
+            const url = URL.createObjectURL(src);
+            return loadImageURL(url).then(img => { URL.revokeObjectURL(url); return img; });
+        }
         return new Promise(res => { const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = src; });
     }
 
-    function saveProject() {
-        if (!state.elements.length) { showToast('Slice an atlas first!', 'error'); return; }
-        const proj = {
-            version: 1, tileSize: state.tileSize, cols: state.cols, nextId: state.nextId,
-            elements: state.elements.map(el => {
-                const e = {
-                    id: el.id, kind: el.kind,
-                    seamless: !!el.seamless, edited: !!el.edited,
-                    material: el.material || null,
-                    base: el.base ?? null, overlay: el.overlay ?? null,
-                    mode: el.mode ?? null, pivot: el.pivot ?? null, hardness: el.hardness ?? null,
-                    blendMethod: el.blendMethod ?? null, wangBits: el.wangBits ?? null
-                };
-                if (el.bset) e.bset = el.bset;   // border-set recipe (re-rendered on load)
-                if (el.kind === 'tile') {
-                    e.original = el.original.toDataURL('image/png');
-                    if (el.seamless || el.edited) e.canvas = el.canvas.toDataURL('image/png');
-                }
-                if (el.customMask) e.customMask = el.customMask.toDataURL('image/png');
-                if (el.overlayGeom) e.overlayGeom = el.overlayGeom;
-                if (el.emissive) e.emissive = el.emissive.toDataURL('image/png');
-                if (hasMatLayers(el)) e.matLayers = el.matLayers.map(L => ({
+    /* PNG-encode a canvas to a data URL *without* blocking the main thread.
+       toDataURL() encodes synchronously, so a 64-tile atlas froze the UI for the
+       whole save; toBlob() hands the encode off and FileReader does the base64
+       asynchronously. Identical bytes out — the project format is unchanged. */
+    function canvasToPNGDataURL(canvas) {
+        return TRLE.Engine.canvasToBlob(canvas).then(blob => new Promise(res => {
+            const r = new FileReader();
+            r.onload  = () => res(r.result);
+            // Losing a tile is worse than a brief hitch, so fall back to the sync path.
+            r.onerror = () => res(canvas.toDataURL('image/png'));
+            r.readAsDataURL(blob);
+        }));
+    }
+
+    /* One serialiser, two pixel encodings. `png` is either canvasToPNGDataURL
+       (saved files — JSON-safe strings, unchanged format) or canvasToBlob (the
+       IndexedDB autosave, which stores Blobs directly and so skips base64
+       entirely along with the multi-MB JSON.stringify that goes with it). */
+    async function buildProjectData(png) {
+        const elements = [];
+        for (const el of state.elements) {
+            const e = {
+                id: el.id, kind: el.kind,
+                seamless: !!el.seamless, edited: !!el.edited,
+                material: el.material || null,
+                base: el.base ?? null, overlay: el.overlay ?? null,
+                mode: el.mode ?? null, pivot: el.pivot ?? null, hardness: el.hardness ?? null,
+                blendMethod: el.blendMethod ?? null, wangBits: el.wangBits ?? null
+            };
+            if (el.bset) e.bset = el.bset;   // border-set recipe (re-rendered on load)
+            if (el.kind === 'tile') {
+                e.original = await png(el.original);
+                if (el.seamless || el.edited) e.canvas = await png(el.canvas);
+            }
+            if (el.customMask) e.customMask = await png(el.customMask);
+            if (el.overlayGeom) e.overlayGeom = el.overlayGeom;
+            // Anim emissive is re-derived from el.anim.glow on load — don't bloat
+            // the file with per-frame PNGs; authored (non-anim) emissive is saved.
+            if (el.emissive && el.kind !== 'anim') e.emissive = await png(el.emissive);
+            if (hasMatLayers(el)) {
+                e.matLayers = [];
+                for (const L of el.matLayers) e.matLayers.push({
                     name: L.name, color: L.color, feather: L.feather || 0,
                     material: L.material || null,
-                    mask: L.mask ? L.mask.toDataURL('image/png') : null
-                }));
-                // Animations store only params — frames are regenerated on load.
-                if (el.anim) e.anim = el.anim;
-                if (el.htParams) e.htParams = el.htParams;   // height-transition recipe (re-editable)
-                return e;
-            })
+                    mask: L.mask ? await png(L.mask) : null
+                });
+            }
+            // Animations store only params — frames are regenerated on load.
+            if (el.anim) e.anim = el.anim;
+            if (el.htParams) e.htParams = el.htParams;   // height-transition recipe (re-editable)
+            if (el.sgParams) e.sgParams = el.sgParams;   // stained-glass recipe (re-editable)
+            elements.push(e);
+        }
+        return {
+            version: 1, name: exportBaseName(),
+            tileSize: state.tileSize, cols: state.cols, nextId: state.nextId,
+            elements
         };
-        downloadBlob(new Blob([JSON.stringify(proj)], { type: 'application/json' }), 'atlas-project.atlasproj.json');
-        showToast('Project saved', 'success');
+    }
+
+    /* Saved-file flavour: data URLs, so JSON.stringify can swallow it whole. */
+    const buildProjectJSON = () => buildProjectData(canvasToPNGDataURL);
+    /* Autosave flavour: Blobs, stored by structured clone with no text step. */
+    const buildProjectSnapshot = () => buildProjectData(c => TRLE.Engine.canvasToBlob(c));
+
+    /* Save asks for a name first: the download is automatic, so an unnamed save
+       silently becomes another atlas-project (3).json nobody can tell apart. The
+       name is the project name field, so one name covers save + every export. */
+    function saveProject() {
+        if (!state.elements.length) { showToast('Slice an atlas first!', 'error'); return; }
+        openConfirm(
+            '💾 Save Project',
+            'Name this project. The same name is used for the save file and for everything you export '
+            + '— use the folder name you want under assets/textures.',
+            '💾 Save',
+            (name) => {
+                $('at-export-name').value = name;          // one global name
+                const base = exportBaseName();             // …sanitised for the file system
+                $('at-export-name').value = base;
+                writeProjectFile(base);
+            },
+            { danger: false, input: { label: 'Project name', value: exportBaseName(), placeholder: 'my_atlas' } }
+        );
+    }
+
+    /* Write the project JSON out under `base`, and mark the work as saved.
+       Encoding is async now, so the button shows a busy state while it runs. */
+    async function writeProjectFile(base) {
+        const btn = $('at-save-project');
+        setBusy(btn, true, 'Saving…');
+        try {
+            const json = JSON.stringify(await buildProjectJSON());
+            downloadBlob(new Blob([json], { type: 'application/json' }), `${base}.atlasproj.json`);
+            markSaved();
+            discardAutosave();   // the file is authoritative now; nothing to recover
+            showToast(`Project saved as “${base}.atlasproj.json” 💾`, 'success');
+        } catch (err) {
+            console.error(err);
+            showToast('Could not save the project — see console for details', 'error');
+        } finally {
+            setBusy(btn, false);
+        }
+    }
+
+    /* Pull the project JSON out of whatever the user picked — either the
+       .atlasproj.json itself, or one of our export ZIPs, which carry a copy
+       (addProjectToZip). That makes the export a self-contained session bundle:
+       textures to ship, project to keep editing, one file. */
+    async function readProjectText(file) {
+        if (!/\.zip$/i.test(file.name) && file.type !== 'application/zip') return file.text();
+        const zip = await JSZip.loadAsync(file);
+        const entry = Object.values(zip.files)
+            .find(f => !f.dir && /\.atlasproj\.json$/i.test(f.name));
+        if (!entry) throw new Error('no project file in zip');
+        return entry.async('string');
+    }
+
+    /* Loading replaces the whole workbench, so unsaved work gets a confirm. */
+    function requestLoadProject(file) {
+        if (!state.dirty || !state.elements.length) { loadProject(file); return; }
+        openConfirm(
+            '📂 Load Project',
+            'You have unsaved changes. Loading replaces everything in the workbench '
+            + '— save the current project first if you want to keep it.',
+            '📂 Load anyway',
+            () => loadProject(file),
+            { danger: true }
+        );
     }
 
     async function loadProject(file) {
         let proj;
-        try { proj = JSON.parse(await file.text()); }
-        catch { showToast('Could not read project file', 'error'); return; }
+        try { proj = JSON.parse(await readProjectText(file)); }
+        catch {
+            showToast(/\.zip$/i.test(file.name)
+                ? 'No project file in that ZIP — re-export with “Include the project file” ticked'
+                : 'Could not read project file', 'error');
+            return;
+        }
+        if (await applyProject(proj)) {
+            showToast(`Project loaded (${state.elements.length} elements)`, 'success');
+        }
+    }
+
+    /* Rebuild the workbench from a project object — from a file, or from the
+       IndexedDB autosave. Tiles arrive as data URLs or Blobs; loadImageURL takes
+       both. Returns false (having complained) if the object isn't one of ours. */
+    async function applyProject(proj) {
         if (!proj || proj.version !== 1 || !Array.isArray(proj.elements)) {
-            showToast('Invalid project file', 'error'); return;
+            showToast('Invalid project file', 'error'); return false;
         }
         const S = proj.tileSize;
         const els = [];
@@ -7967,6 +9369,7 @@ window.TRLE = window.TRLE || {};
                 overlayGeom: e.overlayGeom || null,
                 anim: e.anim || null,
                 htParams: e.htParams || null,
+                sgParams: e.sgParams || null,
                 original: null, canvas: null
             };
             if (e.customMask) { const im = await loadImageURL(e.customMask); if (im) el.customMask = imgToCanvas(im); }
@@ -7993,6 +9396,9 @@ window.TRLE = window.TRLE || {};
         state.nextId = proj.nextId || (Math.max(0, ...els.map(e => e.id)) + 1);
         state.elements = els;
         state.selectedId = null; state.focusedId = null; state.selSet.clear(); state.selAnchor = null;
+        // Restore the project name so a load → edit → save round-trips it (older
+        // files predate the field and simply keep whatever name is in the box).
+        if (proj.name) $('at-export-name').value = proj.name;
         exitPickMode();
         refreshAnims();         // regenerate animation frames from restored params
         refreshTransitions();
@@ -8000,7 +9406,198 @@ window.TRLE = window.TRLE || {};
         $('at-export-card').style.display = 'block';
         renderGrid();
         resetHistory('Project loaded');
-        showToast(`Project loaded (${els.length} elements)`, 'success');
+        return true;
+    }
+
+    /* ============ AUTOSAVE (IndexedDB session) ============
+       A crash net, nothing more: one slot, overwritten as you work, offered back
+       on the next boot. Files remain the way projects are kept — see js/store.js.
+
+       Two rules keep it off the critical path. It is DEBOUNCED, so a burst of
+       edits costs one write, not one per edit; and it stores Blobs, so there is
+       no base64 and no multi-MB JSON.stringify (the residual main-thread cost
+       the saved-file path still pays). Failures are logged, never surfaced —
+       a browser that won't give us storage must not interrupt the work. */
+    const AUTOSAVE_DELAY = 900;
+    const autosave = { timer: null, running: false, again: false, at: 0 };
+    /* What the rail is currently showing. "Autosaved 2 minutes ago" lives on
+       screen permanently now, so it has to keep up with the clock — otherwise it
+       still reads "less than a minute ago" an hour later. Cached so the repaint
+       timer never touches storage. */
+    const storageView = { savedAt: 0, suffix: '' };
+
+    function scheduleAutosave() {
+        if (!TRLE.Store || !TRLE.Store.available()) return;
+        clearTimeout(autosave.timer);
+        autosave.timer = setTimeout(runAutosave, AUTOSAVE_DELAY);
+    }
+
+    async function runAutosave() {
+        if (!state.elements.length) return;
+        // A save already in flight: mark it stale rather than piling up encodes.
+        if (autosave.running) { autosave.again = true; return; }
+        autosave.running = true;
+        try {
+            const project = await buildProjectSnapshot();
+            const header = await TRLE.Store.saveSession(project, {
+                name: project.name, count: project.elements.length, tileSize: project.tileSize,
+                bytes: snapshotBytes(project)
+            });
+            if (header) {
+                autosave.at = header.savedAt;
+                renderStorageInfo();
+            }
+        } catch (err) {
+            console.warn('Autosave skipped:', err);
+        } finally {
+            autosave.running = false;
+            if (autosave.again) { autosave.again = false; scheduleAutosave(); }
+        }
+    }
+
+    /* Saving to a file makes that file authoritative, so the crash net has
+       nothing left to recover — dropping it keeps the restore prompt meaningful
+       (it then only ever appears after an actual crash or an unsaved close). */
+    function discardAutosave() {
+        clearTimeout(autosave.timer);
+        autosave.at = 0;
+        storageView.savedAt = 0;
+        if (TRLE.Store && TRLE.Store.available()) {
+            TRLE.Store.clearSession().then(renderStorageInfo, () => {});
+        }
+    }
+
+    function relativeTime(ts) {
+        const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+        if (s < 60) return 'less than a minute ago';
+        const m = Math.round(s / 60);
+        if (m < 60) return `${m} minute${m === 1 ? '' : 's'} ago`;
+        const h = Math.round(m / 60);
+        if (h < 24) return `${h} hour${h === 1 ? '' : 's'} ago`;
+        const d = Math.round(h / 24);
+        return `${d} day${d === 1 ? '' : 's'} ago`;
+    }
+
+    const fmtBytes = b => b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB`
+                       : b >= 1024 ? `${Math.round(b / 1024)} KB` : `${b} B`;
+
+    /* Exact size of what we just stored — the sum of the PNG Blobs, which are
+       all the bulk. Measured rather than taken from navigator.storage.estimate(),
+       which reports the whole origin (every database, caches, localStorage), pads
+       the figure for privacy, and lags behind deletes because IndexedDB reclaims
+       space lazily — so it drifts up and down by tens of MB on its own. */
+    function snapshotBytes(proj) {
+        let n = 0;
+        const add = v => { if (v instanceof Blob) n += v.size; };
+        for (const e of proj.elements) {
+            add(e.original); add(e.canvas); add(e.customMask); add(e.emissive);
+            if (Array.isArray(e.matLayers)) for (const L of e.matLayers) add(L.mask);
+        }
+        return n;
+    }
+
+    /* "Session autosaved 2 minutes ago · 12.4 MB stored" + the manual clear.
+       Storage is invisible by nature, so show what's held and how to drop it. */
+    /* The whole rail group hides until there's something to say — an empty
+       "Session" heading above the message log would be permanent clutter. */
+    async function renderStorageInfo() {
+        const group = $('at-storage-group'), info = $('at-storage-info');
+        const btn = $('at-storage-clear'), keep = $('at-storage-persist');
+        if (!group || !info || !btn) return;
+        const hide = () => { group.style.display = 'none'; };
+
+        if (!TRLE.Store || !TRLE.Store.available()) {
+            // Worth saying once the user has work that isn't being covered.
+            if (!state.elements.length) return hide();
+            group.style.display = '';
+            info.textContent = 'Autosave unavailable in this browser — save your project to a file.';
+            btn.style.display = 'none';
+            if (keep) keep.style.display = 'none';
+            return;
+        }
+        const meta = await TRLE.Store.sessionMeta();
+        if (!meta) return hide();
+
+        const persisted = await TRLE.Store.isPersisted();
+        group.style.display = '';
+        storageView.savedAt = meta.savedAt;
+        // Our own measured size — steady, and it only moves when the work does.
+        storageView.suffix = (meta.bytes ? ` · ${fmtBytes(meta.bytes)}` : '')
+                           + (persisted ? ' · protected from cleanup' : '');
+        paintStorageInfo();
+        // The browser's origin-wide figure is useful but jittery, so it goes in
+        // the tooltip rather than the line you're looking at while working.
+        const est = await TRLE.Store.estimate();
+        info.title = est && est.usage
+            ? `This session: ${fmtBytes(meta.bytes || 0)}\n`
+              + `All data this site holds in your browser: ${fmtBytes(est.usage)}`
+              + (est.quota ? ` of ~${fmtBytes(est.quota)} available` : '')
+              + `\n(the browser's own figure — it is approximate, covers everything `
+              + `this site has stored, and takes a while to shrink after deletions)`
+            : '';
+        btn.style.display = '';
+        // Offered, never taken: the request raises a permission prompt in Firefox,
+        // so it has to be the user's click, not a background side effect.
+        if (keep) keep.style.display = persisted ? 'none' : '';
+    }
+
+    function paintStorageInfo() {
+        const info = $('at-storage-info');
+        if (!info || !storageView.savedAt) return;
+        info.textContent = `Autosaved ${relativeTime(storageView.savedAt)}${storageView.suffix}`;
+    }
+    setInterval(() => {
+        const group = $('at-storage-group');
+        if (group && group.style.display !== 'none') paintStorageInfo();
+    }, 30000);
+
+    /* Offer the stored session back, once, on boot. Never restores silently:
+       the tool may have been closed deliberately, and stomping a fresh start
+       with an old atlas is worse than one extra click. */
+    async function offerSessionRestore() {
+        if (!TRLE.Store || !TRLE.Store.available()) return;
+        const meta = await TRLE.Store.sessionMeta();
+        renderStorageInfo();
+        if (!meta || !meta.count || state.elements.length) return;
+        openConfirm(
+            '⏱️ Restore last session?',
+            `An autosaved session from ${relativeTime(meta.savedAt)} is still here — `
+            + `“${meta.name}”, ${meta.count} element${meta.count === 1 ? '' : 's'}. `
+            + `Restore it, or pick "Not now" and it stays put until you clear it.`,
+            '⏱️ Restore',
+            async () => {
+                const proj = await TRLE.Store.loadSession();
+                if (!proj) { showToast('That session could not be read', 'error'); return; }
+                if (await applyProject(proj)) {
+                    // Restored work isn't in a file yet, so it counts as unsaved.
+                    markDirty();
+                    showToast(`Session restored (${state.elements.length} elements) ⏱️`, 'success');
+                }
+            },
+            { danger: false, cancelLabel: 'Not now' }
+        );
+    }
+
+    function setupStorageUI() {
+        const btn = $('at-storage-clear');
+        if (!btn) return;
+        const keep = $('at-storage-persist');
+        if (keep) keep.addEventListener('click', async () => {
+            const ok = await TRLE.Store.requestPersistence();
+            showToast(ok ? 'Stored session protected from browser cleanup 🔒'
+                         : 'The browser declined — the session is still autosaved, just evictable if disk runs low',
+                      ok ? 'success' : 'warning', ok ? 3000 : 5000);
+            renderStorageInfo();
+        });
+        btn.addEventListener('click', () => openConfirm(
+            '🧹 Clear stored session',
+            'This deletes the autosaved session from this browser. Your exported files and '
+            + 'saved project files are untouched — but anything not saved to a file is gone.',
+            '🧹 Clear',
+            () => { discardAutosave(); showToast('Stored session cleared 🧹', 'success'); },
+            { danger: true }
+        ));
+        renderStorageInfo();
     }
 
     /* ============ BLANK ATLAS + DYNAMIC TILES (Phase A) ============ */
@@ -8423,7 +10020,7 @@ window.TRLE = window.TRLE || {};
         $('at-save-project').addEventListener('click', saveProject);
         $('at-load-project').addEventListener('click', () => $('at-load-project-file').click());
         $('at-load-project-file').addEventListener('change', e => {
-            if (e.target.files[0]) loadProject(e.target.files[0]);
+            if (e.target.files[0]) requestLoadProject(e.target.files[0]);
             e.target.value = '';
         });
         $('at-undo').addEventListener('click', undo);
@@ -8433,11 +10030,22 @@ window.TRLE = window.TRLE || {};
         setupBulkBar();
         $('at-confirm-ok').addEventListener('click', () => {
             const cb = confirmCb;
+            const value = confirmInputValue();
             confirmNoCb = null;       // OK chosen → suppress the "No" action
             closeModal();
-            if (cb) cb();
+            if (cb) cb(value);
+        });
+        $('at-confirm-input').addEventListener('input', confirmInputOn);
+        $('at-confirm-input').addEventListener('keydown', e => {
+            // Enter commits the prompt (the field swallows it before the modal's
+            // own Ctrl+Enter shortcut would fire).
+            if (e.key !== 'Enter') return;
+            e.preventDefault();
+            if (!$('at-confirm-ok').disabled) $('at-confirm-ok').click();
         });
         setupHistoryShortcuts();
+        setupUnloadGuard();
+        setupStorageUI();
 
         setupGrid();
         setupCtxMenu();
@@ -8450,6 +10058,7 @@ window.TRLE = window.TRLE || {};
         setupVarModal();
         setupOrigamiModal();
         setupBuildModal();
+        setupStainedGlassModal();
         setupWangModal();
         setupBsetModal();
         setupFadeModal();
@@ -8470,7 +10079,10 @@ window.TRLE = window.TRLE || {};
         // Tutorial-asset capture hook — only active with ?capture in the URL, so
         // it has zero effect on normal use. Lets tools/capture-examples.mjs drive
         // the REAL composition functions over CDP (single-sourced, no drift).
+        // Capture runs skip the restore prompt (they build their own atlas and a
+        // stray modal would break them) and trigger it via _cap instead.
         if (/[?&]capture/i.test(location.search)) installCaptureHook();
+        else offerSessionRestore();
     }
 
     function installCaptureHook() {
@@ -8481,6 +10093,33 @@ window.TRLE = window.TRLE || {};
         const url = c => c.toDataURL('image/png');
         const tile = (canvas, id) => ({ id, kind: 'tile', canvas, original: cloneCanvas(canvas), seamless: false, edited: false, material: null });
         window.TRLE._cap = {
+            // Structure introspection for the CDP validators (no pixel data).
+            inspect(i) {
+                const el = state.elements[i];
+                if (!el) return null;
+                return {
+                    id: el.id, kind: el.kind, seamless: !!el.seamless,
+                    material: el.material ? el.material.key : null,
+                    matLayers: hasMatLayers(el) ? el.matLayers.map(L => L.material && L.material.key) : null,
+                    emissive: !!el.emissive,
+                    sgParams: el.sgParams ? JSON.parse(JSON.stringify(el.sgParams)) : null,
+                    htParams: !!el.htParams
+                };
+            },
+            count() { return state.elements.length; },
+            // test-only: mean luma of an element's emissive canvas (-1 if none).
+            // Lets validators confirm glow baking + that Pulse varies across frames.
+            emissiveMean(i) {
+                const el = state.elements[i];
+                if (!el || !el.emissive) return -1;
+                const d = el.emissive.getContext('2d').getImageData(0, 0, el.emissive.width, el.emissive.height).data;
+                let s = 0, n = 0;
+                for (let p = 0; p < d.length; p += 4) { s += 0.299 * d[p] + 0.587 * d[p + 1] + 0.114 * d[p + 2]; n++; }
+                return n ? s / n : -1;
+            },
+            // test-only: force a tile's seamless flag (validators can't cheaply
+            // run the whole Make Seamless flow just to test flag inheritance)
+            setSeamless(i, v) { const el = state.elements[i]; if (el) { el.seamless = !!v; renderGrid(); } return !!el; },
             // tile (just resampled) — used for "before" frames
             async single(src, S) { return url(toC(await loadImg(src), S)); },
             // 2×2 tiled collage — to show seam behaviour
@@ -8652,9 +10291,48 @@ window.TRLE = window.TRLE || {};
                 renderGrid();
                 return true;
             },
+            // Bulk atlas for perf checks — a save has to encode every tile, so the
+            // main-thread cost only shows up once there are enough of them.
+            async setupManyTiles(src, S, n) {
+                const A = toC(await loadImg(src), S);
+                state.tileSize = S; state.cols = 4; state.nextId = n + 1;
+                state.elements = [];
+                for (let i = 0; i < n; i++) state.elements.push(tile(cloneCanvas(A), i + 1));
+                $('at-grid-card').style.display = 'block';
+                renderGrid();
+                return state.elements.length;
+            },
+            // Element order — drives the drag-reorder checks without synthesising
+            // HTML5 drag events (which headless Chrome won't dispatch usefully).
+            ids() { return state.elements.map(e => e.id); },
+            reorder(dragId, targetId) { reorderElements(dragId, targetId); return state.elements.map(e => e.id); },
+            // Autosave drivers — the debounce and the boot prompt are closure-private.
+            async autosaveNow() { clearTimeout(autosave.timer); await runAutosave(); return TRLE.Store.sessionMeta(); },
+            storeMeta() { return TRLE.Store.sessionMeta(); },
+            offerRestore() { return offerSessionRestore(); },
+            clearStore() { discardAutosave(); return true; },
             openAnchor() { openAnchorModal(1, 2); return true; },
             openTrans() { openTransModal(1, 2); return true; },
             openCtx(id) { openCtxMenuForCell(id); return true; },
+            // test-only selection driver: select by index, read back the selection
+            // and the remembered "last material" (all closure-private otherwise).
+            selectIdx(idxs) {
+                setSelection(idxs.map(i => state.elements[i] && state.elements[i].id).filter(v => v != null), false);
+                renderGrid();
+                return state.selSet.size;
+            },
+            selection() { return selectedIdsInOrder(); },
+            lastMaterial() { return state.lastMaterial ? state.lastMaterial.key : null; },
+            dirty() { return state.dirty; },
+            // Boundary-editor anchors (anchored transition / transition grid) — the
+            // tool state objects are closure-private, so validators read them here.
+            anchors(which) {
+                const S = which === 'tg' ? tg : anchorTr;
+                return { axis: S.axis, anchors: S.anchors.map(a => ({ x: a.x, y: a.y })) };
+            },
+            // Project JSON header only — the full thing carries every tile as a
+            // data-URL and would be far too big to hand back over CDP.
+            async projectHead() { const p = await buildProjectJSON(); return { name: p.name, version: p.version, count: p.elements.length }; },
             openGrid() { openTransGridModal(1, 2); return true; },
             openOrganic() { openOrganicModal(1, 2); return true; },
             seamToggle(side, seg) { if (org.seam) org.seam[side][seg] = !org.seam[side][seg]; orgDrawSeamBox(); return org.seam ? org.seam[side][seg] : null; },

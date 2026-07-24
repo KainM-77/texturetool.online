@@ -52,8 +52,21 @@
 
 <div class="at-shell">
 
-<!-- ============ LEFT RAIL: MESSAGE LOG ============ -->
+<!-- ============ LEFT RAIL: SESSION + MESSAGE LOG ============ -->
 <aside class="at-rail at-rail-left">
+    <!-- Session sits above Messages: it's persistent status, not a one-off event,
+         and it belongs where it's visible while working rather than buried at the
+         bottom of the export card. Hidden entirely until there's a session. -->
+    <div class="at-rail-group" id="at-storage-group" style="display:none;">
+        <div class="at-rail-title">Session</div>
+        <div class="at-storage-row">
+            <span id="at-storage-info" class="at-storage-info"></span>
+            <button class="btn btn-secondary" id="at-storage-persist" style="display:none;"
+                    title="Ask the browser to keep this session even when disk space runs low. Firefox will ask your permission.">🔒 Protect from cleanup</button>
+            <button class="btn btn-secondary" id="at-storage-clear" style="display:none;"
+                    title="Delete the autosaved session held in this browser">🧹 Clear stored session</button>
+        </div>
+    </div>
     <div class="at-rail-title">Messages</div>
     <div class="at-msg-log" id="at-msg-log-list" aria-live="polite" aria-label="Messages"></div>
 </aside>
@@ -153,6 +166,7 @@
         <div id="at-bulk-bar" class="at-pick-banner at-bulk-bar" style="display:none;">
             <span class="at-bulk-count"><strong id="at-bulk-count">0</strong> selected</span>
             <button class="btn btn-secondary btn-sm" id="at-bulk-material" title="Apply a material to all selected tiles">🎨 Apply Material…</button>
+            <button class="btn btn-secondary btn-sm" id="at-bulk-lastmaterial" style="display:none;" title="Re-apply the last material you assigned">↺ Repeat material</button>
             <button class="btn btn-secondary btn-sm" id="at-bulk-gather" title="Gather the selected tiles together so they're contiguous in the atlas">🧲 Group together</button>
             <button class="btn btn-secondary btn-sm" id="at-bulk-front" title="Move the selected tiles to the start of the atlas">⏮ To front</button>
             <button class="btn btn-secondary btn-sm" id="at-bulk-back" title="Move the selected tiles to the end of the atlas">To back ⏭</button>
@@ -210,9 +224,9 @@
         </label>
         <div class="form-row" style="margin-top:10px;align-items:flex-end;">
             <div class="form-group" style="min-width:160px;">
-                <label>Atlas name</label>
+                <label>Project name</label>
                 <input type="text" id="at-export-name" value="atlas" maxlength="64"
-                       placeholder="atlas" title="Base file name for the exported atlas and its material maps">
+                       placeholder="atlas" title="One name for everything: the exported atlas and its material maps, the per-tile files, and the saved project. Use the folder name you want under assets/textures.">
             </div>
             <div class="form-group" style="min-width:150px;">
                 <label>Format</label>
@@ -233,6 +247,10 @@
         <label class="checkbox-row" style="margin:8px 0;">
             <input type="checkbox" id="at-export-magenta"> Magenta color-key — flatten transparent pixels to magenta (Tomb Editor invisible)
         </label>
+        <label class="checkbox-row" style="margin:8px 0;"
+               title="Adds the .atlasproj.json save file to the ZIP so the export can be re-opened and edited later. It embeds the tile images, so it adds a few MB.">
+            <input type="checkbox" id="at-export-project" checked> Include the project file (.atlasproj.json) so this export can be re-opened later
+        </label>
         <div class="export-stage" id="at-export-stage" aria-hidden="true">
             <canvas id="at-export-anim" class="export-anim" width="256" height="128"></canvas>
             <div class="export-quip" id="at-export-quip"></div>
@@ -244,8 +262,11 @@
             <button class="btn btn-primary" id="at-export-btn">📥 Export Atlas with Material Maps (ZIP)</button>
             <button class="btn btn-secondary" id="at-export-tiles" title="Export each tile as its own image (plus any enabled maps) for editing elsewhere">🧩 Export Tiles Individually</button>
             <button class="btn btn-secondary" id="at-save-project">💾 Save Project</button>
-            <button class="btn btn-secondary" id="at-load-project">📂 Load Project</button>
-            <input type="file" id="at-load-project-file" accept=".json,application/json" style="display:none;">
+            <span id="at-unsaved" class="at-unsaved" style="display:none;"
+                  title="You have edits that aren't in a saved project file yet">● unsaved changes</span>
+            <button class="btn btn-secondary" id="at-load-project"
+                    title="Open a .atlasproj.json, or an export ZIP that includes one">📂 Load Project</button>
+            <input type="file" id="at-load-project-file" accept=".json,.zip,application/json,application/zip" style="display:none;">
         </div>
     </div>
 </section>
@@ -262,39 +283,67 @@
 
 <!-- ============ CONTEXT MENU ============ -->
 <div class="at-ctx" id="at-ctx" role="menu" aria-label="Element actions" style="display:none;">
-    <button data-action="editanim" role="menuitem" data-animonly>🎞️ Edit Animation…</button>
-    <button data-action="edithtrans" role="menuitem" data-httonly>🏔️ Edit Height Transition…</button>
-    <button data-action="seamless" role="menuitem" data-animhide>🔄 Make Seamless…</button>
-    <button data-action="transition" role="menuitem" data-animhide>🔀 Make Transition with Texture…</button>
-    <button data-action="wang" role="menuitem" data-animhide>🧩 Make Wang Set with Texture…</button>
-    <button data-action="borderset" role="menuitem" data-animhide>🧱 Add Borders &amp; Corners…</button>
-    <button data-action="anchor" role="menuitem" data-animhide>📐 Make Anchored Transition…</button>
-    <button data-action="transgrid" role="menuitem" data-animhide>🗺️ Make Transition Grid…</button>
-    <button data-action="organic" role="menuitem" data-animhide>🌿 Make Organic Transition…</button>
-    <button data-action="heighttrans" role="menuitem" data-animhide>🏔️ Make Height Transition…</button>
-    <button data-action="material" role="menuitem">🎨 Set Material…</button>
-    <button data-action="gotobase" role="menuitem" data-transonly>🧭 Go to Base Texture</button>
-    <button data-action="gotooverlay" role="menuitem" data-transonly>🧭 Go to Overlay Texture</button>
-    <button data-action="heal" role="menuitem" data-tileonly>🩹 Heal / Fill…</button>
-    <button data-action="fade" role="menuitem" data-tileonly>🫥 Fade to Transparent…</button>
-    <button data-action="emissive" role="menuitem" data-tileonly>✨ Make Emissive…</button>
-    <hr data-tileonly>
-    <button data-action="variations" role="menuitem" data-tileonly>✨ Generate Variations…</button>
-    <button data-action="buildpattern" role="menuitem" data-tileonly>🏗️ Build Pattern…</button>
-    <button data-action="origami" role="menuitem" data-tileonly>🪞 Origami Frame (fold to rings)</button>
-    <hr data-tileonly>
-    <button data-action="rotate" role="menuitem" data-tileonly>↻ Rotate 90°</button>
-    <button data-action="fliph"  role="menuitem" data-tileonly>↔ Flip Horizontal</button>
-    <button data-action="flipv"  role="menuitem" data-tileonly>↕ Flip Vertical</button>
-    <button data-action="offset" role="menuitem" data-tileonly>⊹ Offset ½ (roll)</button>
-    <button data-action="coloradj" role="menuitem" data-tileonly>🎚 Adjust Colours…</button>
-    <button data-action="recolor" role="menuitem" data-tileonly>🖌 Recolor from Texture…</button>
-    <button data-action="delight" role="menuitem" data-tileonly>☀ De-light…</button>
-    <button data-action="replace" role="menuitem" data-tileonly>🖼 Replace Image…</button>
-    <hr>
-    <button data-action="download" role="menuitem">⬇️ Download PNG</button>
-    <button data-action="reset" role="menuitem" data-tileonly>↩️ Reset to Original</button>
-    <button data-action="delete" role="menuitem" class="at-ctx-danger">🗑️ Delete…</button>
+    <!-- Columns, not one long list: the menu had grown past the viewport, so
+         reaching the bottom meant scrolling a popup. Each group is a column with
+         a heading; openCtxMenu hides any column whose entries are all hidden, so
+         an anim frame or a transition shows only the columns that apply. -->
+    <div class="at-ctx-col" data-col="edit">
+        <div class="at-ctx-title">Edit</div>
+        <button data-action="editanim" role="menuitem" data-animonly>🎞️ Edit Animation…</button>
+        <button data-action="edithtrans" role="menuitem" data-httonly>🏔️ Edit Height Transition…</button>
+        <button data-action="editstainedglass" role="menuitem" data-sgonly>🪟 Edit Stained Glass…</button>
+    </div>
+    <div class="at-ctx-col" data-col="transitions">
+        <div class="at-ctx-title">Transitions</div>
+        <button data-action="transition" role="menuitem" data-animhide>🔀 Make Transition with Texture…</button>
+        <button data-action="wang" role="menuitem" data-animhide>🧩 Make Wang Set with Texture…</button>
+        <button data-action="borderset" role="menuitem" data-animhide>🧱 Add Borders &amp; Corners…</button>
+        <button data-action="anchor" role="menuitem" data-animhide>📐 Make Anchored Transition…</button>
+        <button data-action="transgrid" role="menuitem" data-animhide>🗺️ Make Transition Grid…</button>
+        <button data-action="organic" role="menuitem" data-animhide>🌿 Make Organic Transition…</button>
+        <button data-action="heighttrans" role="menuitem" data-animhide>🏔️ Make Height Transition…</button>
+    </div>
+    <div class="at-ctx-col" data-col="generate">
+        <div class="at-ctx-title">Generate</div>
+        <button data-action="seamless" role="menuitem" data-animhide>🔄 Make Seamless…</button>
+        <button data-action="variations" role="menuitem" data-tileonly>✨ Generate Variations…</button>
+        <button data-action="buildpattern" role="menuitem" data-tileonly>🏗️ Build Pattern…</button>
+        <button data-action="origami" role="menuitem" data-tileonly>🪞 Origami Frame (fold to rings)</button>
+        <button data-action="stainedglass" role="menuitem" data-tileonly>🪟 Stained Glass…</button>
+    </div>
+    <div class="at-ctx-col" data-col="transform">
+        <div class="at-ctx-title">Transform</div>
+        <button data-action="rotate" role="menuitem" data-tileonly>↻ Rotate 90°</button>
+        <button data-action="fliph"  role="menuitem" data-tileonly>↔ Flip Horizontal</button>
+        <button data-action="flipv"  role="menuitem" data-tileonly>↕ Flip Vertical</button>
+        <button data-action="offset" role="menuitem" data-tileonly>⊹ Offset ½ (roll)</button>
+    </div>
+    <div class="at-ctx-col" data-col="adjust">
+        <div class="at-ctx-title">Adjust</div>
+        <button data-action="coloradj" role="menuitem" data-tileonly>🎚 Adjust Colours…</button>
+        <button data-action="recolor" role="menuitem" data-tileonly>🖌 Recolor from Texture…</button>
+        <button data-action="delight" role="menuitem" data-tileonly>☀ De-light…</button>
+        <button data-action="heal" role="menuitem" data-tileonly>🩹 Heal / Fill…</button>
+        <button data-action="fade" role="menuitem" data-tileonly>🫥 Fade to Transparent…</button>
+        <button data-action="emissive" role="menuitem" data-tileonly>✨ Make Emissive…</button>
+    </div>
+    <div class="at-ctx-col" data-col="material">
+        <div class="at-ctx-title">Material</div>
+        <button data-action="material" role="menuitem">🎨 Set Material…</button>
+        <button data-action="lastmaterial" role="menuitem" style="display:none;">🎨 Apply Last Material</button>
+    </div>
+    <div class="at-ctx-col" data-col="goto">
+        <div class="at-ctx-title">Go to</div>
+        <button data-action="gotobase" role="menuitem" data-transonly>🧭 Go to Base Texture</button>
+        <button data-action="gotooverlay" role="menuitem" data-transonly>🧭 Go to Overlay Texture</button>
+    </div>
+    <div class="at-ctx-col" data-col="file">
+        <div class="at-ctx-title">File</div>
+        <button data-action="download" role="menuitem">⬇️ Download PNG</button>
+        <button data-action="replace" role="menuitem" data-tileonly>🖼 Replace Image…</button>
+        <button data-action="reset" role="menuitem" data-tileonly>↩️ Reset to Original</button>
+        <button data-action="delete" role="menuitem" class="at-ctx-danger">🗑️ Delete…</button>
+    </div>
 </div>
 
 <!-- ============ MODAL OVERLAY ============ -->
@@ -679,7 +728,7 @@
     <div class="at-modal at-modal-xl at-modal-fit" id="at-modal-anchor" role="dialog" aria-modal="true" aria-label="Anchored Transition" style="display:none;">
         <div class="at-modal-title">📐 Anchored Transition — Tile <span id="at-anchor-base-no"></span> → Tile <span id="at-anchor-overlay-no"></span></div>
         <div class="at-modal-body"><div class="at-modal-cols"><div class="at-modal-main">
-        <div class="sm-hint">The border between the two textures is a chain of anchors. Start from a preset, then <strong>drag anchors</strong> to bend the border, <strong>click empty space</strong> to add one, or <strong>right-click an anchor</strong> to remove it. Overlay (B) fills one side.</div>
+        <div class="sm-hint">The border between the two textures is a chain of anchors. Start from a preset, then <strong>drag anchors</strong> to bend the border, <strong>drag the line itself</strong> to slide the whole border across, <strong>click empty space</strong> to add an anchor, or <strong>right-click an anchor</strong> to remove it. Overlay (B) fills one side.</div>
         <div class="form-row" style="align-items:flex-end;">
             <div class="form-group" style="min-width:150px;">
                 <label>Start from</label>
@@ -742,7 +791,7 @@
                     <input type="checkbox" id="at-anchor-hide"> Hide handles (preview)
                 </label>
             </div>
-            <div style="color:var(--text-secondary);font-size:0.72rem;margin:2px 0 4px;"><span id="at-anchor-count">2</span> anchors — drag / click to add / right-click to remove / scroll or middle-click to smooth</div>
+            <div style="color:var(--text-secondary);font-size:0.72rem;margin:2px 0 4px;"><span id="at-anchor-count">2</span> anchors — drag / drag the line to move them all / click to add / right-click to remove / scroll or middle-click to smooth</div>
             <canvas id="at-anchor-canvas" width="256" height="256" style="width:100%;border:1px solid var(--border);border-radius:var(--radius-sm);cursor:crosshair;touch-action:none;"></canvas>
         </div>
         </div><!-- /.at-modal-side -->
@@ -814,7 +863,7 @@
         <details class="form-group" style="border:1px solid var(--border);border-radius:4px;padding:6px 10px;">
             <summary style="cursor:pointer;">📈 Response curve <span style="color:var(--text-secondary);font-size:0.72rem;">(reshape height → fill)</span></summary>
             <label class="checkbox-row" style="margin-top:8px;"><input type="checkbox" id="at-ht-curve-on"> Enable</label>
-            <div style="color:var(--text-secondary);font-size:0.72rem;margin:4px 0;">Left→right = height; up = more fill. Drag / click to add / right-click remove / scroll or middle-click to smooth.</div>
+            <div style="color:var(--text-secondary);font-size:0.72rem;margin:4px 0;">Left→right = height; up = more fill. Drag anchors / drag the line to move them all / click to add / right-click remove / scroll or middle-click to smooth.</div>
             <canvas id="at-ht-curve" width="220" height="150" style="width:100%;max-width:260px;border:1px solid var(--border);border-radius:4px;touch-action:none;cursor:crosshair;background:#1a1a1a;"></canvas>
             <div style="margin-top:6px;"><button class="btn btn-secondary btn-sm" id="at-ht-curve-reset">↺ Reset curve</button></div>
         </details>
@@ -838,7 +887,7 @@
                     <select id="at-ht-drift-axis"><option value="h" selected>Across</option><option value="v">Down</option></select>
                 </div>
             </div>
-            <div style="color:var(--text-secondary);font-size:0.72rem;margin:4px 0;">Drag the line — fill drifts toward the high side. Drag / click to add / right-click remove / scroll to smooth.</div>
+            <div style="color:var(--text-secondary);font-size:0.72rem;margin:4px 0;">Fill drifts toward the high side. Drag anchors / drag the line to move them all / click to add / right-click remove / scroll to smooth.</div>
             <canvas id="at-ht-drift-canvas" width="256" height="256" style="width:100%;max-width:256px;border:1px solid var(--border);border-radius:4px;touch-action:none;cursor:crosshair;"></canvas>
         </details>
         <div class="form-row">
@@ -885,7 +934,7 @@
     <div class="at-modal at-modal-xl at-modal-fit" id="at-modal-grid" role="dialog" aria-modal="true" aria-label="Transition Grid" style="display:none;">
         <div class="at-modal-title">🗺️ Transition Grid — Tile <span id="at-tg-base-no"></span> → Tile <span id="at-tg-overlay-no"></span></div>
         <div class="at-modal-body"><div class="at-modal-cols"><div class="at-modal-main">
-        <div class="sm-hint">Design one continuous A→B border across a whole wall, then slice it into tiles. Set the grid size, drag the anchors (click empty space to add, right-click to remove). <strong>Scroll the wheel or middle-click an anchor</strong> to cycle its smoothness (corner → smooth → rounder); the border curves smoothly through the anchors. It flows across cell edges so the tiles connect seamlessly. <strong>Add</strong> drops one transition tile per cell into the atlas.</div>
+        <div class="sm-hint">Design one continuous A→B border across a whole wall, then slice it into tiles. Set the grid size, drag the anchors (drag the line itself to move the whole border, click empty space to add, right-click to remove). <strong>Scroll the wheel or middle-click an anchor</strong> to cycle its smoothness (corner → smooth → rounder); the border curves smoothly through the anchors. It flows across cell edges so the tiles connect seamlessly. <strong>Add</strong> drops one transition tile per cell into the atlas.</div>
         <div class="form-row" style="align-items:flex-end;">
             <div class="form-group" style="width:90px;">
                 <label>Columns</label>
@@ -1084,6 +1133,7 @@
                 <div class="at-anim-tabs" role="tablist" aria-label="Animated texture settings">
                     <button type="button" class="at-anim-tab active" data-anim-tab="shape" role="tab" aria-selected="true">🌀 Shape &amp; motion</button>
                     <button type="button" class="at-anim-tab" data-anim-tab="colour" role="tab" aria-selected="false">🎨 Colour</button>
+                    <button type="button" class="at-anim-tab" data-anim-tab="glow" role="tab" aria-selected="false">✨ Glow</button>
                 </div>
 
                 <div class="at-anim-panel" data-anim-panel="shape">
@@ -1247,6 +1297,87 @@
                         </label>
                     </div>
                 </div>
+
+                <div class="at-anim-panel" data-anim-panel="glow" style="display:none;">
+                    <div class="form-row" style="gap:10px;align-items:center;">
+                        <label style="display:flex;align-items:center;gap:6px;font-size:0.86rem;cursor:pointer;font-weight:600;">
+                            <input type="checkbox" id="at-anim-glow-enable"> ✨ Emissive glow
+                        </label>
+                    </div>
+                    <div class="sm-hint" style="font-size:0.74rem;margin:0 0 8px;">Bakes a per-frame emissive map so the texture lights up in the dark. Each frame's glow is derived from that frame, so it animates with the motion. Ships an <strong>Emissive</strong> atlas aligned to the animation.</div>
+                    <div id="at-anim-glow-body">
+                        <div class="form-row" style="gap:10px;flex-wrap:wrap;">
+                            <div class="form-group" style="flex:1;min-width:150px;">
+                                <label>What glows</label>
+                                <select id="at-anim-glow-mode">
+                                    <option value="brightness">Bright areas</option>
+                                    <option value="hue">A colour range</option>
+                                </select>
+                            </div>
+                            <div class="form-group" style="flex:1;min-width:150px;">
+                                <label>Glow colour</label>
+                                <select id="at-anim-glow-colortype">
+                                    <option value="texture">Texture's own colours</option>
+                                    <option value="tint">Flat tint</option>
+                                </select>
+                            </div>
+                            <div class="form-group" id="at-anim-glow-tint-wrap" style="width:62px;display:none;">
+                                <label>Tint</label>
+                                <input type="color" id="at-anim-glow-tint" value="#ff6a00" style="width:100%;height:30px;padding:0;border:1px solid var(--border);border-radius:var(--radius-sm);background:none;cursor:pointer;">
+                            </div>
+                        </div>
+                        <div class="form-row" id="at-anim-glow-grp-brightness" style="gap:10px;flex-wrap:wrap;">
+                            <div class="form-group" style="flex:1;min-width:130px;">
+                                <label>Brightness threshold — <span id="at-anim-glow-threshold-val">55</span>%</label>
+                                <input type="range" id="at-anim-glow-threshold" min="0" max="100" value="55" style="width:100%;">
+                            </div>
+                        </div>
+                        <div class="form-row" id="at-anim-glow-grp-hue" style="gap:10px;flex-wrap:wrap;display:none;">
+                            <div class="form-group" style="flex:1;min-width:130px;">
+                                <label>Hue — <span id="at-anim-glow-hue-val">30</span>°</label>
+                                <input type="range" id="at-anim-glow-hue" min="0" max="360" value="30" style="width:100%;">
+                            </div>
+                            <div class="form-group" style="flex:1;min-width:130px;">
+                                <label>Hue width — <span id="at-anim-glow-huewidth-val">40</span>°</label>
+                                <input type="range" id="at-anim-glow-huewidth" min="5" max="180" value="40" style="width:100%;">
+                            </div>
+                        </div>
+                        <div class="form-row" style="gap:10px;flex-wrap:wrap;">
+                            <div class="form-group" style="flex:1;min-width:130px;">
+                                <label>Strength — <span id="at-anim-glow-strength-val">100</span>%</label>
+                                <input type="range" id="at-anim-glow-strength" min="0" max="200" value="100" style="width:100%;">
+                            </div>
+                            <div class="form-group" style="flex:1;min-width:130px;">
+                                <label>Bloom / softness — <span id="at-anim-glow-softness-val">30</span>%</label>
+                                <input type="range" id="at-anim-glow-softness" min="0" max="100" value="30" style="width:100%;">
+                            </div>
+                        </div>
+                        <div class="form-row" style="gap:10px;flex-wrap:wrap;">
+                            <div class="form-group" style="flex:1;min-width:130px;">
+                                <label>Feather (edge) — <span id="at-anim-glow-feather-val">4</span></label>
+                                <input type="range" id="at-anim-glow-feather" min="0" max="32" value="4" style="width:100%;">
+                            </div>
+                            <div class="form-group" style="flex:1;min-width:130px;"></div>
+                        </div>
+
+                        <div class="form-row" style="gap:10px;align-items:center;margin-top:6px;">
+                            <label style="display:flex;align-items:center;gap:6px;font-size:0.82rem;cursor:pointer;">
+                                <input type="checkbox" id="at-anim-glow-pulse"> 💓 Pulse — throb the glow over the loop
+                            </label>
+                        </div>
+                        <div class="form-row" id="at-anim-glow-pulse-grp" style="gap:10px;flex-wrap:wrap;display:none;">
+                            <div class="form-group" style="flex:1;min-width:130px;">
+                                <label>Pulse cycles — <span id="at-anim-glow-pulse-cycles-val">1</span> / loop</label>
+                                <input type="range" id="at-anim-glow-pulse-cycles" min="1" max="6" value="1" style="width:100%;">
+                            </div>
+                            <div class="form-group" style="flex:1;min-width:130px;">
+                                <label>Pulse depth — <span id="at-anim-glow-pulse-depth-val">70</span>%</label>
+                                <input type="range" id="at-anim-glow-pulse-depth" min="0" max="100" value="70" style="width:100%;">
+                            </div>
+                        </div>
+                        <div class="sm-hint" style="font-size:0.72rem;margin-top:4px;">Pulse dims the glow on a sine over the loop (seamless). Depth 0% = steady, 100% = fully off at the trough. Combines with the per-frame motion.</div>
+                    </div>
+                </div>
             </div>
         </div>
         <div class="at-modal-actions">
@@ -1375,6 +1506,10 @@
     <div class="at-modal" id="at-modal-confirm" role="dialog" aria-modal="true" aria-label="Confirm" style="display:none;">
         <div class="at-modal-title" id="at-confirm-title">⚠️ Are you sure?</div>
         <div class="sm-hint" id="at-confirm-msg" style="white-space:pre-line;"></div>
+        <div class="form-group" id="at-confirm-input-wrap" style="display:none;">
+            <label id="at-confirm-input-label">Name</label>
+            <input type="text" id="at-confirm-input" maxlength="64" autocomplete="off" style="width:100%;">
+        </div>
         <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
             <button class="btn btn-primary at-btn-danger" id="at-confirm-ok">Delete</button>
@@ -1480,7 +1615,7 @@
     <!-- ── Variations modal (Phase 7) ───────────────── -->
     <div class="at-modal" id="at-modal-var" role="dialog" aria-modal="true" aria-label="Generate Variations" style="display:none;">
         <div class="at-modal-title">✨ Generate Variations — Tile <span id="at-var-tileno"></span></div>
-        <div class="sm-hint">Creates jittered copies (hue / brightness / rotation) appended to the atlas — handy for breaking up obvious tiling repetition.</div>
+        <div class="sm-hint">Creates jittered copies (hue / brightness / saturation / contrast / grain / rotation / wrap shift) appended to the atlas — handy for breaking up obvious tiling repetition. Same seed reproduces the same set.</div>
         <div class="form-row" style="align-items:flex-end;">
             <div class="form-group" style="width:90px;">
                 <label>Count</label>
@@ -1497,9 +1632,29 @@
                 <input type="range" id="at-var-val" min="0" max="50" value="12" style="width:100%;">
             </div>
         </div>
-        <div class="form-row" style="align-items:center;">
+        <div class="form-row" style="align-items:flex-end;">
+            <div class="form-group" style="flex:1;min-width:120px;">
+                <label>Saturation jitter — <span id="at-var-sat-val">0</span>%</label>
+                <input type="range" id="at-var-sat" min="0" max="50" value="0" style="width:100%;">
+            </div>
+            <div class="form-group" style="flex:1;min-width:120px;">
+                <label>Contrast jitter — <span id="at-var-con-val">0</span>%</label>
+                <input type="range" id="at-var-con" min="0" max="40" value="0" style="width:100%;">
+            </div>
+            <div class="form-group" style="flex:1;min-width:120px;">
+                <label>Grain — <span id="at-var-noise-val">0</span>%</label>
+                <input type="range" id="at-var-noise" min="0" max="30" value="0" style="width:100%;"
+                       title="Subtle per-variant noise overlay so copies don't read identical up close.">
+            </div>
+        </div>
+        <div class="form-row" style="align-items:center;flex-wrap:wrap;gap:10px;">
             <label class="checkbox-row"><input type="checkbox" id="at-var-rotate"> Random 90° rotations</label>
-            <button class="btn btn-secondary btn-sm" id="at-var-shuffle" style="margin-left:auto;">🎲 Shuffle</button>
+            <label class="checkbox-row" title="Offset each copy with wrap-around, so seamless textures stay seamless but repeats stop lining up."><input type="checkbox" id="at-var-shift"> Random wrap shift</label>
+            <div style="margin-left:auto;display:flex;align-items:center;gap:6px;">
+                <label style="margin:0;">Seed</label>
+                <input type="number" id="at-var-seed" value="1" min="0" step="1" style="width:90px;">
+                <button class="btn btn-secondary btn-sm" id="at-var-shuffle">🎲 Shuffle</button>
+            </div>
         </div>
         <div class="form-group">
             <label>Preview</label>
@@ -1536,6 +1691,30 @@
                 <label>Repeats — <span id="at-origami-repeats-val">1</span></label>
                 <input type="range" id="at-origami-repeats" min="1" max="4" value="1" style="width:100%;"
                        title="Mirror the source into this many nested copies (seamless).">
+            </div>
+        </div>
+        <div class="form-row" style="align-items:flex-end;">
+            <div class="form-group" style="flex:1.2;min-width:170px;">
+                <label>Outer shape</label>
+                <select id="at-origami-shape2" title="Morph the ring shape from the inner value to this one toward the edges.">
+                    <option value="same" selected>Same as ring shape</option>
+                    <option value="square">Square</option>
+                    <option value="diamond">Diamond</option>
+                    <option value="circle">Circle</option>
+                </select>
+            </div>
+            <div class="form-group" style="flex:1;min-width:130px;">
+                <label>Ring thickness — <span id="at-origami-thick-val">1.00</span></label>
+                <input type="range" id="at-origami-thick" min="40" max="250" value="100" style="width:100%;"
+                       title="Bias ring widths: <1 widens outer rings, >1 widens inner rings.">
+            </div>
+            <div class="form-group" style="flex:1;min-width:110px;">
+                <label>Origin X — <span id="at-origami-cx-val">50%</span></label>
+                <input type="range" id="at-origami-cx" min="0" max="100" value="50" style="width:100%;">
+            </div>
+            <div class="form-group" style="flex:1;min-width:110px;">
+                <label>Origin Y — <span id="at-origami-cy-val">50%</span></label>
+                <input type="range" id="at-origami-cy" min="0" max="100" value="50" style="width:100%;">
             </div>
         </div>
         <div class="form-group">
@@ -1619,37 +1798,51 @@
                 <label>Joint width — <span id="at-bp-joint-val">8</span>%</label>
                 <input type="range" id="at-bp-joint" min="0" max="25" value="8" style="width:100%;">
             </div>
+            <div class="form-group" data-bp="brick tile planks pipes coursed herringbone shingles floor" style="flex:1;min-width:120px;">
+                <label>Edge irregularity — <span id="at-bp-warp-val">30</span>%</label>
+                <input type="range" id="at-bp-warp" min="0" max="100" value="30" style="width:100%;"
+                       title="Wobble the joint edges with seeded noise so they read hand-laid, not ruler-drawn. Stays seamless.">
+            </div>
         </div>
         <details class="form-group" style="border:1px solid var(--border);border-radius:4px;padding:6px 10px;">
-            <summary style="cursor:pointer;">🧱 Mortar / joint colour</summary>
+            <summary style="cursor:pointer;">🧱 Mortar / joints</summary>
             <div class="form-row" style="align-items:flex-end;margin-top:8px;">
-                <div class="form-group" style="flex:1;min-width:90px;">
-                    <label>Hue — <span id="at-bp-mh-val">0</span>°</label>
-                    <input type="range" id="at-bp-mh" min="0" max="360" value="0" style="width:100%;">
-                </div>
-                <div class="form-group" style="flex:1;min-width:90px;">
-                    <label>Saturation — <span id="at-bp-ms-val">0</span>%</label>
-                    <input type="range" id="at-bp-ms" min="0" max="100" value="0" style="width:100%;">
-                </div>
-                <div class="form-group" style="flex:1;min-width:90px;">
-                    <label>Lightness — <span id="at-bp-ml-val">22</span>%</label>
-                    <input type="range" id="at-bp-ml" min="0" max="100" value="22" style="width:100%;">
+                <div class="form-group" style="flex:1.4;min-width:170px;">
+                    <label>Mortar style</label>
+                    <select id="at-bp-mstyle" title="Natural derives the mortar from a blurred, tinted copy of the texture itself; Flat is a plain colour.">
+                        <option value="natural" selected>Natural (from texture)</option>
+                        <option value="flat">Flat colour</option>
+                    </select>
                 </div>
                 <div class="form-group" style="align-self:flex-end;">
                     <button class="btn btn-secondary btn-sm" id="at-bp-sample" title="Set mortar colour from the texture's average colour">🎨 Sample from texture</button>
                 </div>
             </div>
             <div class="form-row" style="align-items:flex-end;">
+                <div class="form-group" style="flex:1;min-width:90px;">
+                    <label><span id="at-bp-mh-label">Hue shift</span> — <span id="at-bp-mh-val">0</span>°</label>
+                    <input type="range" id="at-bp-mh" min="0" max="360" value="0" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:1;min-width:90px;">
+                    <label><span id="at-bp-ms-label">Saturation</span> — <span id="at-bp-ms-val">40</span>%</label>
+                    <input type="range" id="at-bp-ms" min="0" max="100" value="40" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:1;min-width:90px;">
+                    <label><span id="at-bp-ml-label">Brightness</span> — <span id="at-bp-ml-val">65</span>%</label>
+                    <input type="range" id="at-bp-ml" min="0" max="100" value="65" style="width:100%;">
+                </div>
+            </div>
+            <div class="form-row" style="align-items:flex-end;">
                 <div class="form-group" style="flex:1;min-width:120px;">
-                    <label>Noise — <span id="at-bp-noise-val">0</span>%</label>
-                    <input type="range" id="at-bp-noise" min="0" max="100" value="0" style="width:100%;">
+                    <label>Noise — <span id="at-bp-noise-val">35</span>%</label>
+                    <input type="range" id="at-bp-noise" min="0" max="100" value="35" style="width:100%;">
                 </div>
                 <div class="form-group" style="flex:1;min-width:120px;">
                     <label>Noise type</label>
                     <select id="at-bp-noisetype">
-                        <option value="none" selected>None</option>
+                        <option value="none">None</option>
                         <option value="speckle">Speckle</option>
-                        <option value="grain">Grain</option>
+                        <option value="grain" selected>Grain</option>
                         <option value="clouds">Clouds</option>
                     </select>
                 </div>
@@ -1685,9 +1878,105 @@
         </div>
     </div>
 
+    <!-- ── Stained Glass modal (leaded glass from texture or palette) ── -->
+    <div class="at-modal at-modal-wide" id="at-modal-stainedglass" role="dialog" aria-modal="true" aria-label="Stained Glass" style="display:none;">
+        <div class="at-modal-title">🪟 Stained Glass — Tile <span id="at-sg-tileno"></span></div>
+        <div class="sm-hint">Splits the tile into glass cells separated by lead came. Cell colours come from the texture itself or a palette. The result carries a glass + metal multi-material and an emissive map, so the window glows in the dark.</div>
+        <div class="form-row" style="align-items:flex-end;">
+            <div class="form-group" style="flex:1.4;min-width:170px;">
+                <label>Cell pattern</label>
+                <select id="at-sg-pattern">
+                    <option value="voronoi" selected>🫧 Glass blobs (organic)</option>
+                    <option value="grid-rect">🔲 Rect quarry</option>
+                    <option value="grid-diamond">🔷 Diamond quarry</option>
+                    <option value="grid-hex">⬡ Hex quarry</option>
+                    <option value="rose">🌹 Rose window</option>
+                    <option value="image">🖼 Follow image</option>
+                </select>
+            </div>
+            <div class="form-group" style="flex:1;min-width:120px;">
+                <label><span id="at-sg-cells-label">Cells across</span> — <span id="at-sg-cells-val">6</span></label>
+                <input type="range" id="at-sg-cells" min="2" max="16" value="6" style="width:100%;">
+            </div>
+            <div class="form-group" data-sg="voronoi grid-rect grid-diamond grid-hex rose" style="flex:1;min-width:120px;">
+                <label>Jitter — <span id="at-sg-jitter-val">40</span>%</label>
+                <input type="range" id="at-sg-jitter" min="0" max="100" value="40" style="width:100%;"
+                       title="How irregular the cell boundaries are.">
+            </div>
+        </div>
+        <div class="form-row" style="align-items:flex-end;">
+            <div class="form-group" style="flex:1;min-width:120px;">
+                <label>Leading width — <span id="at-sg-lead-val">5</span>%</label>
+                <input type="range" id="at-sg-lead" min="1" max="12" value="5" style="width:100%;">
+            </div>
+            <div class="form-group" style="flex:1;min-width:130px;">
+                <label>Came metal</label>
+                <select id="at-sg-leadtint" title="Colour + material preset of the strips between the glass.">
+                    <option value="lead" selected>Lead (dark)</option>
+                    <option value="pewter">Pewter</option>
+                    <option value="copper">Copper</option>
+                    <option value="gold">Gold</option>
+                </select>
+            </div>
+            <div class="form-group" style="flex:1.2;min-width:150px;">
+                <label>Glass colours</label>
+                <select id="at-sg-colorsrc">
+                    <option value="texture" selected>From texture</option>
+                    <option value="jewel">Palette: Jewel mix</option>
+                    <option value="medieval">Palette: Medieval</option>
+                    <option value="amber">Palette: Amber</option>
+                    <option value="emerald">Palette: Emerald</option>
+                    <option value="ruby">Palette: Ruby</option>
+                </select>
+            </div>
+        </div>
+        <div class="form-row" style="align-items:flex-end;">
+            <div class="form-group" style="flex:1;min-width:120px;">
+                <label>Mottling — <span id="at-sg-mottle-val">30</span>%</label>
+                <input type="range" id="at-sg-mottle" min="0" max="100" value="30" style="width:100%;"
+                       title="Per-cell streaks so the glass doesn't read flat.">
+            </div>
+            <div class="form-group" id="at-sg-detail-row" style="flex:1;min-width:120px;">
+                <label>Source detail — <span id="at-sg-detail-val">15</span>%</label>
+                <input type="range" id="at-sg-detail" min="0" max="100" value="15" style="width:100%;"
+                       title="Blend a low-contrast copy of the original texture back into each cell.">
+            </div>
+            <div class="form-group" style="flex:1;min-width:120px;">
+                <label>Glow strength — <span id="at-sg-emissive-val">55</span>%</label>
+                <input type="range" id="at-sg-emissive" min="0" max="100" value="55" style="width:100%;"
+                       title="Emissive map strength. 0 = no glow map.">
+            </div>
+            <div class="form-group" style="width:150px;">
+                <label>Seed</label>
+                <div style="display:flex;gap:6px;">
+                    <input type="number" id="at-sg-seed" value="1" min="0" style="flex:1;min-width:0;">
+                    <button class="btn btn-secondary btn-sm" id="at-sg-random" title="Randomize seed">🎲</button>
+                </div>
+            </div>
+        </div>
+        <div class="form-row" data-sg="rose" style="align-items:center;">
+            <label class="checkbox-row"><input type="checkbox" id="at-sg-frame" checked> Square frame border</label>
+            <span class="sm-hint" style="margin:0;">Rose windows are centred — the tile won't repeat seamlessly.</span>
+        </div>
+        <div class="form-group">
+            <label>Preview</label>
+            <canvas id="at-sg-preview" width="256" height="256" style="border:1px solid var(--border);border-radius:4px;image-rendering:pixelated;width:256px;height:256px;background:#111;"></canvas>
+        </div>
+        <div class="at-modal-actions">
+            <button class="btn btn-secondary" data-close>Cancel</button>
+            <button class="btn btn-primary" id="at-sg-add">➕ Add Stained Glass Tile</button>
+        </div>
+    </div>
+
     <!-- ── Material modal ───────────────────────────── -->
     <div class="at-modal" id="at-modal-mat" role="dialog" aria-modal="true" aria-label="Set Material" style="display:none;">
         <div class="at-modal-title" id="at-mat-title">🎨 Set Material</div>
+        <!-- Your saved presets, one click away (they otherwise hide behind the
+             "⭐ My presets" aesthetic). Only rendered once you have some. -->
+        <div class="at-mat-chips" id="at-mat-chips" style="display:none;">
+            <span class="at-mat-chips-label">⭐ My presets</span>
+            <span class="at-mat-chips-row" id="at-mat-chips-row"></span>
+        </div>
         <div class="form-row">
             <div class="form-group">
                 <label>Type</label>
@@ -1834,6 +2123,7 @@
 <!-- ============ SCRIPTS ============ -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/ag-psd/dist/bundle.js"></script>
+<script src="js/store.js"></script>
 <script src="js/shaders.js"></script>
 <script src="js/presets.js"></script>
 <script src="js/engine.js"></script>

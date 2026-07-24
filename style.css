@@ -1850,14 +1850,94 @@ input[type="range"]::-moz-range-thumb {
     pointer-events: none;
 }
 
-/* Bulk-action bar (shown when ≥2 tiles are selected). */
+/* Saved-material chips at the top of the Material modal. */
+.at-mat-chips {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin: 0 0 10px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-tertiary);
+}
+.at-mat-chips-label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+.at-mat-chips-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.at-mat-chip {
+    font: inherit;
+    font-size: 0.78rem;
+    padding: 3px 10px;
+    border: 1px solid var(--border-light);
+    border-radius: 999px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    cursor: pointer;
+}
+.at-mat-chip:hover { border-color: var(--accent); }
+.at-mat-chip.active { border-color: var(--accent); background: rgba(232, 133, 42, 0.16); }
+
+/* "Unsaved changes" marker beside Save Project. */
+.at-unsaved {
+    align-self: center;
+    font-size: 0.78rem;
+    color: var(--accent);
+    white-space: nowrap;
+}
+
+/* Autosave readout in the left rail, above the message log. Storage is
+   invisible by nature, so what's held and how to drop it are stated rather than
+   hidden — and as persistent status it belongs in the rail, in view while you
+   work, not at the bottom of the export card. The rail is a narrow column, so
+   this stacks instead of running inline. */
+/* Inset on the group itself, not its children, so the divider lines up with
+   the title and buttons instead of overhanging them. */
+.at-rail-group {
+    margin: 0 8px 10px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--border);
+}
+.at-rail-group .at-rail-title { padding-left: 0; padding-right: 0; }
+.at-storage-row {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+}
+.at-storage-info {
+    font-size: 0.75rem;
+    line-height: 1.45;
+    color: var(--text-secondary);
+}
+#at-storage-clear,
+#at-storage-persist {
+    width: 100%;
+    justify-content: center;
+    padding: 5px 8px;
+    font-size: 0.75rem;
+}
+
+/* Bulk-action bar (shown when ≥2 tiles are selected). Sticks below the header
+   so the actions stay reachable while scrolling a tall atlas. The tint sits on
+   an opaque layer — tiles scrolling underneath must not show through. */
 .at-bulk-bar {
     border-color: var(--accent);
-    background: rgba(232, 133, 42, 0.08);
+    background-color: var(--bg-secondary);
+    background-image: linear-gradient(rgba(232, 133, 42, 0.1), rgba(232, 133, 42, 0.1));
     display: flex;
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
+    position: sticky;
+    top: 60px;
+    z-index: 20;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
 }
 .at-bulk-count { margin-right: 4px; }
 /* Red danger button (delete confirmations) */
@@ -1870,31 +1950,56 @@ input[type="range"]::-moz-range-thumb {
 .btn.at-btn-danger:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* ---- Context menu ---- */
+/* Grouped columns laid out left-to-right. The entry list had outgrown the
+   viewport vertically, so it now spreads sideways: each column is one labelled
+   group, and the whole thing wraps to more rows if the screen is too narrow to
+   fit them side by side. Width and height are both capped to the viewport, and
+   the JS clamp re-measures after visibility is applied to keep it on-screen. */
 .at-ctx {
     position: fixed;
     z-index: 1000;
-    min-width: 230px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 2px 12px;
+    /* Without this the fixed-position box shrink-to-fits to a single column and
+       wraps every group onto its own row — the exact vertical list this replaces.
+       max-content asks for all columns side by side; max-width then caps it and
+       wraps into as many rows as the screen needs. */
+    width: max-content;
     background: var(--bg-secondary);
     border: 1px solid var(--border-light);
     border-radius: 6px;
     box-shadow: var(--shadow);
-    padding: 4px;
-    /* Never taller than the viewport — long menus scroll instead of overflowing. */
-    max-height: 85vh;
+    padding: 6px;
+    max-width: min(94vw, 1400px);
+    max-height: 88vh;
     overflow-y: auto;
     overscroll-behavior: contain;
 }
-/* On short screens the menu is too tall to read comfortably — flow it into two
-   columns so it stays within view (the JS clamp re-measures width/height after
-   this applies and keeps it on-screen). */
-@media (max-height: 600px) {
-    .at-ctx {
-        column-count: 2;
-        column-gap: 4px;
-        max-width: min(92vw, 480px);
-    }
-    .at-ctx button { break-inside: avoid; }
-    .at-ctx hr { column-span: all; }
+.at-ctx-col {
+    display: flex;
+    flex-direction: column;
+    flex: 0 0 auto;
+    min-width: 205px;
+}
+/* No vertical rules between columns: with wrapping, whichever column starts a
+   second row would carry a stray line at the menu's left edge. The headings and
+   the column gap separate the groups on their own. */
+.at-ctx-title {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    font-weight: 700;
+    color: var(--text-muted);
+    padding: 6px 10px 4px;
+    white-space: nowrap;
+}
+/* Narrow screens: one group per row, so entries stay readable rather than
+   squeezing to unusable widths. */
+@media (max-width: 560px) {
+    .at-ctx { max-width: 94vw; }
+    .at-ctx-col { min-width: 0; width: 100%; }
 }
 .at-ctx button {
     display: block;
