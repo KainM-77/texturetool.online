@@ -88,8 +88,8 @@
         <div class="upload-area" id="at-upload">
             <div class="upload-icon">📁</div>
             <div class="upload-text">Drop atlas here or <span>browse</span></div>
-            <div class="upload-hint" style="color:var(--text-secondary);font-size:0.78rem;margin-top:4px;">PNG · JPG · BMP · WebP · TGA</div>
-            <input type="file" accept="image/*,.tga" id="at-file">
+            <div class="upload-hint" style="color:var(--text-secondary);font-size:0.78rem;margin-top:4px;">PNG · JPG · BMP · WebP · TGA · PSD</div>
+            <input type="file" accept="image/*,.tga,.psd,.psb" id="at-file">
         </div>
 
         <div class="form-row" style="margin-top:14px;align-items:flex-end;">
@@ -310,6 +310,7 @@
         <button data-action="buildpattern" role="menuitem" data-tileonly>🏗️ Build Pattern…</button>
         <button data-action="origami" role="menuitem" data-tileonly>🪞 Origami Frame (fold to rings)</button>
         <button data-action="stainedglass" role="menuitem" data-tileonly>🪟 Stained Glass…</button>
+        <button data-action="surfacenoise" role="menuitem" data-tileonly>🌾 Surface Noise…</button>
     </div>
     <div class="at-ctx-col" data-col="transform">
         <div class="at-ctx-title">Transform</div>
@@ -1848,6 +1849,69 @@
                 </div>
             </div>
         </details>
+        <!-- Surface noise. Deliberately OFF by default: the tool assumes you are
+             building bricks from an already-bricky texture, which usually has all
+             the grain it needs. Switching pattern suggests a preset but never
+             ticks the box. -->
+        <details class="form-group" style="border:1px solid var(--border);border-radius:4px;padding:6px 10px;">
+            <summary style="cursor:pointer;">🌾 Surface noise <span id="at-bp-sn-state" style="opacity:.55;font-size:11px;">— off</span></summary>
+            <div class="sm-hint" style="margin-top:8px;">Grain, pitting and grain-direction laid over the pattern itself. Your texture probably has its own already — this is for flat or over-cleaned sources.</div>
+            <div class="form-group">
+                <label class="checkbox-row"><input type="checkbox" id="at-bp-sn-on"> Add surface noise</label>
+            </div>
+            <div id="at-bp-sn-body" style="display:none;">
+                <div class="form-row" style="align-items:flex-end;">
+                    <div class="form-group" style="flex:1.6;min-width:180px;">
+                        <label>Preset</label>
+                        <select id="at-bp-sn-preset"></select>
+                    </div>
+                    <div class="form-group" style="flex:1.3;min-width:150px;">
+                        <label>Applies to</label>
+                        <select id="at-bp-sn-scope" title="Cells only leaves the mortar joints to their own grain; Whole tile washes over everything.">
+                            <option value="cells" selected>Cells only</option>
+                            <option value="tile">Whole tile</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Strength — <span id="at-bp-sn-strength-val">18</span>%</label>
+                    <input type="range" id="at-bp-sn-strength" min="0" max="100" value="18" style="width:100%;">
+                    <div id="at-bp-sn-advice" class="sm-hint" style="margin-top:4px;"></div>
+                </div>
+                <div class="form-row" style="align-items:flex-end;">
+                    <div class="form-group" style="flex:1;min-width:110px;">
+                        <label>Scale — <span id="at-bp-sn-scale-val">50</span>%</label>
+                        <input type="range" id="at-bp-sn-scale" min="0" max="100" value="50" style="width:100%;">
+                    </div>
+                    <div class="form-group" style="flex:1;min-width:110px;">
+                        <label>Contrast — <span id="at-bp-sn-contrast-val">50</span>%</label>
+                        <input type="range" id="at-bp-sn-contrast" min="0" max="100" value="50" style="width:100%;">
+                    </div>
+                    <div class="form-group" style="flex:1;min-width:110px;" id="at-bp-sn-dirwrap">
+                        <label>Grain direction</label>
+                        <select id="at-bp-sn-dir" title="Relative to the pattern, not the screen — the grain rotates with the Orientation setting, so Vertical always runs along the planks.">
+                            <option value="v" selected>Vertical</option>
+                            <option value="h">Horizontal</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-row" style="align-items:flex-end;">
+                    <div class="form-group" style="flex:1.4;min-width:150px;">
+                        <label>Noise type</label>
+                        <select id="at-bp-sn-type"></select>
+                    </div>
+                    <div class="form-group" style="flex:1;min-width:120px;">
+                        <label>Blend</label>
+                        <select id="at-bp-sn-blend">
+                            <option value="overlay" selected>Overlay</option>
+                            <option value="soft-light">Soft light</option>
+                            <option value="multiply">Multiply (darkens)</option>
+                            <option value="screen">Screen (lightens)</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+        </details>
         <div class="form-row" style="align-items:flex-end;">
             <div class="form-group" style="flex:1;min-width:120px;">
                 <label>Hue jitter — <span id="at-bp-hue-val">8</span>°</label>
@@ -1875,6 +1939,76 @@
         <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
             <button class="btn btn-primary" id="at-bp-add">➕ Add Tile</button>
+        </div>
+    </div>
+
+    <!-- ── Surface Noise modal (grain/pitting/grain-direction onto a tile) ── -->
+    <div class="at-modal at-modal-wide" id="at-modal-noise" role="dialog" aria-modal="true" aria-label="Surface Noise" style="display:none;">
+        <div class="at-modal-title">🌾 Surface Noise — Tile <span id="at-sn-tileno"></span></div>
+        <div class="sm-hint">Lays procedural grain into the texture itself, seamlessly. Material maps are generated <em>from</em> the diffuse, so this is what gives a flat or over-cleaned texture something for them to read.</div>
+        <div class="form-row" style="align-items:flex-end;">
+            <div class="form-group" style="flex:1.6;min-width:180px;">
+                <label>Preset</label>
+                <select id="at-sn-preset"></select>
+            </div>
+            <div class="form-group" style="flex:1.4;min-width:160px;">
+                <label>Noise type</label>
+                <select id="at-sn-type"></select>
+            </div>
+        </div>
+        <div class="form-group">
+            <label>Strength — <span id="at-sn-strength-val">30</span>%</label>
+            <input type="range" id="at-sn-strength" min="0" max="100" value="30" style="width:100%;">
+            <div id="at-sn-advice" class="sm-hint" style="margin-top:4px;"></div>
+        </div>
+        <div class="form-row" style="align-items:flex-end;">
+            <div class="form-group" style="flex:1;min-width:110px;">
+                <label>Scale — <span id="at-sn-scale-val">50</span>%</label>
+                <input type="range" id="at-sn-scale" min="0" max="100" value="50" style="width:100%;">
+            </div>
+            <div class="form-group" style="flex:1;min-width:110px;">
+                <label>Contrast — <span id="at-sn-contrast-val">50</span>%</label>
+                <input type="range" id="at-sn-contrast" min="0" max="100" value="50" style="width:100%;">
+            </div>
+            <div class="form-group" style="flex:1;min-width:110px;" id="at-sn-dirwrap">
+                <label>Grain direction</label>
+                <select id="at-sn-dir">
+                    <option value="v" selected>Vertical</option>
+                    <option value="h">Horizontal</option>
+                </select>
+            </div>
+        </div>
+        <div class="form-row" style="align-items:flex-end;">
+            <div class="form-group" style="flex:1;min-width:130px;">
+                <label>Blend</label>
+                <select id="at-sn-blend">
+                    <option value="overlay" selected>Overlay</option>
+                    <option value="soft-light">Soft light</option>
+                    <option value="multiply">Multiply (darkens)</option>
+                    <option value="screen">Screen (lightens)</option>
+                </select>
+            </div>
+            <div class="form-group" style="width:150px;">
+                <label>Seed</label>
+                <div style="display:flex;gap:6px;">
+                    <input type="number" id="at-sn-seed" value="1" min="0" style="flex:1;min-width:0;">
+                    <button class="btn btn-secondary btn-sm" id="at-sn-random" title="Randomize seed">🎲</button>
+                </div>
+            </div>
+        </div>
+        <div class="form-group">
+            <label>Preview — before / after</label>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                <canvas id="at-sn-before" width="256" height="256" style="border:1px solid var(--border);border-radius:4px;image-rendering:pixelated;width:200px;height:200px;background:#111;"></canvas>
+                <canvas id="at-sn-preview" width="256" height="256" style="border:1px solid var(--border);border-radius:4px;image-rendering:pixelated;width:200px;height:200px;background:#111;"></canvas>
+            </div>
+        </div>
+        <div class="form-group">
+            <label class="checkbox-row"><input type="checkbox" id="at-sn-newtile"> Add as a new tile instead of changing this one</label>
+        </div>
+        <div class="at-modal-actions">
+            <button class="btn btn-secondary" data-close>Cancel</button>
+            <button class="btn btn-primary" id="at-sn-apply">🌾 Apply Noise</button>
         </div>
     </div>
 
@@ -2122,7 +2256,9 @@
 
 <!-- ============ SCRIPTS ============ -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/ag-psd/dist/bundle.js"></script>
+<!-- ag-psd is NOT loaded here: it is ~172 KB over the wire and most sessions
+     never touch a PSD. js/psd.js pulls it on first use (and in a worker). -->
+<script src="js/psd.js"></script>
 <script src="js/store.js"></script>
 <script src="js/shaders.js"></script>
 <script src="js/presets.js"></script>

@@ -92,7 +92,7 @@ are credited for transparency:
 | Library | Use | License | Source |
 |---|---|---|---|
 | **Babylon.js** | 3D material preview (lazy-loaded on first 3D use) | Apache-2.0 | https://github.com/BabylonJS/Babylon.js |
-| **ag-psd** | Photoshop `.psd` export | MIT | https://github.com/Agamnentzar/ag-psd |
+| **ag-psd** | Photoshop `.psd` import + export (lazy-loaded on first PSD use, runs in a Web Worker) | MIT | https://github.com/Agamnentzar/ag-psd |
 | **JSZip** | `.zip` packaging of exported maps | MIT / GPL-3.0 (dual) | https://github.com/Stuk/jszip |
 
 The Babylon studio `.env` IBL is loaded from `assets.babylonjs.com` (Babylon.js

@@ -22,6 +22,7 @@ window.TRLE = window.TRLE || {};
     /* ============ STATE ============ */
     const state = {
         image: null,        // uploaded atlas <img>
+        imageLayers: null,  // atlas-sized material maps read from a PSD's layers, sliced alongside `image`
         tileSize: 256,
         cols: 0,
         elements: [],       // render order == atlas order
@@ -548,6 +549,330 @@ window.TRLE = window.TRLE || {};
         return out;
     }
 
+    /* Anisotropic sibling of makePeriodicNoise: independent x/y lattice periods,
+       so a field can be stretched along one axis (wood grain, brushed metal) and
+       still wrap exactly on both. Sampling x ∈ [0..px), y ∈ [0..py) is toroidal. */
+    function makePeriodicNoiseXY(seed, px, py) {
+        const rnd = mulberry32(seed >>> 0);
+        const PX = Math.max(1, px | 0), PY = Math.max(1, py | 0);
+        const grad = new Float32Array(PX * PY);
+        for (let i = 0; i < grad.length; i++) grad[i] = rnd();
+        const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+        const lerp = (a, b, t) => a + (b - a) * t;
+        const hash = (xi, yi) => grad[((yi % PY + PY) % PY) * PX + ((xi % PX + PX) % PX)];
+        return (x, y) => {
+            const xi = Math.floor(x), yi = Math.floor(y);
+            const u = fade(x - xi), v = fade(y - yi);
+            return lerp(lerp(hash(xi, yi), hash(xi + 1, yi), u),
+                        lerp(hash(xi, yi + 1), hash(xi + 1, yi + 1), u), v);
+        };
+    }
+
+    /* ============ SURFACE NOISE ============
+       Procedural surface detail (grit, grain, pitting, cracks) laid into a
+       texture's diffuse. Every generator below is built on a lattice whose period
+       divides the tile, so seamlessness is structural rather than tuned — a
+       noised tile wraps exactly like the tile it came from.
+
+       Why the diffuse: all material maps derive from diffuse luminance (see the
+       high-pass in shaders.js), so a flat diffuse gives the map generator nothing
+       to bite on — noise is what the maps read. The flip side is that anyone
+       exporting maps gets it counted twice, once as visible grain and again
+       amplified by the preset's normalStrength / roughnessContrast, which is why
+       every preset carries two strength defaults (`solo` vs `mapped`). */
+
+    /* Toroidal fractal value noise. One noise instance per octave, each with its
+       own lattice period, because a single instance can only wrap at one period. */
+    function periodicFbm(seed, baseFreq, octaves) {
+        const layers = [];
+        let f = Math.max(1, Math.round(baseFreq)), amp = 1, norm = 0;
+        for (let i = 0; i < octaves; i++) {
+            layers.push({ n: makePeriodicNoise((seed ^ (i * 0x9e3779b1)) >>> 0, f), f: f, a: amp });
+            norm += amp; amp *= 0.5; f *= 2;
+        }
+        return (u, v) => {                       // u,v ∈ [0,1) over the tile
+            let s = 0;
+            for (const L of layers) s += L.a * L.n(u * L.f, v * L.f);
+            return s / norm;
+        };
+    }
+
+    /* Anisotropic fBm — same idea, but stretched: `fx` cycles across the tile on
+       x, `fy` on y. Both integers, so both axes still wrap. */
+    function periodicFbmXY(seed, fx, fy, octaves) {
+        const layers = [];
+        let ax = Math.max(1, Math.round(fx)), ay = Math.max(1, Math.round(fy)), amp = 1, norm = 0;
+        for (let i = 0; i < octaves; i++) {
+            layers.push({ n: makePeriodicNoiseXY((seed ^ (i * 0x85ebca6b)) >>> 0, ax, ay), x: ax, y: ay, a: amp });
+            norm += amp; amp *= 0.5; ax *= 2; ay *= 2;
+        }
+        return (u, v) => {
+            let s = 0;
+            for (const L of layers) s += L.a * L.n(u * L.x, v * L.y);
+            return s / norm;
+        };
+    }
+
+    /* Jittered-grid Worley on a toroidal lattice (same family as bpCobble).
+       `ridge` returns the F2−F1 cell boundary (cracks); otherwise F1 distance
+       (round pits, dark at each site). Writes 0..1 into `out`. */
+    function worleyField(out, S, G, seed, ridge) {
+        const rnd = mulberry32((seed ^ 0x2545f491) >>> 0);
+        const cw = S / G;
+        const jx = new Float32Array(G * G), jy = new Float32Array(G * G), rad = new Float32Array(G * G);
+        for (let i = 0; i < G * G; i++) {
+            jx[i] = 0.5 + (rnd() * 2 - 1) * 0.45; jy[i] = 0.5 + (rnd() * 2 - 1) * 0.45;
+            // Per-site radius. Without it every pit is the same size on a barely
+            // jittered grid and the result reads as polka dots. The low end of the
+            // range also thins the field out naturally — the smallest sites all but
+            // disappear, which is what gives pitting its uneven clustering.
+            rad[i] = 0.30 + rnd() * 0.85;
+        }
+        for (let y = 0; y < S; y++) {
+            const gy0 = Math.floor(y / cw);
+            for (let x = 0; x < S; x++) {
+                const gx0 = Math.floor(x / cw);
+                let f1 = 1e18, f2 = 1e18, best = 0;
+                for (let dy = -1; dy <= 1; dy++)
+                    for (let dx = -1; dx <= 1; dx++) {
+                        const k = (((gy0 + dy) % G + G) % G) * G + (((gx0 + dx) % G + G) % G);
+                        const px = (gx0 + dx + jx[k]) * cw, py = (gy0 + dy + jy[k]) * cw;
+                        const d = (x - px) * (x - px) + (y - py) * (y - py);
+                        if (d < f1) { f2 = f1; f1 = d; best = k; } else if (d < f2) { f2 = d; }
+                    }
+                const d1 = Math.sqrt(f1);
+                // Both radii are deliberately a small fraction of the cell. Scale
+                // them up toward the cell size and the features stop being pits
+                // and cracks: F1 fills the tile with overlapping dark discs
+                // (leopard print) and the F2−F1 ridge becomes a fat web rather
+                // than a hairline. Most of the surface must stay untouched.
+                out[y * S + x] = ridge
+                    ? Math.min(1, (Math.sqrt(f2) - d1) / (cw * 0.15))
+                    : Math.min(1, d1 / (cw * 0.30 * rad[best]));
+            }
+        }
+    }
+
+    /* Wrap-aware blur of a scalar field, via a canvas round-trip (wrapBlur owns
+       the apron logic). Used by the per-pixel types, which are the only ones that
+       start out sharper than they should be. */
+    function fieldBlur(v, S, radius) {
+        const c = document.createElement('canvas'); c.width = c.height = S;
+        const cx = c.getContext('2d'), img = cx.createImageData(S, S), d = img.data;
+        for (let i = 0; i < v.length; i++) {
+            const g = Math.max(0, Math.min(255, Math.round(v[i] * 255)));
+            d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = g; d[i * 4 + 3] = 255;
+        }
+        cx.putImageData(img, 0, 0);
+        const bd = wrapBlur(c, S, radius).getContext('2d').getImageData(0, 0, S, S).data;
+        for (let i = 0; i < v.length; i++) v[i] = bd[i * 4] / 255;
+    }
+
+    /* Which noise types read as directional and therefore expose the grain-angle
+       control. Angle is restricted to the two axes on purpose: an arbitrary
+       rotation of the sample coords would not land back on the lattice, and the
+       tile would stop wrapping. */
+    const NOISE_DIRECTIONAL = ['woodgrain', 'streak', 'scratches', 'weave'];
+
+    const NOISE_TYPES = [
+        ['grain',     'Grain (fine)'],
+        ['speckle',   'Speckle (coarse grit)'],
+        ['clouds',    'Clouds (soft blotches)'],
+        ['mottle',    'Mottle (patchy dirt)'],
+        ['woodgrain', 'Wood grain (rings)'],
+        ['streak',    'Streaks (brushed)'],
+        ['scratches', 'Scratches / scuffs'],
+        ['weave',     'Weave (fabric)'],
+        ['pits',      'Pits (stone pocking)'],
+        ['cracks',    'Cracks (hairline)']
+    ];
+
+    /* Build a grayscale noise field for one tile. Returns an opaque canvas that
+       averages to mid-gray, so `strength` is symmetric and 0 is a true no-op.
+       o: { type, scale 0..100, contrast 0..100, dir 'v'|'h', seed } */
+    function buildNoiseField(S, opts) {
+        const o = Object.assign({ type: 'grain', scale: 50, contrast: 50, dir: 'v', seed: 1 }, opts);
+        const seed = (o.seed >>> 0) || 1;
+        const sc = Math.max(0, Math.min(100, o.scale)) / 100;      // 0 = fine, 1 = broad
+        // Worley costs 9 distance tests per pixel (~9.4M at 1024²) but the field
+        // is smooth, so compute it at ≤512 and upscale. The per-pixel types can't
+        // do that — upscaling would destroy exactly the detail they exist for.
+        const worleyType = o.type === 'pits' || o.type === 'cracks';
+        const R = worleyType ? Math.min(S, 512) : S;
+        const N = R * R;
+        const v = new Float32Array(N);
+        const rng = mulberry32(seed);
+        // Directional types are authored across x; 'h' transposes the sample so
+        // the grain runs the other way (the tile is square, so this still wraps).
+        const horiz = o.dir === 'h';
+
+        if (o.type === 'grain' || o.type === 'speckle') {
+            // No lattice at all — per-pixel randomness is toroidal by definition,
+            // and the blur that follows is wrap-aware, so the field stays seamless.
+            for (let i = 0; i < N; i++) v[i] = o.type === 'speckle' ? (rng() < 0.5 ? 0 : 1) : rng();
+            const px = R / 256;
+            fieldBlur(v, R, o.type === 'speckle' ? Math.max(0.5, (0.5 + sc * 1.6) * px)
+                                                 : Math.max(0.4, (0.4 + sc * 2.2) * px));
+        } else if (worleyType) {
+            // Cell count, not cell size: 4 gives a handful of big craters, 48 gives
+            // fine porosity. The old 3..24 range bottomed out at ~10px cells on a
+            // 256 tile, so even "fine" pitting still read as polka dots.
+            worleyField(v, R, Math.max(2, Math.round(4 + (1 - sc) * 44)), seed, o.type === 'cracks');
+        } else if (o.type === 'woodgrain') {
+            // Rings across the grain, wobbled by a low-frequency warp and dirtied
+            // by a fine stretched octave. `rings` is an integer, so fract() wraps.
+            const rings = Math.max(2, Math.round(3 + (1 - sc) * 17));
+            const warp = periodicFbmXY(seed ^ 0x27d4eb2d, 2, 1, 3);
+            const fine = periodicFbmXY(seed ^ 0x165667b1, rings * 4, 2, 2);
+            for (let y = 0; y < R; y++) for (let x = 0; x < R; x++) {
+                const u = (horiz ? y : x) / R, w = (horiz ? x : y) / R;
+                const t = u * rings + (warp(u, w) - 0.5) * 2.6;
+                const band = Math.abs((t - Math.floor(t)) * 2 - 1);   // triangle wave
+                // A raw triangle spends half its time mid-grey, which reads as
+                // regular painted bars. The power curve pulls it up fast so the
+                // wood is mostly clear with narrow dark grain lines instead.
+                v[y * R + x] = Math.pow(band, 0.45) * 0.72 + fine(u, w) * 0.28;
+            }
+        } else if (o.type === 'streak' || o.type === 'scratches') {
+            const fx = Math.max(2, Math.round(10 + (1 - sc) * 46));   // tight across
+            const fy = Math.max(1, Math.round(1 + sc * 2));           // stretched along
+            const f = periodicFbmXY(seed, fx, fy, 3);
+            for (let y = 0; y < R; y++) for (let x = 0; x < R; x++) {
+                const u = (horiz ? y : x) / R, w = (horiz ? x : y) / R;
+                const s = f(u, w);
+                // Scratches are the same field pushed through a hard threshold, so
+                // only the extremes survive as sparse streaks.
+                v[y * R + x] = o.type === 'scratches'
+                    ? Math.max(0, Math.min(1, (s - 0.72) / 0.10))
+                    : s;
+            }
+        } else if (o.type === 'weave') {
+            const nT = Math.max(2, Math.round(4 + (1 - sc) * 20));
+            const fine = periodicFbm(seed ^ 0x7feb352d, nT * 3, 2);
+            const tri = t => Math.abs((t - Math.floor(t)) * 2 - 1);
+            for (let y = 0; y < R; y++) for (let x = 0; x < R; x++) {
+                const u = x / R, w = y / R;
+                // Checker of warp/weft cells → the classic over-under shading:
+                // alternating cells show the thread running the other way.
+                const over = ((Math.floor(u * nT) + Math.floor(w * nT)) & 1) === 0;
+                const acrossU = horiz ? !over : over;
+                const band = 1 - tri(acrossU ? w * nT : u * nT);
+                v[y * R + x] = band * 0.75 + fine(u, w) * 0.25;
+            }
+        } else {                                                      // clouds | mottle
+            const f = periodicFbm(seed, Math.max(1, Math.round(1 + (1 - sc) * 11)),
+                                  o.type === 'mottle' ? 4 : 3);
+            for (let y = 0; y < R; y++) for (let x = 0; x < R; x++) v[y * R + x] = f(x / R, y / R);
+        }
+
+        // Re-centre on the field's own mean before applying contrast. Worley and
+        // the thresholded types are nowhere near 0.5 on average, and without this
+        // they would brighten or darken the texture instead of just texturing it.
+        let mean = 0;
+        for (let i = 0; i < N; i++) mean += v[i];
+        mean /= N;
+        const k = 0.25 + (Math.max(0, Math.min(100, o.contrast)) / 100) * 3.75;
+        const out = document.createElement('canvas'); out.width = out.height = R;
+        const octx = out.getContext('2d'), img = octx.createImageData(R, R), d = img.data;
+        for (let i = 0; i < N; i++) {
+            const g = Math.max(0, Math.min(255, Math.round((0.5 + (v[i] - mean) * k) * 255)));
+            d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = g; d[i * 4 + 3] = 255;
+        }
+        octx.putImageData(img, 0, 0);
+        if (R === S) return out;
+        const up = document.createElement('canvas'); up.width = up.height = S;
+        const uctx = up.getContext('2d');
+        uctx.imageSmoothingEnabled = true;
+        uctx.drawImage(out, 0, 0, S, S);
+        return up;
+    }
+
+    /* Blend-specific remap so `strength` means the same thing in every mode:
+       overlay/soft-light are neutral at mid-gray, multiply at white and screen at
+       black. Without this, picking multiply would darken the whole tile before
+       any noise was visible. */
+    function remapFieldForBlend(field, S, blend) {
+        if (blend !== 'multiply' && blend !== 'screen') return;
+        const ctx = field.getContext('2d');
+        const img = ctx.getImageData(0, 0, S, S), d = img.data;
+        for (let i = 0; i < d.length; i += 4) {
+            const g = blend === 'multiply' ? 128 + d[i] * 0.5 : d[i] * 0.5;
+            d[i] = d[i + 1] = d[i + 2] = g;
+        }
+        ctx.putImageData(img, 0, 0);
+    }
+
+    /* Lay surface noise over `target` in place. `mask` (optional) is a canvas
+       whose alpha limits where the noise lands — Build Pattern passes its cell
+       layer so the joints keep their own mortar grain. */
+    function applySurfaceNoise(target, S, opts, mask) {
+        const o = Object.assign({ strength: 0, blend: 'overlay' }, opts);
+        if (!o.type || o.type === 'none' || !(o.strength > 0)) return;
+        const field = buildNoiseField(S, o);
+        remapFieldForBlend(field, S, o.blend);
+        if (mask) {
+            const fc = field.getContext('2d');
+            fc.globalCompositeOperation = 'destination-in';
+            fc.drawImage(mask, 0, 0);
+        }
+        const ctx = target.getContext('2d');
+        ctx.save();
+        ctx.globalAlpha = Math.max(0, Math.min(1, o.strength / 100));
+        ctx.globalCompositeOperation = o.blend;
+        ctx.drawImage(field, 0, 0);
+        ctx.restore();
+    }
+
+    /* Preset recipes. `solo` / `mapped` are the two strength defaults described
+       at the top of this section: `solo` for a diffuse-only texture where noise
+       is the entire detail budget, `mapped` for one that also exports material
+       maps, where the preset amplifies the same grain a second time. */
+    const NOISE_PRESETS = {
+        filmgrain:  { label: '🎞️ Film grain',           type: 'grain',     scale: 15, contrast: 45, blend: 'overlay',  solo: 30, mapped: 12 },
+        brickgrit:  { label: '🧱 Brick grit',            type: 'speckle',   scale: 25, contrast: 55, blend: 'overlay',  solo: 40, mapped: 16 },
+        stonepit:   { label: '🪨 Stone pitting',         type: 'pits',      scale: 35, contrast: 60, blend: 'overlay',  solo: 45, mapped: 18 },
+        concrete:   { label: '🏗️ Concrete mottle',       type: 'mottle',    scale: 55, contrast: 65, blend: 'overlay',  solo: 45, mapped: 18 },
+        dust:       { label: '🌫️ Dust & dirt',           type: 'clouds',    scale: 70, contrast: 50, blend: 'multiply', solo: 40, mapped: 20 },
+        damp:       { label: '💧 Damp stains',           type: 'clouds',    scale: 80, contrast: 70, blend: 'multiply', solo: 45, mapped: 22 },
+        woodfine:   { label: '🪵 Wood grain (fine)',     type: 'woodgrain', scale: 45, contrast: 50, blend: 'overlay',  solo: 40, mapped: 16, dir: 'v' },
+        woodcoarse: { label: '🪵 Wood grain (coarse)',   type: 'woodgrain', scale: 70, contrast: 65, blend: 'overlay',  solo: 55, mapped: 22, dir: 'v' },
+        brushed:    { label: '⚙️ Brushed metal',         type: 'streak',    scale: 30, contrast: 45, blend: 'overlay',  solo: 35, mapped: 14, dir: 'v' },
+        scuffs:     { label: '✂️ Scratches & scuffs',    type: 'scratches', scale: 40, contrast: 60, blend: 'screen',   solo: 30, mapped: 12, dir: 'v' },
+        weave:      { label: '🧵 Fabric weave',          type: 'weave',     scale: 45, contrast: 55, blend: 'overlay',  solo: 40, mapped: 16, dir: 'v' },
+        cracks:     { label: '🕸️ Hairline cracks',       type: 'cracks',    scale: 45, contrast: 70, blend: 'multiply', solo: 35, mapped: 14 }
+    };
+
+    /* Is anything that reads surface relief out of the diffuse being exported?
+       Normal/AO/roughness/height all derive from diffuse luminance; emissive and
+       specular-base don't meaningfully re-read the grain. */
+    function noiseExportsRelief() {
+        let on = false;
+        document.querySelectorAll('#at-map-checks input[data-map]').forEach(cb => {
+            if (cb.checked && ['normal', 'ao', 'roughness', 'height'].includes(cb.dataset.map)) on = true;
+        });
+        return on;
+    }
+
+    /* Which of a preset's two strength defaults applies. `mapped` when this
+       texture also ships material maps — they re-read the same grain out of the
+       diffuse and amplify it by the preset's normalStrength/roughnessContrast, so
+       it lands twice. `solo` when the diffuse is all there is. */
+    function noiseBand(hasMaterial) { return hasMaterial && noiseExportsRelief() ? 'mapped' : 'solo'; }
+
+    function noiseDefaultStrength(presetKey, hasMaterial) {
+        const p = NOISE_PRESETS[presetKey];
+        return p ? p[noiseBand(hasMaterial)] : 30;
+    }
+
+    /* One-line, state-aware guidance under the strength slider. Reads the actual
+       material + export state rather than giving everyone the same warning. */
+    function noiseAdvice(hasMaterial, presetKey) {
+        const s = noiseDefaultStrength(presetKey, hasMaterial);
+        return hasMaterial && noiseExportsRelief()
+            ? `Material maps are on. They read this same grain back out of the diffuse and amplify it, so it lands twice — around <strong>${s}%</strong> is usually plenty.`
+            : `Diffuse-only, so nothing downstream amplifies this and the grain is the whole detail budget — around <strong>${s}%</strong> is a normal starting point.`;
+    }
+
     /* RGB (0-255) → {h,s,l} in HSL(0-360, 0-100, 0-100). */
     function hslOfRgb(r255, g255, b255) {
         const r = r255 / 255, g = g255 / 255, b = b255 / 255;
@@ -646,6 +971,44 @@ window.TRLE = window.TRLE || {};
 
     function cloneCanvas(src) {
         return resizeCanvas(src, src.width, src.height);
+    }
+
+    /* Cut one tile-sized region out of each atlas-wide PSD map layer. `layers` is
+       the state.imageLayers bag; returns null when there's nothing to cut, so
+       tiles from ordinary PNG atlases stay clean. */
+    function sliceImportedMaps(layers, sx, sy, S) {
+        if (!layers) return null;
+        const out = {};
+        for (const mt of TRLE.MapOrder) {
+            if (!layers[mt]) continue;
+            const c = document.createElement('canvas');
+            c.width = S; c.height = S;
+            c.getContext('2d').drawImage(layers[mt], sx, sy, S, S, 0, 0, S, S);
+            out[mt] = c;
+        }
+        return Object.keys(out).length ? out : null;
+    }
+
+    /* Fit a whole PSD's map layers to one tile. Used when a single PSD becomes a
+       single tile (Replace Image, Add Images) rather than a sliced atlas — the
+       maps get the same stretch-to-tile treatment the diffuse gets. */
+    function scaleImportedMaps(maps, S) {
+        if (!maps) return null;
+        const out = {};
+        for (const mt of TRLE.MapOrder) {
+            if (maps[mt]) out[mt] = resizeCanvas(maps[mt], S, S);
+        }
+        return Object.keys(out).length ? out : null;
+    }
+
+    /* Deep-copy an el.importedMaps bag (PSD-sourced material maps). Null stays
+       null so "no imported maps" never becomes an empty object that later reads
+       as truthy. */
+    function cloneImportedMaps(maps) {
+        if (!maps) return null;
+        const out = {};
+        for (const mt of TRLE.MapOrder) if (maps[mt]) out[mt] = cloneCanvas(maps[mt]);
+        return Object.keys(out).length ? out : null;
     }
 
     /* Geometric transform (90° rotation + flips) used to re-orient a transition's
@@ -823,12 +1186,144 @@ window.TRLE = window.TRLE || {};
                /tga/i.test(file.type || '');
     }
 
+    function isPSDFile(file) {
+        return !!(TRLE.PSD && TRLE.PSD.isPSDFile(file));
+    }
+
+    /* ---- PSD layers → material maps --------------------------------------
+       Our own PSD export writes one layer per map, named exactly as in
+       TRLE.MapOrder, plus a "diffuse" layer. Recognising those names on the way
+       back in is what makes the Photoshop round-trip work: export → edit the
+       normal map by hand → import → the edited normal survives instead of being
+       regenerated from the preset.
+
+       Matching is deliberately loose so a hand-built PSD round-trips too: the
+       bare map name, or anything ending in the export file-name suffix (_n, _ao,
+       _s, _r, _e, _h). Group nesting is ignored — only the leaf name matters. */
+    const PSD_DIFFUSE_NAMES = ['diffuse', 'albedo', 'base', 'basecolor', 'base color', 'color', 'colour'];
+
+    function psdLayerMapType(rawName) {
+        const name = String(rawName || '').split('/').pop().trim().toLowerCase();
+        if (!name) return null;
+        if (PSD_DIFFUSE_NAMES.includes(name)) return 'diffuse';
+        if (TRLE.MapOrder.includes(name)) return name;
+        for (const mt of TRLE.MapOrder) {
+            if (name.endsWith(TRLE.MapSuffixes[mt])) return mt;
+        }
+        return null;
+    }
+
+    /* Photoshop blend modes that canvas can reproduce 1:1. Anything outside this
+       table (linear dodge, dissolve, pass-through…) is drawn as Normal and
+       counted, so we can tell the user the flatten is approximate rather than
+       silently handing them the wrong pixels. */
+    const PSD_BLEND_OPS = {
+        'normal': 'source-over', 'multiply': 'multiply', 'screen': 'screen',
+        'overlay': 'overlay', 'darken': 'darken', 'lighten': 'lighten',
+        'color dodge': 'color-dodge', 'color burn': 'color-burn',
+        'hard light': 'hard-light', 'soft light': 'soft-light',
+        'difference': 'difference', 'exclusion': 'exclusion',
+        'hue': 'hue', 'saturation': 'saturation',
+        'color': 'color', 'luminosity': 'luminosity'
+    };
+
+    /* Is this canvas entirely transparent? Checked on a 64² downscale rather than
+       the full image: drawImage does the reduction on the GPU, any real content
+       survives it with non-zero alpha, and it costs one small getImageData
+       instead of scanning 16M pixels on a 4096² atlas. */
+    function canvasIsBlank(canvas) {
+        const n = 64;
+        const c = document.createElement('canvas');
+        c.width = n; c.height = n;
+        c.getContext('2d').drawImage(canvas, 0, 0, n, n);
+        const d = c.getContext('2d').getImageData(0, 0, n, n).data;
+        for (let i = 3; i < d.length; i += 4) if (d[i] !== 0) return false;
+        return true;
+    }
+
+    /* Flatten a PSD ourselves. Needed when the file was saved with "Maximize PSD
+       File Compatibility" turned off: Photoshop still writes a merged-image
+       section (the format demands one) but leaves it EMPTY, so the composite
+       reads back blank rather than missing. Treating blank as absent is what
+       makes those files import instead of arriving as a transparent tile. */
+    function compositePSDLayers(psd) {
+        const c = document.createElement('canvas');
+        c.width = psd.width; c.height = psd.height;
+        const ctx = c.getContext('2d');
+        let approximated = 0;
+        for (const layer of psd.layers) {
+            if (layer.hidden) continue;
+            const op = PSD_BLEND_OPS[layer.blendMode];
+            if (!op) approximated++;
+            ctx.globalCompositeOperation = op || 'source-over';
+            ctx.globalAlpha = layer.opacity == null ? 1 : layer.opacity;
+            ctx.drawImage(layer.canvas, 0, 0);
+        }
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.globalAlpha = 1;
+        return { canvas: c, approximated };
+    }
+
+    /* Read a PSD into the shape the rest of the tool wants: one base image plus
+       any material maps we recognised. Picking the base image, in order:
+         1. a "diffuse" layer   — our own export, and the only layer that is the
+            texture itself (compositing it with the normal/AO layers stacked on
+            top would produce garbage, so map layers are never composited);
+         2. the flattened composite Photoshop stored;
+         3. a composite we build ourselves from the layers. */
+    function readPSDAsset(file) {
+        return TRLE.PSD.read(file).then(psd => {
+            const maps = {};
+            let diffuse = null;
+            for (const layer of psd.layers) {
+                if (layer.hidden) continue;
+                const mt = psdLayerMapType(layer.name);
+                if (mt === 'diffuse') { if (!diffuse) diffuse = layer.canvas; }
+                else if (mt && !maps[mt]) maps[mt] = layer.canvas;
+            }
+
+            let base = diffuse || (psd.composite && !canvasIsBlank(psd.composite) ? psd.composite : null);
+            if (!base) {
+                const flat = compositePSDLayers(psd);
+                base = flat.canvas;
+                if (flat.approximated) {
+                    showToast(`“${file.name}” has no flattened preview and uses ${flat.approximated} `
+                        + 'blend mode(s) the browser can\'t reproduce — flatten it in Photoshop for an exact match.', 'info', 6000);
+                }
+            }
+            if (!base) throw new Error(`“${file.name}” has no visible layers.`);
+
+            const found = Object.keys(maps);
+            if (found.length) {
+                showToast(`Loaded ${found.length} material map${found.length > 1 ? 's' : ''} from “${file.name}” (${found.join(', ')})`, 'success', 4000);
+            }
+
+            // Non-blocking PNG encode, so a big atlas doesn't freeze the UI on
+            // the way to an <img> (see canvasToPNGDataURL).
+            return canvasToPNGDataURL(base).then(url => loadImageURL(url)).then(img => {
+                if (!img) throw new Error(`Couldn’t decode “${file.name}”.`);
+                return { img, maps };
+            });
+        }).catch(err => {
+            throw new Error(`Couldn’t read “${file.name}”: ${err.message}`);
+        });
+    }
+
     /* Read any supported image file into a real <img> element, so every caller
        downstream gets a uniform HTMLImageElement (naturalWidth/Height etc.).
        PNG/JPEG/GIF/WebP/BMP go straight through the browser; TGA is decoded by
        hand (TRLE.Engine.decodeTGA) then re-encoded to a PNG data-URL. Returns a
        Promise that rejects with a human-readable Error on any failure. */
+    /* Full read: the image plus anything else the file carried. Only PSD returns
+       maps today; every other format resolves with an empty `maps`, so callers
+       can treat the result uniformly. */
+    function readImageAsset(file) {
+        if (isPSDFile(file)) return readPSDAsset(file);
+        return readImageFile(file).then(img => ({ img, maps: {} }));
+    }
+
     function readImageFile(file) {
+        if (isPSDFile(file)) return readPSDAsset(file).then(a => a.img);
         if (isTGAFile(file)) {
             return file.arrayBuffer().then(buf => {
                 let canvas;
@@ -849,7 +1344,7 @@ window.TRLE = window.TRLE || {};
                 const img = new Image();
                 img.onload = () => resolve(img);
                 img.onerror = () => reject(new Error(
-                    `Couldn’t read “${file.name}”. Unsupported or corrupt image — try PNG or TGA.`));
+                    `Couldn’t read “${file.name}”. Unsupported or corrupt image — try PNG, TGA or PSD.`));
                 img.src = e.target.result;
             };
             reader.onerror = () => reject(new Error(`Couldn’t read “${file.name}”.`));
@@ -858,7 +1353,7 @@ window.TRLE = window.TRLE || {};
     }
 
     function loadImageFile(file, area, callback) {
-        readImageFile(file).then(img => {
+        readImageAsset(file).then(({ img, maps }) => {
             area.querySelectorAll('.preview-img').forEach(el => el.remove());
             const preview = document.createElement('img');
             preview.className = 'preview-img';
@@ -866,7 +1361,7 @@ window.TRLE = window.TRLE || {};
             area.appendChild(preview);
             area.querySelector('.upload-text').textContent =
                 `${file.name} (${img.naturalWidth}×${img.naturalHeight})`;
-            callback(img, file.name);
+            callback(img, file.name, maps);
         }).catch(err => showToast(err.message, 'error'));
     }
 
@@ -1690,6 +2185,7 @@ window.TRLE = window.TRLE || {};
                 customMask: el.customMask || null,                     // immutable ref (set once at add)
                 overlayGeom: el.overlayGeom ? { ...el.overlayGeom } : null, // transition overlay re-orient
                 emissive: el.emissive ? cloneCanvas(el.emissive) : null, // authored glow (mutable)
+                importedMaps: cloneImportedMaps(el.importedMaps),        // maps read out of a PSD's layers
                 // Animation metadata — frames are regenerated from params on
                 // restore (like transitions), so no pixels are snapshotted.
                 anim: el.anim ? JSON.parse(JSON.stringify(el.anim)) : null,
@@ -1737,6 +2233,7 @@ window.TRLE = window.TRLE || {};
                 customMask: s.customMask || null,
                 overlayGeom: s.overlayGeom ? { ...s.overlayGeom } : null,
                 emissive: s.emissive ? cloneCanvas(s.emissive) : null,
+                importedMaps: cloneImportedMaps(s.importedMaps),
                 anim: s.anim ? JSON.parse(JSON.stringify(s.anim)) : null,
                 htParams: s.htParams ? JSON.parse(JSON.stringify(s.htParams)) : null,
                 sgParams: s.sgParams ? JSON.parse(JSON.stringify(s.sgParams)) : null,
@@ -2106,6 +2603,10 @@ window.TRLE = window.TRLE || {};
                 if (el.kind !== 'tile') { showToast('Stained Glass works on source tiles only', 'info'); return; }
                 openStainedGlassModal(id);
                 break;
+            case 'surfacenoise':
+                if (el.kind !== 'tile') { showToast('Surface Noise works on source tiles only', 'info'); return; }
+                openNoiseModal(id);
+                break;
             case 'editstainedglass': if (el.sgParams) editStainedGlassModal(el); break;
             case 'replace':
                 if (el.kind !== 'tile') { showToast('Replace works on source tiles only', 'info'); return; }
@@ -2206,7 +2707,7 @@ window.TRLE = window.TRLE || {};
     }
 
     /* ============ MODAL INFRASTRUCTURE ============ */
-    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'bset', 'fade', 'emissive', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'delight', 'import', 'origami', 'stainedglass', 'confirm'];
+    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'bset', 'fade', 'emissive', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'delight', 'import', 'origami', 'stainedglass', 'noise', 'confirm'];
 
     function visibleModal() {
         return MODAL_NAMES
@@ -2229,7 +2730,13 @@ window.TRLE = window.TRLE || {};
         document.body.classList.add('at-modal-open');
         $('at-overlay').style.display = 'flex';
         MODAL_NAMES.forEach(n => {
-            $(`at-modal-${n}`).style.display = (n === name) ? 'block' : 'none';
+            // MUST be 'flex', not 'block': .at-modal is a viewport-capped flex column
+            // (pinned title / scrolling .at-modal-body / pinned actions). An inline
+            // display:block silently defeats that — the body gets no height constraint,
+            // its overflow-y:auto never engages, and tall content (e.g. the Build
+            // Pattern mortar accordion) pushes the action buttons out past the modal's
+            // bottom edge onto the backdrop.
+            $(`at-modal-${n}`).style.display = (n === name) ? 'flex' : 'none';
         });
         // Move focus into the dialog after it's laid out.
         requestAnimationFrame(() => {
@@ -3955,23 +4462,31 @@ window.TRLE = window.TRLE || {};
                  shape morphs into it over the radius
        The along-ring coordinate is a symmetric min/max of the folded distances,
        so detail wraps continuously through the corners (no diagonal seam) and the
-       result is 8-fold symmetric. Source alpha is preserved. */
+       result is 8-fold symmetric. Source alpha is preserved.
+
+       opts.ss (1|2|4) supersamples: the fold runs on an S·ss grid and is
+       box-averaged back to S, antialiasing the ring/reflection boundaries that
+       nearest-neighbour sampling would otherwise stair-step. It adds no source
+       detail (the source is still S) — it only removes the geometric aliasing the
+       fold creates. Preview uses ss=2, commit ss=4. */
     function makeOrigamiFrame(srcCanvas, S, opts = {}) {
         const shape = opts.shape || 'square';
         const repeats = Math.max(1, opts.repeats || 1);
         const gamma = opts.gamma > 0 ? opts.gamma : 1;
         const shape2 = (opts.shape2 && opts.shape2 !== 'same' && opts.shape2 !== shape) ? opts.shape2 : null;
+        const ss = [1, 2, 4].includes(opts.ss) ? opts.ss : 1;   // supersample factor (SSAA)
         const src = (srcCanvas.width === S && srcCanvas.height === S)
             ? srcCanvas : resizeCanvas(srcCanvas, S, S);
         const sd = src.getContext('2d').getImageData(0, 0, S, S).data;
         const axis = (opts.axis && opts.axis !== 'auto') ? opts.axis : origamiDetectAxis(sd, S);
-        const out = document.createElement('canvas');
-        out.width = S; out.height = S;
-        const octx = out.getContext('2d');
-        const od = octx.createImageData(S, S);
+        const SS = S * ss;                       // supersampled output resolution
+        const hires = document.createElement('canvas');
+        hires.width = SS; hires.height = SS;
+        const hctx = hires.getContext('2d');
+        const od = hctx.createImageData(SS, SS);
         const dd = od.data;
-        const Cx = (opts.cx == null ? 0.5 : Math.min(1, Math.max(0, opts.cx))) * (S - 1);
-        const Cy = (opts.cy == null ? 0.5 : Math.min(1, Math.max(0, opts.cy))) * (S - 1);
+        const Cx = (opts.cx == null ? 0.5 : Math.min(1, Math.max(0, opts.cx))) * (SS - 1);
+        const Cy = (opts.cy == null ? 0.5 : Math.min(1, Math.max(0, opts.cy))) * (SS - 1);
         const tri = t => { let p = (t * repeats) % 2; if (p < 0) p += 2; return p > 1 ? 2 - p : p; };
         // (rn, tn) for a shape from per-side-normalized distances a,b ∈ 0..1.
         const shapeCoords = (sh, a, b) => {
@@ -3980,12 +4495,13 @@ window.TRLE = window.TRLE || {};
             if (sh === 'circle')  return [Math.hypot(a, b) / Math.SQRT2, (hi ? Math.atan2(lo, hi) : 0) / (Math.PI / 4)];
             return [hi, lo];   // square
         };
-        for (let y = 0; y < S; y++) {
-            for (let x = 0; x < S; x++) {
+        for (let y = 0; y < SS; y++) {
+            for (let x = 0; x < SS; x++) {
                 // Normalize each axis against its own side of the origin so
                 // rn hits 1 at every border even when the origin is off-centre.
-                const a = Math.abs(x - Cx) / Math.max(1, x < Cx ? Cx : (S - 1 - Cx));
-                const b = Math.abs(y - Cy) / Math.max(1, y < Cy ? Cy : (S - 1 - Cy));
+                // Fold geometry is computed on the SS grid; source is sampled at S.
+                const a = Math.abs(x - Cx) / Math.max(1, x < Cx ? Cx : (SS - 1 - Cx));
+                const b = Math.abs(y - Cy) / Math.max(1, y < Cy ? Cy : (SS - 1 - Cy));
                 let [rn, tn] = shapeCoords(shape, a, b);
                 if (shape2) {   // morph inner shape → outer shape over the radius
                     const [rn2, tn2] = shapeCoords(shape2, a, b);
@@ -4001,13 +4517,26 @@ window.TRLE = window.TRLE || {};
                 if (v < 0) v = 0; else if (v > S - 1) v = S - 1;
                 const sx = axis === 'h' ? v : u;         // 'v' ridges vary by column
                 const sy = axis === 'h' ? u : v;
-                const si = (sy * S + sx) * 4, di = (y * S + x) * 4;
+                const si = (sy * S + sx) * 4, di = (y * SS + x) * 4;
                 dd[di] = sd[si]; dd[di + 1] = sd[si + 1];
                 dd[di + 2] = sd[si + 2]; dd[di + 3] = sd[si + 3];
             }
         }
-        octx.putImageData(od, 0, 0);
-        return out;
+        hctx.putImageData(od, 0, 0);
+        if (ss === 1) return hires;
+        // Box-average down to S by repeated halving (each step averages a 2×2
+        // block exactly, so 4× → 2× → 1× is a true box filter, no undersampling).
+        let cur = hires, curS = SS;
+        while (curS > S) {
+            const nextS = Math.max(S, curS >> 1);
+            const tmp = document.createElement('canvas');
+            tmp.width = nextS; tmp.height = nextS;
+            const tctx = tmp.getContext('2d');
+            tctx.imageSmoothingEnabled = true; tctx.imageSmoothingQuality = 'high';
+            tctx.drawImage(cur, 0, 0, nextS, nextS);
+            cur = tmp; curS = nextS;
+        }
+        return cur;
     }
 
     /* ============ BORDER SET MODAL ============ */
@@ -4871,6 +5400,11 @@ window.TRLE = window.TRLE || {};
             TRLE.Engine.deleteTexture(tex);
         }
         if (el.emissive) canv.emissive = el.emissive;   // authored glow wins (matches deriveMaps)
+        // …and PSD-imported maps win over both (again, matching deriveMaps), so
+        // the 3D preview shows what will actually be exported.
+        if (el.importedMaps) {
+            for (const mt of TRLE.MapOrder) if (el.importedMaps[mt]) canv[mt] = el.importedMaps[mt];
+        }
 
         const ctrl = mat3dCtrl();
         ctrl.setRelief(mat3dReliefFromSlider(), false);  // store; setMaps rebuilds once
@@ -7030,11 +7564,11 @@ window.TRLE = window.TRLE || {};
         if (!el || el.kind !== 'tile') return;
         const input = document.createElement('input');
         input.type = 'file';
-        input.accept = 'image/*,.tga';
+        input.accept = 'image/*,.tga,.psd,.psb';
         input.addEventListener('change', e => {
             const file = e.target.files[0];
             if (!file) return;
-            readImageFile(file).then(img => {
+            readImageAsset(file).then(({ img, maps }) => {
                 const S = state.tileSize;
                 const ctx = el.canvas.getContext('2d');
                 ctx.clearRect(0, 0, S, S);
@@ -7042,6 +7576,10 @@ window.TRLE = window.TRLE || {};
                 el.original = cloneCanvas(el.canvas);
                 el.seamless = false;
                 el.edited = false;
+                // Replacing the pixels replaces the maps that described them:
+                // a PSD brings its own, anything else drops whatever was there
+                // so stale maps never outlive the texture they belonged to.
+                el.importedMaps = scaleImportedMaps(maps, S);
                 refreshTransitions();
                 renderGrid();
                 pushHistory('Replace image');
@@ -7456,7 +7994,7 @@ window.TRLE = window.TRLE || {};
         const el = byId(origamiState.id);
         if (!el) return;
         const S = state.tileSize;
-        origamiState.canvas = makeOrigamiFrame(el.canvas, S, origamiOpts());
+        origamiState.canvas = makeOrigamiFrame(el.canvas, S, { ...origamiOpts(), ss: 2 });
         const cv = $('at-origami-preview');
         cv.width = S; cv.height = S;
         cv.getContext('2d').drawImage(origamiState.canvas, 0, 0);
@@ -7483,7 +8021,8 @@ window.TRLE = window.TRLE || {};
         $('at-origami-add').addEventListener('click', () => {
             const el = byId(origamiState.id);
             if (!el || !origamiState.canvas) return;
-            const canvas = cloneCanvas(origamiState.canvas);
+            // Commit at 4× supersampling (the preview is 2×) for the kept pixels.
+            const canvas = makeOrigamiFrame(el.canvas, state.tileSize, { ...origamiOpts(), ss: 4 });
             const tile = {
                 id: state.nextId++, kind: 'tile', canvas, original: cloneCanvas(canvas),
                 seamless: false, edited: true, material: deepCopyMaterial(el.material)
@@ -7517,18 +8056,20 @@ window.TRLE = window.TRLE || {};
         $('at-var-generate').addEventListener('click', () => {
             if (varState.id === null || !varState.variants.length) return;
             const srcEl = byId(varState.id);
-            varState.variants.forEach(v => {
-                state.elements.push({
-                    id: state.nextId++,
-                    kind: 'tile',
-                    canvas: cloneCanvas(v),
-                    original: cloneCanvas(v),
-                    seamless: srcEl ? !!srcEl.seamless : false,
-                    edited: false,
-                    material: null
-                });
-            });
-            const n = varState.variants.length;
+            const newTiles = varState.variants.map(v => ({
+                id: state.nextId++,
+                kind: 'tile',
+                canvas: cloneCanvas(v),
+                original: cloneCanvas(v),
+                seamless: srcEl ? !!srcEl.seamless : false,
+                edited: false,
+                material: null
+            }));
+            // Insert right after the source tile (falls back to append if it's gone).
+            const at = indexOf(varState.id);
+            if (at >= 0) state.elements.splice(at + 1, 0, ...newTiles);
+            else state.elements.push(...newTiles);
+            const n = newTiles.length;
             closeModal();
             renderGrid();
             pushHistory(`Add ${n} variation${n > 1 ? 's' : ''}`);
@@ -7549,6 +8090,15 @@ window.TRLE = window.TRLE || {};
     const BP_PRESET = {
         brick: 'brick', tile: 'tile', planks: 'wood', pipes: 'metal',
         coursed: 'stone', herringbone: 'brick', cobble: 'stone', shingles: 'slate', floor: 'wood'
+    };
+
+    /* Which surface-noise preset each pattern suggests. Selecting a pattern loads
+       these into the controls but never ticks the enable box — the assumption is
+       still that you're building from an already-textured source. */
+    const BP_NOISE_PRESET = {
+        brick: 'brickgrit', tile: 'concrete', planks: 'woodfine', pipes: 'brushed',
+        coursed: 'stonepit', herringbone: 'brickgrit', cobble: 'stonepit',
+        shingles: 'damp', floor: 'woodfine'
     };
 
     /* HSL(0-360,0-100,0-100) → CSS rgb() string, for the mortar colour sliders. */
@@ -8065,8 +8615,17 @@ window.TRLE = window.TRLE || {};
 
         if (organic && p.warp > 0)
             cellLayer = warpLayerToroidal(cellLayer, S, p.warp, (buildState.seed ^ 0x51ed270b) >>> 0);
+        // Surface noise. Off → bpNoiseParams() is null and nothing below runs, so
+        // the output stays byte-identical to a build made before this existed.
+        // "Cells only" masks the field with the cell layer's own alpha, leaving the
+        // joints to the mortar's separate grain. Both scopes land BEFORE the
+        // orientation rotation, so a directional grain follows the pattern (pick
+        // Vertical and it runs along the planks whichever way they're laid).
+        const sn = bpNoiseParams();
+        if (sn && sn.scope === 'cells') applySurfaceNoise(cellLayer, S, sn, cellLayer);
         ctx.drawImage(cellLayer, 0, 0);
         if (organic && p.joint > 0) bpJointAO(ctx, cellLayer, S, 0.30);
+        if (sn && sn.scope === 'tile') applySurfaceNoise(out, S, sn, null);
 
         // Vertically-built patterns are rotated for the horizontal option (stays seamless).
         if (['planks', 'pipes', 'floor', 'herringbone'].includes(p.pattern) && p.orient === 'h') {
@@ -8114,6 +8673,55 @@ window.TRLE = window.TRLE || {};
         $('at-bp-ml-label').textContent = natural ? 'Brightness' : 'Lightness';
     }
 
+    /* ---- Build Pattern: surface noise ---- */
+
+    /* Read the surface-noise controls. Returns null when the feature is off, which
+       is the early-out that keeps output byte-identical to a pre-noise build. */
+    function bpNoiseParams() {
+        if (!$('at-bp-sn-on').checked) return null;
+        return {
+            type:     $('at-bp-sn-type').value,
+            strength: parseInt($('at-bp-sn-strength').value),
+            scale:    parseInt($('at-bp-sn-scale').value),
+            contrast: parseInt($('at-bp-sn-contrast').value),
+            dir:      $('at-bp-sn-dir').value,
+            blend:    $('at-bp-sn-blend').value,
+            scope:    $('at-bp-sn-scope').value,     // cells | tile
+            // Derived from the pattern seed so 🎲 reseeds the grain too, the same
+            // way the mortar noise hangs off it.
+            seed:     (buildState.seed ^ 0x6b7f2c19) >>> 0
+        };
+    }
+
+    const bpSetSlider = (id, v) => { $(id).value = v; const l = $(id + '-val'); if (l) l.textContent = v; };
+
+    /* Load a preset's recipe into the controls, picking the strength band that
+       matches whether this tile will also carry material maps. */
+    function bpApplyNoisePreset(key) {
+        const p = NOISE_PRESETS[key];
+        if (!p) return;
+        $('at-bp-sn-type').value = p.type;
+        $('at-bp-sn-blend').value = p.blend;
+        $('at-bp-sn-dir').value = p.dir || 'v';
+        bpSetSlider('at-bp-sn-scale', p.scale);
+        bpSetSlider('at-bp-sn-contrast', p.contrast);
+        bpSetSlider('at-bp-sn-strength', noiseDefaultStrength(key, $('at-bp-assign').checked));
+    }
+
+    function bpSyncNoiseControls() {
+        const on = $('at-bp-sn-on').checked;
+        $('at-bp-sn-body').style.display = on ? '' : 'none';
+        $('at-bp-sn-dirwrap').style.display = NOISE_DIRECTIONAL.includes($('at-bp-sn-type').value) ? '' : 'none';
+        const key = $('at-bp-sn-preset').value;
+        $('at-bp-sn-advice').innerHTML = noiseAdvice($('at-bp-assign').checked, key);
+        // Summary line doubles as the at-a-glance state, since the accordion is
+        // usually collapsed and "is noise on?" is the question people will have.
+        const p = NOISE_PRESETS[key];
+        $('at-bp-sn-state').textContent = on
+            ? `— ${p ? p.label : key} ${$('at-bp-sn-strength').value}%`
+            : '— off';
+    }
+
     /* Reset the mortar sliders to the chosen style's defaults. */
     function bpApplyMortarDefaults(style) {
         const d = style === 'natural'
@@ -8130,6 +8738,7 @@ window.TRLE = window.TRLE || {};
         $('at-bp-tileno').textContent = indexOf(id) + 1;
         openModal('build');
         bpSyncControls();
+        bpSyncNoiseControls();
         bpGenerate();
     }
 
@@ -8149,10 +8758,47 @@ window.TRLE = window.TRLE || {};
                 bpScheduleRegen();
             });
         });
+        // Populate the noise selects from the tables, so adding a preset or type
+        // is a one-line change with no matching markup to keep in sync.
+        (() => {
+            const ps = $('at-bp-sn-preset');
+            for (const k in NOISE_PRESETS) ps.add(new Option(NOISE_PRESETS[k].label, k));
+            const ts = $('at-bp-sn-type');
+            for (const [k, label] of NOISE_TYPES) ts.add(new Option(label, k));
+            bpApplyNoisePreset(ps.value);
+        })();
+        [['at-bp-sn-strength', 'at-bp-sn-strength-val'], ['at-bp-sn-scale', 'at-bp-sn-scale-val'],
+         ['at-bp-sn-contrast', 'at-bp-sn-contrast-val']].forEach(([rid, lid]) => {
+            $(rid).addEventListener('input', function () {
+                $(lid).textContent = this.value;
+                bpSyncNoiseControls();
+                bpScheduleRegen();
+            });
+        });
+        $('at-bp-sn-on').addEventListener('change', () => { bpSyncNoiseControls(); bpGenerate(); });
+        $('at-bp-sn-preset').addEventListener('change', function () {
+            bpApplyNoisePreset(this.value);
+            bpSyncNoiseControls();
+            bpGenerate();
+        });
+        $('at-bp-sn-type').addEventListener('change', () => { bpSyncNoiseControls(); bpGenerate(); });
+        ['at-bp-sn-dir', 'at-bp-sn-blend', 'at-bp-sn-scope'].forEach(id =>
+            $(id).addEventListener('change', bpGenerate));
+        // Assigning a material is the signal for which strength band applies, and
+        // it lives in this same modal — so unticking it retargets the noise live.
+        $('at-bp-assign').addEventListener('change', function () {
+            bpApplyNoisePreset($('at-bp-sn-preset').value);
+            bpSyncNoiseControls();
+            if ($('at-bp-sn-on').checked) bpGenerate();
+        });
         $('at-bp-pattern').addEventListener('change', function () {
             const w = BP_WARP_DEF[this.value];
             if (w != null) { $('at-bp-warp').value = w; $('at-bp-warp-val').textContent = w; }
+            // Suggest a matching noise recipe, but never switch the feature on.
+            const np = BP_NOISE_PRESET[this.value];
+            if (np) { $('at-bp-sn-preset').value = np; bpApplyNoisePreset(np); }
             bpSyncControls();
+            bpSyncNoiseControls();
             bpGenerate();
         });
         $('at-bp-mstyle').addEventListener('change', function () {
@@ -8186,7 +8832,7 @@ window.TRLE = window.TRLE || {};
             const pat = $('at-bp-pattern').value;
             const gen = cloneCanvas(buildState.canvas);
             const assign = $('at-bp-assign').checked;
-            state.elements.push({
+            const tile = {
                 id: state.nextId++,
                 kind: 'tile',
                 canvas: gen,
@@ -8194,7 +8840,11 @@ window.TRLE = window.TRLE || {};
                 seamless: true,           // tileable by construction → snapshot keeps its pixels
                 edited: false,
                 material: assign ? { type: 'solid', key: BP_PRESET[pat], aesthetic: 'realistic' } : null
-            });
+            };
+            // Insert right after the source tile (falls back to append if it's gone).
+            const at = indexOf(buildState.id);
+            if (at >= 0) state.elements.splice(at + 1, 0, tile);
+            else state.elements.push(tile);
             closeModal();
             renderGrid();
             pushHistory(`Build ${pat} pattern`);
@@ -8736,6 +9386,147 @@ window.TRLE = window.TRLE || {};
         if (cb && !cb.checked) cb.checked = true;
     }
 
+    /* ============ SURFACE NOISE MODAL ============
+       Generate-column entry point for the same engine Build Pattern uses, aimed
+       at any existing tile.
+
+       Applied destructively (undo + Reset to Original cover it) rather than
+       stored as a re-editable recipe like sgParams: noise is a modulation of
+       pixels that are already there, so re-editing would mean keeping a full
+       pre-noise copy of every noised tile in the project file AND in every
+       autosave snapshot. That is a real cost for a feature you normally set once.
+       `el.original` is deliberately left alone so Reset to Original still undoes
+       it long after the undo stack has rolled past. */
+    const noiseState = { id: null, seed: 1, canvas: null };
+
+    function snParams() {
+        return {
+            type:     $('at-sn-type').value,
+            strength: parseInt($('at-sn-strength').value),
+            scale:    parseInt($('at-sn-scale').value),
+            contrast: parseInt($('at-sn-contrast').value),
+            dir:      $('at-sn-dir').value,
+            blend:    $('at-sn-blend').value,
+            seed:     noiseState.seed >>> 0
+        };
+    }
+
+    const snSetSlider = (id, v) => { $(id).value = v; const l = $(id + '-val'); if (l) l.textContent = v; };
+
+    /* Does this tile carry a material? That, plus which export maps are ticked,
+       is what picks the strength band the advisory recommends. */
+    function snHasMaterial() {
+        const el = byId(noiseState.id);
+        return !!(el && (el.material || hasMatLayers(el)));
+    }
+
+    function snApplyPreset(key) {
+        const p = NOISE_PRESETS[key];
+        if (!p) return;
+        $('at-sn-type').value = p.type;
+        $('at-sn-blend').value = p.blend;
+        $('at-sn-dir').value = p.dir || 'v';
+        snSetSlider('at-sn-scale', p.scale);
+        snSetSlider('at-sn-contrast', p.contrast);
+        snSetSlider('at-sn-strength', noiseDefaultStrength(key, snHasMaterial()));
+    }
+
+    function snSyncControls() {
+        $('at-sn-dirwrap').style.display = NOISE_DIRECTIONAL.includes($('at-sn-type').value) ? '' : 'none';
+        $('at-sn-advice').innerHTML = noiseAdvice(snHasMaterial(), $('at-sn-preset').value);
+    }
+
+    function snRender() {
+        const el = byId(noiseState.id);
+        if (!el || !el.canvas) return;
+        const out = cloneCanvas(el.canvas);
+        applySurfaceNoise(out, out.width, snParams(), null);
+        noiseState.canvas = out;
+        const pv = $('at-sn-preview');
+        pv.getContext('2d').clearRect(0, 0, pv.width, pv.height);
+        pv.getContext('2d').drawImage(out, 0, 0, pv.width, pv.height);
+        snSyncControls();
+    }
+
+    let snTimer = null;
+    function snScheduleRegen() { clearTimeout(snTimer); snTimer = setTimeout(snRender, 80); }
+
+    function openNoiseModal(id) {
+        const el = byId(id);
+        if (!el || !el.canvas) return;
+        // The generators build a square toroidal lattice. Every tile in AtlasTool
+        // is square (one grid size slices the whole atlas), so this only fires if
+        // that ever stops being true — better a refusal than a tile that silently
+        // stops tiling.
+        if (el.canvas.width !== el.canvas.height) {
+            showToast('Surface Noise needs a square tile', 'info');
+            return;
+        }
+        noiseState.id = id;
+        noiseState.canvas = null;
+        $('at-sn-tileno').textContent = indexOf(id) + 1;
+        $('at-sn-newtile').checked = false;
+        const bf = $('at-sn-before');
+        bf.getContext('2d').clearRect(0, 0, bf.width, bf.height);
+        bf.getContext('2d').drawImage(el.canvas, 0, 0, bf.width, bf.height);
+        openModal('noise');
+        snApplyPreset($('at-sn-preset').value);
+        snRender();
+    }
+
+    function setupNoiseModal() {
+        const ps = $('at-sn-preset');
+        for (const k in NOISE_PRESETS) ps.add(new Option(NOISE_PRESETS[k].label, k));
+        const ts = $('at-sn-type');
+        for (const [k, label] of NOISE_TYPES) ts.add(new Option(label, k));
+
+        [['at-sn-strength', 'at-sn-strength-val'], ['at-sn-scale', 'at-sn-scale-val'],
+         ['at-sn-contrast', 'at-sn-contrast-val']].forEach(([rid, lid]) => {
+            $(rid).addEventListener('input', function () {
+                $(lid).textContent = this.value;
+                snScheduleRegen();
+            });
+        });
+        ps.addEventListener('change', function () { snApplyPreset(this.value); snRender(); });
+        ['at-sn-type', 'at-sn-dir', 'at-sn-blend'].forEach(id =>
+            $(id).addEventListener('change', snRender));
+        $('at-sn-seed').addEventListener('input', function () {
+            noiseState.seed = (parseInt(this.value, 10) || 1) >>> 0;
+            snScheduleRegen();
+        });
+        $('at-sn-random').addEventListener('click', () => {
+            noiseState.seed = (Math.random() * 1e9) >>> 0;
+            $('at-sn-seed').value = noiseState.seed;
+            snRender();
+        });
+        $('at-sn-apply').addEventListener('click', () => {
+            const el = byId(noiseState.id);
+            if (!el || !noiseState.canvas) return;
+            const gen = cloneCanvas(noiseState.canvas);
+            if ($('at-sn-newtile').checked) {
+                const tile = {
+                    id: state.nextId++, kind: 'tile',
+                    canvas: gen, original: cloneCanvas(gen),
+                    seamless: !!el.seamless, edited: false,
+                    material: el.material ? JSON.parse(JSON.stringify(el.material)) : null,
+                    matLayers: hasMatLayers(el) ? cloneMatLayers(el.matLayers) : null,
+                    emissive: el.emissive ? cloneCanvas(el.emissive) : null
+                };
+                state.elements.splice(indexOf(el.id) + 1, 0, tile);
+                state.selectedId = tile.id;
+                closeModal(); renderGrid();
+                pushHistory('Surface noise (new tile)');
+                showToast('Added a noised copy', 'success');
+                return;
+            }
+            el.canvas = gen;
+            el.edited = true;              // `original` untouched → Reset still works
+            closeModal(); renderGrid();
+            pushHistory('Surface noise');
+            showToast('Surface noise applied', 'success');
+        });
+    }
+
     /* ============ MATERIAL MAP DERIVATION ============
        Plain tiles: GPU generateMaps with their preset.
        Transition tiles: parents' maps composited with the same
@@ -8801,6 +9592,14 @@ window.TRLE = window.TRLE || {};
             // Authored emissive overrides the preset-derived one (which is black
             // unless a preset opts in). Lets a tile glow without a glowing preset.
             if (enabledMaps.emissive && el.emissive) result.emissive = cloneCanvas(el.emissive);
+        }
+        // Maps that came in from a PSD's layers beat anything we'd generate:
+        // the user edited them in Photoshop on purpose. Same precedence rule as
+        // authored emissive above, just applied to every map type.
+        if (el.importedMaps) {
+            for (const mt of TRLE.MapOrder) {
+                if (enabledMaps[mt] && el.importedMaps[mt]) result[mt] = cloneCanvas(el.importedMaps[mt]);
+            }
         }
         cache[el.id] = result;
         return result;
@@ -9041,14 +9840,16 @@ window.TRLE = window.TRLE || {};
 
             if (fmt === 'psd') {
                 // One layered PSD: diffuse + each enabled map as its own layer.
-                if (!window.agPsd) throw new Error('PSD library not loaded');
-                const children = [{ name: 'diffuse', canvas: diffuse }];
+                // Layer names match TRLE.MapOrder exactly — that is the contract
+                // readPSDAsset relies on to give the maps back on re-import.
+                const layers = [{ name: 'diffuse', canvas: diffuse }];
                 for (const mt of TRLE.MapOrder) {
                     if (!enabledMaps[mt]) continue;
-                    children.push({ name: mt, canvas: buildAtlas(el => cache[el.id][mt]) });
+                    layers.push({ name: mt, canvas: buildAtlas(el => cache[el.id][mt]) });
                 }
-                const buf = window.agPsd.writePsd({ width: cols * S, height: rows * S, canvas: diffuse, children });
-                zip.file(`${prefix}${baseName}.psd`, new Blob([buf], { type: 'image/vnd.adobe.photoshop' }));
+                zip.file(`${prefix}${baseName}.psd`, await TRLE.PSD.write({
+                    width: cols * S, height: rows * S, composite: diffuse, layers
+                }));
             } else {
                 const ext = fmt === 'tga' ? 'tga' : 'png';
                 const encode = (canvas) => fmt === 'tga'
@@ -9135,14 +9936,15 @@ window.TRLE = window.TRLE || {};
         progress.classList.add('active'); fill.style.width = '0%';
         try {
             const cols = state.cols;
-            const fmt = $('at-export-format').value === 'tga' ? 'tga' : 'png';   // per-tile PSD → PNG
-            const ext = fmt;
+            const fmt = $('at-export-format').value;   // 'png' | 'tga' | 'psd'
+            const ext = fmt === 'tga' ? 'tga' : 'png';
             const encode = (canvas) => fmt === 'tga'
                 ? Promise.resolve(TRLE.Engine.encodeTGA(canvas))
                 : TRLE.Engine.canvasToBlob(canvas);
             const useMagenta = $('at-export-magenta').checked;
             const prefix = $('at-export-layout').value === 'ten' ? 'Textures/' : '';
             const anyMap = TRLE.MapOrder.some(mt => enabledMaps[mt]);
+            const S = state.tileSize;
             const zip = new JSZip();
             const cache = {};
             for (let i = 0; i < state.elements.length; i++) {
@@ -9150,12 +9952,29 @@ window.TRLE = window.TRLE || {};
                 const name = `tile_r${Math.floor(i / cols)}_c${i % cols}`;
                 let diffuse = el.canvas;
                 if (useMagenta) diffuse = magentaKey(diffuse);
-                zip.file(`${prefix}${name}.${ext}`, await encode(diffuse));
-                if (anyMap) {
-                    deriveMaps(el, enabledMaps, cache);
-                    for (const mt of TRLE.MapOrder) {
-                        if (!enabledMaps[mt] || !cache[el.id][mt]) continue;
-                        zip.file(`${prefix}${name}${TRLE.MapSuffixes[mt]}.${ext}`, await encode(cache[el.id][mt]));
+                if (anyMap) deriveMaps(el, enabledMaps, cache);
+
+                if (fmt === 'psd') {
+                    // One layered PSD per tile, same layer names as the atlas
+                    // export, so a single tile round-trips through Photoshop the
+                    // same way a whole sheet does.
+                    const layers = [{ name: 'diffuse', canvas: diffuse }];
+                    if (anyMap) {
+                        for (const mt of TRLE.MapOrder) {
+                            if (!enabledMaps[mt] || !cache[el.id][mt]) continue;
+                            layers.push({ name: mt, canvas: cache[el.id][mt] });
+                        }
+                    }
+                    zip.file(`${prefix}${name}.psd`, await TRLE.PSD.write({
+                        width: S, height: S, composite: diffuse, layers
+                    }));
+                } else {
+                    zip.file(`${prefix}${name}.${ext}`, await encode(diffuse));
+                    if (anyMap) {
+                        for (const mt of TRLE.MapOrder) {
+                            if (!enabledMaps[mt] || !cache[el.id][mt]) continue;
+                            zip.file(`${prefix}${name}${TRLE.MapSuffixes[mt]}.${ext}`, await encode(cache[el.id][mt]));
+                        }
                     }
                 }
                 fill.style.width = ((i + 1) / state.elements.length * 95) + '%';
@@ -9163,7 +9982,7 @@ window.TRLE = window.TRLE || {};
             }
             zip.file(`${prefix}manifest.json`, JSON.stringify({
                 tileSize: state.tileSize, cols, rows: Math.ceil(state.elements.length / cols),
-                count: state.elements.length, naming: 'tile_r{row}_c{col}'
+                count: state.elements.length, naming: 'tile_r{row}_c{col}', format: fmt
             }, null, 2));
             await addProjectToZip(zip, prefix, exportBaseName());
             const content = await zip.generateAsync({ type: 'blob' });
@@ -9242,6 +10061,14 @@ window.TRLE = window.TRLE || {};
             // Anim emissive is re-derived from el.anim.glow on load — don't bloat
             // the file with per-frame PNGs; authored (non-anim) emissive is saved.
             if (el.emissive && el.kind !== 'anim') e.emissive = await png(el.emissive);
+            // PSD-sourced maps are hand-authored pixels — they cannot be
+            // re-derived from a preset, so they have to be stored.
+            if (el.importedMaps) {
+                e.importedMaps = {};
+                for (const mt of TRLE.MapOrder) {
+                    if (el.importedMaps[mt]) e.importedMaps[mt] = await png(el.importedMaps[mt]);
+                }
+            }
             if (hasMatLayers(el)) {
                 e.matLayers = [];
                 for (const L of el.matLayers) e.matLayers.push({
@@ -9374,6 +10201,15 @@ window.TRLE = window.TRLE || {};
             };
             if (e.customMask) { const im = await loadImageURL(e.customMask); if (im) el.customMask = imgToCanvas(im); }
             if (e.emissive) { const im = await loadImageURL(e.emissive); if (im) el.emissive = imgToCanvas(im); }
+            if (e.importedMaps) {
+                const bag = {};
+                for (const mt of TRLE.MapOrder) {
+                    if (!e.importedMaps[mt]) continue;
+                    const im = await loadImageURL(e.importedMaps[mt]);
+                    if (im) bag[mt] = imgToCanvas(im);
+                }
+                if (Object.keys(bag).length) el.importedMaps = bag;
+            }
             if (Array.isArray(e.matLayers)) {
                 el.matLayers = [];
                 for (const L of e.matLayers) {
@@ -9601,22 +10437,36 @@ window.TRLE = window.TRLE || {};
     }
 
     /* ============ BLANK ATLAS + DYNAMIC TILES (Phase A) ============ */
-    function makeTileFromImage(img) {
+    function makeTileFromImage(img, maps) {
         const S = state.tileSize;
         const canvas = document.createElement('canvas');
         canvas.width = S; canvas.height = S;
         canvas.getContext('2d').drawImage(img, 0, 0, S, S);
         return { id: state.nextId++, kind: 'tile', canvas, original: cloneCanvas(canvas),
-                 seamless: false, edited: false, material: null };
+                 seamless: false, edited: false, material: null,
+                 importedMaps: scaleImportedMaps(maps, S) };
     }
 
     /* A tile from a sub-rectangle of a source image, resampled to S×S. */
-    function makeTileFromRegion(img, sx, sy, sw, sh, S) {
+    function makeTileFromRegion(img, sx, sy, sw, sh, S, maps) {
         const canvas = document.createElement('canvas');
         canvas.width = S; canvas.height = S;
         canvas.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, S, S);
+        // The same sub-rectangle out of each PSD map layer, resampled to match.
+        let importedMaps = null;
+        if (maps) {
+            const bag = {};
+            for (const mt of TRLE.MapOrder) {
+                if (!maps[mt]) continue;
+                const c = document.createElement('canvas');
+                c.width = S; c.height = S;
+                c.getContext('2d').drawImage(maps[mt], sx, sy, sw, sh, 0, 0, S, S);
+                bag[mt] = c;
+            }
+            if (Object.keys(bag).length) importedMaps = bag;
+        }
         return { id: state.nextId++, kind: 'tile', canvas, original: cloneCanvas(canvas),
-                 seamless: false, edited: false, material: null };
+                 seamless: false, edited: false, material: null, importedMaps };
     }
 
     /* ============ IMPORT MODAL (grid + cell selection) ============
@@ -9624,9 +10474,9 @@ window.TRLE = window.TRLE || {};
        resampled to the atlas tile size and appended (creating the atlas if empty).
        Covers: rip one texture · grab several from a sheet · stitch from many
        atlases (re-open per source). */
-    const imp = { img: null, cols: 1, rows: 1, sel: new Set(), targetSize: 256, isFirst: false };
+    const imp = { img: null, maps: null, cols: 1, rows: 1, sel: new Set(), targetSize: 256, isFirst: false };
 
-    function importCleanup() { imp.img = null; imp.sel.clear(); }
+    function importCleanup() { imp.img = null; imp.maps = null; imp.sel.clear(); }
 
     const impKey = (r, c) => r + '_' + c;
     function impSelectAll() {
@@ -9694,8 +10544,10 @@ window.TRLE = window.TRLE || {};
         else warn.style.display = 'none';
     }
 
-    function openImportModal(img, targetSize, isFirst) {
+    function openImportModal(img, targetSize, isFirst, maps) {
         imp.img = img; imp.targetSize = targetSize; imp.isFirst = isFirst;
+        // PSD map layers, if the source was a PSD — cut on the same cells.
+        imp.maps = maps && Object.keys(maps).length ? maps : null;
         imp.cols = Math.max(1, Math.round(img.naturalWidth / targetSize));
         imp.rows = Math.max(1, Math.round(img.naturalHeight / targetSize));
         $('at-import-cols').value = imp.cols;
@@ -9750,7 +10602,7 @@ window.TRLE = window.TRLE || {};
             }
             const cells = [...imp.sel].map(k => k.split('_').map(Number)).sort((a, b) => a[0] - b[0] || a[1] - b[1]);
             for (const [r, c] of cells) {
-                state.elements.push(makeTileFromRegion(imp.img, c * cw, r * ch, cw, ch, S));
+                state.elements.push(makeTileFromRegion(imp.img, c * cw, r * ch, cw, ch, S, imp.maps));
             }
             const n = cells.length;
             closeModal();
@@ -9813,10 +10665,11 @@ window.TRLE = window.TRLE || {};
 
     /* Load image files into tiles (preserves selection order). */
     /* Commit loaded images as tiles (preserving order). */
-    function commitImageTiles(imgs) {
-        imgs.forEach(img => state.elements.push(makeTileFromImage(img)));
+    /* `assets` is [{ img, maps }] — maps is empty for everything but PSD. */
+    function commitImageTiles(assets) {
+        assets.forEach(a => state.elements.push(makeTileFromImage(a.img, a.maps)));
         renderGrid();
-        const n = imgs.length;
+        const n = assets.length;
         pushHistory(`Add ${n} image${n !== 1 ? 's' : ''}`);
         showToast(`Added ${n} tile${n !== 1 ? 's' : ''}`, 'success');
     }
@@ -9832,38 +10685,39 @@ window.TRLE = window.TRLE || {};
     }
 
     function addImageTiles(files) {
-        // Accept anything that reports an image MIME type OR is a .tga (whose
-        // type is often empty), so TGA files aren't silently dropped here.
+        // Accept anything that reports an image MIME type OR is a .tga/.psd
+        // (whose type is often empty), so those aren't silently dropped here.
         const list = [...files].filter(f =>
-            (f.type && f.type.startsWith('image/')) || isTGAFile(f));
+            (f.type && f.type.startsWith('image/')) || isTGAFile(f) || isPSDFile(f));
         if (!list.length) return;
         if (!state.elements) state.elements = [];
         const slots = new Array(list.length).fill(null);
         let pending = list.length, failed = 0;
         const done = () => {
             if (failed) showToast(`${failed} file${failed > 1 ? 's' : ''} couldn’t be read (unsupported or corrupt).`, 'error');
-            const imgs = slots.filter(Boolean);
-            if (!imgs.length) return;
+            const assets = slots.filter(Boolean);
+            if (!assets.length) return;
             // A single atlas-looking image → offer the tile picker instead of
             // squishing the whole sheet into one tile (honour the original
             // "add as a tile" intent on Cancel/dismiss).
-            if (imgs.length === 1) {
-                const why = atlasLikeReason(imgs[0]);
+            if (assets.length === 1) {
+                const img = assets[0].img;
+                const why = atlasLikeReason(img);
                 if (why) {
                     const S = state.tileSize || getTileSize();
                     openConfirm('🗺️ Looks like an atlas',
-                        `This image is ${imgs[0].naturalWidth}×${imgs[0].naturalHeight} — ${why}. Adding it as one tile resizes the whole sheet down to ${S}². Pick tiles from it as an atlas instead?`,
+                        `This image is ${img.naturalWidth}×${img.naturalHeight} — ${why}. Adding it as one tile resizes the whole sheet down to ${S}². Pick tiles from it as an atlas instead?`,
                         '🗺️ Import from Atlas…',
-                        () => openImportModal(imgs[0], S, !state.elements.length),
-                        { cancelLabel: 'Add as one tile', danger: false, onNo: () => commitImageTiles(imgs) });
+                        () => openImportModal(img, S, !state.elements.length, assets[0].maps),
+                        { cancelLabel: 'Add as one tile', danger: false, onNo: () => commitImageTiles(assets) });
                     return;
                 }
             }
-            commitImageTiles(imgs);
+            commitImageTiles(assets);
         };
         list.forEach((file, idx) => {
-            readImageFile(file)
-                .then(img => { slots[idx] = img; })
+            readImageAsset(file)
+                .then(asset => { slots[idx] = asset; })
                 .catch(() => { failed++; })
                 .finally(() => { if (--pending === 0) done(); });
         });
@@ -9872,7 +10726,7 @@ window.TRLE = window.TRLE || {};
     function triggerAddImages() {
         if (!state.tileSize) return;
         const inp = document.createElement('input');
-        inp.type = 'file'; inp.accept = 'image/*,.tga'; inp.multiple = true;
+        inp.type = 'file'; inp.accept = 'image/*,.tga,.psd,.psb'; inp.multiple = true;
         inp.addEventListener('change', e => { if (e.target.files.length) addImageTiles(e.target.files); });
         inp.click();
     }
@@ -9935,7 +10789,10 @@ window.TRLE = window.TRLE || {};
                         canvas,
                         original: cloneCanvas(canvas),
                         seamless: false,
-                        material: null
+                        material: null,
+                        // Cut each PSD map layer on the identical grid, so tile
+                        // (r,c)'s normal map is the same region as its diffuse.
+                        importedMaps: sliceImportedMaps(state.imageLayers, c * S, r * S, S)
                     });
                 }
             }
@@ -9962,12 +10819,18 @@ window.TRLE = window.TRLE || {};
             return;
         }
 
-        setupUpload('at-upload', 'at-file', (img) => {
+        setupUpload('at-upload', 'at-file', (img, name, maps) => {
             state.image = img;
+            // A PSD's recognised map layers ride along with the atlas image and
+            // get sliced on the same grid (see sliceAtlas).
+            state.imageLayers = maps && Object.keys(maps).length ? maps : null;
             $('at-slice-btn').disabled = false;
             $('at-pick-btn').disabled = false;
+            const layerNote = state.imageLayers
+                ? ` · ${Object.keys(state.imageLayers).length} material map(s) from PSD layers`
+                : '';
             $('at-upload-summary-hint').textContent =
-                `${img.naturalWidth}×${img.naturalHeight} loaded — choose a tile size, then Slice or Pick tiles`;
+                `${img.naturalWidth}×${img.naturalHeight} loaded${layerNote} — choose a tile size, then Slice or Pick tiles`;
         });
         $('at-slice-btn').addEventListener('click', sliceAtlas);
         $('at-pick-btn').addEventListener('click', () => {
@@ -9975,12 +10838,12 @@ window.TRLE = window.TRLE || {};
         });
         $('at-import-atlas').addEventListener('click', () => {
             const inp = document.createElement('input');
-            inp.type = 'file'; inp.accept = 'image/*,.tga';
+            inp.type = 'file'; inp.accept = 'image/*,.tga,.psd,.psb';
             inp.addEventListener('change', e => {
                 const file = e.target.files[0];
                 if (!file) return;
-                readImageFile(file)
-                    .then(img => openImportModal(img, state.tileSize || getTileSize(), !state.elements.length))
+                readImageAsset(file)
+                    .then(({ img, maps }) => openImportModal(img, state.tileSize || getTileSize(), !state.elements.length, maps))
                     .catch(err => showToast(err.message, 'error'));
             });
             inp.click();
@@ -10058,6 +10921,7 @@ window.TRLE = window.TRLE || {};
         setupVarModal();
         setupOrigamiModal();
         setupBuildModal();
+        setupNoiseModal();
         setupStainedGlassModal();
         setupWangModal();
         setupBsetModal();
@@ -10092,21 +10956,94 @@ window.TRLE = window.TRLE || {};
         const toC = (img, S) => { const c = document.createElement('canvas'); c.width = S; c.height = S; c.getContext('2d').drawImage(img, 0, 0, S, S); return c; };
         const url = c => c.toDataURL('image/png');
         const tile = (canvas, id) => ({ id, kind: 'tile', canvas, original: cloneCanvas(canvas), seamless: false, edited: false, material: null });
+        // Cheap content hash (FNV-1a over a stride), so validators can compare
+        // "did these pixels change?" without shipping canvases over CDP.
+        const capSig = cv => {
+            if (!cv) return null;
+            const d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+            let h = 2166136261;
+            for (let i = 0; i < d.length; i += 17) { h ^= d[i]; h = Math.imul(h, 16777619); }
+            return (h >>> 0).toString(16);
+        };
         window.TRLE._cap = {
             // Structure introspection for the CDP validators (no pixel data).
             inspect(i) {
                 const el = state.elements[i];
                 if (!el) return null;
                 return {
-                    id: el.id, kind: el.kind, seamless: !!el.seamless,
+                    id: el.id, kind: el.kind, seamless: !!el.seamless, edited: !!el.edited,
                     material: el.material ? el.material.key : null,
                     matLayers: hasMatLayers(el) ? el.matLayers.map(L => L.material && L.material.key) : null,
                     emissive: !!el.emissive,
+                    importedMaps: el.importedMaps ? Object.keys(el.importedMaps) : null,
                     sgParams: el.sgParams ? JSON.parse(JSON.stringify(el.sgParams)) : null,
                     htParams: !!el.htParams
                 };
             },
             count() { return state.elements.length; },
+            // test-only: hashes of a tile's live pixels vs its untouched
+            // `original`, so a destructive edit can be shown to change one and
+            // leave the other intact (which is what keeps Reset to Original honest).
+            tileSig(i) { return capSig(state.elements[i] && state.elements[i].canvas); },
+            originalSig(i) { return capSig(state.elements[i] && state.elements[i].original); },
+            // test-only: the surface-noise engine, headless. Returns the raw
+            // grayscale field so validate-noise.mjs can assert seamlessness and
+            // determinism directly, without a UI in the way.
+            noiseField(S, opts) {
+                const d = buildNoiseField(S, opts).getContext('2d').getImageData(0, 0, S, S).data;
+                const g = new Array(S * S);
+                for (let i = 0; i < g.length; i++) g[i] = d[i * 4];
+                return g;
+            },
+            noisePresets() {
+                const o = {};
+                for (const k in NOISE_PRESETS) o[k] = NOISE_PRESETS[k];
+                return o;
+            },
+            noiseTypes() { return NOISE_TYPES.map(t => t[0]); },
+            // test-only: run applySurfaceNoise over a flat mid-gray tile and hand
+            // back the pixels, so "strength 0 is a true no-op" is measurable.
+            noiseApply(S, opts) {
+                const c = document.createElement('canvas'); c.width = c.height = S;
+                const x = c.getContext('2d');
+                x.fillStyle = '#808080'; x.fillRect(0, 0, S, S);
+                applySurfaceNoise(c, S, opts, null);
+                const d = x.getImageData(0, 0, S, S).data;
+                const g = new Array(S * S);
+                for (let i = 0; i < g.length; i++) g[i] = d[i * 4];
+                return g;
+            },
+            // test-only: top-left RGB of a PSD-imported map, and of the map that
+            // deriveMaps actually hands the exporter. Equal values are the proof
+            // that an imported layer survives all the way to export instead of
+            // being regenerated from the preset.
+            importedMapPixel(i, mt) {
+                const el = state.elements[i];
+                const c = el && el.importedMaps && el.importedMaps[mt];
+                if (!c) return null;
+                return [...c.getContext('2d').getImageData(0, 0, 1, 1).data].slice(0, 3);
+            },
+            derivedMapPixel(i, mt) {
+                const el = state.elements[i];
+                if (!el) return null;
+                const enabled = {}; TRLE.MapOrder.forEach(m => { enabled[m] = true; });
+                const maps = deriveMaps(el, enabled, {});
+                if (!maps[mt]) return null;
+                return [...maps[mt].getContext('2d').getImageData(0, 0, 1, 1).data].slice(0, 3);
+            },
+            // test-only: did ag-psd stay off the main thread? window.agPsd is only
+            // ever set by the file:// fallback path.
+            agPsdOnMainThread() { return !!window.agPsd; },
+            // test-only: serialise the project and load it straight back, so a
+            // validator can prove a per-element field actually persists.
+            async projectRoundTrip() {
+                const json = JSON.parse(JSON.stringify(await buildProjectJSON()));
+                return applyProject(json);
+            },
+            // Layout validators drive the REAL open/close path (so a regression in
+            // how openModal sets display is caught, not papered over).
+            openModal(name) { openModal(name); return true; },
+            closeModal() { closeModal(); return true; },
             // test-only: mean luma of an element's emissive canvas (-1 if none).
             // Lets validators confirm glow baking + that Pulse varies across frames.
             emissiveMean(i) {

@@ -1255,8 +1255,19 @@ input[type="range"]::-moz-range-thumb {
         grid-template-columns: 1fr;
     }
 }
+/* Below ~760px the header's accessibility cluster (FONT SIZE A- A A+ /
+   DARK / LIGHT MODE 🌙) no longer fits beside the logo + Learn buttons, and
+   because .header-top is a nowrap flex row it pushed the whole page into a
+   horizontal scrollbar. Drop the decorative labels first — the buttons keep
+   their title tooltips + aria-labels — then let the row wrap. */
+@media (max-width: 760px) {
+    .controls-label { display: none; }
+    .header-top { flex-wrap: wrap; height: auto; padding: 6px 20px; row-gap: 6px; }
+    .app-controls { flex-shrink: 1; }
+}
 @media (max-width: 600px) {
     .app-header { padding: 0 10px; }
+    .header-top { padding: 6px 10px; }
     .tab-btn { padding: 0 10px; font-size: 0.78rem; }
     .app-main { padding: 16px 10px 40px; }
     .mask-groups { grid-template-columns: 1fr; }

@@ -43,8 +43,9 @@ Then open <http://localhost:8080>.
 
 - **WebGL 2.0** with the `EXT_color_buffer_float` and `OES_texture_float_linear`
   extensions (current Chrome / Edge / Firefox / Safari all qualify).
-- A small number of libraries load at runtime from a CDN (JSZip, ag-psd, and —
-  only on first use of the 3D preview — Babylon.js).
+- A small number of libraries load at runtime from a CDN: JSZip up front, plus
+  two that are fetched only when you first use the feature that needs them —
+  ag-psd (loading or exporting `.psd`) and Babylon.js (the 3D preview).
 
 ## License
 

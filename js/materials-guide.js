@@ -152,16 +152,16 @@
             what: `The <strong>specular</strong> map sets how strongly each spot bounces direct light back at you, which is the highlight you see. Bright means shiny, dark means matte. This is about how <em>much</em> light reflects, not how sharp the reflection is (that’s roughness, coming up next).`,
             derive: `It’s built from the preset’s <strong>Specular Base</strong> (the overall shininess) plus <strong>Specular Contrast</strong> (how much the texture’s own detail brightens or dulls the highlight, so a glaze reads brighter than the mortar around it).`,
             sliders: [
-                ['Specular Base', 'overall reflectivity. Metals and glass sit high (200 to 248), stone, fabric and sand sit low (30 to 55).'],
-                ['Specular Contrast', 'how much the surface detail varies the shine across the tile.']
+                ['Specular Base', 'overall reflectivity, and the map’s actual average. Metals and glass sit high (130 to 180), stone, fabric and sand sit low (30 to 55).'],
+                ['Specular Contrast', 'how much the surface detail varies the shine across the tile. It works as a share of the room left between the Base and pure white, so a high Base varies less rather than flattening out.']
             ],
             tuning: [
-                ['Metals (chrome, gold, steel)', 'Base very high, 210 to 248.'],
-                ['Marble / tile / ceramic / ice', 'high-ish Base (170 to 225) for a polished gleam.'],
+                ['Metals (chrome, gold, steel)', 'Base high, 150 to 180.'],
+                ['Marble / tile / ceramic / ice', 'mid-high Base (135 to 170) for a polished gleam.'],
                 ['Brick / stone / concrete / wood', 'low Base (40 to 80), mostly matte.'],
                 ['Fabric / sand / dirt / paper', 'lowest Base (20 to 50), barely any highlight at all.']
             ],
-            tip: `Specular and roughness work together in TEN. High specular with high roughness gives a broad soft sheen like satin. High specular with low roughness gives a tight mirror hotspot.`
+            tip: `Specular and roughness work together in TEN. High specular with high roughness gives a broad soft sheen like satin. High specular with low roughness gives a tight mirror hotspot. Push Base above about 200 and you are asking for a near-white map: in-engine that lays white over your texture and drains the colour out of it, which is why even the metals top out at 180.`
         },
         {
             id: 'roughness', icon: '🔲', title: 'Roughness (sharp vs blurry reflection)',

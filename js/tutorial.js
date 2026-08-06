@@ -40,7 +40,8 @@
                 'Click <strong>Pick tiles…</strong> to set a grid and choose exactly which cells to import — rip one texture, grab several, or stitch from multiple atlases (each cell is resized to your tile size). Add more later with <strong>Import from Atlas…</strong>.',
                 'Or click <strong>Create Blank Atlas</strong> (choose tile size + columns), then add textures with <strong>Add Image(s)</strong>, <strong>Add Blank</strong>, or the <strong>＋</strong> cell.',
                 'You can also <strong>paste an image</strong> (Ctrl/Cmd+V) from your clipboard — confirm, then slice it like an imported atlas.',
-                'Each tile is an element you can <strong>right-click</strong> to edit.'
+                'Each tile is an element you can <strong>right-click</strong> to edit.',
+                'PNG, JPG, BMP, WebP, TGA and PSD all load. A layered PSD brings its material maps in with it — see <em>File types</em>.'
             ],
             tip: 'Everything is non-destructive and fully undoable (<strong>Ctrl/Cmd+Z</strong>). <strong>Pick tiles…</strong> and <strong>Import from Atlas…</strong> append to the current atlas, so you can build one up from several sources.'
         },
@@ -258,6 +259,20 @@
             tip: 'The tile arrives with a two-layer material (glass panes + metal came) and the <strong>Emissive</strong> export map already switched on. Rose windows are centred, so use them as a single wall panel rather than a repeating surface.'
         },
         {
+            id: 'surfacenoise', icon: '🌾', title: 'Surface noise',
+            what: 'Lays procedural grain into a texture: grit, pitting, wood grain, cracks, scuffs, weave. All of it tiles seamlessly, and all of it is optional. Material maps are generated <em>from</em> the diffuse, so a flat or heavily cleaned-up texture gives the map generator nothing to read. This is what gives it something.',
+            how: [
+                '<strong>Right-click</strong> a tile → <strong>🌾 Surface Noise</strong>. The before/after previews sit side by side.',
+                'Pick a <strong>Preset</strong> (Brick grit, Stone pitting, Concrete mottle, Wood grain, Brushed metal, Dust &amp; dirt, Damp stains, Scratches, Fabric weave, Hairline cracks, Film grain). It loads a full recipe you can then take apart.',
+                '<strong>Strength</strong> is the subtle-to-dramatic control. <strong>Scale</strong> sets feature size, <strong>Contrast</strong> how hard the grain reads, and <strong>Blend</strong> how it combines: <strong>Overlay</strong> and <strong>Soft light</strong> keep the texture\'s brightness, <strong>Multiply</strong> only darkens (dirt, damp), <strong>Screen</strong> only lightens (scuffs).',
+                'Directional types (wood grain, streaks, scratches, weave) get a <strong>Grain direction</strong>. It only offers vertical and horizontal, because rotating the grain off-axis would break the seamless tiling.',
+                'Reroll the <strong>Seed</strong> (<strong>🎲</strong>), then <strong>🌾 Apply Noise</strong>. It changes the tile in place; tick <strong>Add as a new tile</strong> to keep the clean one too. <strong>Undo</strong> and <strong>Reset to Original</strong> both take it back.',
+                'In <strong>🏗️ Build Pattern</strong> the same engine sits in the <strong>🌾 Surface noise</strong> accordion, off by default. Choosing a pattern suggests a matching preset without switching it on. <strong>Applies to</strong> chooses <strong>Cells only</strong>, which leaves the mortar joints their own grain, or <strong>Whole tile</strong>, which washes over everything.'
+            ],
+            before: 'noise',
+            tip: 'Watch out for double-counting. If the tile also exports material maps, the preset reads this same grain back out of the diffuse and amplifies it through Normal and Roughness, so it lands twice and a value that looked fine in the diffuse can come out as a violently pitted normal map. The tool detects this and the line under <strong>Strength</strong> tells you which case you are in: with maps on, keep it low; on a diffuse-only texture nothing downstream amplifies it, so judge it by eye. It is off by default in Build Pattern on purpose, since most people build bricks from a texture that is already bricky.'
+        },
+        {
             id: 'animated', icon: '🎞️', title: 'Animated textures',
             what: 'Generates a procedural, seamlessly-<em>looping</em> animation — water, lava, clouds, smoke, energy, plus directional effects like <strong>fire, waterfalls and rivers</strong> — as a group of frames you drop straight into the atlas. There’s a wide preset library (caustic/deep/boiling water, lava &amp; molten metal, blood, ice, mercury, honey, poison gas, steam, electric plasma, aurora sky…). Every frame also tiles on its own, so you can emit a <strong>single seamless tile</strong> for UV-rotate instead of a sequence.',
             how: [
@@ -340,11 +355,26 @@
                 'Click <strong>Export Atlas with Material Maps</strong> for a ZIP (atlas + maps + manifest). <strong>Include the project file</strong> is on by default, so the ZIP also carries the <code>.atlasproj.json</code> and can be reopened and edited later.',
                 '<strong>Save Project</strong> asks for a name, then downloads <code>yourname.atlasproj.json</code> with every tile, material and transition. <strong>Load Project</strong> restores it, name included.',
                 '<strong>Load Project</strong> takes either file: the <code>.atlasproj.json</code>, or an export ZIP that was made with the project file included. One ZIP is both the textures you ship and the session you keep editing. If you have unsaved edits, it asks before replacing them.',
-                'To edit tiles elsewhere, use <strong>Export Tiles Individually</strong> (one image per tile + any enabled maps, named <code>tile_r{row}_c{col}</code>), or right-click a single tile → <strong>Download PNG</strong>; bring edits back with <strong>Replace Image</strong>.',
+                'To edit tiles elsewhere, use <strong>Export Tiles Individually</strong> (one image per tile + any enabled maps, named <code>tile_r{row}_c{col}</code>), or right-click a single tile → <strong>Download PNG</strong>; bring edits back with <strong>Replace Image</strong>. With <strong>PSD</strong> selected you get one layered PSD per tile instead, maps included.',
                 'The tool autosaves to your browser as you work. If it crashes or you close the tab by accident, the next visit offers to restore that session. It is a safety net, not a filing system: one session is kept, and saving to a file clears it. The <strong>Session</strong> block at the top of the left rail shows when it last saved and how much is held, with <strong>Clear stored session</strong> to drop it by hand.',
                 'Browsers can discard stored data when disk space runs low. <strong>Protect from cleanup</strong> asks yours not to — Firefox will ask your permission, Chrome decides on its own. Optional either way: it only affects the autosave, never your files.'
             ],
             tip: 'An <strong>● unsaved changes</strong> marker sits next to <strong>Save Project</strong> whenever you have edits that are not in a save file, and the browser asks before you close the tab. Autosave covers crashes, not backups — clearing your browser data deletes it, so keep real work in exported files. Use PNG/TGA alpha for Tomb Engine; use the magenta key for classic Tomb Editor workflows.'
+        },
+        {
+            id: 'filetypes', icon: '🗂️', title: 'File types',
+            what: 'What each format does on the way in and on the way out, and which one to reach for.',
+            how: [
+                '<strong>PNG</strong> — lossless, keeps alpha. Loads and exports. This is the default and the right answer unless you need something specific.',
+                '<strong>TGA</strong> — lossless, 32-bit, keeps alpha. Loads and exports. Uncompressed, so files are several times larger than the same PNG.',
+                '<strong>JPG</strong> — loads only, never exports. Lossy: it throws away detail every time it is saved, and the damage accumulates across saves. It also has no alpha. Fine as a photo you are about to turn into a texture, bad as the texture itself.',
+                '<strong>BMP</strong> and <strong>WebP</strong> — load only. Both come in fine; pick PNG or TGA to go back out.',
+                '<strong>PSD</strong> — loads and exports, with layers. Exporting as PSD packs the diffuse and every enabled map into one file as separate layers instead of writing a folder of images.',
+                'Loading a PSD reads those layers back. Any layer named <code>diffuse</code>, <code>normal</code>, <code>ao</code>, <code>specular</code>, <code>roughness</code>, <code>emissive</code> or <code>height</code> is picked up as that map, as is any layer whose name ends in the export suffix (<code>_n</code>, <code>_ao</code>, <code>_s</code>, <code>_r</code>, <code>_e</code>, <code>_h</code>). Everything else is ignored.',
+                'An imported map <em>replaces</em> the one the tool would have generated. Export a PSD, repaint the normal map by hand in Photoshop, load it back, and your version is what ships. Slicing an atlas PSD cuts every map layer on the same grid, so tile positions stay lined up.',
+                '<strong>Replace Image</strong> drops a tile\'s imported maps, since they described the old pixels. Resetting a tile keeps them: they came in with the file.'
+            ],
+            tip: 'PSD is the slow one. PNG, JPG and the rest are decoded by the browser itself; PSD is parsed and written in JavaScript, so a large atlas takes noticeably longer both ways. It runs in the background and will not freeze the tool, and the library it needs (about 170 KB) downloads the first time you touch a PSD and not before. If a PSD loads blank or flattens oddly, it was probably saved with <em>Maximize PSD File Compatibility</em> switched off — the tool rebuilds the image from the layers, but unusual blend modes can only be approximated. Flatten a copy in Photoshop if you need an exact match.<br><br>Please contact me if you face issues — PSD implementation threw a fit a couple of times!'
         },
         {
             id: 'accessibility', icon: '♿', title: 'Accessibility',

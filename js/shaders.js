@@ -692,6 +692,17 @@ TRLE.Shaders = {
 
     /* ---------- Specular Map ----------
        Inverse-roughness concept: smooth = high specular.
+
+       The detail term is SIGNED and headroom-scaled — the same correction
+       roughnessMap got when it abandoned height-variance (see PresetHistory.md,
+       "Specular — the 'baked white' artifact, round two"). The old form was
+           spec = base + smoothness * contrast
+       where `smoothness` sits near 1.0 on any smooth area, so the term could
+       only ever ADD. 35 of 75 presets had base + contrast > 1.0, so their maps
+       clamped to a flat white sheet (metal: 64% of pixels at exactly 255) and
+       Specular Contrast controlled nothing. In-engine that reads as a
+       full-strength white specular over the whole surface, which greys out
+       saturated diffuse colours — the "dingy pink ladder" report.
        --------------------------------------------------- */
     specularMap: `#version 300 es
         precision highp float;
@@ -724,10 +735,18 @@ TRLE.Shaders = {
             }
             dev /= count;
 
-            float smoothness = 1.0 - sqrt(dev) * 4.0;
-            float spec = u_baseValue + smoothness * u_contrast;
-            // Luminance influence
-            spec += (center - 0.5) * 0.10;
+            // Signed detail: +1 = locally smooth (glossy), -1 = locally busy (dulled).
+            // Luminance folded in at a low weight so brighter pixels read slightly
+            // shinier, as before — but now scaled by contrast like everything else.
+            float smoothness = clamp(1.0 - sqrt(dev) * 4.0, 0.0, 1.0);
+            float detail = clamp((smoothness * 2.0 - 1.0) + (center - 0.5) * 0.20, -1.0, 1.0);
+
+            // Scale the swing by the headroom on the side we're moving toward, so a
+            // high base varies less upward instead of clipping. u_contrast is then
+            // "fraction of the available headroom the detail may use", which makes
+            // clipping structurally impossible for any base/contrast pair.
+            float room = detail > 0.0 ? (1.0 - u_baseValue) : u_baseValue;
+            float spec = u_baseValue + detail * u_contrast * room;
             fragColor = vec4(vec3(clamp(spec, 0.0, 1.0)), 1.0);
         }`,
 
