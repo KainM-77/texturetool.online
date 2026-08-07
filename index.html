@@ -206,6 +206,13 @@
                 Prefer applying height to <strong>individual textures</strong> rather than a whole atlas, so you can
                 measure the performance impact per texture and drop it where it isn’t worth the cost.
             </div>
+            <div id="at-height-alpha-warning" class="at-inline-warning" style="display:none;">
+                ⚠️ <strong><span id="at-height-alpha-count">Some</span> of your tiles have transparency.</strong>
+                Their holes are kept flat in the height map so they don’t carve into the relief, but parallax on an
+                alpha-tested texture is still fragile in Tomb Engine — the UV offset drags texels across the cutout
+                edge, which can read as a milky fringe or let you see straight through. Check fences, grates and
+                foliage in-game, and drop Height for those textures if it looks wrong.
+            </div>
             <label class="checkbox-row" id="at-height-seamless-row" style="display:none;margin-top:8px;"
                    title="Blur the height map toward continuity in a border band so a tiling texture doesn't show a parallax 'cliff' at the repeat seam. Interior detail is preserved.">
                 <input type="checkbox" id="at-export-height-seamless" checked> Seamless height edges — blur the border so parallax doesn’t cliff at the seam

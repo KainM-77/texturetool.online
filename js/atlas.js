@@ -973,6 +973,23 @@ window.TRLE = window.TRLE || {};
         return resizeCanvas(src, src.width, src.height);
     }
 
+    /* Does this diffuse have cutouts? Drives `alphaFlatten` in generateMaps so a
+       fence/grate/foliage texture doesn't get its holes carved into the height
+       map (see the comment on Step 1 of Engine.generateMaps for why that ruins
+       parallax in TEN). Transparency is a property of the TEXTURE, not of the
+       material you picked — which is why this can't stay tied to preset.decal.
+
+       Deliberately uncached: it early-exits on the first transparent pixel, so
+       the textures that need it are the cheap case, and a full opaque scan of a
+       256² tile is well under a millisecond. Caching it would mean tracking
+       every in-place canvas mutation (noise, painting, undo) for no real gain. */
+    function canvasHasAlpha(cv) {
+        if (!cv || !cv.width || !cv.height) return false;
+        const d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+        for (let i = 3; i < d.length; i += 4) if (d[i] < 255) return true;
+        return false;
+    }
+
     /* Cut one tile-sized region out of each atlas-wide PSD map layer. `layers` is
        the state.imageLayers bag; returns null when there's nothing to cut, so
        tiles from ordinary PNG atlases stay clean. */
@@ -1075,9 +1092,10 @@ window.TRLE = window.TRLE || {};
        { mapType: canvas } object. Later layers win where masks overlap. */
     function composeLayerMaps(diffuseCanvas, layers, enabledMaps, S) {
         const tex = TRLE.Engine.createTextureFromImage(diffuseCanvas);
+        const alphaFlatten = canvasHasAlpha(diffuseCanvas);   // once, not per layer
         const genLayer = (layer) => {
             const preset = Object.assign({}, presetFromMaterial(layer.material),
-                { flipNormalY: state.flipNormalY, heightSeamless: heightSeamlessOn() });
+                { flipNormalY: state.flipNormalY, heightSeamless: heightSeamlessOn(), alphaFlatten });
             const maps = TRLE.Engine.generateMaps(tex, S, S, preset, enabledMaps);
             const out = {};
             for (const mt of TRLE.MapOrder) if (maps[mt]) { out[mt] = TRLE.Engine.fboToCanvas(maps[mt]); TRLE.Engine.deleteFBO(maps[mt]); }
@@ -5292,7 +5310,7 @@ window.TRLE = window.TRLE || {};
                 wrap.innerHTML = '<p class="sm-hint" style="margin:6px 0;">Pick or save a preset to preview its maps.</p>';
                 return;
             }
-            const preset = Object.assign({}, matCurrentPresetObj(), { flipNormalY: state.flipNormalY, heightSeamless: heightSeamlessOn() });
+            const preset = Object.assign({}, matCurrentPresetObj(), { flipNormalY: state.flipNormalY, heightSeamless: heightSeamlessOn(), alphaFlatten: canvasHasAlpha(el.canvas) });
             const tex = TRLE.Engine.createTextureFromImage(el.canvas);
             const maps = TRLE.Engine.generateMaps(tex, S, S, preset, enabled);
             mat.gl = { tex, maps };
@@ -5388,7 +5406,7 @@ window.TRLE = window.TRLE || {};
             const c = composeLayerMaps(el.canvas, matMulti.layers, enabled, S);
             canv = { diffuse: el.canvas, normal: c.normal, ao: c.ao, roughness: c.roughness, emissive: c.emissive, height: c.height };
         } else {
-            const preset = Object.assign({}, matCurrentPresetObj(), { flipNormalY: state.flipNormalY, heightSeamless: heightSeamlessOn() });
+            const preset = Object.assign({}, matCurrentPresetObj(), { flipNormalY: state.flipNormalY, heightSeamless: heightSeamlessOn(), alphaFlatten: canvasHasAlpha(el.canvas) });
             const tex  = TRLE.Engine.createTextureFromImage(el.canvas);
             const maps = TRLE.Engine.generateMaps(tex, S, S, preset, enabled);
             const toCanvas = k => maps[k] ? TRLE.Engine.fboToCanvas(maps[k]) : null;
@@ -9580,7 +9598,7 @@ window.TRLE = window.TRLE || {};
             if (enabledMaps.emissive && el.emissive) result.emissive = cloneCanvas(el.emissive);
         } else {
             const tex  = TRLE.Engine.createTextureFromImage(el.canvas);
-            const preset = Object.assign({}, resolvePreset(el), { flipNormalY: state.flipNormalY, heightSeamless: heightSeamlessOn() });
+            const preset = Object.assign({}, resolvePreset(el), { flipNormalY: state.flipNormalY, heightSeamless: heightSeamlessOn(), alphaFlatten: canvasHasAlpha(el.canvas) });
             const maps = TRLE.Engine.generateMaps(tex, S, S, preset, enabledMaps);
             for (const mt of TRLE.MapOrder) {
                 if (maps[mt]) {
@@ -10870,9 +10888,20 @@ window.TRLE = window.TRLE || {};
         const heightWarn = $('at-height-warning');
         if (heightCb && heightWarn) {
             const seamlessRow = $('at-height-seamless-row');
+            const alphaWarn = $('at-height-alpha-warning');
             const syncHeightWarn = toast => {
                 heightWarn.style.display = heightCb.checked ? 'block' : 'none';
                 if (seamlessRow) seamlessRow.style.display = heightCb.checked ? 'flex' : 'none';
+                // Cutout tiles get their holes flattened in the height map, but
+                // parallax over an alpha edge is still dicey in-engine — say so.
+                // Only scanned while Height is actually ticked, so the per-tile
+                // alpha scan never runs on the common path.
+                if (alphaWarn) {
+                    const n = heightCb.checked ? state.elements.filter(el => canvasHasAlpha(el.canvas)).length : 0;
+                    alphaWarn.style.display = n ? 'block' : 'none';
+                    const label = $('at-height-alpha-count');
+                    if (label) label.textContent = n === state.elements.length ? 'All' : String(n);
+                }
                 if (toast && heightCb.checked) {
                     showToast('Height maps are GPU-expensive — prefer one texture at a time over a whole atlas', 'warning', 5000);
                 }
@@ -10981,6 +11010,9 @@ window.TRLE = window.TRLE || {};
                 };
             },
             count() { return state.elements.length; },
+            // test-only: the cutout detector that drives alphaFlatten, so
+            // validate-alpha-maps can assert on the same predicate the pipeline uses.
+            canvasHasAlpha,
             // test-only: hashes of a tile's live pixels vs its untouched
             // `original`, so a destructive edit can be shown to change one and
             // leave the other intact (which is what keeps Reset to Original honest).

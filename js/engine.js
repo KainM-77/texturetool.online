@@ -366,13 +366,26 @@ TRLE.Engine = (function() {
         const results = {};
         const texel = 1.0 / Math.max(width, height);
 
-        // Step 1: Desaturate to grayscale (alpha-flattened for decal presets so
-        // transparent areas read as flat, not as deep crevices).
+        // Step 1: Desaturate to grayscale, alpha-flattened where the diffuse is
+        // transparent so those areas read as flat rather than as deep crevices.
+        //
+        // Transparent pixels reach us as pure BLACK (the canvas discards whatever
+        // RGB sat under alpha=0), which is the lowest luminance there is — so
+        // without this, every cutout becomes the deepest part of the height map
+        // and each alpha edge a cliff. In-engine, parallax then treats the holes
+        // in a grate or fence as a real recessed surface and drags texels across
+        // the boundary: translucent smearing, and see-through where the offset
+        // pushes the hole outward.
+        //
+        // `alphaFlatten` is set by the caller from the tile's actual alpha
+        // (AtlasTool scans the diffuse). `decal` stays as a fallback so the decal
+        // presets keep forcing it on regardless of what the tile looks like.
+        const flatten = (preset.alphaFlatten != null) ? preset.alphaFlatten : preset.decal;
         const grayFBO = createFBO(width, height);
         blit('desaturate', {
             u_texture: diffuseTexture,
             u_gamma: 0.8,
-            u_alphaFlatten: preset.decal ? 1.0 : 0.0
+            u_alphaFlatten: flatten ? 1.0 : 0.0
         }, grayFBO);
 
         // Step 2: Blur grayscale for height base

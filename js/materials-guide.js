@@ -196,6 +196,17 @@
             tip: `Height is GPU-heavy in Tomb Engine, since every pixel does extra samples. Use it on a handful of hero textures per level rather than the whole atlas, and keep <strong>Seamless height edges</strong> ticked so a tiling texture doesn’t show a parallax “cliff” where it repeats. The tool warns you if you switch it on atlas-wide.`
         },
         {
+            id: 'transparency', icon: '🕳️', title: 'Transparency (fences, grates, foliage)',
+            what: `Maps are always fully opaque, even when the texture they came from isn’t. That’s on purpose: a height or normal map is data, not a picture, and a hole in it means nothing. Your <em>diffuse</em> keeps its alpha exactly as you made it.`,
+            derive: `The catch is what the tool reads <em>inside</em> a cutout. Transparent pixels arrive as pure black, which is the darkest value there is, so left alone every hole would become the deepest part of the height map and every cutout edge a cliff. The tool checks each tile for transparency and flattens those areas to neutral instead, so the holes carry no relief. Nothing to switch on: if the tile has alpha, it happens.`,
+            tuning: [
+                ['Fences / grates / railings', 'the classic case. Bars get relief, gaps stay flat.'],
+                ['Foliage / cobwebs / dust overlays', 'same handling. The <strong>decal</strong> presets also force it on regardless, which matters for soft-edged overlays that fade out rather than cut out.'],
+                ['Glass panes', 'flattening applies to the transparent parts, so only the frame and any dirt or cracks carry relief.']
+            ],
+            tip: `Be careful pairing <strong>Height</strong> with a cutout texture. Even with the holes flattened, parallax shifts the UV, and near a cutout edge that drags texels across the alpha boundary: you can get a milky fringe, or see straight through to the skybox. The export card warns you when you tick <strong>Height</strong> with transparent tiles in the atlas. Normal and AO are safe, so if a fence looks wrong in-game, drop Height first and keep the rest.`
+        },
+        {
             id: 'emissive', icon: '💡', title: 'Emissive (glow in the dark)',
             what: `An <strong>emissive</strong> map makes parts of a texture glow on their own, ignoring the scene lighting: lava cracks, neon, runes, screens, lit windows. Black means no glow, and coloured pixels glow in that colour even in pitch darkness.`,
             derive: `Most materials emit nothing at all. Emissive gets built from a brightness <strong>Threshold</strong> (only pixels brighter than this glow) times a <strong>Strength</strong>. Liquid presets like <strong>Lava</strong>, <strong>Slime</strong>, <strong>Acid</strong> and <strong>Magic Liquid</strong> already have it switched on, and the <strong>Make Emissive</strong> tool lets you paint it exactly where you want.`,
