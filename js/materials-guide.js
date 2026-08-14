@@ -137,6 +137,8 @@
             sliders: [
                 ['AO Radius', 'how wide the shadow spreads out from a crevice.'],
                 ['AO Intensity', 'how dark the crevices get.'],
+                ['AO Depth', 'the hard limit on how far AO is allowed to darken. At the default 0.5 a crevice bottoms out at mid-grey no matter how high Intensity goes, which keeps AO from crushing dark textures to black. Raise it for real contact shadow, drop it toward 0 for flat stylised shading.'],
+                ['AO Curve', 'the shape of the falloff between exposed and occluded. Lower values shade the mid-tones harder, so more of the surface picks up some shadow instead of just the deepest pockets.'],
                 ['AO Normal Mix', 'blends in the normal map’s shape so the AO hugs the relief more closely.']
             ],
             tuning: [
@@ -145,7 +147,26 @@
                 ['Sand / fabric / snow', 'low Intensity (around 10). Soft materials have shallow occlusion, and heavy AO just makes them look dirty.'],
                 ['Decals (dust, cobweb, moss)', 'very low. A thin overlay has almost no depth to occlude.']
             ],
-            tip: `If a texture looks grimy or muddy, it’s usually the AO that’s too strong, not the normal. Back off <strong>AO Intensity</strong> first.`
+            tip: `If a texture looks grimy or muddy, it’s usually the AO that’s too strong, not the normal. Back off <strong>AO Intensity</strong> first. If crevices look shallow instead, Intensity won’t help much once it’s saturated against <strong>AO Depth</strong>: raise Depth.`
+        },
+        {
+            id: 'tiers', icon: '🗂️', title: 'Preset tiers (Realistic, Dramatic, Fantasy)',
+            what: `The material picker has a second dropdown next to the preset list. It re-cuts the same 53 solid materials three ways. <strong>Stone</strong> is still stone in all three; what changes is how hard the generated maps push.`,
+            derive: `<strong>📷 Realistic</strong> is the default and the safe choice for TR-style texture packs. <strong>🗿 Dramatic</strong> deepens the crevice shadows and strengthens the relief for a weathered, Elder-Scrolls-ish read. <strong>✨ Fantasy</strong> goes the other way: soft relief, flat shading, a brighter sheen, and a little glow on the precious materials, for a stylised pastel look.<br><br>Each tier scales off how much relief a material actually has, so <em>Stone</em> and <em>Bark</em> shift a lot between tiers while <em>Glass</em> and <em>Chrome</em> barely move. Every material appears in every tier even when the difference is tiny, so you can switch tier without losing your material.`,
+            slidersTitle: 'The tiers',
+            tuningTitle: 'Good to know',
+            sliders: [
+                ['Realistic', 'the calibrated default. Start here.'],
+                ['Dramatic', 'deeper AO, stronger normals and height. Best on stone, brick, bark, rusted metal, wood.'],
+                ['Fantasy', 'flat shading, soft bumps, glossier, some emissive. Best on clean invented surfaces.'],
+                ['Decal', 'solid-only, for transparent overlays: cobweb, dust, moss, thin ice.']
+            ],
+            tuning: [
+                ['Liquids', 'one set only. A liquid’s character comes from the texture itself, so the tier dropdown hides the solid-only options when you pick Liquid.'],
+                ['Mixing tiers', 'fine. Tier is per tile, so a Dramatic stone wall can sit next to a Realistic metal door.'],
+                ['Going further', 'every tier is just a starting point for the advanced sliders. Tweak one and it becomes a custom material you can save.']
+            ],
+            tip: `Fantasy only changes the <em>maps</em>. Presets never touch your diffuse, so the colours stay exactly as you painted them — if you want a pastel look, stylise the texture itself and let the Fantasy tier handle how it catches light.`
         },
         {
             id: 'specular', icon: '✨', title: 'Specular (how shiny)',
@@ -153,7 +174,7 @@
             derive: `It’s built from the preset’s <strong>Specular Base</strong> (the overall shininess) plus <strong>Specular Contrast</strong> (how much the texture’s own detail brightens or dulls the highlight, so a glaze reads brighter than the mortar around it).`,
             sliders: [
                 ['Specular Base', 'overall reflectivity, and the map’s actual average. Metals and glass sit high (130 to 180), stone, fabric and sand sit low (30 to 55).'],
-                ['Specular Contrast', 'how much the surface detail varies the shine across the tile. It works as a share of the room left between the Base and pure white, so a high Base varies less rather than flattening out.']
+                ['Specular Contrast', 'how much the surface detail varies the shine across the tile. The swing is symmetric around the Base: smooth areas go brighter, busy areas go duller, by the same amount either way. Turn it up and the highlight follows the texture more closely.']
             ],
             tuning: [
                 ['Metals (chrome, gold, steel)', 'Base high, 150 to 180.'],
@@ -229,7 +250,7 @@
         },
         {
             id: 'where', icon: '🎛️', title: 'Where to tune this in the tool',
-            what: `Everything above lives in one place: right-click a tile and hit <strong>Set Material</strong>. Pick a <strong>type</strong> (Solid or Liquid), an <strong>aesthetic</strong> (Realistic, Fantasy, Decal or your ⭐ saved presets) and a <strong>preset</strong>, then open the <strong>Advanced editor</strong>. The sliders there map one-to-one to the names on this page.`,
+            what: `Everything above lives in one place: right-click a tile and hit <strong>Set Material</strong>. Pick a <strong>type</strong> (Solid or Liquid), a <strong>tier</strong> (Realistic, Dramatic, Fantasy, Decal or your ⭐ saved presets) and a <strong>preset</strong>, then open the <strong>Advanced editor</strong>. The sliders there map one-to-one to the names on this page.`,
             derive: `Drag the lit preview to move the light around and see how it reads, or flip the <strong>🧊 3D</strong> toggle to watch the height map displace a real mesh. Once you’ve dialled it in, hit <strong>⭐ Save as preset…</strong> to reuse that exact recipe on any tile, in this project or the next. Saved presets stay in your browser between sessions and appear as one-click chips along the top of <strong>Set Material</strong>, so a “my rock” or “my sand” is always one click away (<strong>⬇ Export</strong> writes them to a JSON file for backup or sharing). In the <strong>Export</strong> panel you choose which maps actually get generated.`,
             tip: `Transition, Wang and border tiles inherit their materials from their source tiles, so you tune the sources rather than the blended tiles. If one texture mixes surfaces (a brick wall with a wooden door and a metal knob), use <strong>🎭 Multiple materials</strong> to paint a different material onto each region. To put the same material on many tiles, select them and use <strong>🎨 Apply Material</strong>, or right-click any of them: the menu acts on the whole selection. <strong>🎨 Apply Last Material</strong> repeats your previous choice with no modal at all.`
         }
@@ -574,8 +595,11 @@
             if (s.keys) sec.appendChild(buildSuffixKeys());
             if (s.tuner) sec.appendChild(buildTuner());
             if (s.derive) sec.appendChild(el('p', 'tut-what', `<em>How the tool makes it:</em> ${s.derive}`));
-            if (s.sliders) sec.appendChild(labelledList('The sliders', s.sliders));
-            if (s.tuning) sec.appendChild(labelledList('Tuning per material', s.tuning));
+            // Headings are overridable: most sections list sliders and per-material
+            // tuning, but not every one is about a slider (the tiers section lists
+            // the tiers themselves).
+            if (s.sliders) sec.appendChild(labelledList(s.slidersTitle || 'The sliders', s.sliders));
+            if (s.tuning) sec.appendChild(labelledList(s.tuningTitle || 'Tuning per material', s.tuning));
             if (s.recipes) sec.appendChild(buildRecipeTable());
             if (s.tip) sec.appendChild(el('div', 'tut-tip', `<strong>Tip:</strong> ${s.tip}`));
             main.appendChild(sec);

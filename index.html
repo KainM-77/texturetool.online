@@ -77,23 +77,14 @@
 <section class="tab-content" style="display:block;">
     <details class="card at-upload-card" id="at-upload-card" open>
         <summary class="at-upload-summary">
-            <span class="card-title" style="margin-bottom:0;">1️⃣ Upload Atlas</span>
-            <span class="at-upload-summary-hint" id="at-upload-summary-hint">drop a texture atlas to begin</span>
+            <span class="card-title" style="margin-bottom:0;">1️⃣ Start</span>
+            <span class="at-upload-summary-hint" id="at-upload-summary-hint">pick how you want to begin</span>
         </summary>
-        <p style="color:var(--text-secondary);font-size:0.85rem;margin:14px 0 16px;">
-            Drop your texture atlas, choose the tile size, and slice it into editable elements.
-            Right-click any element afterwards to make it seamless, build transitions or assign materials.
-        </p>
 
-        <div class="upload-area" id="at-upload">
-            <div class="upload-icon">📁</div>
-            <div class="upload-text">Drop atlas here or <span>browse</span></div>
-            <div class="upload-hint" style="color:var(--text-secondary);font-size:0.78rem;margin-top:4px;">PNG · JPG · BMP · WebP · TGA · PSD</div>
-            <input type="file" accept="image/*,.tga,.psd,.psb" id="at-file">
-        </div>
-
-        <div class="form-row" style="margin-top:14px;align-items:flex-end;">
-            <div class="form-group">
+        <!-- Tile size is shared by the two "new atlas" routes below. Loading a
+             saved project brings its own size, so it ignores this. -->
+        <div class="at-start-size">
+            <div class="form-group" style="margin-bottom:0;">
                 <label>Texture (tile) size</label>
                 <select id="at-tile-size">
                     <option value="32">32 × 32</option>
@@ -108,35 +99,68 @@
                 <input type="number" id="at-tile-size-custom" min="16" max="2048" step="1" value="256"
                        placeholder="px" title="Custom tile size 16–2048" style="display:none;width:110px;margin-top:6px;">
             </div>
-            <div class="form-group">
-                <button class="btn btn-primary" id="at-slice-btn" disabled>✂️ Slice Atlas</button>
-            </div>
-            <div class="form-group">
-                <button class="btn btn-secondary" id="at-pick-btn" disabled title="Choose a grid and pick which tiles to import">🗺️ Pick tiles…</button>
-            </div>
+            <p class="at-start-sizenote">
+                📐 <strong>Set this before you start, and write it down.</strong> Every map atlas in a texture set has to
+                share the same dimensions. If you export some maps now and the rest in a later pass, use the same tile
+                size and layout both times or Tomb Engine cannot line them up. Opening a saved project uses whatever
+                size it was built at.
+            </p>
         </div>
-        <p style="color:var(--text-secondary);font-size:0.8rem;margin-top:6px;">
-            <strong>Slice Atlas</strong> cuts the whole image on a uniform grid. <strong>Pick tiles…</strong> lets you set the grid and choose which cells to import — great for ripping one texture or stitching from several atlases.
-        </p>
-        <p style="color:var(--text-secondary);font-size:0.8rem;margin-top:6px;">
-            📐 <strong>Pick your tile size deliberately.</strong> Every map atlas for a texture set must share the same
-            dimensions — if you’ll export some maps now and others in a later pass, use the <strong>same tile size and
-            layout</strong> each time so Tomb Engine can line them up.
-        </p>
 
-        <div class="at-or-sep">or</div>
-        <div class="form-row" style="align-items:flex-end;">
-            <div class="form-group">
-                <label>Columns</label>
-                <input type="number" id="at-blank-cols" value="4" min="1" max="12" style="width:80px;">
-            </div>
-            <div class="form-group">
-                <button class="btn btn-secondary" id="at-create-blank">🆕 Create Blank Atlas</button>
-            </div>
+        <div class="at-start-grid">
+
+            <!-- 1. Bring your own atlas -->
+            <section class="at-start-card">
+                <h3 class="at-start-title">📤 Upload an atlas</h3>
+                <p class="at-start-lede">Got a texture atlas already? Drop it in and cut it into tiles you can work on one by one.</p>
+                <div class="upload-area" id="at-upload">
+                    <div class="upload-icon">📁</div>
+                    <div class="upload-text">Drop atlas here or <span>browse</span></div>
+                    <div class="upload-hint" style="color:var(--text-secondary);font-size:0.78rem;margin-top:4px;">PNG · JPG · BMP · WebP · TGA · PSD</div>
+                    <input type="file" accept="image/*,.tga,.psd,.psb" id="at-file">
+                </div>
+                <p class="at-start-note">
+                    <strong>Slice Atlas</strong> cuts the whole image on an even grid. <strong>Pick tiles…</strong> lets you
+                    set the grid and choose only the cells you want, which is handy for ripping a single texture or
+                    stitching one atlas together from several.
+                </p>
+                <div class="at-start-actions">
+                    <button class="btn btn-primary" id="at-slice-btn" disabled>✂️ Slice Atlas</button>
+                    <button class="btn btn-secondary" id="at-pick-btn" disabled title="Choose a grid and pick which tiles to import">🗺️ Pick tiles…</button>
+                </div>
+            </section>
+
+            <!-- 2. Build one from nothing -->
+            <section class="at-start-card">
+                <h3 class="at-start-title">🆕 Generate a new atlas</h3>
+                <p class="at-start-lede">No atlas yet? Start with an empty one and drop textures into it a tile at a time. Good for building a set from loose images.</p>
+                <div class="form-group">
+                    <label>Columns</label>
+                    <input type="number" id="at-blank-cols" value="4" min="1" max="12" style="width:90px;">
+                </div>
+                <p class="at-start-note">
+                    You get an empty grid at the tile size above. Add textures with <strong>⬜ Add Blank</strong>, then
+                    paste or drop an image onto any cell.
+                </p>
+                <div class="at-start-actions">
+                    <button class="btn btn-primary" id="at-create-blank">🆕 Create Blank Atlas</button>
+                </div>
+            </section>
+
+            <!-- 3. Come back to earlier work -->
+            <section class="at-start-card">
+                <h3 class="at-start-title">📂 Load existing atlas project</h3>
+                <p class="at-start-lede">Been here before? Open the ZIP you exported last time, or a saved <code>.atlasproj.json</code>, and pick up where you left off with every tile, material and transition intact.</p>
+                <p class="at-start-note">
+                    Export ZIPs carry the project file inside them, so the ZIP the tool gave you is all you need. Keep
+                    <strong>Include project file in ZIP</strong> ticked on export and every export stays re-openable.
+                </p>
+                <div class="at-start-actions">
+                    <button class="btn btn-primary" id="at-load-project-start">📂 Load Project</button>
+                </div>
+            </section>
+
         </div>
-        <p style="color:var(--text-secondary);font-size:0.8rem;margin-top:6px;">
-            No atlas yet? Create a blank one (using the tile size above) and add textures one at a time.
-        </p>
     </details>
 
     <!-- ============ STEP 2: ATLAS GRID ============ -->
@@ -2130,6 +2154,7 @@
                 <label>Aesthetic</label>
                 <select id="at-mat-aesthetic">
                     <option value="realistic" selected>📷 Realistic</option>
+                    <option value="dramatic">🗿 Dramatic</option>
                     <option value="fantasy">✨ Fantasy</option>
                     <option value="decal">🫥 Decal (transparent)</option>
                     <option value="saved">⭐ My presets</option>

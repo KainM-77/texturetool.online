@@ -513,7 +513,11 @@ TRLE.Engine = (function() {
                 u_texelSize: texel,
                 u_radius: preset.aoRadius,
                 u_intensity: preset.aoIntensity / 5.0,
-                u_normalBlend: aoNormalBlend
+                u_normalBlend: aoNormalBlend,
+                // Defaults reproduce the previously hard-coded 0.85 curve / 0.5 floor,
+                // so every preset that omits these keys is byte-for-byte unchanged.
+                u_aoDepth: preset.aoDepth ?? 0.5,
+                u_aoCurve: preset.aoCurve ?? 0.85
             }, aoFBO);
             results.ao = aoFBO;
             deleteFBO(aoHeightFBO);

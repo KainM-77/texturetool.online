@@ -287,6 +287,8 @@ TRLE.Shaders = {
         uniform float u_radius;         // sample radius in texels (1-30)
         uniform float u_intensity;      // darkness multiplier
         uniform float u_normalBlend;    // 0 = height-field only, 1 = normal-field only (dual-channel AO)
+        uniform float u_aoDepth;        // how far AO may darken: 0 = none, 1 = down to black. Floor is 1-depth
+        uniform float u_aoCurve;        // response exponent. Lower = more mid-tone shading
         in vec2 v_uv;
         out vec4 fragColor;
 
@@ -327,12 +329,17 @@ TRLE.Shaders = {
             aoH /= float(DIRS);
             aoN /= float(DIRS);
             float ao = mix(aoH, aoN, clamp(u_normalBlend, 0.0, 1.0));
-            // Gentler response (0.85 vs old 0.5 — less boosting) plus an AO floor
-            // so AO can shade but never crush colour to black. The old curve +
-            // no-floor made AO derived from albedo "fry" dark/patterned textures.
-            float occ = pow(clamp(ao * u_intensity, 0.0, 1.0), 0.85);
-            const float AO_FLOOR = 0.5;          // darkest AO output (≥50% brightness)
-            fragColor = vec4(vec3(1.0 - occ * (1.0 - AO_FLOOR)), 1.0);
+            // Gentler response than the original 0.5 curve, plus a floor, so AO can
+            // shade without crushing colour to black — the old curve + no-floor made
+            // AO derived from albedo "fry" dark/patterned textures.
+            //
+            // Both are per-preset now (u_aoCurve / u_aoDepth) rather than baked
+            // constants. The engine defaults them to 0.85 / 0.5, which is exactly the
+            // old hard-coded pair, so a preset that omits the keys is unchanged.
+            // Depth rather than floor because it reads the way every other slider
+            // does: more = more visible effect. Floor = 1 - depth.
+            float occ = pow(clamp(ao * u_intensity, 0.0, 1.0), u_aoCurve);
+            fragColor = vec4(vec3(1.0 - occ * u_aoDepth), 1.0);
         }`,
 
     /* ---------- Roughness Map ----------
@@ -741,12 +748,22 @@ TRLE.Shaders = {
             float smoothness = clamp(1.0 - sqrt(dev) * 4.0, 0.0, 1.0);
             float detail = clamp((smoothness * 2.0 - 1.0) + (center - 0.5) * 0.20, -1.0, 1.0);
 
-            // Scale the swing by the headroom on the side we're moving toward, so a
-            // high base varies less upward instead of clipping. u_contrast is then
-            // "fraction of the available headroom the detail may use", which makes
-            // clipping structurally impossible for any base/contrast pair.
-            float room = detail > 0.0 ? (1.0 - u_baseValue) : u_baseValue;
-            float spec = u_baseValue + detail * u_contrast * room;
+            // Symmetric half-range swing. This used to scale by the headroom on the
+            // side we were moving toward (1-base above, base below), which stopped
+            // high-base presets clipping but was asymmetric: a base far from 0.5 got
+            // a ~7.5x slope kink at detail == 0, and since detail runs mostly
+            // negative on any textured tile, every matte preset lived on the
+            // compressed side and its map went flat (dirt: range 45 -> 8 levels).
+            // The detail signal was never the problem; the multiplier destroyed it.
+            //
+            // Symmetric removes the kink. SWING is the floor of the old
+            // min(base, 1-base) — which, at 0.5, that expression can never exceed —
+            // so it reduces to a constant. u_contrast now reads as "fraction of half
+            // the range the detail may use", which is what materials-guide.js has
+            // always claimed it means. No built-in preset clips at its default
+            // contrast; the clamp below still catches extreme hand-set values.
+            const float SWING = 0.5;
+            float spec = u_baseValue + detail * u_contrast * SWING;
             fragColor = vec4(vec3(clamp(spec, 0.0, 1.0)), 1.0);
         }`,
 

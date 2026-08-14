@@ -34,11 +34,13 @@
     const SECTIONS = [
         {
             id: 'getting-started', icon: '🏁', title: 'Getting started',
-            what: 'Every project is an <em>atlas</em> — a grid of equal-size tiles. Start from an existing atlas image or build one from scratch.',
+            what: 'Every project is an <em>atlas</em>, a grid of equal-size tiles. The start screen gives you three ways in: <strong>Upload an atlas</strong>, <strong>Generate a new atlas</strong>, or <strong>Load existing atlas project</strong> if you have been here before.',
             how: [
-                'Drop an atlas image, set the <strong>Tile Size</strong>, and click <strong>Slice Atlas</strong> to cut the whole sheet; or',
+                'Coming back to earlier work? <strong>Load existing atlas project</strong> takes the export ZIP the tool gave you, or a saved <code>.atlasproj.json</code>, and restores every tile, material and transition. You do not need to re-slice anything.',
+                'Set the <strong>Tile Size</strong> first if you are starting fresh. Every map atlas in a set has to share it, and a saved project brings its own.',
+                'Drop an atlas image and click <strong>Slice Atlas</strong> to cut the whole sheet; or',
                 'Click <strong>Pick tiles…</strong> to set a grid and choose exactly which cells to import — rip one texture, grab several, or stitch from multiple atlases (each cell is resized to your tile size). Add more later with <strong>Import from Atlas…</strong>.',
-                'Or click <strong>Create Blank Atlas</strong> (choose tile size + columns), then add textures with <strong>Add Image(s)</strong>, <strong>Add Blank</strong>, or the <strong>＋</strong> cell.',
+                'Or click <strong>Create Blank Atlas</strong> under <strong>Generate a new atlas</strong> (set the columns), then add textures with <strong>Add Image(s)</strong>, <strong>Add Blank</strong>, or the <strong>＋</strong> cell.',
                 'You can also <strong>paste an image</strong> (Ctrl/Cmd+V) from your clipboard — confirm, then slice it like an imported atlas.',
                 'Each tile is an element you can <strong>right-click</strong> to edit.',
                 'PNG, JPG, BMP, WebP, TGA and PSD all load. A layered PSD brings its material maps in with it — see <em>File types</em>.'

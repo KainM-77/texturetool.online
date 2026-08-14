@@ -1749,6 +1749,93 @@ input[type="range"]::-moz-range-thumb {
     margin: 16px 0 8px;
     position: relative;
 }
+
+/* ---- Start screen: three ways in ----------------------------------------
+   Upload / generate / load-a-project as equal, self-contained choices. Load
+   Project used to be reachable only from the export card, which is hidden
+   until an atlas exists, so returning users could not find their own ZIPs. */
+.at-start-size {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 20px;
+    align-items: stretch;
+    margin: 14px 0 18px;
+    padding: 12px 14px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-sm);
+}
+.at-start-size > .form-group { min-width: 150px; }
+.at-start-size label {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+/* Same accent callout the height warning uses. This note kept getting missed as
+   plain muted text, and getting tile size wrong means a whole map set that
+   won't line up in-engine, which is expensive to discover later. */
+.at-start-sizenote {
+    flex: 1 1 340px;
+    align-self: center;
+    margin: 0;
+    padding: 9px 11px;
+    color: var(--text-primary);
+    font-size: 0.79rem;
+    line-height: 1.5;
+    background: rgba(232, 133, 42, 0.12);
+    border: 1px solid rgba(232, 133, 42, 0.45);
+    border-radius: 6px;
+}
+.at-start-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 14px;
+    align-items: stretch;
+}
+.at-start-card {
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 16px;
+}
+.at-start-card:hover { border-color: var(--accent); }
+.at-start-title {
+    margin: 0 0 6px;
+    font-size: 0.98rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+.at-start-lede {
+    margin: 0 0 12px;
+    color: var(--text-secondary);
+    font-size: 0.83rem;
+    line-height: 1.5;
+}
+/* Actions are the LAST element in each card and take the auto margin, so the
+   three buttons land on one baseline however much copy sits above them. */
+.at-start-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: auto;
+    padding-top: 14px;
+}
+.at-start-note {
+    margin: 10px 0 0;
+    color: var(--text-muted);
+    font-size: 0.76rem;
+    line-height: 1.5;
+}
+.at-start-card .upload-area { margin-bottom: 12px; }
+.at-start-card code {
+    background: var(--bg-tertiary);
+    border-radius: 3px;
+    padding: 1px 4px;
+    font-size: 0.95em;
+}
 .at-add-cell {
     aspect-ratio: 1;
     border: 2px dashed var(--border);

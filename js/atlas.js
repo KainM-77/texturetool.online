@@ -5033,6 +5033,8 @@ window.TRLE = window.TRLE || {};
         ['aoRadius',               'AO Radius',            1, 30],
         ['aoIntensity',            'AO Intensity',         1, 30],
         ['aoNormalBlend',          'AO Normal Mix',        0, 1,   0.05],
+        ['aoDepth',                'AO Depth',             0, 1,   0.05],
+        ['aoCurve',                'AO Curve',             0.3, 1.5, 0.05],
         ['roughnessBase',          'Roughness Base',       0, 255],
         ['roughnessContrast',      'Roughness Contrast',   0, 30],
         ['specularBase',           'Specular Base',        0, 255],
@@ -5043,7 +5045,14 @@ window.TRLE = window.TRLE || {};
         ['emissiveThreshold',      'Emissive Threshold',   0, 255]
     ];
     // Params measured on a 0–1 float scale (need parseFloat, not parseInt).
-    const MAT_FLOAT_PARAMS = new Set(['normalAngularity', 'normalAngularIntensity', 'aoNormalBlend', 'normalFineDetail', 'normalLargeScale']);
+    const MAT_FLOAT_PARAMS = new Set(['normalAngularity', 'normalAngularIntensity', 'aoNormalBlend',
+                                      'normalFineDetail', 'normalLargeScale', 'aoDepth', 'aoCurve']);
+    /* Params whose "absent from the preset" value is NOT the slider's minimum.
+       Every other optional param means "off at 0", so the slider min is the right
+       fallback; these two mean "the engine's default", and falling back to min would
+       silently set AO Depth to 0 (no AO at all) the moment anyone touched a slider on
+       a preset that doesn't declare them. Must match the ?? defaults in engine.js. */
+    const MAT_PARAM_DEFAULTS = { aoDepth: 0.5, aoCurve: 0.85 };
     const MAT_PREVIEW_MAPS = ['normal', 'ao', 'specular', 'roughness', 'emissive', 'height'];
 
     const mat = { id: null, batchIds: null, dirty: false, previewTimer: null,
@@ -5067,8 +5076,33 @@ window.TRLE = window.TRLE || {};
     function matPresetKeys(type, aesthetic) {
         if (aesthetic === 'saved') return userPresets.map(p => p.id);
         return type === 'liquid'
-            ? TRLE.getLiquidPresetKeys(aesthetic)
+            ? TRLE.getLiquidPresetKeys()
             : TRLE.getSolidPresetKeys(aesthetic);
+    }
+
+    /* Aesthetics that only exist for solids. Liquids are deliberately a single set,
+       so offering these on a liquid means getLiquidPresetKeys falls through and you
+       get realistic liquids under someone else's label — which is what Decal has
+       been doing silently. Realistic and ⭐ My presets always apply. */
+    const SOLID_ONLY_AESTHETICS = ['dramatic', 'fantasy', 'decal'];
+
+    /* Show only the aesthetics that apply to the current type, and among the
+       solid-only ones only those whose table is actually populated — so an empty
+       table hides itself instead of becoming a dead menu item, which is exactly what
+       ✨ Fantasy was before it was filled in. */
+    function matSyncAesthetics() {
+        const sel = $('at-mat-aesthetic');
+        if (!sel) return;
+        const isLiquid = $('at-mat-type').value === 'liquid';
+        [...sel.options].forEach(o => {
+            const solidOnly = SOLID_ONLY_AESTHETICS.includes(o.value);
+            const ok = !solidOnly
+                ? true
+                : !isLiquid && TRLE.getSolidPresetKeys(o.value).length > 0;
+            o.hidden = o.disabled = !ok;
+        });
+        const cur = sel.selectedOptions[0];
+        if (!cur || cur.hidden) sel.value = 'realistic';
     }
 
     function matPopulatePresets(selectedKey) {
@@ -5123,7 +5157,8 @@ window.TRLE = window.TRLE || {};
     function matLoadParams(params) {
         MAT_PARAMS.forEach(([key]) => {
             const slider = $(`at-mat-p-${key}`);
-            slider.value = params[key] != null ? params[key] : slider.min;
+            slider.value = params[key] != null ? params[key]
+                         : (MAT_PARAM_DEFAULTS[key] != null ? MAT_PARAM_DEFAULTS[key] : slider.min);
             $(`at-mat-p-${key}-val`).textContent = slider.value;
         });
     }
@@ -5457,6 +5492,8 @@ window.TRLE = window.TRLE || {};
     function matLoadMaterialDescriptor(m) {
         $('at-mat-type').value      = m ? m.type : 'solid';
         $('at-mat-aesthetic').value = m ? m.aesthetic : 'realistic';
+        matSyncAesthetics();   // after the value is set: a stored aesthetic that no
+                               // longer applies to this type falls back to realistic
         matPopulatePresets(m ? m.key : DEFAULTS.solid);
         if (m && m.custom) {
             matLoadParams(m.custom);
@@ -5884,12 +5921,10 @@ window.TRLE = window.TRLE || {};
     }
 
     function setupMatModal() {
-        // Fantasy preset lists are empty placeholders right now — hide the
-        // option until presets.js actually defines them
-        if (!TRLE.getSolidPresetKeys('fantasy').length && !TRLE.getLiquidPresetKeys('fantasy').length) {
-            const fantasyOpt = $('at-mat-aesthetic').querySelector('option[value="fantasy"]');
-            if (fantasyOpt) fantasyOpt.remove();
-        }
+        // Which aesthetics apply is per-type and re-evaluated on every type change;
+        // matSyncAesthetics also covers the "table is empty, hide the option" case
+        // that used to be a one-shot removal of ✨ Fantasy here.
+        matSyncAesthetics();
 
         // Build the advanced slider grid once
         const wrap = $('at-mat-sliders');
@@ -5907,7 +5942,7 @@ window.TRLE = window.TRLE || {};
             });
         });
 
-        $('at-mat-type').addEventListener('change', () => { matPopulatePresets(); matOnPresetChange(); });
+        $('at-mat-type').addEventListener('change', () => { matSyncAesthetics(); matPopulatePresets(); matOnPresetChange(); });
         $('at-mat-aesthetic').addEventListener('change', () => { matPopulatePresets(); matOnPresetChange(); });
         $('at-mat-preset').addEventListener('change', () => { matOnPresetChange(); updatePresetBarButtons(); });
 
@@ -10258,6 +10293,10 @@ window.TRLE = window.TRLE || {};
         refreshTransitions();
         $('at-grid-card').style.display = 'block';
         $('at-export-card').style.display = 'block';
+        // Fold the start chooser away, same as slicing does — otherwise a loaded
+        // project opens with three "how do you want to begin?" cards sitting on
+        // top of the atlas the user just opened.
+        collapseUploadCard(`${els.length} elements · click to start a different atlas`);
         renderGrid();
         resetHistory('Project loaded');
         return true;
@@ -10625,7 +10664,7 @@ window.TRLE = window.TRLE || {};
             const n = cells.length;
             closeModal();
             renderGrid();
-            if (firstSetup) collapseUploadCard(`${state.elements.length} elements — click to slice a different atlas`);
+            if (firstSetup) collapseUploadCard(`${state.elements.length} elements · click to start a different atlas`);
             if (firstSetup) resetHistory(`Imported ${n} tile${n !== 1 ? 's' : ''}`);
             else pushHistory(`Imported ${n} tile${n !== 1 ? 's' : ''}`);
             showToast(`Imported ${n} tile${n !== 1 ? 's' : ''}`, 'success');
@@ -10676,7 +10715,7 @@ window.TRLE = window.TRLE || {};
         $('at-grid-card').style.display = 'block';
         $('at-export-card').style.display = 'block';
         renderGrid();
-        collapseUploadCard('blank atlas — click to upload an atlas instead');
+        collapseUploadCard('blank atlas · click to start a different atlas');
         resetHistory('Blank atlas');
         showToast('Blank atlas created — add tiles with “Add Image(s)”', 'info', 3500);
     }
@@ -10818,7 +10857,7 @@ window.TRLE = window.TRLE || {};
             $('at-grid-card').style.display = 'block';
             $('at-export-card').style.display = 'block';
             renderGrid();
-            collapseUploadCard(`${state.elements.length} elements — click to slice a different atlas`);
+            collapseUploadCard(`${state.elements.length} elements · click to start a different atlas`);
             resetHistory('Sliced atlas');   // fresh atlas → new undo baseline
             showToast(`Sliced into ${state.elements.length} elements (${cols}×${rows})`, 'success');
         } finally {
@@ -10910,7 +10949,13 @@ window.TRLE = window.TRLE || {};
             syncHeightWarn(false);   // reflect initial state (height defaults off)
         }
         $('at-save-project').addEventListener('click', saveProject);
+        // Two entry points, one picker: the export bar's button for mid-session
+        // loads, and the one on the start screen. Load Project used to live ONLY
+        // in the export card, which is display:none until an atlas exists, so a
+        // returning user with an export ZIP had no visible way back in.
         $('at-load-project').addEventListener('click', () => $('at-load-project-file').click());
+        const loadStart = $('at-load-project-start');
+        if (loadStart) loadStart.addEventListener('click', () => $('at-load-project-file').click());
         $('at-load-project-file').addEventListener('change', e => {
             if (e.target.files[0]) requestLoadProject(e.target.files[0]);
             e.target.value = '';
