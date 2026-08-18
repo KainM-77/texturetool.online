@@ -720,6 +720,34 @@ TRLE.Shaders = {
         in vec2 v_uv;
         out vec4 fragColor;
 
+        /* How far out to look when judging "is this spot smooth or busy".
+           ------------------------------------------------------------
+           7x7 samples at this spacing, so the window reaches +/-3*SPACING texels.
+           This was 1.5 (a +/-4.5 texel reach) and that width was visible in-engine
+           on glazed mosaic: local deviation cannot tell a rough surface from a hard
+           boundary between two SMOOTH surfaces, so a grout line dulled every pixel
+           whose window touched it. The result was a band of grout-level specular
+           bleeding ~5px onto clean glaze, traced around each tile in the shape of
+           that tile — on a 32px mosaic cell it ate 38% of the face and read as a
+           worn, dingy inset square.
+
+           At 0.75 the reach is +/-2.25 texels and the band drops to 23% of the face,
+           with the grout itself just as dull as before (the effect is intended; only
+           its bleed onto the glaze was not). Measured cost is ~4% of specular
+           variation across all 53 solids, which is the price of judging roughness
+           over a smaller neighbourhood.
+
+           An edge-aware (bilateral) version was built and measured, and rejected:
+           it reached the same 77% glossy core only when combined with this same
+           narrowing, cost 16% of specular variation instead of 4%, and lifted the
+           grout from 128 to 153 — eroding the very glaze-vs-grout distinction it
+           was meant to protect. Magnitude-based edge rejection cannot separate
+           "rough" from "edge", because roughness IS large-magnitude deviation.
+           A real fix would have to discriminate on spatial structure (sign changes,
+           coherence) rather than magnitude. Not worth it for a 4%-cost alternative
+           that lands the same geometry. */
+        const float SPACING = 0.75;
+
         void main() {
             // Sample local smoothness (inverse of variance)
             float center = texture(u_heightMap, v_uv).r;
@@ -728,7 +756,7 @@ TRLE.Shaders = {
             float avg = 0.0;
             for (int x = -3; x <= 3; x++) {
                 for (int y = -3; y <= 3; y++) {
-                    float s = texture(u_heightMap, v_uv + vec2(float(x), float(y)) * u_texelSize * 1.5).r;
+                    float s = texture(u_heightMap, v_uv + vec2(float(x), float(y)) * u_texelSize * SPACING).r;
                     avg += s;
                     count += 1.0;
                 }
@@ -736,7 +764,7 @@ TRLE.Shaders = {
             avg /= count;
             for (int x = -3; x <= 3; x++) {
                 for (int y = -3; y <= 3; y++) {
-                    float s = texture(u_heightMap, v_uv + vec2(float(x), float(y)) * u_texelSize * 1.5).r;
+                    float s = texture(u_heightMap, v_uv + vec2(float(x), float(y)) * u_texelSize * SPACING).r;
                     dev += abs(s - avg);
                 }
             }
