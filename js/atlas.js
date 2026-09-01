@@ -507,25 +507,174 @@ window.TRLE = window.TRLE || {};
        toroidally — edges of the warped result still wrap. Warping a cell layer
        (pixels + alpha together) is how Build Pattern gets irregular joint edges
        without touching any per-pattern drawing code. amount 0..1. */
-    function warpLayerToroidal(layer, S, amount, seed) {
+    /* Octave set for the joint-edge warp. A single frequency (this used to be a
+       bare freq=4) gives one wobble scale and — because it's the same field in
+       every tile — a repeat you can literally count when the texture is laid out.
+       Three coprime-ish octaves give large-scale sag AND fine chipping, and the
+       combined period stops reading as a wave. */
+    const WARP_OCTAVES = [
+        { freq: 3,  amp: 1.00 },
+        { freq: 7,  amp: 0.45 },
+        { freq: 17, amp: 0.20 }
+    ];
+
+    /* Planks and pipes run a groove along the whole length of the tile, and on
+       the strip patterns that groove sits ON the wrap seam. Fine octaves make it
+       wiggle from one pixel row to the next, which tiles arithmetically but reads
+       as a kink down the join — the same reason BP_WARP_DEF gives these patterns
+       the lowest default warp in the table. They keep the original single coarse
+       octave; the extra detail is for patterns whose joints are interior. */
+    const WARP_OCTAVES_COARSE = [{ freq: 4, amp: 1.00 }];
+
+    /* Build a periodic 2-D displacement field as a pair of sample functions.
+       Every octave frequency is an integer, so each octave — and therefore the
+       sum — is periodic over the tile and the warp can't break seamlessness. */
+    function makeWarpField(seed, octaves) {
+        const oct = (octaves || WARP_OCTAVES).map((o, i) => ({
+            freq: o.freq, amp: o.amp,
+            nX: makePeriodicNoise((seed + i * 0x9e3779b9) >>> 0, o.freq),
+            nY: makePeriodicNoise((seed ^ (0x85ebca6b + i * 0x27d4eb2d)) >>> 0, o.freq)
+        }));
+        const norm = oct.reduce((a, o) => a + o.amp, 0);
+        return (x, y, S) => {
+            let dx = 0, dy = 0;
+            for (const o of oct) {
+                const u = (x / S) * o.freq, v = (y / S) * o.freq;
+                dx += o.amp * (o.nX(u, v) - 0.5);
+                dy += o.amp * (o.nY(u + 1.7, v + 2.3) - 0.5);
+            }
+            return [2 * dx / norm, 2 * dy / norm];   // each in −1..1
+        };
+    }
+
+    /* Roughen a cell layer's OUTLINE without smearing its faces.
+       The old version displaced the whole composited layer, so brick faces
+       travelled with the joints and anything past ~30% looked like wet paint.
+       Here the warped coordinate supplies the ALPHA (so the silhouette goes
+       ragged) while colour is taken from the *unwarped* position wherever that
+       position was already inside a cell — which is every interior pixel, so
+       faces stay pixel-sharp. Only the thin sliver where a cell has grown into
+       former mortar falls back to the warped colour, and at that width the
+       displacement is invisible.
+
+       `maskOnly` is off for planks and pipes, and has to be: those patterns fake
+       their relief with gradients painted INSIDE a full-bleed strip, so their
+       grooves live in the colour rather than in the alpha outline. Warping only
+       the alpha there slides the silhouette out from under its own shading, and
+       the two disagree across the wrap — measured as the plank seam ratio going
+       from 2.1 to 9.9. They get the original whole-layer displacement, which is
+       what they always had. */
+    function warpLayerToroidal(layer, S, amount, seed, maskOnly) {
         if (!amount || amount <= 0) return layer;
-        const freq = 4;
-        const nX = makePeriodicNoise(seed >>> 0, freq);
-        const nY = makePeriodicNoise((seed ^ 0x85ebca6b) >>> 0, freq);
+        // maskOnly and the octave set go together: the patterns that need the
+        // whole layer displaced are exactly the strip patterns that also need the
+        // warp kept coarse.
+        const field = makeWarpField(seed >>> 0, maskOnly ? WARP_OCTAVES : WARP_OCTAVES_COARSE);
         const maxD = amount * S * 0.10;
         const sdata = layer.getContext('2d').getImageData(0, 0, S, S).data;
         const out = document.createElement('canvas'); out.width = S; out.height = S;
         const octx = out.getContext('2d');
         const img = octx.createImageData(S, S), d = img.data;
         for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
-            const u = (x / S) * freq, v = (y / S) * freq;
+            const [fx, fy] = field(x, y, S);
             // Math.floor, not |0: truncation toward zero isn't translation-
             // invariant, which would shift samples by 1px where x+dx < 0 and
             // open a visible band along the wrap seam.
-            const sx = (Math.floor(x + (nX(u, v) - 0.5) * 2 * maxD) % S + S) % S;
-            const sy = (Math.floor(y + (nY(u + 1.7, v + 2.3) - 0.5) * 2 * maxD) % S + S) % S;
+            const sx = (Math.floor(x + fx * maxD) % S + S) % S;
+            const sy = (Math.floor(y + fy * maxD) % S + S) % S;
             const si = (sy * S + sx) * 4, di = (y * S + x) * 4;
-            d[di] = sdata[si]; d[di + 1] = sdata[si + 1]; d[di + 2] = sdata[si + 2]; d[di + 3] = sdata[si + 3];
+            // Take colour from whichever sample is the more opaque. Testing
+            // `alpha > 0` instead lets an antialiased edge pixel win: canvas
+            // stores premultiplied colour, so getImageData un-premultiplies, and
+            // at alpha≈1/255 that scales rounding noise up to near-white. Those
+            // pixels then got the warped (large) alpha and painted bright streaks
+            // along the joints. The more-opaque sample is never garbage, and deep
+            // inside a cell both are 255 so the face still comes through unwarped.
+            const ci = maskOnly && sdata[di + 3] >= sdata[si + 3] ? di : si;
+            d[di] = sdata[ci]; d[di + 1] = sdata[ci + 1]; d[di + 2] = sdata[ci + 2];
+            d[di + 3] = sdata[si + 3];
+        }
+        octx.putImageData(img, 0, 0);
+        return out;
+    }
+
+    /* Crumble cell edges away. Erosion has to bite only near an outline or it
+       punches holes in the middle of otherwise sound bricks, so the depth into
+       the cell is read off a wrap-aware blur of the alpha: ~1 deep inside, small
+       near a joint. A high-frequency periodic noise then carves wherever that
+       depth is shallower than the noise threshold, which eats corners (shallow
+       from two sides) fastest — the same way real masonry goes. */
+    /* Distance, in pixels, from every opaque pixel of `layer` to the nearest
+       transparent one — a two-pass chamfer transform run on a wrapped apron so
+       the result is toroidal. Distances are only needed near an edge, so the
+       apron just has to exceed `maxD` and the field can saturate past it. */
+    function alphaEdgeDistance(layer, S, maxD) {
+        const ap = Math.ceil(maxD) + 2, W = S + ap * 2;
+        const big = document.createElement('canvas'); big.width = big.height = W;
+        const bctx = big.getContext('2d');
+        for (let ty = -1; ty <= 1; ty++)
+            for (let tx = -1; tx <= 1; tx++) bctx.drawImage(layer, ap + tx * S, ap + ty * S);
+        const a = bctx.getImageData(0, 0, W, W).data;
+        const INF = 1e9, d = new Float32Array(W * W);
+        for (let i = 0; i < W * W; i++) d[i] = a[i * 4 + 3] > 127 ? INF : 0;
+        const D1 = 1, D2 = Math.SQRT2;
+        for (let y = 1; y < W; y++) for (let x = 1; x < W - 1; x++) {
+            const i = y * W + x;
+            if (!d[i]) continue;
+            let v = d[i];
+            if (d[i - W] + D1 < v) v = d[i - W] + D1;
+            if (d[i - 1] + D1 < v) v = d[i - 1] + D1;
+            if (d[i - W - 1] + D2 < v) v = d[i - W - 1] + D2;
+            if (d[i - W + 1] + D2 < v) v = d[i - W + 1] + D2;
+            d[i] = v;
+        }
+        for (let y = W - 2; y >= 0; y--) for (let x = W - 2; x >= 1; x--) {
+            const i = y * W + x;
+            if (!d[i]) continue;
+            let v = d[i];
+            if (d[i + W] + D1 < v) v = d[i + W] + D1;
+            if (d[i + 1] + D1 < v) v = d[i + 1] + D1;
+            if (d[i + W + 1] + D2 < v) v = d[i + W + 1] + D2;
+            if (d[i + W - 1] + D2 < v) v = d[i + W - 1] + D2;
+            d[i] = v;
+        }
+        const out = new Float32Array(S * S);
+        for (let y = 0; y < S; y++)
+            for (let x = 0; x < S; x++) out[y * S + x] = d[(y + ap) * W + (x + ap)];
+        return out;
+    }
+
+    /* Crumble cell edges away. Erosion has to bite only near an outline or it
+       punches holes through the middle of otherwise sound bricks, so how far a
+       pixel sits inside its cell is measured directly — a blurred alpha was tried
+       first and can't work here, because a 2px joint in an otherwise opaque field
+       barely dents the blur and no threshold fires. With a real distance field the
+       depth eaten is in honest pixels, and convex corners (close to empty space on
+       two sides) fall first, which is how masonry actually goes. */
+    function erodeCellEdges(layer, S, amount, seed, cellMin) {
+        if (!amount || amount <= 0) return layer;
+        // Bite depth is a fraction of the CELL, not of the tile: a fixed pixel
+        // depth that merely roughens a big flagstone will chew a small brick down
+        // to a nugget, which is exactly what the first tile-relative version did.
+        // 0.22 for the same reason as the sag cap: at 0.35 a fully-eroded brick
+        // lost roughly a third of itself from every side and stopped being a brick.
+        const maxEat = Math.max(1.2, (cellMin || S / 6) * 0.22) * amount;
+        const dist = alphaEdgeDistance(layer, S, maxEat + 2);
+        const sdata = layer.getContext('2d').getImageData(0, 0, S, S).data;
+        const fine = Math.max(6, Math.round(S / 10));
+        const nFine = makePeriodicNoise((seed ^ 0x1b873593) >>> 0, fine);
+        const nCoarse = makePeriodicNoise((seed ^ 0xcc9e2d51) >>> 0, 5);
+        const out = document.createElement('canvas'); out.width = S; out.height = S;
+        const octx = out.getContext('2d');
+        const img = octx.createImageData(S, S), d = img.data;
+        for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+            const i = (y * S + x) * 4;
+            const u = x / S, v = y / S;
+            // Coarse term leaves whole stretches of edge sound while others rot.
+            const n = 0.55 * nFine(u * fine, v * fine) + 0.45 * nCoarse(u * 5, v * 5);
+            const eat = maxEat * n;
+            d[i] = sdata[i]; d[i + 1] = sdata[i + 1]; d[i + 2] = sdata[i + 2];
+            d[i + 3] = dist[y * S + x] > eat ? sdata[i + 3] : 0;
         }
         octx.putImageData(img, 0, 0);
         return out;
@@ -3108,6 +3257,76 @@ window.TRLE = window.TRLE || {};
         });
     }
 
+    /* The size the live preview bakes at. "Tile size" (auto) follows the atlas,
+       capped for responsiveness; an explicit pick lets someone working at 256
+       check how the same texture reads at 32 or 64 without changing the atlas.
+       Preview-only — anAdd() always bakes at state.tileSize. */
+    function anPreviewSize() {
+        const tile = state.tileSize || 256;
+        const v = $('at-anim-preview-size').value;
+        if (v === 'auto') return Math.min(tile, PREVIEW_CAP);
+        return Math.min(+v || tile, PREVIEW_CAP);
+    }
+
+    /* Supersample factor for the current Crisp state, resolved against `size`
+       (there's no headroom left at a 1024 tile, so it collapses to 1 there). */
+    function anCrispFactor(size) {
+        return $('at-anim-crisp').checked ? TRLE.AnimGen.ssFactor(size, 4) : 1;
+    }
+
+    /* Note under the preview: say so when it isn't showing the export size, in
+       either direction (a small tile drawn big, or a big tile capped at 256). */
+    function anPreviewNote() {
+        const tile = state.tileSize || 256, pv = anPreviewSize();
+        const el = $('at-anim-preview-note');
+        if (pv === tile) { el.textContent = `Showing real ${tile}×${tile} pixels.`; el.style.color = 'var(--text-secondary)'; return; }
+        if ($('at-anim-preview-size').value === 'auto') {
+            el.textContent = `Baked at ${pv}×${pv} — your ${tile}×${tile} tiles will have more detail than this.`;
+            el.style.color = 'var(--text-secondary)';
+        } else {
+            el.textContent = `Previewing at ${pv}×${pv}, but the atlas is ${tile}×${tile} — tiles export at ${tile}.`;
+            el.style.color = 'var(--warning)';
+        }
+    }
+
+    /* Resolution note under Scale/Detail (C). Pattern scale is in lattice cells
+       per tile, so the feature size in *pixels* depends entirely on the tile
+       size — at 32×32 a scale of 8 puts each cell on 4 px and the result reads
+       as confetti, with nothing in the slider's 1–16 range to say so. Measured
+       cutoff (lag-1 neighbour correlation) is around 6–8 px per cell; below
+       that, coherence falls off a cliff. Octaves get the same treatment: any
+       octave finer than ~2 px per cell only adds dither. */
+    function anResNote() {
+        const tile = state.tileSize || 256;
+        const scale = Math.max(1, +$('at-anim-scale').value);
+        const oct = Math.max(1, +$('at-anim-octaves').value);
+        const basePx = tile / scale;
+        const finestPx = tile / (scale * Math.pow(2, oct - 1));
+        const usefulOct = Math.max(1, Math.floor(1 + Math.log2(Math.max(1, tile / (2 * scale)))));
+
+        const parts = [`≈${basePx < 10 ? basePx.toFixed(1) : Math.round(basePx)} px per feature at ${tile}×${tile}`];
+        let warn = false;
+        if (basePx < 6) {
+            warn = true;
+            parts.push(`too fine for this tile size — drop Pattern scale to about ${Math.max(1, Math.floor(tile / 8))} or use a bigger tile`);
+        } else if (finestPx < 2 && oct > usefulOct) {
+            parts.push(`Detail above ${usefulOct} octaves only adds dither at this size`);
+        }
+        const el = $('at-anim-res-note');
+        el.textContent = parts.join(' · ');
+        el.style.color = warn ? 'var(--warning)' : 'var(--text-secondary)';
+    }
+
+    /* Note beside the Crisp checkbox — spell out the factor it actually gets. */
+    function anCrispNote() {
+        const tile = state.tileSize || 256;
+        const f = TRLE.AnimGen.ssFactor(tile, 4);
+        $('at-anim-crisp-note').textContent = f > 1
+            ? `— render at ${f}× and average down (cleaner at small tile sizes)`
+            : '— no headroom at this tile size';
+        $('at-anim-crisp').disabled = f <= 1;
+    }
+
     function anSyncLabels() {
         $('at-anim-scale-val').textContent    = $('at-anim-scale').value;
         $('at-anim-speed-val').textContent    = $('at-anim-speed').value;
@@ -3118,6 +3337,7 @@ window.TRLE = window.TRLE || {};
         $('at-anim-flowspeed-val').textContent = $('at-anim-flowspeed').value;
         $('at-anim-stretch-val').textContent  = $('at-anim-stretch').value;
         $('at-anim-fps-val').textContent      = $('at-anim-fps').value;
+        anResNote();
     }
 
     /* Push a preset's params into the controls. */
@@ -3166,6 +3386,9 @@ window.TRLE = window.TRLE || {};
         $('at-anim-flowdir').value  = fc.dir;
         $('at-anim-flowspeed').value = fc.speed;
         $('at-anim-seed').value     = seed != null ? seed : 0;
+        // Legacy groups predate supersampling and have no stored factor → off,
+        // so re-opening one and hitting Update reproduces its existing pixels.
+        $('at-anim-crisp').checked  = (params.supersample || 1) > 1;
         anSyncLabels();
     }
 
@@ -3491,8 +3714,10 @@ window.TRLE = window.TRLE || {};
         const single = $('at-anim-output').value === 'single';
         const tile = state.tileSize || 256;
         const frames = single ? 2 : TRLE.AnimGen.clampFrames($('at-anim-frames').value);
+        const size = full ? tile : anPreviewSize();
         const overrides = {
-            size: full ? tile : Math.min(tile, PREVIEW_CAP),
+            size,
+            supersample: anCrispFactor(size),
             frames: single ? 1 : frames,
             seed: +$('at-anim-seed').value || 0,
             style: +$('at-anim-style').value,
@@ -3524,6 +3749,7 @@ window.TRLE = window.TRLE || {};
 
     function anRegenerate() {
         if ($('at-overlay').style.display === 'none') return;
+        anResNote(); anCrispNote(); anPreviewNote();
         const info = anBuildParams(false);
         try {
             an.frames = anGenerate(info);
@@ -3559,9 +3785,15 @@ window.TRLE = window.TRLE || {};
                     const idx = an.playIdx % an.frames.length;
                     const f = an.frames[idx];
                     const gf = an.glowFrames ? an.glowFrames[idx % an.glowFrames.length] : null;
+                    // Blow the frame up nearest-neighbour so a 32/64px tile shows
+                    // its real pixels instead of a bilinear blur that no engine
+                    // will ever produce. Downscales (a 256px frame into the 128px
+                    // tiled cell) still smooth, or they'd alias on their own.
+                    pctx.imageSmoothingEnabled = f.width > D;
                     pctx.clearRect(0, 0, D, D);
                     pctx.drawImage(f, 0, 0, D, D);
                     if (gf) { pctx.globalCompositeOperation = 'lighter'; pctx.drawImage(gf, 0, 0, D, D); pctx.globalCompositeOperation = 'source-over'; }
+                    tctx.imageSmoothingEnabled = f.width > D / 2;
                     tctx.clearRect(0, 0, D, D);
                     for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++)
                         tctx.drawImage(f, x * (D / 2), y * (D / 2), D / 2, D / 2);
@@ -3712,7 +3944,15 @@ window.TRLE = window.TRLE || {};
             if (!$('at-anim-preset').value) $('at-anim-preset').value = TRLE.AnimPresetOrder[0];
             anApplyPreset($('at-anim-preset').value);
             anWriteGlow(null);   // default: glow off
+            // Crisp pays for itself at small tile sizes (measurably less
+            // per-pixel snow, roughly twice the surviving colours at 32px) and
+            // costs little there, so default it on for the low-res builders and
+            // leave it off where the native render is already clean.
+            $('at-anim-crisp').checked = (state.tileSize || 256) <= 64;
         }
+        $('at-anim-preview-size').value = 'auto';
+        anCrispNote();
+        anPreviewNote();
         anFramesVisibility();
         anSetTab('shape');
         openModal('anim');
@@ -3786,6 +4026,8 @@ window.TRLE = window.TRLE || {};
         });
         $('at-anim-seed').addEventListener('input', anScheduleRegen);
         $('at-anim-fps').addEventListener('input', anSyncLabels);
+        $('at-anim-preview-size').addEventListener('change', () => { anPreviewNote(); anRegenerate(); });
+        $('at-anim-crisp').addEventListener('change', anRegenerate);
         $('at-anim-randomize').addEventListener('click', () => {
             $('at-anim-seed').value = Math.floor(Math.random() * 9999);
             anRegenerate();
@@ -8214,7 +8456,20 @@ window.TRLE = window.TRLE || {};
        tinted copy of the source texture (mortar shares the texture's character);
        'flat' is the plain colour fill. */
     function bpMortarFill(ctx, S, p, src, seed) {
-        if (p.mstyle === 'natural' && src) {
+        // 'atlas': lay the pattern over another texture from the atlas rather than
+        // over a blur or a flat colour. This is the same layer the joints always
+        // showed through — it just gets real structure now, which is what makes a
+        // cell taken out by Missing pieces read as the wall behind rather than as
+        // a hole punched in the image. The hue/sat/brightness sliders act as
+        // filters here exactly as they do for 'natural', so the backing can be
+        // pushed back with brightness instead of competing with the cells.
+        if (p.mstyle === 'atlas' && p.bg) {
+            const base = (p.bg.width === S && p.bg.height === S) ? p.bg : resizeCanvas(p.bg, S, S);
+            ctx.save();
+            ctx.filter = `hue-rotate(${p.mh}deg) saturate(${p.ms}%) brightness(${p.ml}%)`;
+            ctx.drawImage(base, 0, 0);
+            ctx.restore();
+        } else if (p.mstyle === 'natural' && src) {
             const base = wrapBlur(src.width === S && src.height === S ? src : resizeCanvas(src, S, S),
                                   S, Math.max(2, S / 24));
             ctx.save();
@@ -8246,15 +8501,20 @@ window.TRLE = window.TRLE || {};
 
     /* Subtle top-light / bottom-dark bevel inside a cell — fakes rounded relief so
        the generated normal map reads each cell as raised. */
-    function bpBevel(ctx, dx, dy, dw, dh) {
+    /* `depth` (−1 sunk … 0 flush … +1 proud) deepens the lit/shadowed edges in
+       proportion, so a recessed cell reads as recessed once generateMaps turns
+       luminance into height rather than just being a darker rectangle. */
+    function bpBevel(ctx, dx, dy, dw, dh, depth) {
         const t = Math.max(1, Math.min(dw, dh) * 0.12);
+        const k = 1 + (depth || 0) * 0.8;
+        const top = Math.max(0, 0.12 * k), bot = Math.max(0, 0.20 * k);
         ctx.save();
         ctx.beginPath(); ctx.rect(dx, dy, dw, dh); ctx.clip();
         const g = ctx.createLinearGradient(0, dy, 0, dy + dh);
-        g.addColorStop(0, 'rgba(255,255,255,0.12)');
+        g.addColorStop(0, `rgba(255,255,255,${top.toFixed(3)})`);
         g.addColorStop(Math.min(0.49, t / dh), 'rgba(255,255,255,0)');
         g.addColorStop(Math.max(0.51, 1 - t / dh), 'rgba(0,0,0,0)');
-        g.addColorStop(1, 'rgba(0,0,0,0.20)');
+        g.addColorStop(1, `rgba(0,0,0,${bot.toFixed(3)})`);
         ctx.fillStyle = g; ctx.fillRect(dx, dy, dw, dh);
         ctx.restore();
     }
@@ -8266,8 +8526,18 @@ window.TRLE = window.TRLE || {};
     function bpDrawSample(ctx, src, dx, dy, dw, dh, s) {
         const S = src.width;
         ctx.save();
+        // Rotation goes on before the clip is defined, so the clip rect turns with
+        // the content and the cell stays a rectangle — just not an axis-aligned
+        // one. No path rewrite needed; ctx.rect() under a transform is a quad.
+        if (s.rot) {
+            const cx = dx + dw / 2, cy = dy + dh / 2;
+            ctx.translate(cx, cy); ctx.rotate(s.rot); ctx.translate(-cx, -cy);
+        }
         ctx.beginPath(); ctx.rect(dx, dy, dw, dh); ctx.clip();
-        ctx.filter = `hue-rotate(${s.hue.toFixed(1)}deg) brightness(${s.val.toFixed(3)})`;
+        // Depth rides on the same brightness filter the per-cell value jitter uses:
+        // sunk cells sit in shadow, proud ones catch light.
+        const val = s.val * (1 + (s.depth || 0) * 0.22);
+        ctx.filter = `hue-rotate(${s.hue.toFixed(1)}deg) brightness(${val.toFixed(3)})`;
         if (s.fx < 0) { ctx.translate(dx + dw / 2, 0); ctx.scale(-1, 1); ctx.translate(-(dx + dw / 2), 0); }
         if (s.overlay) {                            // tile source over the rect, aligned to world origin
             const ox = Math.floor(dx / S) * S, oy = Math.floor(dy / S) * S;
@@ -8280,21 +8550,83 @@ window.TRLE = window.TRLE || {};
                 for (let tx = dx; tx < dx + dw; tx += S) ctx.drawImage(src, tx, ty);
         }
         ctx.restore();
-        if (s.bevel) bpBevel(ctx, dx, dy, dw, dh);
+        if (s.bevel || s.depth) {
+            ctx.save();
+            if (s.rot) {
+                const cx = dx + dw / 2, cy = dy + dh / 2;
+                ctx.translate(cx, cy); ctx.rotate(s.rot); ctx.translate(-cx, -cy);
+            }
+            bpBevel(ctx, dx, dy, dw, dh, s.depth);
+            ctx.restore();
+        }
     }
 
     /* A cell at logical (dx) which may straddle the left/right seam → draw the
        wrapped copy with the SAME sample so the tile stays seamless horizontally.
        Always pulls 6 rng values (hue, val, flip, sx, sy, tile-pick) so the sequence
        is stable regardless of fill mode or which cells are skipped. */
-    function bpCell(ctx, src, dx, dy, dw, dh, S, p, rng) {
+    /* Maximum random tilt, in radians. Masonry needs very little — past a couple
+       of degrees bricks stop looking hand-laid and start looking spilled. */
+    const BP_MAX_TILT = 3.5 * Math.PI / 180;
+
+    /* Per-cell deformation draws.
+
+       These come from `p.drng`, a SEPARATE stream from the layout rng, on
+       purpose: the layout rng's draw sequence is load-bearing (bpCell's original
+       comment documents pulling exactly six values so the sequence stays stable
+       regardless of which cells are skipped). Interleaving new draws into it
+       would have re-rolled every existing seed. With a separate stream, a build
+       with all the deformation sliders at 0 reproduces byte-for-byte.
+
+       Position jitter is measured in units of the mortar gap the layout stashed
+       in `p._gap`, so a cell can never wander more than half a joint and the
+       joints can't close up. Size jitter stays small for the same reason. */
+    function bpDeform(p, dx, dy, dw, dh) {
+        const dr = p.drng;
+        const j1 = dr(), j2 = dr(), j3 = dr(), j4 = dr(), j5 = dr(), j6 = dr();
+        // Planks and pipes are full-height strips: their cell spans the tile top to
+        // bottom, so anything that changes the height or turns the cell would leave
+        // a gap or a kink at the y-seam. They take width jitter, depth and missing
+        // pieces; vertical deformation is refused rather than silently breaking the
+        // tiling. (Sag and tilt are also hidden in the UI for these patterns.)
+        const vert = !p._noVert;
+        const gap = Math.max(p._gap || 0, 0.04 * Math.min(dw, dh));
+        const move = p.jitter * gap * 0.5;
+        const grow = p.jitter * 0.06;
+        const ddw = (j3 * 2 - 1) * grow * dw;
+        const ddh = vert ? (j4 * 2 - 1) * grow * dh : 0;
+        return {
+            gone: j6 < p.missing,
+            dx: dx + (j1 * 2 - 1) * move - ddw / 2,
+            dy: dy + (vert ? (j2 * 2 - 1) * move : 0) - ddh / 2,
+            dw: Math.max(0, dw + ddw),
+            dh: Math.max(0, dh + ddh),
+            rot: vert ? (j5 * 2 - 1) * p.tilt * BP_MAX_TILT : 0,
+            depth: (j1 * 2 - 1) * p.depthVar          // reuse j1: depth tracks position, which
+        };                                             // reads as a cell settling into its bed
+    }
+
+    /* One cell, wrapped on BOTH axes. bpCell and bpCellTor used to be two nearly
+       identical functions differing only in whether they wrapped vertically; once
+       course sag and vertical jitter existed, every pattern could push a cell over
+       the top or bottom edge, so there is now a single toroidal implementation.
+       For an undeformed cell that sits clear of the vertical seams the ±S copies
+       cull out and the result is what the x-only version drew.
+
+       `extraRot` is the course slope from bpSag — bricks on a sagging row tilt to
+       follow it, which is what stops sag from looking like a wave filter. */
+    function bpCellTor(ctx, src, dx, dy, dw, dh, S, p, rng, extraRot) {
         const r1 = rng(), r2 = rng(), r3 = rng(), r4 = rng(), r5 = rng(), r6 = rng();
+        const g = bpDeform(p, dx, dy, dw, dh);
+        if (g.gone) return;
+        dx = g.dx; dy = g.dy; dw = g.dw; dh = g.dh;
         if (dw <= 0 || dh <= 0) return;
         const overlay = p.fill === 'overlay';
         // Random-tiles: each cell pulls from a random tile in the atlas pool.
         if (p.fill === 'tiles' && p.pool && p.pool.length) src = p.pool[Math.floor(r6 * p.pool.length)];
         const maxsx = Math.max(0, src.width - Math.ceil(dw));
         const maxsy = Math.max(0, src.height - Math.ceil(dh));
+        const rot = (g.rot + (extraRot || 0));
         const s = {
             hue: (r1 * 2 - 1) * p.hue,
             val: 1 + (r2 * 2 - 1) * (p.val / 100),
@@ -8302,12 +8634,49 @@ window.TRLE = window.TRLE || {};
             sx: Math.floor(r4 * maxsx),
             sy: Math.floor(r5 * maxsy),
             bevel: p.bevel,
+            depth: g.depth,
+            rot: overlay ? 0 : rot,     // rotating would break overlay's world-space continuity
             overlay
         };
-        bpDrawSample(ctx, src, dx, dy, dw, dh, s);
-        if (dx < 0) bpDrawSample(ctx, src, dx + S, dy, dw, dh, s);
-        else if (dx + dw > S) bpDrawSample(ctx, src, dx - S, dy, dw, dh, s);
+        // A rotated or nudged cell reaches past its own rect, so the cull has to
+        // allow for it or a wrapped copy gets dropped and the seam shows.
+        const pad = (s.rot ? 0.5 * (dw + dh) * Math.abs(Math.sin(s.rot)) : 0) + (p.jitter ? Math.max(dw, dh) * 0.1 : 0);
+        for (let oy = -S; oy <= S; oy += S)
+            for (let ox = -S; ox <= S; ox += S) {
+                if (dx + ox + dw + pad <= 0 || dx + ox - pad >= S ||
+                    dy + oy + dh + pad <= 0 || dy + oy - pad >= S) continue;
+                bpDrawSample(ctx, src, dx + ox, dy + oy, dw, dh, s);
+            }
     }
+
+    /* Kept as the name the strip patterns call; both wrap on both axes now. */
+    function bpCell(ctx, src, dx, dy, dw, dh, S, p, rng, extraRot) {
+        bpCellTor(ctx, src, dx, dy, dw, dh, S, p, rng, extraRot);
+    }
+
+    /* Course sag: where row `r`'s baseline actually sits at horizontal position
+       `cx`, plus the local slope so cells can tilt to match. The field is a
+       periodic noise sampled with an integer number of cycles across the tile, so
+       the sag wraps exactly and the left and right edges still meet.
+
+       Rows share one field but are offset into it by row index, so neighbouring
+       courses sag differently instead of the whole wall bending as one sheet. */
+    function bpSag(p, S, cx, row, cellH) {
+        if (!p.sag) return { dy: 0, rot: 0 };
+        const n = p._sagN || (p._sagN = makePeriodicNoise((p._seed ^ 0x2545f491) >>> 0, BP_SAG_FREQ));
+        // 0.34, not the 0.55 this started at: at full sag a course used to swing
+        // far enough that neighbouring rows collided and the wall read as rubble
+        // rather than as settled masonry. The top of the slider should be the
+        // strongest setting you'd actually ship, not the strongest one possible.
+        const amp = p.sag * cellH * 0.34;
+        const v = (x) => n((x / S) * BP_SAG_FREQ, row * 0.37) - 0.5;
+        const dy = v(cx) * 2 * amp;
+        // Slope from a finite difference of the same field, in pixels per pixel.
+        const h = Math.max(1, S / 32);
+        const slope = (v(cx + h) - v(cx - h)) * 2 * amp / (2 * h);
+        return { dy, rot: Math.atan(slope) };
+    }
+    const BP_SAG_FREQ = 3;
 
     /* Brick / tile: rectangular cells with a per-row bond offset (0 = stack/tile,
        0.5 = running bond). Rows fill [0,S] exactly and (for offset) are forced even
@@ -8322,12 +8691,14 @@ window.TRLE = window.TRLE || {};
         }
         const ch = S / rows;
         const m = p.joint * Math.min(cw, ch);
+        p._gap = m; p._cellMin = Math.min(cw, ch);
         for (let r = 0; r < rows; r++) {
             const y = r * ch;
             const rowShift = (!square && r % 2) ? p.offset * cw : 0;
             for (let k = 0; k < p.across; k++) {
                 const x = rowShift + k * cw;
-                bpCell(ctx, src, x + m / 2, y + m / 2, cw - m, ch - m, S, p, rng);
+                const sag = bpSag(p, S, x + cw / 2, r, ch);
+                bpCell(ctx, src, x + m / 2, y + m / 2 + sag.dy, cw - m, ch - m, S, p, rng, sag.rot);
             }
         }
     }
@@ -8339,6 +8710,7 @@ window.TRLE = window.TRLE || {};
        handled by a final rotate. */
     function bpPlanks(ctx, src, S, p, rng) {
         const n = p.across, pw = S / n, m = p.joint * pw;
+        p._gap = m; p._cellMin = pw; p._noVert = true; p._colourRelief = true;   // see bpDeform / warpLayerToroidal
         for (let k = 0; k < n; k++) {
             const x = k * pw + m / 2, w = pw - m;
             bpCell(ctx, src, x, 0, w, S, S, p, rng);   // p.bevel is false for planks
@@ -8363,6 +8735,7 @@ window.TRLE = window.TRLE || {};
        (screen) so it reads as a curved metal rod; gaps between pipes are recessed. */
     function bpPipes(ctx, src, S, p, rng) {
         const n = p.across, pw = S / n, gap = p.joint * pw, hi = p.highlight;
+        p._gap = gap; p._cellMin = pw; p._noVert = true; p._colourRelief = true;   // see bpDeform / warpLayerToroidal
         for (let k = 0; k < n; k++) {
             const x = k * pw + gap / 2, w = pw - gap;
             if (w <= 0) { bpCell(ctx, src, 0, 0, 0, 0, S, p, rng); continue; }
@@ -8387,33 +8760,6 @@ window.TRLE = window.TRLE || {};
         }
     }
 
-    /* Fully-toroidal cell draw: like bpCell but wraps on BOTH axes (patterns whose
-       cells can straddle either seam — herringbone, coursed stone, plank floor).
-       Pulls a stable 6-value rng sequence, then blits the sample at every ±S offset
-       that intersects the tile so a cell crossing any edge reappears on the far side. */
-    function bpCellTor(ctx, src, dx, dy, dw, dh, S, p, rng) {
-        const r1 = rng(), r2 = rng(), r3 = rng(), r4 = rng(), r5 = rng(), r6 = rng();
-        if (dw <= 0 || dh <= 0) return;
-        const overlay = p.fill === 'overlay';
-        if (p.fill === 'tiles' && p.pool && p.pool.length) src = p.pool[Math.floor(r6 * p.pool.length)];
-        const maxsx = Math.max(0, src.width - Math.ceil(dw));
-        const maxsy = Math.max(0, src.height - Math.ceil(dh));
-        const s = {
-            hue: (r1 * 2 - 1) * p.hue,
-            val: 1 + (r2 * 2 - 1) * (p.val / 100),
-            fx: (p.flip && !overlay && r3 < 0.5) ? -1 : 1,
-            sx: Math.floor(r4 * maxsx),
-            sy: Math.floor(r5 * maxsy),
-            bevel: p.bevel,
-            overlay
-        };
-        for (let oy = -S; oy <= S; oy += S)
-            for (let ox = -S; ox <= S; ox += S) {
-                if (dx + ox + dw <= 0 || dx + ox >= S || dy + oy + dh <= 0 || dy + oy >= S) continue;
-                bpDrawSample(ctx, src, dx + ox, dy + oy, dw, dh, s);
-            }
-    }
-
     /* Straight (axis-aligned) herringbone. Cells are u-wide; bricks are 2u×u. The
        rule key=(i+j)%4 → 0:horizontal brick, 2:vertical brick is a perfect toroidal
        partition when the cell count is a multiple of 4, so the tile stays seamless
@@ -8421,6 +8767,7 @@ window.TRLE = window.TRLE || {};
     function bpHerringbone(ctx, src, S, p, rng) {
         const k = Math.max(1, Math.round(p.across / 2));  // "bricks across" → 2k, cells = 4k
         const C = 4 * k, u = S / C, m = p.joint * u;
+        p._gap = m; p._cellMin = u;
         for (let j = 0; j < C; j++)
             for (let i = 0; i < C; i++) {
                 const key = ((i + j) % 4 + 4) % 4;
@@ -8449,10 +8796,12 @@ window.TRLE = window.TRLE || {};
             while (wtot < S * 0.999) { const w = avgw * (0.55 + rng() * 0.95); widths.push(w); wtot += w; }
             for (let i = 0; i < widths.length; i++) widths[i] = widths[i] / wtot * S;
             const mm = p.joint * Math.min(avgw, rh);
+            p._gap = mm; p._cellMin = Math.min(avgw, rh);
             let x = rng() * S;
             for (let i = 0; i < widths.length; i++) {
                 const w = widths[i];
-                bpCellTor(ctx, src, x + mm / 2, y + mm / 2, w - mm, rh - mm, S, p, rng);
+                const sag = bpSag(p, S, x + w / 2, r, rh);
+                bpCellTor(ctx, src, x + mm / 2, y + mm / 2 + sag.dy, w - mm, rh - mm, S, p, rng, sag.rot);
                 x += w;
             }
             y += rh;
@@ -8465,7 +8814,9 @@ window.TRLE = window.TRLE || {};
        (Built vertical; the orient='h' rotate in bpGenerate turns it horizontal.) */
     function bpFloor(ctx, src, S, p, rng) {
         const n = p.across, pw = S / n, m = p.joint * pw;
+        p._gap = m;
         const avgL = Math.max(0.15, p.boardlen) * S;
+        p._cellMin = Math.min(pw, avgL);
         for (let k = 0; k < n; k++) {
             const x = k * pw;
             const lens = []; let ltot = 0;
@@ -8504,10 +8855,15 @@ window.TRLE = window.TRLE || {};
         const G = Math.max(2, p.across), cw = S / G;
         const sites = [];
         for (let gy = 0; gy < G; gy++) { sites[gy] = []; for (let gx = 0; gx < G; gx++) {
+            // Cobble has no rectangular cell to nudge, so laying jitter widens the
+            // site scatter (stones pack less evenly) and missing/depth act per stone.
+            const g = bpDeform(p, 0, 0, cw, cw);
+            const scat = 0.36 + p.jitter * 0.24;
             sites[gy][gx] = {
-                jx: 0.5 + (rng() * 2 - 1) * 0.36, jy: 0.5 + (rng() * 2 - 1) * 0.36,
-                val: 1 + (rng() * 2 - 1) * (p.val / 100),
-                ox: Math.floor(rng() * S), oy: Math.floor(rng() * S)
+                jx: 0.5 + (rng() * 2 - 1) * scat, jy: 0.5 + (rng() * 2 - 1) * scat,
+                val: (1 + (rng() * 2 - 1) * (p.val / 100)) * (1 + g.depth * 0.22),
+                ox: Math.floor(rng() * S), oy: Math.floor(rng() * S),
+                gone: g.gone
             };
         } }
         const src2 = (p.fill === 'tiles' && p.pool && p.pool.length) ? p.pool[Math.floor(rng() * p.pool.length)] : src;
@@ -8540,6 +8896,7 @@ window.TRLE = window.TRLE || {};
                 const sx = ((x + best.ox) % sw + sw) % sw, sy = ((y + best.oy) % sh + sh) % sh;
                 const si = (sy * sw + sx) * 4;
                 let mF = edge < gap ? 1 - edge / gap : 0; mF = Math.min(1, mF * mF * 1.3);
+                if (best.gone) mF = 1;                 // stone prised out — mortar/bed shows
                 const o = (y * S + x) * 4, sc = shade * best.val;
                 od[o]     = sd[si]     * sc * (1 - mF) + mort[0] * mF;
                 od[o + 1] = sd[si + 1] * sc * (1 - mF) + mort[1] * mF;
@@ -8561,6 +8918,7 @@ window.TRLE = window.TRLE || {};
         let rows = Math.max(2, Math.round(S / (sw * 0.62)));
         rows += rows % 2;                                    // even → brick offset tiles vertically
         const rh = S / rows, sr = sw * 0.42;                 // corner radius
+        p._cellMin = Math.min(sw, rh);
         const shadow = (0.18 + 0.4 * (p.overlap / 100)) * rh; // top shadow strip height
         const tw = sw * 0.88, tworder = p.fill === 'overlay';
         for (let r = 0; r < rows; r++) {
@@ -8569,13 +8927,18 @@ window.TRLE = window.TRLE || {};
             for (let k = -1; k <= across; k++) {
                 // one sample per tab, reused for every seam-wrapped copy so they match
                 const r1 = rng(), r2 = rng(), r3 = rng(), r4 = rng();
-                if (th <= 0) continue;
+                // Tabs are drawn as rounded paths rather than through bpCellTor, so
+                // they take the deformation draws directly. A slipped/missing slate
+                // is the most recognisable sign of an old roof.
+                const g = bpDeform(p, 0, 0, tw, th);
+                if (th <= 0 || g.gone) continue;
                 const s = {
                     hue: (r1 * 2 - 1) * p.hue, val: 1 + (r2 * 2 - 1) * (p.val / 100), fx: 1,
                     sx: Math.floor(r3 * Math.max(0, src.width - tw)),
-                    sy: Math.floor(r4 * Math.max(0, src.height - th)), bevel: false, overlay: tworder
+                    sy: Math.floor(r4 * Math.max(0, src.height - th)), bevel: false,
+                    depth: g.depth, rot: 0, overlay: tworder
                 };
-                const cx = rowShift + k * sw;
+                const cx = rowShift + k * sw + (g.dx - 0);
                 const rad = Math.min(sr, tw / 2, th * 0.7);
                 for (let ox = -S; ox <= S; ox += S) {
                     const tx = cx + ox + 0.06 * sw;
@@ -8615,7 +8978,8 @@ window.TRLE = window.TRLE || {};
             orient:    $('at-bp-orient').value,
             joint:     parseInt($('at-bp-joint').value) / 100,
             warp:      parseInt($('at-bp-warp').value) / 100,  // joint-edge irregularity
-            mstyle:    $('at-bp-mstyle').value,          // natural (from texture) | flat colour
+            mstyle:    $('at-bp-mstyle').value,          // natural (blurred source) | flat | atlas tile
+            bgId:      parseInt($('at-bp-bg').value),    // backing tile, when mstyle === 'atlas'
             mh:        parseInt($('at-bp-mh').value),    // mortar hue / sat / lightness (flat)
             ms:        parseInt($('at-bp-ms').value),    //   or hue-shift / sat / brightness (natural)
             ml:        parseInt($('at-bp-ml').value),
@@ -8627,6 +8991,13 @@ window.TRLE = window.TRLE || {};
             irregular: parseInt($('at-bp-irregular').value),      // cobble mound steepness
             overlap:   parseInt($('at-bp-overlap').value),        // shingle coverage
             boardlen:  parseInt($('at-bp-boardlen').value) / 100, // plank-floor board length
+            // Age & deformation — all 0 = the original machine-perfect grid.
+            sag:      parseInt($('at-bp-sag').value) / 100,      // course baseline wander
+            jitter:   parseInt($('at-bp-jitter').value) / 100,   // per-cell position/size nudge
+            tilt:     parseInt($('at-bp-tilt').value) / 100,     // per-cell rotation
+            depthVar: parseInt($('at-bp-depth').value) / 100,    // per-cell proud/sunk
+            missing:  parseInt($('at-bp-missing').value) / 100,  // chance a cell is left out
+            erode:    parseInt($('at-bp-erode').value) / 100,    // outline crumbling
             flip:  true,
             bevel: !['pipes', 'cobble', 'shingles', 'planks'].includes(pat)  // these fake their own relief
         };
@@ -8643,7 +9014,18 @@ window.TRLE = window.TRLE || {};
         // Random-tiles pool = every source tile in the atlas (so each brick can pull a
         // different texture); falls back to the source itself when there's only one.
         p.pool = state.elements.filter(e => e.kind === 'tile' && e.canvas).map(e => e.canvas);
+        // Resolved to a canvas here and read once — Build Pattern bakes pixels into
+        // a new tile and stores no recipe, so nothing holds a reference to the
+        // backing tile afterwards and deleting it later can't dangle.
+        const bgEl = byId(p.bgId);
+        p.bg = (bgEl && bgEl.canvas) ? bgEl.canvas : src;
         const rng = mulberry32(buildState.seed >>> 0);
+        // Deformation runs on its own stream so adding it didn't re-roll every
+        // existing seed — see bpDeform. Same seed in, same wall out.
+        p._seed = buildState.seed >>> 0;
+        p._noVert = false; p._colourRelief = false;
+        p._cellMin = S / Math.max(2, p.across);
+        p.drng = mulberry32((buildState.seed ^ 0x6d2b79f5) >>> 0);
 
         ctx.clearRect(0, 0, S, S);
         bpMortarFill(ctx, S, p, src, buildState.seed);   // mortar shows through the joint gaps
@@ -8667,7 +9049,12 @@ window.TRLE = window.TRLE || {};
         else if (p.pattern === 'pipes')       bpPipes(cctx, src, S, p, rng);
 
         if (organic && p.warp > 0)
-            cellLayer = warpLayerToroidal(cellLayer, S, p.warp, (buildState.seed ^ 0x51ed270b) >>> 0);
+            cellLayer = warpLayerToroidal(cellLayer, S, p.warp, (buildState.seed ^ 0x51ed270b) >>> 0, !p._colourRelief);
+        // Erosion comes after the warp so it bites into the already-roughened
+        // outline rather than a ruler-straight one; cobble's Worley grooves are
+        // organic to begin with and are left alone, as with the warp.
+        if (organic && p.erode > 0)
+            cellLayer = erodeCellEdges(cellLayer, S, p.erode, (buildState.seed ^ 0x2f6e2b1) >>> 0, p._cellMin);
         // Surface noise. Off → bpNoiseParams() is null and nothing below runs, so
         // the output stays byte-identical to a build made before this existed.
         // "Cells only" masks the field with the cell layer's own alpha, leaving the
@@ -8719,11 +9106,13 @@ window.TRLE = window.TRLE || {};
         $('at-bp-assign-label').textContent = `Assign ${preset ? preset.label : BP_PRESET[pat]} material preset`;
         // Mortar style: the flat-colour sliders double as tint filters in natural
         // mode; the sample button only makes sense for flat colour.
-        const natural = $('at-bp-mstyle').value === 'natural';
-        $('at-bp-sample').style.display = natural ? 'none' : '';
-        $('at-bp-mh-label').textContent = natural ? 'Hue shift' : 'Hue';
+        const mstyle = $('at-bp-mstyle').value;
+        const tinted = mstyle !== 'flat';    // natural + atlas both filter a real image
+        $('at-bp-sample').style.display = tinted ? 'none' : '';
+        $('at-bp-bg-wrap').style.display = mstyle === 'atlas' ? '' : 'none';
+        $('at-bp-mh-label').textContent = tinted ? 'Hue shift' : 'Hue';
         $('at-bp-ms-label').textContent = 'Saturation';
-        $('at-bp-ml-label').textContent = natural ? 'Brightness' : 'Lightness';
+        $('at-bp-ml-label').textContent = tinted ? 'Brightness' : 'Lightness';
     }
 
     /* ---- Build Pattern: surface noise ---- */
@@ -8777,18 +9166,39 @@ window.TRLE = window.TRLE || {};
 
     /* Reset the mortar sliders to the chosen style's defaults. */
     function bpApplyMortarDefaults(style) {
-        const d = style === 'natural'
-            ? { mh: 0, ms: 40, ml: 65, noise: 35, noisetype: 'grain' }
-            : { mh: 0, ms: 0, ml: 22, noise: 0, noisetype: 'none' };
+        const d = style === 'natural' ? { mh: 0, ms: 40, ml: 65, noise: 35, noisetype: 'grain' }
+                : style === 'atlas'   ? { mh: 0, ms: 100, ml: 78, noise: 0, noisetype: 'none' }
+                :                       { mh: 0, ms: 0, ml: 22, noise: 0, noisetype: 'none' };
         for (const [id, v] of [['at-bp-mh', d.mh], ['at-bp-ms', d.ms], ['at-bp-ml', d.ml], ['at-bp-noise', d.noise]]) {
             $(id).value = v; $(id + '-val').textContent = v;
         }
         $('at-bp-noisetype').value = d.noisetype;
     }
 
+    /* Fill the backing-tile picker from the current atlas. Rebuilt on every open
+       because the atlas changes between them; plain tiles only, matching the
+       random-tiles pool — an animation frame or a transition as backing is odd
+       and would just make the list long. Keeps the previous choice if it's still
+       there, otherwise falls back to the tile the modal was opened on. */
+    function bpPopulateBackings(selfId) {
+        const sel = $('at-bp-bg');
+        const prev = sel.value;
+        sel.innerHTML = '';
+        state.elements.forEach((e, i) => {
+            if (e.kind !== 'tile' || !e.canvas) return;
+            const o = document.createElement('option');
+            o.value = e.id;
+            o.textContent = `Tile ${i + 1}${e.id === selfId ? ' (this one)' : ''}`;
+            sel.appendChild(o);
+        });
+        const keep = [...sel.options].some(o => o.value === prev);
+        sel.value = keep ? prev : String(selfId);
+    }
+
     function openBuildModal(id) {
         buildState.id = id;
         $('at-bp-tileno').textContent = indexOf(id) + 1;
+        bpPopulateBackings(id);
         openModal('build');
         bpSyncControls();
         bpSyncNoiseControls();
@@ -8804,7 +9214,10 @@ window.TRLE = window.TRLE || {};
          ['at-bp-noise', 'at-bp-noise-val'], ['at-bp-hue', 'at-bp-hue-val'],
          ['at-bp-val', 'at-bp-val-val'], ['at-bp-highlight', 'at-bp-highlight-val'],
          ['at-bp-irregular', 'at-bp-irregular-val'], ['at-bp-overlap', 'at-bp-overlap-val'],
-         ['at-bp-boardlen', 'at-bp-boardlen-val']
+         ['at-bp-boardlen', 'at-bp-boardlen-val'],
+         ['at-bp-sag', 'at-bp-sag-val'], ['at-bp-jitter', 'at-bp-jitter-val'],
+         ['at-bp-tilt', 'at-bp-tilt-val'], ['at-bp-depth', 'at-bp-depth-val'],
+         ['at-bp-missing', 'at-bp-missing-val'], ['at-bp-erode', 'at-bp-erode-val']
         ].forEach(([rid, lid, fmt]) => {
             $(rid).addEventListener('input', function () {
                 $(lid).textContent = fmt ? fmt(this.value) : this.value;
@@ -8859,6 +9272,7 @@ window.TRLE = window.TRLE || {};
             bpSyncControls();
             bpGenerate();
         });
+        $('at-bp-bg').addEventListener('change', bpGenerate);
         $('at-bp-fill').addEventListener('change', bpGenerate);
         $('at-bp-noisetype').addEventListener('change', bpGenerate);
         $('at-bp-orient').addEventListener('change', bpGenerate);
@@ -11120,6 +11534,76 @@ window.TRLE = window.TRLE || {};
             // Layout validators drive the REAL open/close path (so a regression in
             // how openModal sets display is caught, not papered over).
             openModal(name) { openModal(name); return true; },
+            /* test-only: toroidal invariants for Build Pattern's deformation.
+               An image-level seam statistic turned out to be useless on these
+               patterns — the grid's own mortar lines are the sharpest edges in
+               the tile, so a deliberately broken wrap scored the same as an
+               intact one. These probe the mechanisms that would actually break
+               tiling, which is both decisive and much cheaper. */
+            bpDeformProbe(S) {
+                S = S || 128;
+                const out = {};
+
+                // 1. The warp displacement field must repeat exactly over the tile.
+                const f = makeWarpField(12345);
+                let wmax = 0;
+                for (let i = 0; i < 40; i++) {
+                    const x = (i * 7) % S, y = (i * 13) % S;
+                    const a = f(x, y, S), b = f(x + S, y, S), c = f(x, y + S, S);
+                    wmax = Math.max(wmax, Math.abs(a[0] - b[0]), Math.abs(a[1] - b[1]),
+                                          Math.abs(a[0] - c[0]), Math.abs(a[1] - c[1]));
+                }
+                out.warpFieldPeriodicErr = wmax;
+
+                // 2. Course sag must repeat over the tile width, or the left and
+                //    right edges of a row sit at different heights.
+                const p = { sag: 1, _seed: 999 };
+                let smax = 0;
+                for (let i = 0; i < 40; i++) {
+                    const cx = (i * 11) % S;
+                    const a = bpSag(p, S, cx, 3, 20), b = bpSag(p, S, cx + S, 3, 20);
+                    smax = Math.max(smax, Math.abs(a.dy - b.dy), Math.abs(a.rot - b.rot));
+                }
+                out.sagPeriodicErr = smax;
+
+                // 3. The edge-distance field carries no noise, so a toroidal
+                //    implementation must commute with rolling: rolling the input
+                //    and rolling the output have to agree exactly. A version that
+                //    measured distance to the tile border instead of wrapping
+                //    fails this immediately.
+                const mk = (rollBy) => {
+                    const c = document.createElement('canvas'); c.width = c.height = S;
+                    const g = c.getContext('2d');
+                    g.fillStyle = '#fff';
+                    for (let k = 0; k < 3; k++) {
+                        const x = (20 + k * 37 + rollBy) % S;
+                        g.fillRect(x - S, 30, 26, 40); g.fillRect(x, 30, 26, 40); g.fillRect(x + S, 30, 26, 40);
+                    }
+                    return c;
+                };
+                const R = 17;
+                const d0 = alphaEdgeDistance(mk(0), S, 12);
+                const dR = alphaEdgeDistance(mk(R), S, 12);
+                let dmax = 0;
+                for (let y = 0; y < S; y++) for (let x = 0; x < S; x++)
+                    dmax = Math.max(dmax, Math.abs(d0[y * S + x] - dR[y * S + ((x + R) % S)]));
+                out.edgeDistanceRollErr = dmax;
+
+                // 4. A cell straddling the left edge has to appear on BOTH sides.
+                const cv = document.createElement('canvas'); cv.width = cv.height = S;
+                const cc = cv.getContext('2d');
+                const solid = document.createElement('canvas'); solid.width = solid.height = S;
+                const sc = solid.getContext('2d'); sc.fillStyle = '#fff'; sc.fillRect(0, 0, S, S);
+                const cp = { fill: 'crop', hue: 0, val: 0, flip: false, bevel: false,
+                             jitter: 0, tilt: 0, depthVar: 0, missing: 0, _gap: 2,
+                             drng: mulberry32(1) };
+                bpCellTor(cc, solid, -8, 20, 30, 30, S, cp, mulberry32(2), 0);
+                const px = cc.getImageData(0, 0, S, S).data;
+                const at = (x, y) => px[(y * S + x) * 4 + 3] > 100;
+                out.wrapsLeft = at(2, 35);          // the part still inside
+                out.wrapsRight = at(S - 4, 35);     // the copy that came round
+                return out;
+            },
             closeModal() { closeModal(); return true; },
             // test-only: mean luma of an element's emissive canvas (-1 if none).
             // Lets validators confirm glow baking + that Pulse varies across frames.
@@ -11307,6 +11791,28 @@ window.TRLE = window.TRLE || {};
             },
             // Bulk atlas for perf checks — a save has to encode every tile, so the
             // main-thread cost only shows up once there are enough of them.
+            // test-only: delete by 1-based grid position through the real removal
+            // path (dependency closure included), skipping only the confirm dialog.
+            deleteTileAt(pos) {
+                const el = state.elements[pos - 1];
+                if (!el) return -1;
+                const n = performDelete([el.id]);
+                renderGrid();
+                return n;
+            },
+            // test-only: an atlas of DIFFERENT textures, one per url. setupManyTiles
+            // clones one image n times, which can't show whether something read the
+            // tile it was told to or just any tile.
+            async setupTilesFrom(srcs, S) {
+                state.tileSize = S; state.cols = 4; state.elements = []; state.nextId = 1;
+                for (const u of srcs) {
+                    const c = toC(await loadImg(u), S);
+                    state.elements.push(tile(c, state.nextId++));
+                }
+                $('at-grid-card').style.display = 'block';
+                renderGrid();
+                return state.elements.length;
+            },
             async setupManyTiles(src, S, n) {
                 const A = toC(await loadImg(src), S);
                 state.tileSize = S; state.cols = 4; state.nextId = n + 1;

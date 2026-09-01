@@ -1145,10 +1145,23 @@
                         <canvas id="at-anim-tiled" width="256" height="256" style="width:256px;height:256px;display:block;border:1px solid var(--border);border-radius:var(--radius-sm);image-rendering:pixelated;background:#111;"></canvas>
                     </div>
                 </div>
-                <div class="form-group" style="margin-top:8px;">
-                    <label>Preview speed — <span id="at-anim-fps-val">12</span> fps</label>
-                    <input type="range" id="at-anim-fps" min="2" max="30" value="12" style="width:100%;">
+                <div class="form-row" style="gap:10px;flex-wrap:wrap;margin-top:8px;">
+                    <div class="form-group" style="flex:1;min-width:150px;">
+                        <label>Preview speed — <span id="at-anim-fps-val">12</span> fps</label>
+                        <input type="range" id="at-anim-fps" min="2" max="30" value="12" style="width:100%;">
+                    </div>
+                    <div class="form-group" style="width:150px;">
+                        <label>Preview at</label>
+                        <select id="at-anim-preview-size">
+                            <option value="auto" selected>Tile size</option>
+                            <option value="32">32 × 32</option>
+                            <option value="64">64 × 64</option>
+                            <option value="128">128 × 128</option>
+                            <option value="256">256 × 256</option>
+                        </select>
+                    </div>
                 </div>
+                <div id="at-anim-preview-note" style="font-size:0.75rem;color:var(--text-secondary);margin-top:2px;"></div>
                 <div id="at-anim-status" style="font-size:0.78rem;color:var(--text-secondary);margin-top:4px;"></div>
             </div>
             <div class="at-org-right">
@@ -1211,6 +1224,13 @@
                             <label>Roughness — <span id="at-anim-gain-val">0.50</span></label>
                             <input type="range" id="at-anim-gain" min="20" max="80" value="50" style="width:100%;">
                         </div>
+                    </div>
+                    <div id="at-anim-res-note" style="font-size:0.75rem;margin:0 0 6px;"></div>
+                    <div class="form-group" style="margin-bottom:8px;">
+                        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                            <input type="checkbox" id="at-anim-crisp" style="width:auto;margin:0;">
+                            <span>✨ Crisp <span id="at-anim-crisp-note" style="color:var(--text-secondary);font-weight:normal;"></span></span>
+                        </label>
                     </div>
                     <div class="form-row" style="gap:10px;flex-wrap:wrap;">
                         <div class="form-group" style="flex:1;min-width:130px;">
@@ -1836,15 +1856,61 @@
                        title="Wobble the joint edges with seeded noise so they read hand-laid, not ruler-drawn. Stays seamless.">
             </div>
         </div>
+        <details class="form-group" id="at-bp-deform-wrap" style="border:1px solid var(--border);border-radius:4px;padding:6px 10px;">
+            <summary style="cursor:pointer;">🏚️ Age &amp; deformation</summary>
+            <div class="sm-hint" style="margin:6px 0 2px;">Breaks up the machine-perfect grid for ruins and old stonework. Everything here is seeded and stays seamless — a flush city wall is all zeroes.</div>
+            <div class="form-row" style="align-items:flex-end;">
+                <div class="form-group" data-bp="brick tile coursed" style="flex:1;min-width:120px;">
+                    <label>Course sag — <span id="at-bp-sag-val">0</span>%</label>
+                    <input type="range" id="at-bp-sag" min="0" max="100" value="0" style="width:100%;"
+                           title="Rows wander up and down instead of running dead level, like a settled foundation. Bricks tilt to follow the slope.">
+                </div>
+                <div class="form-group" style="flex:1;min-width:120px;">
+                    <label>Laying jitter — <span id="at-bp-jitter-val">0</span>%</label>
+                    <input type="range" id="at-bp-jitter" min="0" max="100" value="0" style="width:100%;"
+                           title="Nudges each cell's position and size within its joint, so no two bricks line up perfectly. Hand-laid, not machine-laid.">
+                </div>
+            </div>
+            <div class="form-row" style="align-items:flex-end;">
+                <div class="form-group" data-bp="brick tile coursed herringbone floor" style="flex:1;min-width:120px;">
+                    <label>Tilt — <span id="at-bp-tilt-val">0</span>%</label>
+                    <input type="range" id="at-bp-tilt" min="0" max="100" value="0" style="width:100%;"
+                           title="Rotates each cell a degree or two at random. Small values read best.">
+                </div>
+                <div class="form-group" style="flex:1;min-width:120px;">
+                    <label>Depth variation — <span id="at-bp-depth-val">0</span>%</label>
+                    <input type="range" id="at-bp-depth" min="0" max="100" value="0" style="width:100%;"
+                           title="Pushes cells proud or sunk. Becomes real relief once the height/normal maps are generated.">
+                </div>
+            </div>
+            <div class="form-row" style="align-items:flex-end;">
+                <div class="form-group" style="flex:1;min-width:120px;">
+                    <label>Missing pieces — <span id="at-bp-missing-val">0</span>%</label>
+                    <input type="range" id="at-bp-missing" min="0" max="60" value="0" style="width:100%;"
+                           title="Chance a cell is left out entirely, exposing the mortar behind it.">
+                </div>
+                <div class="form-group" data-bp="brick tile planks pipes coursed herringbone shingles floor" style="flex:1;min-width:120px;">
+                    <label>Edge erosion — <span id="at-bp-erode-val">0</span>%</label>
+                    <input type="range" id="at-bp-erode" min="0" max="100" value="0" style="width:100%;"
+                           title="Crumbles cell corners and edges away. Works on the outline only — the faces stay sharp.">
+                </div>
+            </div>
+        </details>
         <details class="form-group" style="border:1px solid var(--border);border-radius:4px;padding:6px 10px;">
-            <summary style="cursor:pointer;">🧱 Mortar / joints</summary>
+            <summary style="cursor:pointer;">🧱 Behind the cells</summary>
+            <div class="sm-hint" style="margin:6px 0 2px;">What shows through the joints — and through anything <strong>Missing pieces</strong> takes out. Pick another atlas tile here to lay blocks over a wall, instead of over a blur.</div>
             <div class="form-row" style="align-items:flex-end;margin-top:8px;">
                 <div class="form-group" style="flex:1.4;min-width:170px;">
-                    <label>Mortar style</label>
-                    <select id="at-bp-mstyle" title="Natural derives the mortar from a blurred, tinted copy of the texture itself; Flat is a plain colour.">
-                        <option value="natural" selected>Natural (from texture)</option>
+                    <label>Backing</label>
+                    <select id="at-bp-mstyle" title="Blurred source derives it from a blurred, tinted copy of this texture; Flat is a plain colour; Atlas tile lays the pattern over another texture from your atlas.">
+                        <option value="natural" selected>Blurred source</option>
                         <option value="flat">Flat colour</option>
+                        <option value="atlas">Atlas tile…</option>
                     </select>
+                </div>
+                <div class="form-group" id="at-bp-bg-wrap" style="flex:1.4;min-width:150px;display:none;">
+                    <label>Backing tile</label>
+                    <select id="at-bp-bg" title="The tile drawn behind the cells. Read once when the pattern is built, so deleting it later can't break this tile."></select>
                 </div>
                 <div class="form-group" style="align-self:flex-end;">
                     <button class="btn btn-secondary btn-sm" id="at-bp-sample" title="Set mortar colour from the texture's average colour">🎨 Sample from texture</button>

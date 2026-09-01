@@ -46,8 +46,18 @@ TRLE.AnimGen = (function () {
         style: 0,           // 0 fBm, 1 ridged, 2 billow
         equalize: 0,        // 0..1 colour-spread: flatten value distribution (ramp only)
         palette: null,      // [{ pos:0..1, color:[r,g,b] | [r,g,b,a] (0-255) }]
-        colorAdjust: null   // { hue°, sat, val, contrast, gamma, invert, posterize } over the ramp
+        colorAdjust: null,  // { hue°, sat, val, contrast, gamma, invert, posterize } over the ramp
+        supersample: 1      // 1 = render at `size`; >1 renders N× and box-averages down
     };
+
+    /* Largest whole supersample factor that keeps the oversampled render inside
+       MAX_SIZE. At a 1024 tile there's no headroom, so this returns 1 and the
+       whole supersample path drops out. */
+    function ssFactor(size, want) {
+        want = Math.round(Number(want) || 1);
+        if (want < 2) return 1;
+        return Math.max(1, Math.min(want, Math.floor(LIMITS.MAX_SIZE / size)));
+    }
 
     const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
     const clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
@@ -147,6 +157,36 @@ TRLE.AnimGen = (function () {
         return c;
     }
 
+    /* Box-average an f×-oversampled canvas down to S². Hand-rolled rather than
+       drawImage-with-smoothing because the browsers disagree on the filter for
+       a downscale, and AnimGen's contract is that the same params give the same
+       pixels. f is always a whole number, so every output pixel is an exact
+       mean of an f×f block — no weighting, no edge cases, tiling preserved. */
+    function boxDown(src, S, f) {
+        const sd = src.getContext('2d').getImageData(0, 0, src.width, src.height).data;
+        const out = document.createElement('canvas');
+        out.width = S; out.height = S;
+        const ctx = out.getContext('2d');
+        const od = ctx.createImageData(S, S);
+        const n = f * f;
+        for (let y = 0; y < S; y++) {
+            for (let x = 0; x < S; x++) {
+                let r = 0, g = 0, b = 0, a = 0;
+                for (let j = 0; j < f; j++) {
+                    let p = ((y * f + j) * src.width + x * f) * 4;
+                    for (let i = 0; i < f; i++, p += 4) {
+                        r += sd[p]; g += sd[p + 1]; b += sd[p + 2]; a += sd[p + 3];
+                    }
+                }
+                const q = (y * S + x) * 4;
+                od.data[q] = r / n; od.data[q + 1] = g / n;
+                od.data[q + 2] = b / n; od.data[q + 3] = a / n;
+            }
+        }
+        ctx.putImageData(od, 0, 0);
+        return out;
+    }
+
     function frameUniforms(p, t) {
         // Periods must be integers for the noise to stay tileable; stretch shrinks
         // the Y period (taller features). Flow is integer tiles/loop so the scroll
@@ -179,6 +219,12 @@ TRLE.AnimGen = (function () {
         const p = Object.assign({}, DEFAULTS, params);
         const S = clampSize(p.size);
         const N = clampFrames(p.frames);
+        // Supersampling: render at R = S×f, then box-average back to S. The noise
+        // is periodic over the tile regardless of raster size, so the oversampled
+        // render tiles and loops exactly as the native one does — averaging whole
+        // f×f blocks keeps both properties.
+        const f = ssFactor(S, p.supersample);
+        const R = S * f;
 
         let rampTex = null;
         if (p.palette && p.palette.length) {
@@ -190,13 +236,14 @@ TRLE.AnimGen = (function () {
         const frames = [];
         try {
             for (let i = 0; i < N; i++) {
-                const fbo = E.createFBO(S, S);
+                const fbo = E.createFBO(R, R);
                 const u = frameUniforms(p, i / N);
                 u.u_useRamp = rampTex ? 1 : 0;
                 if (rampTex) u.u_ramp = rampTex;
-                E.blit('animNoise', u, fbo, S, S);
-                frames.push(E.fboToCanvas(fbo));
+                E.blit('animNoise', u, fbo, R, R);
+                const raw = E.fboToCanvas(fbo);
                 E.deleteFBO(fbo);
+                frames.push(f > 1 ? boxDown(raw, S, f) : raw);
             }
         } finally {
             if (rampTex) E.deleteTexture(rampTex);
@@ -210,5 +257,6 @@ TRLE.AnimGen = (function () {
         return generateFrames(Object.assign({}, params, { frames: LIMITS.MIN_FRAMES }))[0];
     }
 
-    return { generateFrames, generatePoster, buildRamp: buildRampCanvas, clampFrames, clampSize, LIMITS, DEFAULTS };
+    return { generateFrames, generatePoster, buildRamp: buildRampCanvas, clampFrames, clampSize,
+             ssFactor, LIMITS, DEFAULTS };
 })();
