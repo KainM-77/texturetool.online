@@ -208,6 +208,8 @@
                 <input type="number" id="at-rows-input" min="1" max="99" step="1" value="1">
             </label>
             <span class="at-layout-note" id="at-layout-note"></span>
+            <span style="flex:1;"></span>
+            <button class="btn btn-secondary btn-sm" id="at-preview-atlas" title="See the whole atlas stitched together, exactly as it exports">👁️ Preview atlas</button>
         </div>
         <div class="at-grid" id="at-grid"></div>
     </div>
@@ -527,11 +529,65 @@
             <div class="form-group" style="flex:1;min-width:170px;">
                 <label>Corner style</label>
                 <select id="at-tr-set-corners">
-                    <option value="round" selected>Rounded (curved blend)</option>
-                    <option value="sharp">Sharp 45° (slope cut)</option>
+                    <option value="seamless" selected>Seamless (recommended)</option>
+                    <option value="round">Rounded (legacy)</option>
+                    <option value="sharp">Sharp 45° (legacy)</option>
                 </select>
+                <div class="sm-hint" id="at-tr-corner-hint" style="margin-top:4px;"></div>
             </div>
         </div>
+        <details data-tr-panel="set" id="at-tr-org-acc" style="display:none;margin-top:6px;">
+            <summary style="cursor:pointer;">🌿 Organic edge <span style="color:var(--text-secondary);font-size:0.72rem;">(blobby, hand-painted boundary)</span></summary>
+            <div class="sm-hint" id="at-tr-org-hint" style="margin-top:6px;">Off by default — every slider at 0 gives the clean geometric boundary. Raising them keeps the set exactly seamless; the wobble is faded out at each tile border, which is the only place a neighbour's pixels would be needed.</div>
+            <div class="form-row" style="gap:10px;flex-wrap:wrap;margin-top:6px;">
+                <div class="form-group" style="flex:1;min-width:150px;">
+                    <label>Wobble — <span id="at-tr-org-wobble-val">0</span>%</label>
+                    <input type="range" id="at-tr-org-wobble" min="0" max="100" value="0" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:1;min-width:150px;">
+                    <label>Drift — <span id="at-tr-org-drift-val">0</span>%</label>
+                    <input type="range" id="at-tr-org-drift" min="0" max="100" value="0" style="width:100%;">
+                </div>
+            </div>
+            <div class="form-row" style="gap:10px;flex-wrap:wrap;">
+                <div class="form-group" style="flex:1;min-width:150px;">
+                    <label>Scatter — <span id="at-tr-org-scatter-val">0</span>%</label>
+                    <input type="range" id="at-tr-org-scatter" min="0" max="100" value="0" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:1;min-width:150px;">
+                    <label>Contact shadow — <span id="at-tr-org-shadow-val">0</span>%</label>
+                    <input type="range" id="at-tr-org-shadow" min="0" max="100" value="0" style="width:100%;">
+                </div>
+            </div>
+            <div class="form-row" style="gap:10px;flex-wrap:wrap;">
+                <div class="form-group" style="flex:1;min-width:150px;">
+                    <label>Blob feather — <span id="at-tr-org-feather-val">0</span>%</label>
+                    <input type="range" id="at-tr-org-feather" min="0" max="100" value="0" style="width:100%;">
+                    <div class="sm-hint" style="margin-top:3px;">Softens only where the noise moved the boundary — the flecks and the deepest wobble. <strong>Hardness</strong> above widens the blend across the whole tile instead.</div>
+                </div>
+            </div>
+            <div class="form-row" style="gap:10px;flex-wrap:wrap;align-items:flex-end;">
+                <div class="form-group" style="flex:1;min-width:150px;">
+                    <label>Feature size — <span id="at-tr-org-scale-val">3</span></label>
+                    <input type="range" id="at-tr-org-scale" min="1" max="8" value="3" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:0 0 auto;">
+                    <button class="btn btn-secondary btn-sm" id="at-tr-org-seed" title="Reroll the organic pattern">🎲 Reroll</button>
+                </div>
+            </div>
+            <div class="form-row" style="gap:10px;flex-wrap:wrap;">
+                <div class="form-group" style="flex:1;min-width:170px;">
+                    <label>Alternates</label>
+                    <select id="at-tr-org-alts">
+                        <option value="1" selected>1 — just the set</option>
+                        <option value="2">2 copies</option>
+                        <option value="3">3 copies</option>
+                        <option value="4">4 copies</option>
+                    </select>
+                    <div class="sm-hint" style="margin-top:3px;">Adds the set more than once, each with a different noise draw. Cycle them along a boundary so a run of the same tile doesn't read as a repeating motif. They stay seamless with each other.</div>
+                </div>
+            </div>
+        </details>
         <div class="sm-hint" data-tr-panel="set" style="display:none;">The whole arrangement is added to the atlas laid out <strong>exactly like the preview</strong>, so it reads as one connected terrain patch when picking in Tomb Editor. Pivot &amp; Hardness above shape every edge; plain cells stay linked to their source tiles.</div>
         </div><!-- /.at-modal-main -->
         <div class="at-modal-side">
@@ -637,6 +693,10 @@
     <div class="at-modal at-modal-wide" id="at-modal-emissive" role="dialog" aria-modal="true" aria-label="Make Emissive" style="display:none;">
         <div class="at-modal-title">✨ Make Emissive — Tile <span id="at-em-tileno"></span></div>
         <div class="sm-hint">Authors a glow (emissive) map for this tile — areas that shine on their own, independent of scene lighting. Pick what glows, then how it's coloured. Black = no emission.</div>
+        <!-- Current state of the tile, not of the controls: the preview below always
+             shows the glow you'd get if you hit Apply, which is indistinguishable
+             from a glow that's already on the tile. This line is the difference. -->
+        <div class="sm-hint" id="at-em-state"></div>
         <div class="form-row" style="align-items:flex-end;">
             <div class="form-group" style="min-width:170px;">
                 <label>What glows</label>
@@ -1039,6 +1099,28 @@
         <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
             <button class="btn btn-primary" id="at-tg-add">➕ Add <span id="at-tg-addcount">9</span> Tiles</button>
+        </div>
+    </div>
+
+    <!-- ── Atlas preview modal ─────── -->
+    <div class="at-modal at-modal-wide" id="at-modal-atlaspreview" role="dialog" aria-modal="true" aria-label="Preview atlas" style="display:none;">
+        <div class="at-modal-title">👁️ Atlas preview</div>
+        <div class="sm-hint">The whole atlas stitched exactly as it exports — same tile order, same column count, same pixel size. <strong>Transparent</strong> areas show as a checkerboard here; tick <strong>Magenta key</strong> in Export to turn them into Tomb Editor's invisible colour.</div>
+        <div class="form-row" style="gap:12px;flex-wrap:wrap;align-items:center;">
+            <label class="checkbox-row"><input type="checkbox" id="at-ap-grid" checked> Tile boundaries</label>
+            <label class="checkbox-row"><input type="checkbox" id="at-ap-numbers" checked> Tile numbers</label>
+            <label class="checkbox-row"><input type="checkbox" id="at-ap-magenta"> Magenta key</label>
+            <span style="flex:1;"></span>
+            <span class="at-layout-note" id="at-ap-dims"></span>
+        </div>
+        <div class="at-modal-body" style="overflow:auto;">
+            <div id="at-ap-wrap" style="display:inline-block;background:
+                repeating-conic-gradient(#2a2a2a 0% 25%, #1e1e1e 0% 50%) 50% / 16px 16px;">
+                <canvas id="at-ap-canvas" style="display:block;max-width:100%;height:auto;image-rendering:pixelated;"></canvas>
+            </div>
+        </div>
+        <div class="at-modal-actions">
+            <button class="btn btn-secondary" data-close>Close</button>
         </div>
     </div>
 

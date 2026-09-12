@@ -1737,6 +1737,13 @@ input[type="range"]::-moz-range-thumb {
     color: var(--text-secondary);
 }
 .at-layout-row input[type="number"] { width: 60px; }
+/* A tile that belongs to a set-builder block. Deliberately visible: blocks lose
+   their metadata when a drag or delete breaks the run, and that is only fair if
+   you could see the block was there. Inset so it never fights the .selected
+   outline. */
+.at-cell.at-in-block { box-shadow: inset 0 0 0 2px rgba(232, 133, 42, 0.38); }
+.at-cell.at-in-block.selected { box-shadow: inset 0 0 0 2px rgba(232, 133, 42, 0.75); }
+
 .at-layout-x { color: var(--text-muted); }
 .at-layout-note { font-size: 0.78rem; color: var(--text-muted); }
 /* "or" separator + add-tile cell (Phase A: blank atlas / dynamic tiles) */
@@ -1882,6 +1889,7 @@ input[type="range"]::-moz-range-thumb {
 .at-badge-s { background: #4ec9b0; }
 .at-badge-t { background: var(--accent); }
 .at-badge-a { background: #c586c0; }
+.at-badge-e { background: #f2c94c; }
 
 /* Animated-texture modal: Shape / Colour tab bar */
 .at-anim-tabs {

@@ -110,7 +110,266 @@ window.TRLE = window.TRLE || {};
         }
     }
 
-    function buildTopologyMask(S, mode, pivot, hardness) {
+    /* ============ CORNER-STATE MASKS ("seamless" corner style) ============
+       The JohnnyJF10 topology above is a RATIO field, v = d1/(d1+d2), and that
+       denominator is not constant — so the ratio saturates at the tile border.
+       `DiagonalBottomRight` (the island's NW corner) has d2 = 0 down its whole
+       right edge, i.e. v = 1: 100% overlay all the way along it. Its neighbour
+       `BottomFull` has v = ny on its left edge, overlay in the bottom half only.
+       Measured mismatch across that seam: 0.98 of full scale. The corner tiles
+       "go all the way" and the sets visibly break where corners meet edges.
+
+       Fix: put the state on the four CORNERS and interpolate bilinearly.
+           g = c00(1-nx)(1-ny) + c10·nx(1-ny) + c01(1-nx)ny + c11·nx·ny
+       On the north edge (ny=0) this collapses to c00(1-nx) + c10·nx — a function
+       of ONLY the two corners shared with the neighbour above, which computes
+       the identical profile from the identical two corners. Seamlessness is
+       structural here, not tuned, so validate-transseam.mjs asserts against ~0
+       rather than a threshold.
+
+       The edge modes fall out unchanged (both north corners on → g = 1-ny, which
+       is exactly what `TopFull` already produces), so only the 8 corner modes
+       are new. They reuse buildTopologyMask's pivot/hardness remap verbatim:
+       a set mixes both families, and a different remap would put different band
+       widths on the two sides of a seam even when the pre-remap values match. */
+    const CORNER_NW = 1, CORNER_NE = 2, CORNER_SE = 4, CORNER_SW = 8;
+    /* Null-prototype: buildTopologyMask dispatches on `CORNER_BITS[mode] !== undefined`
+       and `mode` comes out of a project file, so a plain object literal would make
+       a file saying mode:"toString" or "constructor" resolve to an inherited
+       function and take the corner path with garbage bits. */
+    const CORNER_BITS = Object.assign(Object.create(null), {
+        // Island (outer) corners — overlay pokes into one corner.
+        CornerTopLeft:     CORNER_NW,
+        CornerTopRight:    CORNER_NE,
+        CornerBottomRight: CORNER_SE,
+        CornerBottomLeft:  CORNER_SW,
+        // Hole (inner) corners — overlay everywhere but one corner.
+        NotchTopLeft:      CORNER_NE | CORNER_SE | CORNER_SW,
+        NotchTopRight:     CORNER_NW | CORNER_SE | CORNER_SW,
+        NotchBottomRight:  CORNER_NW | CORNER_NE | CORNER_SW,
+        NotchBottomLeft:   CORNER_NW | CORNER_NE | CORNER_SE,
+        // Edge cells. Pre-blur these are algebraically identical to TopFull &c.
+        // (both north corners on → g = 1-ny), but a seamless set must run the
+        // WHOLE arrangement through this builder: the ratio field's blur tail is
+        // what the corner cells would then be mismatching against, and at a hard
+        // cut that alone is worth 0.34 of full scale across the seam.
+        EdgeTop:           CORNER_NW | CORNER_NE,
+        EdgeBottom:        CORNER_SW | CORNER_SE,
+        EdgeLeft:          CORNER_NW | CORNER_SW,
+        EdgeRight:         CORNER_NE | CORNER_SE
+    });
+    /* Narrowest blend band, in g units, at "hard cut". The ratio field antialiases
+       its step by blurring the finished mask; that can't be used here because a
+       blur reads pixels from outside the tile, which is the one place a mask in a
+       set has to stay exact. A floor on the band width antialiases the same step
+       while staying a pointwise function of g — so both sides of a seam still
+       agree exactly. ~1.5px for a unit-gradient field. */
+    const CORNER_AA_PX = 1.5;
+
+    /* ============ ORGANIC EDGE (blobbiness) ============
+       A bilinear boundary is smooth and obviously machine-made; hand-painted
+       terrain is ragged, asymmetric, and flecked. All three are available here
+       WITHOUT giving up the exactness above, because of one rule:
+
+         anything that is a pointwise function of g is automatically edge-matched
+         (g on a border already depends only on the shared corners), and anything
+         spatial must be windowed to zero at the border.
+
+       So:
+       - `wobble` domain-warps g with periodic fbm, amplitude multiplied by
+         sin(pi*nx)*sin(pi*ny) — zero on all four borders, largest mid-tile.
+       - `drift` reparametrises nx,ny through one shared monotone wiggle u().
+         Substituting u(nx) into the bilinear form keeps every border profile a
+         function of the shared corners: both neighbours apply the SAME u along
+         the edge they share. This is what stops every tile's boundary crossing
+         the edge at dead centre, which is the main tell that a set is generated.
+       - `scatter` adds flecks near the contour only, via the 4g(1-g) band, again
+         border-windowed.
+
+       Cost of the window: the boundary is pinned where it crosses a tile edge,
+       so a very high wobble reads as a regular pinch every tile. That's inherent
+       — a neighbour's pixels aren't available — and `drift` hides it by moving
+       where the crossing happens. NOISE_ORG_PERIOD is the lattice period; it
+       divides nothing in particular because the window, not periodicity, is what
+       guarantees the seam. */
+    const ORG_OFF = { wobble: 0, drift: 0, scatter: 0, feather: 0, shadow: 0, seed: 1, driftSeed: 1, scale: 3 };
+    const ORG_PERIOD = 16;
+    const orgIsOff = o => !o || (!o.wobble && !o.drift && !o.scatter);
+    /* One shared monotone reparametrisation, u(0)=0 and u(1)=1 so the corners
+       stay put. Sampled from a 1-D slice of the periodic lattice and windowed by
+       sin(pi*t), which is what keeps the endpoints exact. */
+    function orgReparam(noise, amt) {
+        if (!amt) return t => t;
+        return t => {
+            const d = (noise(t * 2.7, 0.5) - 0.5) * 2 * amt * Math.sin(Math.PI * t);
+            return t + d < 0 ? 0 : t + d > 1 ? 1 : t + d;
+        };
+    }
+
+    function buildCornerMask(S, bits, pivot, hardness, org) {
+        pivot    = Math.max(0, Math.min(1, pivot));
+        hardness = Math.max(0, Math.min(1, hardness));
+        let lower = pivot * hardness;
+        let upper = 1.0 - (1.0 - pivot) * hardness;
+        const aa = CORNER_AA_PX / Math.max(2, S);
+        if (upper - lower < aa) { lower = pivot - aa * 0.5; upper = pivot + aa * 0.5; }
+        const c00 = bits & CORNER_NW ? 1 : 0, c10 = bits & CORNER_NE ? 1 : 0,
+              c11 = bits & CORNER_SE ? 1 : 0, c01 = bits & CORNER_SW ? 1 : 0;
+
+        const o = orgIsOff(org) ? null : Object.assign({}, ORG_OFF, org);
+        let n1, n2, n3, uu, freq;
+        if (o) {
+            const sd = (o.seed >>> 0) || 1;
+            n1 = makePeriodicNoise(sd, ORG_PERIOD);
+            n2 = makePeriodicNoise((sd ^ 0x9e3779b9) >>> 0, ORG_PERIOD);
+            n3 = makePeriodicNoise((sd ^ 0x85ebca6b) >>> 0, ORG_PERIOD * 2);
+            /* Drift is seeded SEPARATELY and deliberately not from `seed`. It is
+               the one organic control that reaches the tile border — it warps the
+               edge profile itself rather than being windowed away — so every tile
+               that might sit next to another has to share it. Re-rolling `seed`
+               to make a second variant of a tile therefore must not move it, or
+               the two variants stop being seamless with each other. */
+            uu = orgReparam(makePeriodicNoise(((o.driftSeed >>> 0) || 1) ^ 0xc2b2ae35, ORG_PERIOD),
+                            o.drift * 0.28);
+            freq = Math.max(1, o.scale || 3);
+        }
+        const fbm = (f, x, y) => {
+            let a = 1, fr = 1, s = 0, nn = 0;
+            for (let i = 0; i < 3; i++) { s += a * f(x * fr, y * fr); nn += a; a *= 0.5; fr *= 2; }
+            return s / nn;
+        };
+        /* Normalise each noise field to zero mean / unit spread over the region
+           this tile actually samples. Raw fbm over a small lattice window is
+           measurably off-centre (mean 0.52–0.58 depending on seed and feature
+           size), and an uncentred warp doesn't roughen the boundary, it shifts
+           it — the island quietly grows or shrinks as you raise the slider. The
+           estimate is a 12×12 probe, negligible against the S² main loop. */
+        const calibrate = (f, fx, fy) => {
+            let sum = 0, sq = 0;
+            for (let j = 0; j < 12; j++) for (let i = 0; i < 12; i++) {
+                const v = fbm(f, (i / 11) * freq + fx, (j / 11) * freq + fy);
+                sum += v; sq += v * v;
+            }
+            const mean = sum / 144;
+            return { mean, inv: 1 / Math.max(1e-4, Math.sqrt(Math.max(0, sq / 144 - mean * mean))) };
+        };
+        let k1, k2, k3;
+        if (o) { k1 = calibrate(n1, 0, 0); k2 = calibrate(n2, 3.1, 7.7); k3 = calibrate(n3, 0, 0); }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = S; canvas.height = S;
+        const ctx = canvas.getContext('2d');
+        const img = ctx.createImageData(S, S);
+        const d   = img.data;
+
+        for (let y = 0; y < S; y++) {
+            for (let x = 0; x < S; x++) {
+                const nx = S > 1 ? x / (S - 1) : 0.5;
+                const ny = S > 1 ? y / (S - 1) : 0.5;
+                let ux = nx, uy = ny, uxP = nx, uyP = ny;
+                let win = 0;
+                if (o) {
+                    win = Math.sin(Math.PI * nx) * Math.sin(Math.PI * ny);   // 0 on every border
+                    ux = uu(nx); uy = uu(ny);
+                    uxP = ux; uyP = uy;              // drift-only, for the feather's reference field
+                    if (o.wobble) {
+                        // 0.20 => roughly +/-20% of a tile at full slider, which is
+                        // where the boundary stops reading as a curve and starts
+                        // reading as a coastline.
+                        const a = o.wobble * 0.20 * win;
+                        ux += (fbm(n1, nx * freq, ny * freq) - k1.mean) * k1.inv * a;
+                        uy += (fbm(n2, nx * freq + 3.1, ny * freq + 7.7) - k2.mean) * k2.inv * a;
+                        ux = ux < 0 ? 0 : ux > 1 ? 1 : ux;
+                        uy = uy < 0 ? 0 : uy > 1 ? 1 : uy;
+                    }
+                }
+                let g = c00 * (1 - ux) * (1 - uy) + c10 * ux * (1 - uy)
+                      + c01 * (1 - ux) * uy       + c11 * ux * uy;
+                if (o && o.scatter) {
+                    const band = 4 * g * (1 - g);          // strongest at the contour
+                    g += (fbm(n3, nx * freq * 4.3, ny * freq * 4.3) - k3.mean) * k3.inv
+                       * o.scatter * 0.30 * band * win;
+                }
+                let lo = lower, hi = upper;
+                if (o && o.feather) {
+                    /* Feather the blobbiness WITHOUT feathering the tile.
+                       Hardness widens the blend band everywhere, which turns the
+                       whole transition into one broad ramp. This widens it only
+                       in proportion to how far the organic terms actually moved
+                       the contour here: `act` is the deviation from the plain
+                       (drift-only) field, so it is 0 along a stretch the noise
+                       left alone and largest through the flecks and the deepest
+                       wobble. Widened symmetrically about the midpoint, so the
+                       50% contour does not move — it only softens.
+
+                       Safe at the seam for the same reason everything else here
+                       is: wobble and scatter are windowed to zero at the border,
+                       so `act` is 0 there and the band reverts to exactly the
+                       global one, which both neighbours compute identically. */
+                    const gPlain = c00 * (1 - uxP) * (1 - uyP) + c10 * uxP * (1 - uyP)
+                                 + c01 * (1 - uxP) * uyP       + c11 * uxP * uyP;
+                    const act = Math.abs(g - gPlain);
+                    const extra = o.feather * 2.0 * act;
+                    const mid = (lower + upper) * 0.5, half = (upper - lower) * 0.5 + extra * 0.5;
+                    lo = mid - half; hi = mid + half;
+                }
+                const w = Math.max(0.0, Math.min(1.0, (g - lo) / Math.max(1e-6, hi - lo)));
+                const byte = Math.round(w * 255);
+                const idx = (y * S + x) * 4;
+                d[idx] = byte; d[idx+1] = byte; d[idx+2] = byte; d[idx+3] = 255;
+            }
+        }
+        ctx.putImageData(img, 0, 0);
+        // No blur tail here. The ratio field needs one because 0/0 at the corners
+        // leaves a hard pixel singularity (hence its `sum < 1e-10` guard); the
+        // bilinear field is smooth everywhere and has none. Blurring would also
+        // pull transparent black in from outside the canvas along the border,
+        // which is the one place a mask in a set must stay exact.
+        return canvas;
+    }
+
+    /* Contact shadow: darken the BASE side just outside the contour so the
+       overlay reads as sitting on top of it rather than inlaid into it.
+       Deliberately a pointwise function of the finished mask, not blur(mask) -
+       mask: a blur needs the neighbour tile's pixels, which don't exist, whereas
+       a LUT over w inherits the mask's exactness for free (and works on the
+       legacy masks too). Peaks a little way onto the base side and dies at both
+       ends, so full-base and full-overlay areas are untouched. */
+    function contactShadowField(maskCanvas, S) {
+        const m = maskCanvas.getContext('2d').getImageData(0, 0, S, S).data;
+        const f = new Float32Array(S * S);
+        const PEAK = 0.16, HALF = 0.17;
+        for (let i = 0, p = 0; i < m.length; i += 4, p++) {
+            const w = m[i] / 255;
+            const t = 1 - Math.abs(w - PEAK) / HALF;
+            f[p] = t <= 0 ? 0 : t * t * (3 - 2 * t);
+        }
+        return f;
+    }
+    /* Multiply a composited diffuse down by the contact shadow. Returns src
+       untouched at amount 0 so a shadow-less tile is byte-identical. */
+    function applyContactShadow(src, maskCanvas, S, amount) {
+        if (!amount || amount <= 0) return src;
+        const f = contactShadowField(maskCanvas, S);
+        const out = document.createElement('canvas');
+        out.width = S; out.height = S;
+        const ctx = out.getContext('2d');
+        const img = src.getContext('2d').getImageData(0, 0, S, S);
+        const d = img.data;
+        // 0.30 at full slider. Higher reads as a drawn black outline rather than
+        // a shadow, and with Scatter on, every fleck gets its own contact band —
+        // the amplitude has to suit the busiest case, not the cleanest.
+        const k = amount * 0.30;
+        for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+            const s = 1 - k * f[p];
+            d[i] = d[i] * s; d[i + 1] = d[i + 1] * s; d[i + 2] = d[i + 2] * s;
+        }
+        ctx.putImageData(img, 0, 0);
+        return out;
+    }
+
+    function buildTopologyMask(S, mode, pivot, hardness, org) {
+        if (CORNER_BITS[mode] !== undefined) return buildCornerMask(S, CORNER_BITS[mode], pivot, hardness, org);
         pivot    = Math.max(0, Math.min(1, pivot));
         hardness = Math.max(0, Math.min(1, hardness));
         const lower     = pivot * hardness;
@@ -1581,6 +1840,7 @@ window.TRLE = window.TRLE || {};
         const parts = [`Element ${i + 1}`, el.kind === 'transition' ? 'transition tile' : 'tile'];
         parts.push(el.kind === 'transition' ? 'material inherited' : materialLabel(el));
         if (el.seamless) parts.push('seamless');
+        if (el.emissive) parts.push('has glow');
         if (state.selSet.has(el.id)) parts.push('selected');
         return parts.join(', ');
     }
@@ -1617,6 +1877,12 @@ window.TRLE = window.TRLE || {};
             cell.setAttribute('aria-selected', isSel ? 'true' : 'false');
             cell.setAttribute('aria-label', cellAriaLabel(el, i));
             if (isSel) cell.classList.add('selected');
+            // A block has to be visible before it is allowed to be fragile — see
+            // the comment on validateBlocks.
+            if (el.block) {
+                cell.classList.add('at-in-block');
+                cell.title = `Part of a ${el.block.label} — keeps its ${el.block.cols}-column shape when the atlas is resized`;
+            }
             if (el.id === state.selectedId) cell.classList.add('at-primary');
             if (el.id === state.pickBaseId) cell.classList.add('locked');
             else if (state.pickBaseId !== null) cell.classList.add('pickable');
@@ -1636,6 +1902,10 @@ window.TRLE = window.TRLE || {};
                 const a = el.anim || {};
                 badges.innerHTML += `<span class="at-badge at-badge-a" title="Animated frame ${(a.index || 0) + 1} of ${a.total || 1}">A${a.total > 1 ? (a.index || 0) + 1 : ''}</span>`;
             }
+            // An authored glow never touches el.canvas, so without a badge the cell
+            // looks identical with and without one — which is how "Reset to Original
+            // didn't remove my glow" gets reported for a reset that worked.
+            if (el.emissive) badges.innerHTML += '<span class="at-badge at-badge-e" title="Has an authored glow (Make Emissive)">E</span>';
             cell.appendChild(badges);
 
             const lbl = document.createElement('span');
@@ -1768,13 +2038,24 @@ window.TRLE = window.TRLE || {};
     }
 
     /* Reflow the atlas into a new column count (elements keep their order). */
+    /* Column changes preserve blocks silently and leave an undo entry, rather
+       than opening a modal. Padding is non-destructive and one Ctrl+Z away, so a
+       dialog on every tweak of the Columns box is pure friction — and an atlas
+       with no blocks in it (most of them) never has anything to decide. */
     function setColumns(n) {
         if (!Number.isFinite(n)) { renderGrid(); return; }
         n = Math.max(1, Math.min(12, Math.round(n)));
         if (n === state.cols) { renderGrid(); return; }
         state.cols = n;
+        if (!hasBlocks()) { renderGrid(); pushHistory(`Columns: ${n}`); return; }
+        const r = reflowPreservingBlocks(n);
         renderGrid();
-        pushHistory(`Columns: ${n}`);
+        pushHistory(`Columns: ${n}` + (r.added ? ` (+${r.added} spacer${r.added > 1 ? 's' : ''})` : ''));
+        if (r.tooWide.length) {
+            showToast(`${r.tooWide.join(', ')} is wider than ${n} columns — it now flows with the loose tiles`, 'info');
+        } else if (r.added) {
+            showToast(`Kept ${r.kept} block${r.kept > 1 ? 's' : ''} in shape · ${r.added} spacer${r.added > 1 ? 's' : ''} added · Undo in History`, 'success');
+        }
     }
 
     /* Set columns indirectly by target row count (cols = ceil(N / rows)). */
@@ -1784,9 +2065,7 @@ window.TRLE = window.TRLE || {};
         r = Math.max(1, Math.min(99, Math.round(r)));
         const n = Math.max(1, Math.min(12, Math.ceil(N / r)));
         if (n === state.cols) { renderGrid(); return; }
-        state.cols = n;
-        renderGrid();
-        pushHistory(`Rows: ${Math.ceil(N / n)}`);
+        setColumns(n);          // Rows is just Columns by another route — same block handling
     }
 
     /* Effective tile size from the picker: a preset value, or the Custom field,
@@ -1807,10 +2086,97 @@ window.TRLE = window.TRLE || {};
         const canvas = document.createElement('canvas');
         canvas.width = S; canvas.height = S;
         const ctx = canvas.getContext('2d');
-        ctx.fillStyle = '#808080'; ctx.fillRect(0, 0, S, S);
+        // Black and fully opaque, not the grey of a manual blank: a spacer only
+        // exists to hold page alignment, and it ships, so it wants to be the
+        // least distracting thing possible in the exported sheet. `spacer` also
+        // makes it removable — re-padding has to strip the old ones or every
+        // column change would leave another row of them behind.
+        ctx.fillStyle = '#000000'; ctx.fillRect(0, 0, S, S);
         return { id: state.nextId++, kind: 'tile', canvas, original: cloneCanvas(canvas),
-                 seamless: false, edited: false, material: null };
+                 seamless: false, edited: false, material: null, spacer: true };
     }
+
+    /* ============ GRID BLOCKS ============
+       A "block" is a run of tiles a set builder added that only reads correctly
+       at a particular column count — a 4x4 Wang sheet, a 3x3 island. Elements
+       carry `el.block = { id, cols, label }`.
+
+       The invariant is contiguity-modulo-spacers: from the first member to the
+       last, every element is either a member of this block or an auto-spacer.
+       Padding interleaves spacers into the block's rows (a 4-wide block in a
+       5-column atlas is 4 tiles + 1 spacer per row), so plain contiguity would
+       be false the moment the block is padded.
+
+       Blocks are DELIBERATELY fragile: drag a tile out or drop a foreign tile in
+       and the metadata is dropped, because the claim "this is a 4-wide block" has
+       stopped being true. That is only honest if the user can see the block in
+       the first place, hence the outline in renderGrid — an invisible property
+       that silently disappears is the same failure mode as a glow that Reset
+       removed with nothing showing it had. */
+    let nextBlockId = 1;
+    const newBlock = (cols, label) => ({ id: nextBlockId++, cols, label });
+
+    /* Drop the metadata from any block that is no longer intact. Returns the
+       labels of the blocks that were dropped, so the caller can say so. */
+    function validateBlocks() {
+        const seen = new Map();          // block id -> {first, last, members, label}
+        state.elements.forEach((el, i) => {
+            if (!el.block) return;
+            const r = seen.get(el.block.id);
+            if (r) { r.last = i; r.members++; }
+            else seen.set(el.block.id, { first: i, last: i, members: 1, label: el.block.label, cols: el.block.cols });
+        });
+        const dropped = [];
+        for (const [id, r] of seen) {
+            let intact = r.members % r.cols === 0;
+            for (let i = r.first; intact && i <= r.last; i++) {
+                const el = state.elements[i];
+                if (el.spacer) continue;
+                if (!el.block || el.block.id !== id) intact = false;
+            }
+            if (!intact) {
+                dropped.push(r.label || 'block');
+                state.elements.forEach(el => { if (el.block && el.block.id === id) delete el.block; });
+            }
+        }
+        return dropped;
+    }
+
+    /* Re-lay the atlas at `newCols` so every intact block keeps its own width,
+       padding each of its rows out with spacers. Old auto-spacers are stripped
+       first (otherwise they accumulate a row at a time); an edited spacer is
+       treated as a real tile and kept. A block wider than newCols cannot be
+       preserved — it flows like loose tiles and loses its metadata. */
+    function reflowPreservingBlocks(newCols) {
+        const src = state.elements.filter(e => !(e.spacer && !e.edited));
+        const out = [];
+        let added = 0, kept = 0, tooWide = [];
+        let i = 0;
+        while (i < src.length) {
+            const b = src[i].block;
+            if (!b) { out.push(src[i++]); continue; }
+            let j = i;
+            while (j < src.length && src[j].block && src[j].block.id === b.id) j++;
+            const run = src.slice(i, j);
+            i = j;
+            if (b.cols > newCols) {
+                tooWide.push(b.label || 'block');
+                run.forEach(el => { delete el.block; out.push(el); });
+                continue;
+            }
+            while (out.length % newCols) { out.push(makeSpacerTile()); added++; }
+            for (let k = 0; k < run.length; k += b.cols) {
+                const row = run.slice(k, k + b.cols);
+                out.push(...row);
+                for (let p = row.length; p < newCols; p++) { out.push(makeSpacerTile()); added++; }
+            }
+            kept++;
+        }
+        state.elements = out;
+        return { kept, added, tooWide };
+    }
+
+    const hasBlocks = () => state.elements.some(e => e.block);
 
     /* Add a grid-shaped block of tiles that reads best at `width` columns. If the
        atlas already holds tiles in a different column count, ask whether to reflow
@@ -1827,14 +2193,23 @@ window.TRLE = window.TRLE || {};
             padThenAdd();
             return;
         }
+        // Blocks already in the atlas keep their own width through the reflow, so
+        // "resize" no longer means "shear whatever is already here" — say so.
+        const blocks = hasBlocks();
         const pads = (width - (state.elements.length % width)) % width;
         openConfirm(
             '🧩 Arrange as a grid?',
             `This set reads best as a ${width}-column block, but the atlas is ${state.cols} columns. ` +
-            `Resize the atlas to ${width} columns so the tiles line up? Existing tiles reflow into ${width} columns.` +
+            `Resize the atlas to ${width} columns so the tiles line up?` +
+            (blocks ? ' Blocks already in the atlas keep their own shape — their rows are padded with spacers.'
+                    : ` Existing tiles reflow into ${width} columns.`) +
             (pads ? ` ${pads} blank spacer tile${pads > 1 ? 's' : ''} will pad the last row so the block starts on a fresh row.` : ''),
             `Resize to ${width} columns & add`,
-            () => { state.cols = width; padThenAdd(); },
+            () => {
+                state.cols = width;
+                if (blocks) reflowPreservingBlocks(width);
+                padThenAdd();
+            },
             { danger: false, cancelLabel: 'Cancel' }
         );
     }
@@ -2166,6 +2541,17 @@ window.TRLE = window.TRLE || {};
        Taken before removal, `to` works out for both directions: dragging forward
        the target slides left and inserting at `to` lands just after it; dragging
        backward the target is untouched and inserting at `to` displaces it. */
+    /* Run after anything that can rearrange or remove elements. A block whose
+       run has been broken loses its metadata, and the user is told — silently
+       dropping it would leave the outline gone with no explanation. */
+    function blocksChanged(verb) {
+        const dropped = validateBlocks();
+        if (dropped.length) {
+            showToast(`${dropped.join(', ')} no longer lines up after ${verb} — it will reflow with the loose tiles now`, 'info');
+        }
+        return dropped.length;
+    }
+
     function reorderElements(dragId, targetId) {
         if (dragId == null || dragId === targetId) return;
         const to = indexOf(targetId);
@@ -2191,6 +2577,7 @@ window.TRLE = window.TRLE || {};
 
         enforceAnimOrder();
         const repaired = enforceTransitionOrder();
+        blocksChanged('the move');
         state.focusedId = dragId;
         renderGrid();
         pushHistory(moving.length > 1 ? `Reorder ${moving.length} tiles` : 'Reorder');
@@ -2207,6 +2594,7 @@ window.TRLE = window.TRLE || {};
         const a = state.elements;
         [a[i], a[j]] = [a[j], a[i]];
         enforceAnimOrder();
+        blocksChanged('the move');
         enforceTransitionOrder();
         state.focusedId = id;
         renderGrid();
@@ -2249,6 +2637,7 @@ window.TRLE = window.TRLE || {};
         if (!state.elements.some(e => e.id === state.focusedId)) {
             state.focusedId = state.elements.length ? state.elements[0].id : null;
         }
+        blocksChanged('the delete');
         renderGrid();
         updateBulkBar();
         return closure.size;
@@ -2349,6 +2738,9 @@ window.TRLE = window.TRLE || {};
                 blendMethod: el.blendMethod,
                 wangBits: el.wangBits,
                 bset: el.bset ? JSON.parse(JSON.stringify(el.bset)) : null,  // border-set recipe
+                organic: el.organic ? { ...el.organic } : null,         // organic-edge recipe
+                block: el.block ? { ...el.block } : null,               // grid-block membership
+                spacer: !!el.spacer,
                 customMask: el.customMask || null,                     // immutable ref (set once at add)
                 overlayGeom: el.overlayGeom ? { ...el.overlayGeom } : null, // transition overlay re-orient
                 emissive: el.emissive ? cloneCanvas(el.emissive) : null, // authored glow (mutable)
@@ -2397,6 +2789,9 @@ window.TRLE = window.TRLE || {};
                 blendMethod: s.blendMethod,
                 wangBits: s.wangBits,
                 bset: s.bset ? JSON.parse(JSON.stringify(s.bset)) : null,
+                organic: s.organic ? { ...s.organic } : null,
+                block: s.block ? { ...s.block } : null,
+                spacer: !!s.spacer,
                 customMask: s.customMask || null,
                 overlayGeom: s.overlayGeom ? { ...s.overlayGeom } : null,
                 emissive: s.emissive ? cloneCanvas(s.emissive) : null,
@@ -2650,6 +3045,11 @@ window.TRLE = window.TRLE || {};
         menu.querySelectorAll('[data-animhide]').forEach(b => {
             b.style.display = el.kind === 'anim' ? 'none' : '';
         });
+        // Make Emissive doubles as the editor, so name the tile's current state —
+        // the menu is the first place someone looks to check whether a glow stuck.
+        const emBtn = menu.querySelector('[data-action="emissive"]');
+        if (emBtn) emBtn.textContent = el.emissive ? '✨ Edit Glow…' : '✨ Make Emissive…';
+
         // Edit Height Transition — only on tiles that carry a stored height-transition recipe.
         menu.querySelectorAll('[data-httonly]').forEach(b => {
             b.style.display = el.htParams ? '' : 'none';
@@ -2783,17 +3183,24 @@ window.TRLE = window.TRLE || {};
                 TRLE.Engine.canvasToBlob(el.canvas).then(b => downloadBlob(b, `tile_${indexOf(id) + 1}.png`));
                 showToast('Downloading tile PNG', 'info', 1500);
                 break;
-            case 'reset':
+            case 'reset': {
                 if (el.kind !== 'tile') return;
+                // Say what went with it. The glow lives off-canvas, so a silent
+                // "restored to original" leaves no way to tell it was cleared.
+                const hadGlow = !!el.emissive;
                 el.canvas.getContext('2d').drawImage(el.original, 0, 0);
                 el.seamless = false;
                 el.edited = false;
                 el.emissive = null;
                 refreshTransitions();
                 renderGrid();
+                const unticked = hadGlow && syncEmissiveExport();
                 pushHistory('Reset tile');
-                showToast('Tile restored to original', 'success');
+                showToast('Tile restored to original'
+                    + (hadGlow ? ' — glow removed' : '')
+                    + (unticked ? ' (Emissive export map off)' : ''), 'success');
                 break;
+            }
             case 'delete':
                 confirmDelete([id]);
                 break;
@@ -2864,9 +3271,13 @@ window.TRLE = window.TRLE || {};
                 ? softenMask(el.customMask, S)
                 : el.wangBits != null
                     ? buildWangMask(S, el.wangBits, el.pivot, el.hardness)
-                    : buildTopologyMask(S, el.mode, el.pivot, el.hardness);
+                    : buildTopologyMask(S, el.mode, el.pivot, el.hardness, el.organic);
             const overlayCanvas = el.overlayGeom ? geomTransform(overlay.canvas, el.overlayGeom) : overlay.canvas;
-            const comp = composeTransitionDiffuse(base.canvas, overlayCanvas, mask, S, el.blendMethod);
+            let comp = composeTransitionDiffuse(base.canvas, overlayCanvas, mask, S, el.blendMethod);
+            // Diffuse only — it's a painted contact cue, not geometry. The maps in
+            // deriveMaps stay clean so a material can still light the tile itself.
+            if (el.organic && el.organic.shadow > 0)
+                comp = applyContactShadow(comp, mask, S, el.organic.shadow);
             const tctx = el.canvas.getContext('2d');
             tctx.clearRect(0, 0, S, S);   // clear so transparent transitions don't keep stale pixels
             tctx.drawImage(comp, 0, 0);
@@ -2874,7 +3285,7 @@ window.TRLE = window.TRLE || {};
     }
 
     /* ============ MODAL INFRASTRUCTURE ============ */
-    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'bset', 'fade', 'emissive', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'delight', 'import', 'origami', 'stainedglass', 'noise', 'confirm'];
+    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'bset', 'fade', 'emissive', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'delight', 'import', 'origami', 'stainedglass', 'noise', 'atlaspreview', 'confirm'];
 
     function visibleModal() {
         return MODAL_NAMES
@@ -4069,32 +4480,89 @@ window.TRLE = window.TRLE || {};
     /* Full-set layout table — pure (no DOM), so the modal and the Learn-page
        capture hook share one source of truth. `@BASE`/`@OVERLAY` = plain cells;
        `sharp` swaps rounded corners for 45° slope cuts. */
-    function transSetCells(layout, sharp) {
-        const C = { NW: sharp ? 'SlopeBR' : 'DiagonalBottomRight',   // island (outer) corners
-                    NE: sharp ? 'SlopeBL' : 'DiagonalBottomLeft',
-                    SW: sharp ? 'SlopeTR' : 'DiagonalTopRight',
-                    SE: sharp ? 'SlopeTL' : 'DiagonalTopLeft' };
-        const H = { NW: sharp ? 'SlopeTL' : 'BottomRightFull',       // hole (inner) corners
-                    NE: sharp ? 'SlopeTR' : 'BottomLeftFull',
-                    SW: sharp ? 'SlopeBL' : 'TopRightFull',
-                    SE: sharp ? 'SlopeBR' : 'TopLeftFull' };
+    /* `style`: 'seamless' (corner-state masks — the only one whose corners meet
+       the edge cells without a seam), 'round' / 'sharp' (the original ratio-field
+       corners, kept so existing projects and the Learn captures still render as
+       they did). A boolean is accepted for the old (layout, sharp) signature. */
+    function transSetCells(layout, style) {
+        if (typeof style === 'boolean') style = style ? 'sharp' : 'round';
+        const sharp = style === 'sharp', seam = style === 'seamless';
+        const C = { NW: seam ? 'CornerBottomRight' : sharp ? 'SlopeBR' : 'DiagonalBottomRight',   // island (outer) corners
+                    NE: seam ? 'CornerBottomLeft'  : sharp ? 'SlopeBL' : 'DiagonalBottomLeft',
+                    SW: seam ? 'CornerTopRight'    : sharp ? 'SlopeTR' : 'DiagonalTopRight',
+                    SE: seam ? 'CornerTopLeft'     : sharp ? 'SlopeTL' : 'DiagonalTopLeft' };
+        const H = { NW: seam ? 'NotchBottomRight'  : sharp ? 'SlopeTL' : 'BottomRightFull',       // hole (inner) corners
+                    NE: seam ? 'NotchBottomLeft'   : sharp ? 'SlopeTR' : 'BottomLeftFull',
+                    SW: seam ? 'NotchTopRight'     : sharp ? 'SlopeBL' : 'TopRightFull',
+                    SE: seam ? 'NotchTopLeft'      : sharp ? 'SlopeBR' : 'TopLeftFull' };
+        // Edge cells go through the corner builder too in 'seamless' — see the
+        // Edge* entries in CORNER_BITS for why half-converting is worse than not
+        // converting at all.
+        const E = { T: seam ? 'EdgeTop'    : 'TopFull',    B: seam ? 'EdgeBottom' : 'BottomFull',
+                    L: seam ? 'EdgeLeft'   : 'LeftFull',   R: seam ? 'EdgeRight'  : 'RightFull' };
+        // `blocks` = the rectangles that are actually one connected terrain patch.
+        // complete5 PACKS two independent patches (island 3×3, hole 2×2) plus two
+        // spare plain tiles into one 5-wide atlas block, so cells that merely sit
+        // next to each other there are not neighbours in any level.
         switch (layout) {
-            case 'hole3': return { width: 3, cells: [
-                H.NW,       'TopFull',    H.NE,
-                'LeftFull', '@BASE',      'RightFull',
-                H.SW,       'BottomFull', H.SE] };
-            case 'complete5': return { width: 5, cells: [
-                C.NW,        'BottomFull', C.NE,       H.NW,    H.NE,
-                'RightFull', '@OVERLAY',   'LeftFull', H.SW,    H.SE,
-                C.SW,        'TopFull',    C.SE,       '@BASE', '@OVERLAY'] };
-            default: return { width: 3, cells: [                 // island3
-                C.NW,        'BottomFull', C.NE,
-                'RightFull', '@OVERLAY',   'LeftFull',
-                C.SW,        'TopFull',    C.SE] };
+            case 'hole3': return { width: 3, blocks: [{ x: 0, y: 0, w: 3, h: 3 }], cells: [
+                H.NW,  E.T,     H.NE,
+                E.L,   '@BASE', E.R,
+                H.SW,  E.B,     H.SE] };
+            case 'complete5': return { width: 5,
+                blocks: [{ x: 0, y: 0, w: 3, h: 3 }, { x: 3, y: 0, w: 2, h: 2 }], cells: [
+                C.NW, E.B,        C.NE, H.NW,    H.NE,
+                E.R,  '@OVERLAY', E.L,  H.SW,    H.SE,
+                C.SW, E.T,        C.SE, '@BASE', '@OVERLAY'] };
+            default: return { width: 3, blocks: [{ x: 0, y: 0, w: 3, h: 3 }], cells: [  // island3
+                C.NW, E.B,        C.NE,
+                E.R,  '@OVERLAY', E.L,
+                C.SW, E.T,        C.SE] };
         }
     }
     function trSetLayout() {
-        return transSetCells($('at-tr-set-layout').value, $('at-tr-set-corners').value === 'sharp');
+        return transSetCells($('at-tr-set-layout').value, $('at-tr-set-corners').value);
+    }
+
+    /* Organic-edge params from the modal, or null when every slider is at 0 —
+       null means buildCornerMask takes its original path and the output is
+       byte-identical to a pre-organic build. Also null for the legacy corner
+       styles, whose ratio-field masks have no organic path at all. */
+    let trOrgSeed = 1, trOrgDriftSeed = 1;
+    function trOrgParams() {
+        if ($('at-tr-set-corners').value !== 'seamless') return null;
+        const v = id => parseInt($(id).value) / 100;
+        const p = { wobble: v('at-tr-org-wobble'), drift: v('at-tr-org-drift'),
+                    scatter: v('at-tr-org-scatter'), feather: v('at-tr-org-feather'),
+                    shadow: v('at-tr-org-shadow'),
+                    scale: parseInt($('at-tr-org-scale').value) || 3,
+                    seed: trOrgSeed, driftSeed: trOrgDriftSeed };
+        return (p.wobble || p.drift || p.scatter || p.feather || p.shadow) ? p : null;
+    }
+    /* How many copies of the set to add. Only meaningful with organic on — with
+       a clean boundary every copy would be the same nine tiles. */
+    function trAltCount() {
+        if (!trOrgParams()) return 1;
+        const n = parseInt($('at-tr-org-alts').value);
+        return Math.max(1, Math.min(4, Number.isFinite(n) ? n : 1));
+    }
+    /* Organic params for alternate `a`. Only `seed` moves: `driftSeed` is held
+       across alternates on purpose, because drift is the one control that reaches
+       the tile border. Two alternates with independently drifted edges are NOT
+       seamless with each other (measured 0.30) — which defeats the entire point
+       of having alternates. See buildCornerMask. */
+    function trOrgForAlt(org, a) {
+        if (!org || a === 0) return org;
+        return { ...org, seed: ((org.seed + a * 0x9E3779B1) >>> 0) || 1 };
+    }
+
+    /* The accordion is only meaningful for the seamless style, so hide it rather
+       than leave dead sliders that silently do nothing. */
+    function trOrgVisibility() {
+        const acc = $('at-tr-org-acc');
+        if (!acc) return;
+        const on = tr.tab === 'set' && $('at-tr-set-corners').value === 'seamless';
+        acc.style.display = on ? '' : 'none';
     }
 
     /* Tab + mask-source combined visibility (they interact: pivot/hardness is
@@ -4110,7 +4578,8 @@ window.TRLE = window.TRLE || {};
             $('at-tr-custom-controls').style.display = custom ? '' : 'none';
         }
         $('at-tr-pivot-row').style.display = (!set && custom) ? 'none' : '';
-        $('at-tr-add').textContent = set ? `➕ Add ${trSetLayout().cells.length} Tiles` : '➕ Add to Atlas';
+        $('at-tr-add').textContent = set
+            ? `➕ Add ${trSetLayout().cells.length * trAltCount()} Tiles` : '➕ Add to Atlas';
     }
 
     function trSetTab(name) {
@@ -4121,6 +4590,7 @@ window.TRLE = window.TRLE || {};
             b.setAttribute('aria-selected', on ? 'true' : 'false');
         });
         trApplyVisibility();
+        trOrgVisibility();
         trPreview();
     }
 
@@ -4132,24 +4602,32 @@ window.TRLE = window.TRLE || {};
         const pivot    = parseInt($('at-tr-pivot').value) / 100;
         const hardness = parseInt($('at-tr-hardness').value) / 100;
         const L = trSetLayout();
+        const org0 = trOrgParams();
+        const alts = trAltCount();
         const base    = resizeCanvas(byId(tr.baseId).canvas, P, P);
         const overlay = resizeCanvas(trOverlayCanvas(), P, P);
         const wrap = $('at-tr-set-previews');
         wrap.style.gridTemplateColumns = `repeat(${L.width},1fr)`;
         wrap.innerHTML = '';
-        for (const cell of L.cells) {
+        const allCells = [];
+        for (let a = 0; a < alts; a++) for (const cell of L.cells) allCells.push([cell, trOrgForAlt(org0, a)]);
+        for (const [cell, org] of allCells) {
             const c = document.createElement('canvas'); c.width = P; c.height = P;
             c.style.cssText = 'width:100%;border:1px solid var(--border);border-radius:3px;image-rendering:pixelated;';
             const x = c.getContext('2d');
             if (cell === '@BASE') x.drawImage(base, 0, 0);
             else if (cell === '@OVERLAY') x.drawImage(overlay, 0, 0);
-            else x.drawImage(composeTransitionDiffuse(base, overlay,
-                buildTopologyMask(P, cell, pivot, hardness), P, method,
-                method === 'poisson' ? 120 : undefined), 0, 0);
+            else {
+                const mk = buildTopologyMask(P, cell, pivot, hardness, org);
+                let cmp = composeTransitionDiffuse(base, overlay, mk, P, method,
+                    method === 'poisson' ? 120 : undefined);
+                if (org && org.shadow > 0) cmp = applyContactShadow(cmp, mk, P, org.shadow);
+                x.drawImage(cmp, 0, 0);
+            }
             wrap.appendChild(c);
         }
-        $('at-tr-set-count').textContent = L.cells.length;
-        $('at-tr-add').textContent = `➕ Add ${L.cells.length} Tiles`;
+        $('at-tr-set-count').textContent = L.cells.length * alts;
+        $('at-tr-add').textContent = `➕ Add ${L.cells.length * alts} Tiles`;
     }
 
     /* The overlay (B) canvas re-oriented by the modal's rotate/flip buttons. */
@@ -4201,6 +4679,12 @@ window.TRLE = window.TRLE || {};
         trPreview();
     }
 
+    const TR_CORNER_HINTS = {
+        seamless: 'Corner tiles meet the edge tiles exactly — the island reads as one shape.',
+        round:    'Legacy shape. The corner tiles run overlay along their whole inner edges, so the block shows a seam where a corner meets an edge cell.',
+        sharp:    'Legacy 45° cut. Same seam as Rounded, half the amplitude.'
+    };
+
     const TR_HINTS = {
         alpha:   'Straight cross-fade along the topology mask (original behaviour).',
         height:  'Biases the mid-line blend by each texture’s luminance so the edge interlocks instead of cutting straight. Great for organic surfaces.',
@@ -4229,8 +4713,38 @@ window.TRLE = window.TRLE || {};
     function setupTransModal() {
         document.querySelectorAll('#at-modal-trans .at-anim-tab').forEach(b =>
             b.addEventListener('click', () => trSetTab(b.dataset.trTab)));
+        const updateCornerHint = () => {
+            const h = $('at-tr-corner-hint');
+            if (h) h.textContent = TR_CORNER_HINTS[$('at-tr-set-corners').value] || '';
+        };
         ['at-tr-set-layout', 'at-tr-set-corners'].forEach(id =>
-            $(id).addEventListener('change', () => { trApplyVisibility(); trPreview(); }));
+            $(id).addEventListener('change', () => {
+                updateCornerHint(); trApplyVisibility(); trOrgVisibility(); trPreview();
+            }));
+        updateCornerHint();
+        /* Debounced, unlike every other control in this modal. An organic mask is
+           ~26x the cost of a plain one and Alternates multiplies the set by up to
+           4, so a dragged slider can be ~180 ms of mask building per step. The
+           label updates immediately so the slider still feels live. */
+        let trOrgTimer = null;
+        const trOrgSchedule = () => {
+            clearTimeout(trOrgTimer);
+            trOrgTimer = setTimeout(trPreview, 110);
+        };
+        ['wobble', 'drift', 'scatter', 'feather', 'shadow', 'scale'].forEach(k => {
+            const el = $('at-tr-org-' + k);
+            if (!el) return;
+            el.addEventListener('input', function () {
+                $('at-tr-org-' + k + '-val').textContent = this.value;
+                trOrgSchedule();
+            });
+        });
+        if ($('at-tr-org-alts')) $('at-tr-org-alts').addEventListener('change', () => { trApplyVisibility(); trPreview(); });
+        if ($('at-tr-org-seed')) $('at-tr-org-seed').addEventListener('click', () => {
+            trOrgSeed = (Math.random() * 0x7fffffff) | 0 || 1;
+            trOrgDriftSeed = (Math.random() * 0x7fffffff) | 0 || 1;
+            trPreview();
+        });
         const dirs = $('at-tr-dirs');
         TRANS_MODES.forEach(({ mode, label }) => {
             const btn = document.createElement('button');
@@ -4307,9 +4821,14 @@ window.TRLE = window.TRLE || {};
                 const pivot    = parseInt($('at-tr-pivot').value) / 100;
                 const hardness = parseInt($('at-tr-hardness').value) / 100;
                 const geom = geomIsIdentity(tr.overlayGeom) ? null : { ...tr.overlayGeom };
+                const org0 = trOrgParams();
+                const alts = trAltCount();
                 const baseId = tr.baseId, overlayId = tr.overlayId;
                 // Build now, then (optionally) reflow the atlas so the block lines up.
-                const els = L.cells.map(cell => {
+                const cellSpecs = [];
+                for (let a = 0; a < alts; a++)
+                    for (const cell of L.cells) cellSpecs.push([cell, trOrgForAlt(org0, a)]);
+                const els = cellSpecs.map(([cell, org]) => {
                     const common = {
                         id: 0, kind: 'transition', canvas: blankCanvas(S), original: null,
                         seamless: false, material: null, base: baseId, overlay: overlayId,
@@ -4317,10 +4836,11 @@ window.TRLE = window.TRLE || {};
                     };
                     if (cell === '@BASE')    return { ...common, mode: 'custom', pivot: 0, hardness: 0, customMask: solidMask(S, false) };
                     if (cell === '@OVERLAY') return { ...common, mode: 'custom', pivot: 0, hardness: 0, customMask: solidMask(S, true) };
-                    return { ...common, mode: cell, pivot, hardness };
+                    return { ...common, mode: cell, pivot, hardness, organic: org };
                 });
                 confirmResizeCols(L.width, () => {
-                    for (const el of els) { el.id = state.nextId++; state.elements.push(el); }
+                    const blk = newBlock(L.width, `${L.width}-wide transition set`);
+                    for (const el of els) { el.id = state.nextId++; el.block = blk; state.elements.push(el); }
                     closeModal();
                     renderGrid();
                     refreshTransitions();
@@ -4462,7 +4982,8 @@ window.TRLE = window.TRLE || {};
                 mode: 'wang', wangBits: bits, pivot, hardness, blendMethod: method
             }));
             confirmResizeCols(L.width, () => {
-                for (const el of els) { el.id = state.nextId++; state.elements.push(el); }
+                const blk = L.width ? newBlock(L.width, `${L.width}-wide Wang set`) : null;
+                for (const el of els) { el.id = state.nextId++; if (blk) el.block = blk; state.elements.push(el); }
                 closeModal();
                 renderGrid();
                 refreshTransitions();   // paint into the now-attached canvases (forces repaint)
@@ -4994,14 +5515,21 @@ window.TRLE = window.TRLE || {};
             const slots = L.slots.map(key => key === null ? null
                 : { key, recipe: bsetRecipeFor(key, L, p) });
             confirmResizeCols(L.width, () => {
+                const blk = newBlock(L.width, `${L.width}-wide border set`);
                 let n = 0;
                 for (const slot of slots) {
-                    if (slot === null) { state.elements.push(makeSpacerTile()); continue; }
+                    // An empty slot is part of the set's SHAPE, so its filler
+                    // carries the block too — otherwise validateBlocks would see
+                    // a foreign tile inside the run and drop the whole block.
+                    if (slot === null) {
+                        const sp = makeSpacerTile(); sp.block = blk;
+                        state.elements.push(sp); continue;
+                    }
                     state.elements.push({
                         id: state.nextId++, kind: 'transition', canvas: blankCanvas(S),
                         original: null, seamless: false, material: null,
                         base: baseId, overlay: overlayId, blendMethod: p.method,
-                        bset: slot.recipe
+                        bset: slot.recipe, block: blk
                     });
                     n++;
                 }
@@ -6721,10 +7249,27 @@ window.TRLE = window.TRLE || {};
         emissivePreview();
     }
 
+    /* The preview below always renders the glow the CONTROLS would produce, so a
+       tile whose glow was just removed looks exactly like one that still has it.
+       Say which it is, and don't offer to remove a glow that isn't there. */
+    function emSyncState() {
+        const el = emissive.id === null ? null : byId(emissive.id);
+        const has = !!(el && el.emissive);
+        const line = $('at-em-state');
+        if (line) {
+            line.textContent = has
+                ? '✨ This tile currently has a glow. Apply replaces it; Remove glow clears it.'
+                : 'This tile has no glow yet — the preview below shows what Apply would give you.';
+        }
+        const rm = $('at-em-remove');
+        if (rm) { rm.disabled = !has; rm.title = has ? '' : 'This tile has no glow'; }
+    }
+
     function openEmissiveModal(id) {
         emissive.id = id;
         emissive.brushErase = false;
         $('at-em-tileno').textContent = indexOf(id) + 1;
+        emSyncState();
         const mc = emissive.maskCanvas.getContext('2d');
         mc.fillStyle = '#000'; mc.fillRect(0, 0, emissive.maskCanvas.width, emissive.maskCanvas.height);
         const bm = $('at-em-brush-mode');
@@ -6774,19 +7319,19 @@ window.TRLE = window.TRLE || {};
         $('at-em-remove').addEventListener('click', () => {
             if (emissive.id === null) return;
             const el = byId(emissive.id);
+            if (!el.emissive) { showToast('This tile has no glow to remove', 'info'); return; }
             el.emissive = null;
             closeModal();
             renderGrid();
+            const unticked = syncEmissiveExport();
             pushHistory('Remove emissive');
-            showToast('Emissive glow removed', 'success');
+            showToast('Emissive glow removed' + (unticked ? ' (Emissive export map off)' : ''), 'success');
         });
         $('at-em-apply').addEventListener('click', () => {
             if (emissive.id === null) return;
             const el = byId(emissive.id);
             el.emissive = emissiveCompute(cloneCanvas(el.canvas));
-            // Auto-enable the Emissive export map so the glow actually ships.
-            const cb = document.querySelector('#at-map-checks input[data-map="emissive"]');
-            if (cb && !cb.checked) cb.checked = true;
+            enableEmissiveExport();   // so the glow actually ships
             closeModal();
             renderGrid();
             pushHistory('Emissive map');
@@ -7800,7 +8345,8 @@ window.TRLE = window.TRLE || {};
                 });
             }
             confirmResizeCols(cols, () => {
-                for (const el of els) { el.id = state.nextId++; state.elements.push(el); }
+                const blk = newBlock(cols, `${cols}-wide transition grid`);
+                for (const el of els) { el.id = state.nextId++; el.block = blk; state.elements.push(el); }
                 closeModal();
                 renderGrid();
                 refreshTransitions();
@@ -9823,7 +10369,7 @@ window.TRLE = window.TRLE || {};
                 el.matLayers = matLayers;
                 el.emissive = emissive;
                 el.sgParams = sp;
-                if (emissive) sgEnableEmissiveExport();
+                if (emissive) enableEmissiveExport();
                 closeModal(); renderGrid();
                 pushHistory('Edit stained glass');
                 showToast('Stained glass updated', 'success');
@@ -9837,7 +10383,7 @@ window.TRLE = window.TRLE || {};
             };
             state.elements.splice(indexOf(sgState.id) + 1, 0, tile);
             state.selectedId = tile.id;
-            if (emissive) sgEnableEmissiveExport();
+            if (emissive) enableEmissiveExport();
             closeModal();
             renderGrid();
             pushHistory('Stained glass');
@@ -9847,10 +10393,39 @@ window.TRLE = window.TRLE || {};
         });
     }
 
+    function emissiveExportCheckbox() {
+        return document.querySelector('#at-map-checks input[data-map="emissive"]');
+    }
+
     /* Auto-enable the Emissive export map so the glow actually ships. */
-    function sgEnableEmissiveExport() {
-        const cb = document.querySelector('#at-map-checks input[data-map="emissive"]');
-        if (cb && !cb.checked) cb.checked = true;
+    function enableEmissiveExport() {
+        const cb = emissiveExportCheckbox();
+        if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change')); }
+    }
+
+    /* Would this element export anything but a black emissive map? An authored
+       glow, a PSD-imported emissive layer, or a material whose preset emits on
+       its own (Lava 90, Molten Metal 80 … but also Gold 20, Ice 18, Glass 12). */
+    function elementEmits(el) {
+        if (el.emissive) return true;
+        if (el.importedMaps && el.importedMaps.emissive) return true;
+        if (el.kind === 'transition') return false;   // inherits — counted on base/overlay
+        const mats = hasMatLayers(el) ? el.matLayers.map(L => L.material) : [el.material];
+        return mats.some(m => (presetFromMaterial(m).emissiveStrength || 0) > 0);
+    }
+
+    /* Applying a glow auto-ticks the Emissive export map, and nothing ever
+       unticked it: an atlas with no glow left still shipped a black emissive
+       PNG, and the ticked box read as "the glow is still on the tile" — which
+       is how a Reset that did remove the glow gets reported as broken. Only
+       unticks when NOTHING in the atlas emits, so a lava tile keeps it on. */
+    function syncEmissiveExport() {
+        const cb = emissiveExportCheckbox();
+        if (!cb || !cb.checked) return false;
+        if (state.elements.some(elementEmits)) return false;
+        cb.checked = false;
+        cb.dispatchEvent(new Event('change'));
+        return true;
     }
 
     /* ============ SURFACE NOISE MODAL ============
@@ -10031,7 +10606,7 @@ window.TRLE = window.TRLE || {};
                 ? softenMask(el.customMask, S)
                 : el.wangBits != null
                     ? buildWangMask(S, el.wangBits, el.pivot, el.hardness)
-                    : buildTopologyMask(S, el.mode, el.pivot, el.hardness);
+                    : buildTopologyMask(S, el.mode, el.pivot, el.hardness, el.organic);
             for (const mt of TRLE.MapOrder) {
                 if (enabledMaps[mt] && base[mt] && overlay[mt]) {
                     let om = overlay[mt];
@@ -10088,6 +10663,91 @@ window.TRLE = window.TRLE || {};
         const cb = $('at-export-project');
         if (!cb || !cb.checked || !state.elements.length) return;
         zip.file(`${prefix}${baseName}.atlasproj.json`, JSON.stringify(await buildProjectJSON()));
+    }
+
+    /* Lay the elements out into one atlas-sized canvas — the exact geometry the
+       exported PNG/TGA/PSD uses. Shared with the 👁 Preview atlas modal on
+       purpose: a preview that computed its own layout could drift from the
+       export and would then be worse than no preview at all. */
+    function stitchAtlas(getTile) {
+        const S = state.tileSize;
+        const cols = Math.max(1, state.cols);
+        const rows = Math.max(1, Math.ceil(state.elements.length / cols));
+        const atlas = document.createElement('canvas');
+        atlas.width = cols * S;
+        atlas.height = rows * S;
+        const ctx = atlas.getContext('2d');
+        state.elements.forEach((el, i) => {
+            const tile = getTile(el);
+            if (tile) ctx.drawImage(tile, (i % cols) * S, Math.floor(i / cols) * S);
+        });
+        return atlas;
+    }
+
+    /* ============ ATLAS PREVIEW (👁 next to Layout) ============
+       Answers "what am I actually shipping?" without running an export. Draws
+       the stitched diffuse at native size into a scrollable, checkerboarded
+       frame, with optional tile boundaries and 1-based numbers drawn as an
+       OVERLAY on a separate pass — never baked into the pixels, so what you see
+       under the guides is exactly the exported image. */
+    function atlasPreviewRender() {
+        if (!state.elements.length) return;
+        const S = state.tileSize;
+        const cols = Math.max(1, state.cols);
+        const rows = Math.ceil(state.elements.length / cols);
+        let atlas = stitchAtlas(el => el.canvas);
+        if ($('at-ap-magenta').checked) atlas = magentaKey(atlas);
+
+        const c = $('at-ap-canvas');
+        c.width = atlas.width; c.height = atlas.height;
+        const x = c.getContext('2d');
+        x.clearRect(0, 0, c.width, c.height);
+        x.drawImage(atlas, 0, 0);
+
+        // Guides scale with the atlas so they stay ~1px once it's fit to the modal.
+        const px = Math.max(1, Math.round(Math.max(atlas.width, atlas.height) / 900));
+        if ($('at-ap-grid').checked) {
+            x.strokeStyle = 'rgba(232,133,42,0.55)';
+            x.lineWidth = px;
+            x.beginPath();
+            for (let i = 1; i < cols; i++) { x.moveTo(i * S, 0); x.lineTo(i * S, rows * S); }
+            for (let j = 1; j < rows; j++) { x.moveTo(0, j * S); x.lineTo(cols * S, j * S); }
+            x.stroke();
+        }
+        if ($('at-ap-numbers').checked) {
+            const fs = Math.max(10, Math.round(S * 0.16));
+            x.font = `bold ${fs}px system-ui, sans-serif`;
+            x.textBaseline = 'top';
+            state.elements.forEach((el, i) => {
+                const tx = (i % cols) * S + fs * 0.3, ty = Math.floor(i / cols) * S + fs * 0.3;
+                const label = String(i + 1);
+                const w = x.measureText(label).width;
+                x.fillStyle = 'rgba(0,0,0,0.62)';
+                x.fillRect(tx - fs * 0.15, ty - fs * 0.08, w + fs * 0.3, fs * 1.16);
+                x.fillStyle = '#fff';
+                x.fillText(label, tx, ty);
+            });
+        }
+        const blanks = state.elements.filter(e => e.spacer).length;
+        $('at-ap-dims').textContent =
+            `${atlas.width} × ${atlas.height} px · ${cols} × ${rows} tiles · ${state.elements.length} used`
+            + (blanks ? ` · ${blanks} spacer${blanks > 1 ? 's' : ''}` : '')
+            + (rows * cols > state.elements.length ? ` · ${rows * cols - state.elements.length} empty` : '');
+    }
+
+    function openAtlasPreview() {
+        if (!state.elements.length) { showToast('Nothing in the atlas yet', 'info'); return; }
+        openModal('atlaspreview');
+        atlasPreviewRender();
+    }
+
+    function setupAtlasPreview() {
+        const btn = $('at-preview-atlas');
+        if (btn) btn.addEventListener('click', openAtlasPreview);
+        ['at-ap-grid', 'at-ap-numbers', 'at-ap-magenta'].forEach(id => {
+            const e = $(id);
+            if (e) e.addEventListener('change', atlasPreviewRender);
+        });
     }
 
     /* ---- Export "conveyor belt" flavour animation --------------------------
@@ -10283,17 +10943,7 @@ window.TRLE = window.TRLE || {};
 
             // Assemble atlases
             const zip = new JSZip();
-            const buildAtlas = (getTile) => {
-                const atlas = document.createElement('canvas');
-                atlas.width = cols * S;
-                atlas.height = rows * S;
-                const ctx = atlas.getContext('2d');
-                state.elements.forEach((el, i) => {
-                    const tile = getTile(el);
-                    if (tile) ctx.drawImage(tile, (i % cols) * S, Math.floor(i / cols) * S);
-                });
-                return atlas;
-            };
+            const buildAtlas = (getTile) => stitchAtlas(getTile);
 
             // Optional TombEngine layout nests everything under Textures/.
             const prefix = $('at-export-layout').value === 'ten' ? 'Textures/' : '';
@@ -10519,6 +11169,9 @@ window.TRLE = window.TRLE || {};
                 blendMethod: el.blendMethod ?? null, wangBits: el.wangBits ?? null
             };
             if (el.bset) e.bset = el.bset;   // border-set recipe (re-rendered on load)
+            if (el.organic) e.organic = el.organic;   // organic-edge recipe (re-rendered on load)
+            if (el.block) e.block = el.block;         // grid-block membership (shape on resize)
+            if (el.spacer) e.spacer = true;           // auto-padding filler, strippable on reflow
             if (el.kind === 'tile') {
                 e.original = await png(el.original);
                 if (el.seamless || el.edited) e.canvas = await png(el.canvas);
@@ -10660,6 +11313,9 @@ window.TRLE = window.TRLE || {};
                 blendMethod: e.blendMethod ?? undefined,
                 wangBits: e.wangBits == null ? undefined : e.wangBits,
                 bset: e.bset || null,
+                organic: e.organic || null,
+                block: e.block || null,
+                spacer: !!e.spacer,
                 overlayGeom: e.overlayGeom || null,
                 anim: e.anim || null,
                 htParams: e.htParams || null,
@@ -10696,6 +11352,9 @@ window.TRLE = window.TRLE || {};
         }
         state.tileSize = S;
         state.cols = proj.cols;
+        // Past every block id in the file, or the next set added would collide
+        // with a loaded one and validateBlocks would see them as one broken run.
+        nextBlockId = Math.max(1, ...els.map(e => (e.block && e.block.id) || 0)) + 1;
         state.nextId = proj.nextId || (Math.max(0, ...els.map(e => e.id)) + 1);
         state.elements = els;
         state.selectedId = null; state.focusedId = null; state.selSet.clear(); state.selAnchor = null;
@@ -11412,6 +12071,7 @@ window.TRLE = window.TRLE || {};
         setupNoiseModal();
         setupStainedGlassModal();
         setupWangModal();
+        setupAtlasPreview();
         setupBsetModal();
         setupFadeModal();
         setupEmissiveModal();
@@ -11534,6 +12194,79 @@ window.TRLE = window.TRLE || {};
             // Layout validators drive the REAL open/close path (so a regression in
             // how openModal sets display is caught, not papered over).
             openModal(name) { openModal(name); return true; },
+            /* test-only: worst mask mismatch across every shared edge of a
+               transition-set layout, on the REAL masks the tool builds (blur
+               tail and all), as a fraction of full scale. The corner-state
+               ("seamless") style is exact by construction, so this asserts
+               against ~0 rather than a tuned threshold; the legacy styles are
+               included so the numbers stay comparable when they're retuned.
+               `@BASE`/`@OVERLAY` cells are solid, and the 5-wide `complete5`
+               packs two unrelated blocks side by side, so only the seams the
+               layout actually claims are terrain-adjacent are scored. */
+            // test-only: the mask builders themselves, so a validator can hash a
+            // single mode's pixels rather than infer it from a composed tile.
+            buildTopologyMask, buildCornerMask, transSetCells, applyContactShadow,
+            // test-only: grid-block state, so block preservation can be asserted
+            // on the real element array rather than inferred from the DOM.
+            blockMap() {
+                return state.elements.map(e => ({
+                    block: e.block ? e.block.id : null,
+                    cols: e.block ? e.block.cols : null,
+                    spacer: !!e.spacer, kind: e.kind
+                }));
+            },
+            setCols(n) { setColumns(n); return { cols: state.cols, n: state.elements.length }; },
+            validateBlocks() { return validateBlocks(); },
+            stitchSize() { const c = stitchAtlas(el => el.canvas); return { w: c.width, h: c.height }; },
+            // test-only: fingerprint one mask, so "all sliders at 0 changes
+            // nothing" can be asserted as byte-equality rather than eyeballed.
+            maskHash(S, mode, pivot, hardness, org) {
+                const d = buildTopologyMask(S, mode, pivot, hardness, org || null)
+                    .getContext('2d').getImageData(0, 0, S, S).data;
+                let h = 2166136261;
+                for (let i = 0; i < d.length; i += 4) { h ^= d[i]; h = Math.imul(h, 16777619); }
+                return (h >>> 0).toString(16);
+            },
+            transSeamProbe(layout, style, pivot, hardness, S, org) {
+                S = S || 128;
+                pivot = pivot == null ? 0.5 : pivot;
+                hardness = hardness == null ? 0.6 : hardness;
+                const L = transSetCells(layout, style);
+                const rows = L.cells.length / L.width;
+                const maskOf = cell => {
+                    if (cell === '@BASE' || cell === '@OVERLAY')
+                        return { solid: cell === '@OVERLAY' ? 255 : 0 };
+                    const c = buildTopologyMask(S, cell, pivot, hardness, org || null);
+                    return { d: c.getContext('2d').getImageData(0, 0, S, S).data };
+                };
+                const M = L.cells.map(maskOf);
+                const at = (m, x, y) => m.solid !== undefined ? m.solid : m.d[(y * S + x) * 4];
+                let worst = 0, worstAt = null;
+                const score = (a, b, pick) => {
+                    let mx = 0;
+                    for (let t = 0; t < S; t++) mx = Math.max(mx, Math.abs(pick(a, t, true) - pick(b, t, false)));
+                    return mx / 255;
+                };
+                const blocks = L.blocks || [{ x: 0, y: 0, w: L.width, h: rows }];
+                const sameBlock = (c1, r1, c2, r2) => blocks.some(b =>
+                    c1 >= b.x && c1 < b.x + b.w && r1 >= b.y && r1 < b.y + b.h &&
+                    c2 >= b.x && c2 < b.x + b.w && r2 >= b.y && r2 < b.y + b.h);
+                let scored = 0;
+                for (let r = 0; r < rows; r++) for (let c = 0; c < L.width; c++) {
+                    const i = r * L.width + c;
+                    if (c + 1 < L.width && sameBlock(c, r, c + 1, r)) {
+                        scored++;
+                        const d = score(M[i], M[i + 1], (m, t, left) => at(m, left ? S - 1 : 0, t));
+                        if (d > worst) { worst = d; worstAt = `H[${r},${c}] ${L.cells[i]}|${L.cells[i + 1]}`; }
+                    }
+                    if (r + 1 < rows && sameBlock(c, r, c, r + 1)) {
+                        scored++;
+                        const d = score(M[i], M[i + L.width], (m, t, top) => at(m, t, top ? S - 1 : 0));
+                        if (d > worst) { worst = d; worstAt = `V[${r},${c}] ${L.cells[i]}/${L.cells[i + L.width]}`; }
+                    }
+                }
+                return { worst, worstAt, scored, cells: L.cells.length, width: L.width };
+            },
             /* test-only: toroidal invariants for Build Pattern's deformation.
                An image-level seam statistic turned out to be useless on these
                patterns — the grid's own mortar lines are the sharpest edges in
@@ -11742,9 +12475,35 @@ window.TRLE = window.TRLE || {};
             // Full-set montage: the same spatial layouts the Make Transition "Full
             // Set" tab adds, stitched into one figure with grid lines. base (A) /
             // overlay (B); layout = island3 | hole3 | complete5; sharp = 45° cuts.
-            async transSet(aSrc, bSrc, S, layout, sharp, cell, line) {
+            /* Seamless-style set sheet with organic params applied, for the Learn
+               page's before/after. Separate from transSet because that one takes a
+               corner STYLE in the same argument slot; folding both in would make
+               the call site ambiguous. `org` null = the clean boundary. */
+            async transSetOrganic(aSrc, bSrc, S, layout, cell, org) {
                 const A = toC(await loadImg(aSrc), S), B = toC(await loadImg(bSrc), S);
-                const { width, cells } = transSetCells(layout, !!sharp);
+                const { width, cells } = transSetCells(layout, 'seamless');
+                const rows = cells.length / width;
+                const o = document.createElement('canvas');
+                o.width = cell * width; o.height = cell * rows;
+                const x = o.getContext('2d');
+                cells.forEach((mode, i) => {
+                    const r = (i / width) | 0, ci = i % width;
+                    let comp;
+                    if (mode === '@BASE') comp = A;
+                    else if (mode === '@OVERLAY') comp = B;
+                    else {
+                        const mk = buildTopologyMask(S, mode, 0.5, 0.6, org || null);
+                        comp = composeTransitionDiffuse(A, B, mk, S, 'alpha');
+                        if (org && org.shadow > 0) comp = applyContactShadow(comp, mk, S, org.shadow);
+                    }
+                    x.drawImage(comp, ci * cell, r * cell, cell, cell);
+                });
+                return url(o);
+            },
+            // `style` takes 'seamless' | 'round' | 'sharp', or the old boolean.
+            async transSet(aSrc, bSrc, S, layout, style, cell, line) {
+                const A = toC(await loadImg(aSrc), S), B = toC(await loadImg(bSrc), S);
+                const { width, cells } = transSetCells(layout, style);
                 const rows = cells.length / width;
                 const L = line || 0;
                 const o = document.createElement('canvas');
@@ -11855,6 +12614,65 @@ window.TRLE = window.TRLE || {};
             async projectHead() { const p = await buildProjectJSON(); return { name: p.name, version: p.version, count: p.elements.length }; },
             openGrid() { openTransGridModal(1, 2); return true; },
             openOrganic() { openOrganicModal(1, 2); return true; },
+            openTrans(baseId, overlayId) { openTransModal(baseId || 1, overlayId || 2); return true; },
+            /* test-only: worst mismatch between the COMPOSED pixels either side of
+               every shared edge inside a terrain block, read off the live grid
+               canvases — what actually ships, not just the mask.
+
+               Reported against a baseline, because two errors live here and only
+               one of them is the mask's. Both tiles blend at the same uv, so the
+               right column of tile A samples the source at x=S-1 while the left
+               column of tile B samples it at x=0: if the SOURCE doesn't tile, the
+               composite can't either, however perfect the mask. That floor is
+               `srcWrapH/V`. A matching mask adds nothing on top of it; a
+               mismatched one adds |base − overlay| × Δmask, which is why this has
+               to be run on two DIFFERENT textures to mean anything (base ≡ overlay
+               makes even a completely broken mask invisible). */
+            composedSeamProbe(layout, style) {
+                const L = transSetCells(layout, style);
+                const rows = L.cells.length / L.width;
+                const blocks = L.blocks || [{ x: 0, y: 0, w: L.width, h: rows }];
+                const inBlock = (c1, r1, c2, r2) => blocks.some(b =>
+                    c1 >= b.x && c1 < b.x + b.w && r1 >= b.y && r1 < b.y + b.h &&
+                    c2 >= b.x && c2 < b.x + b.w && r2 >= b.y && r2 < b.y + b.h);
+                const n = L.cells.length;
+                const first = state.elements.length - n;   // the block just added
+                if (first < 0) return { error: 'not enough elements' };
+                const S = state.tileSize;
+                const px = state.elements.slice(first).map(el =>
+                    el.canvas.getContext('2d').getImageData(0, 0, S, S).data);
+                let worst = 0, worstAt = null, scored = 0;
+                const cmp = (a, b, ai, bi) => {
+                    let mx = 0;
+                    for (let t = 0; t < S; t++) for (let k = 0; k < 3; k++)
+                        mx = Math.max(mx, Math.abs(a[ai(t) + k] - b[bi(t) + k]));
+                    return mx / 255;
+                };
+                for (let r = 0; r < rows; r++) for (let c = 0; c < L.width; c++) {
+                    const i = r * L.width + c;
+                    if (c + 1 < L.width && inBlock(c, r, c + 1, r)) {
+                        scored++;
+                        const d = cmp(px[i], px[i + 1], t => (t * S + (S - 1)) * 4, t => (t * S) * 4);
+                        if (d > worst) { worst = d; worstAt = `H[${r},${c}] ${L.cells[i]}|${L.cells[i + 1]}`; }
+                    }
+                    if (r + 1 < rows && inBlock(c, r, c, r + 1)) {
+                        scored++;
+                        const d = cmp(px[i], px[i + L.width], t => ((S - 1) * S + t) * 4, t => t * 4);
+                        if (d > worst) { worst = d; worstAt = `V[${r},${c}] ${L.cells[i]}/${L.cells[i + L.width]}`; }
+                    }
+                }
+                // Floor: how badly the two SOURCE tiles fail to tile with themselves.
+                const el0 = state.elements[first];
+                const srcs = [byId(el0.base), byId(el0.overlay)].filter(Boolean)
+                    .map(e => e.canvas.getContext('2d').getImageData(0, 0, S, S).data);
+                let srcWrapH = 0, srcWrapV = 0;
+                for (const s of srcs) {
+                    srcWrapH = Math.max(srcWrapH, cmp(s, s, t => (t * S + (S - 1)) * 4, t => (t * S) * 4));
+                    srcWrapV = Math.max(srcWrapV, cmp(s, s, t => ((S - 1) * S + t) * 4, t => t * 4));
+                }
+                return { worst, worstAt, scored, srcWrapH, srcWrapV,
+                         srcWrap: Math.max(srcWrapH, srcWrapV), modes: L.cells };
+            },
             seamToggle(side, seg) { if (org.seam) org.seam[side][seg] = !org.seam[side][seg]; orgDrawSeamBox(); return org.seam ? org.seam[side][seg] : null; },
             modalRect(name) { const m = $(`at-modal-${name}`); const r = m.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height }; }
         };

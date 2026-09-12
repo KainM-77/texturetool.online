@@ -56,9 +56,11 @@
                 '<strong>Drag</strong> tiles to reorder, or <strong>Ctrl/Cmd+←/→</strong> to nudge; change <strong>Columns</strong> / <strong>Rows</strong> to reflow the whole atlas. Dragging a tile that is part of a selection moves the <em>whole</em> selection as one block, keeping its order.',
                 '<strong>Replace Image</strong> (right-click) swaps a tile’s texture; <strong>Reset to Original</strong> reverts it.',
                 'Remove a tile with right-click → <strong>Delete…</strong> (or press <strong>Delete</strong> on a focused tile); to clear several at once, select them (see below) and hit <strong>Delete</strong> on the bulk bar.',
+                'Tiles added by a set builder are outlined in orange: they form a <em>block</em> that only reads correctly at its own width. Change <strong>Columns</strong> and each block keeps its shape, its rows padded out with black spacer tiles. Delete a tile out of one and the block can no longer be whole rows, so it gives up the outline and reflows like any other tile.',
+                '<strong>👁️ Preview atlas</strong>, on the right of the Layout row, stitches everything into one image exactly as it exports — same order, same columns, same pixel size — with optional tile boundaries and numbers drawn over the top.',
                 '<strong>Undo</strong> / <strong>Redo</strong> sit in the grid header (<strong>Ctrl/Cmd+Z</strong>, <strong>Ctrl/Cmd+Shift+Z</strong>); the <strong>History</strong> panel on the right lists every step — click one to jump back.'
             ],
-            tip: 'Deleting a tile that other transitions are built on also removes those transitions (you’re warned first, and it’s fully undoable). Status messages appear in the log on the left, and transition tiles always stay after their source tiles automatically.'
+            tip: 'Deleting a tile that other transitions are built on also removes those transitions (you’re warned first, and it’s fully undoable). Spacer tiles are black and they <em>do</em> ship in the exported atlas — that is the point of them, they hold your page alignment. Status messages appear in the log on the left, and transition tiles always stay after their source tiles automatically.'
         },
         {
             id: 'batch-select', icon: '☑️', title: 'Select & batch-edit tiles',
@@ -97,11 +99,27 @@
             how: [
                 '<strong>Right-click</strong> tile A → <strong>Make Transition with Texture</strong>, click tile B, then switch to the <strong>🧩 Full Set</strong> tab.',
                 'Pick a <strong>Set layout</strong>: <strong>3×3 Island</strong> (a pocket of the overlay surrounded by the base), <strong>3×3 Hole</strong> (a window of the base inside the overlay), or <strong>5×3 Complete</strong> (island + hole + plain tiles together).',
-                'Choose a <strong>Corner style</strong> — <strong>Rounded</strong> (curved blend) or <strong>Sharp 45°</strong> (a clean slope cut) — then shape every edge with <strong>Pivot</strong>, <strong>Hardness</strong> and the <strong>Blend method</strong>. The preview updates as one connected patch.',
+                'Leave <strong>Corner style</strong> on <strong>Seamless</strong>. It puts the boundary state on the four tile corners, so a corner cell and the edge cell beside it agree exactly and the nine tiles read as one shape. <strong>Rounded</strong> and <strong>Sharp 45°</strong> are the older styles, kept so existing projects still open; their corner cells run the overlay along their whole inner edges, which shows as a step wherever a corner meets an edge.',
+                'Shape every edge with <strong>Pivot</strong>, <strong>Hardness</strong> and the <strong>Blend method</strong>. The preview updates as one connected patch.',
                 'Click <strong>Add … Tiles</strong>. If the atlas isn’t already the right width, it offers to <strong>resize the columns</strong> (padding the last row with blank spacers) so the block drops in keeping the exact preview shape.'
             ],
-            figure: 'transition-set', figureCaption: 'A 3×3 Island set: full overlay (sand) in the centre, the four edges blending outward, and the corners pulling the overlay toward the middle — so the nine tiles read as one sand pocket in a grass field, exactly as they’re laid into the atlas.',
-            tip: 'Plain cells (the base/overlay fills in the Complete layout) stay <em>linked</em> to their source tiles, so they still inherit materials and refresh when you edit the source — they’re not flat copies. For an overlay that must flow in every direction at once, use a <strong>Wang set</strong> instead.'
+            figure: 'transition-set', figureCaption: 'A 3×3 Island set on the Seamless corner style: full overlay (sand) in the centre, the four edges blending outward, the corners pulling the overlay toward the middle. The nine tiles are drawn here with no gaps between them, so any mismatch at a corner would be visible as a step.',
+            tip: 'Plain cells (the base/overlay fills in the Complete layout) stay <em>linked</em> to their source tiles, so they still inherit materials and refresh when you edit the source, not flat copies. The <strong>5×3 Complete</strong> layout packs two separate patches side by side (a 3×3 island in the first three columns, a 2×2 hole in the last two) plus two spare plain tiles, so cells that sit next to each other across that split are not meant to join up. For an overlay that must flow in every direction at once, use a <strong>Wang set</strong> instead.'
+        },
+        {
+            id: 'organic-edge', icon: '🌿', title: 'Organic edges (blobby set boundaries)',
+            what: 'The boundary a transition set draws is a clean curve, which reads as generated. The <strong>🌿 Organic edge</strong> panel in the <strong>Full Set</strong> tab breaks it up into a ragged, flecked, hand-painted one. It is a different thing from <strong>Make Organic Transition</strong> below: that scatters the overlay into loose patches across a single tile, this reshapes the boundary of a whole set while keeping every tile joined to its neighbours.',
+            how: [
+                'Build a set as usual with <strong>Corner style</strong> on <strong>Seamless</strong>, then open <strong>🌿 Organic edge</strong>. Every slider starts at 0 and the set is unchanged until you move one.',
+                '<strong>Wobble</strong> pushes the boundary around. <strong>Drift</strong> stops it crossing each tile edge at dead centre, which is the main tell that a set was generated. <strong>Scatter</strong> throws flecks of the overlay out past the edge.',
+                '<strong>Blob feather</strong> softens the parts the noise moved, and only those. <strong>Hardness</strong> above widens the blend across the whole tile instead, which flattens the shape you just made.',
+                '<strong>Contact shadow</strong> darkens the base just outside the boundary so the overlay sits <em>on</em> it rather than inlaid into it.',
+                '<strong>Feature size</strong> sets how many blobs fit across a tile; <strong>🎲 Reroll</strong> draws a new pattern.',
+                '<strong>Alternates</strong> adds the whole set more than once, each copy drawn with different noise. Cycle them along a boundary instead of repeating one tile. They are still seamless with each other, and with the originals.'
+            ],
+            before: 'organic-edge',
+            figureCaption: 'The same 3×3 island with the organic sliders off and on. Both are exactly seamless: the noise is faded out at each tile border, which is the one place a neighbouring tile’s pixels would be needed.',
+            tip: 'An organic edge makes <em>repetition</em> more obvious, not less. A straight boundary tiles invisibly; a distinctive blob does not, so a long run of one organic tile reads as a repeating motif. That is what <strong>Alternates</strong> is for. Keep the sliders modest for edges you will lay in long runs, and save the strong settings for a boundary that appears once or twice.'
         },
         {
             id: 'wang', icon: '🧩', title: 'Wang sets',
