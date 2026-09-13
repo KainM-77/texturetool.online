@@ -538,10 +538,23 @@
         </div>
         <details data-tr-panel="set" id="at-tr-org-acc" style="display:none;margin-top:6px;">
             <summary style="cursor:pointer;">🌿 Organic edge <span style="color:var(--text-secondary);font-size:0.72rem;">(blobby, hand-painted boundary)</span></summary>
-            <div class="sm-hint" id="at-tr-org-hint" style="margin-top:6px;">Off by default — every slider at 0 gives the clean geometric boundary. Raising them keeps the set exactly seamless; the wobble is faded out at each tile border, which is the only place a neighbour's pixels would be needed.</div>
+            <div class="sm-hint" id="at-tr-org-hint" style="margin-top:6px;">Off by default — <strong>Amount</strong> at 0 gives the clean geometric boundary. Raising it keeps the set exactly seamless; the detail is faded out at each tile border, which is the only place a neighbouring tile's pixels would be needed.</div>
             <div class="form-row" style="gap:10px;flex-wrap:wrap;margin-top:6px;">
+                <div class="form-group" style="flex:1;min-width:200px;">
+                    <label>Edge style</label>
+                    <select id="at-tr-org-style">
+                        <option value="blobs" selected>Blobs — soft rounded lobes</option>
+                        <option value="spikes">Spikes — narrow tapered teeth</option>
+                        <option value="drips">Drips — long reaching fingers</option>
+                        <option value="clumps">Clumps — chunky lobes with gaps</option>
+                        <option value="fray">Fray — fine ragged fringe</option>
+                    </select>
+                    <div class="sm-hint" id="at-tr-org-style-hint" style="margin-top:4px;"></div>
+                </div>
+            </div>
+            <div class="form-row" style="gap:10px;flex-wrap:wrap;">
                 <div class="form-group" style="flex:1;min-width:150px;">
-                    <label>Wobble — <span id="at-tr-org-wobble-val">0</span>%</label>
+                    <label>Amount — <span id="at-tr-org-wobble-val">0</span>%</label>
                     <input type="range" id="at-tr-org-wobble" min="0" max="100" value="0" style="width:100%;">
                 </div>
                 <div class="form-group" style="flex:1;min-width:150px;">
@@ -559,11 +572,38 @@
                     <input type="range" id="at-tr-org-shadow" min="0" max="100" value="0" style="width:100%;">
                 </div>
             </div>
+            <div class="form-row" id="at-tr-shadow-opts" style="gap:10px;flex-wrap:wrap;display:none;">
+                <div class="form-group" style="flex:0 0 auto;">
+                    <label>Colour</label>
+                    <input type="color" id="at-tr-org-shcolor" value="#000000" style="width:56px;height:30px;padding:2px;">
+                </div>
+                <div class="form-group" style="flex:1;min-width:150px;">
+                    <label>Blend</label>
+                    <select id="at-tr-org-shmode">
+                        <option value="multiply" selected>Multiply — darkens, keeps texture</option>
+                        <option value="tint">Tint — paints over, can lighten</option>
+                    </select>
+                </div>
+                <div class="form-group" style="flex:1;min-width:150px;">
+                    <label>Sits on — <span id="at-tr-org-shpos-val">16</span>%</label>
+                    <input type="range" id="at-tr-org-shpos" min="0" max="100" value="16" style="width:100%;">
+                    <div class="sm-hint" style="margin-top:3px;">0 = on the base, 100 = on the overlay. A pale colour on <strong>Tint</strong> near 100 gives a lit rim instead of a shadow.</div>
+                </div>
+                <div class="form-group" style="flex:1;min-width:190px;">
+                    <label>Apply to</label>
+                    <select id="at-tr-org-shtarget">
+                        <option value="diffuse" selected>Diffuse — painted into the texture</option>
+                        <option value="ao">AO map — engine applies it</option>
+                        <option value="both">Both</option>
+                    </select>
+                    <div class="sm-hint" id="at-tr-org-shtarget-hint" style="margin-top:3px;"></div>
+                </div>
+            </div>
             <div class="form-row" style="gap:10px;flex-wrap:wrap;">
                 <div class="form-group" style="flex:1;min-width:150px;">
-                    <label>Blob feather — <span id="at-tr-org-feather-val">0</span>%</label>
+                    <label>Detail softness — <span id="at-tr-org-feather-val">0</span>%</label>
                     <input type="range" id="at-tr-org-feather" min="0" max="100" value="0" style="width:100%;">
-                    <div class="sm-hint" style="margin-top:3px;">Softens only where the noise moved the boundary — the flecks and the deepest wobble. <strong>Hardness</strong> above widens the blend across the whole tile instead.</div>
+                    <div class="sm-hint" style="margin-top:3px;">Softens only where the style moved the boundary — the teeth, the flecks, the deepest lobes. <strong>Hardness</strong> above widens the blend across the whole tile instead, which flattens the shape.</div>
                 </div>
             </div>
             <div class="form-row" style="gap:10px;flex-wrap:wrap;align-items:flex-end;">
@@ -1680,6 +1720,71 @@
                 <input type="range" id="at-wang-hardness" min="0" max="100" value="0" style="width:100%;">
             </div>
         </div>
+        <details id="at-wang-org-acc" style="margin-top:6px;">
+            <summary style="cursor:pointer;">🌿 Organic edge <span style="color:var(--text-secondary);font-size:0.72rem;">(blobs, spikes, drips…)</span></summary>
+            <div class="sm-hint" style="margin-top:6px;">Off at <strong>Amount</strong> 0. The detail is faded out at each tile border, so the set joins up exactly as well as it did without it.</div>
+            <div class="form-row" style="gap:10px;flex-wrap:wrap;margin-top:6px;">
+                <div class="form-group" style="flex:1;min-width:200px;">
+                    <label>Edge style</label>
+                    <select id="at-wang-org-style">
+                        <option value="blobs" selected>Blobs — soft rounded lobes</option>
+                        <option value="spikes">Spikes — narrow tapered teeth</option>
+                        <option value="drips">Drips — long reaching fingers</option>
+                        <option value="clumps">Clumps — chunky lobes with gaps</option>
+                        <option value="fray">Fray — fine ragged fringe</option>
+                    </select>
+                    <div class="sm-hint" id="at-wang-org-style-hint" style="margin-top:4px;"></div>
+                </div>
+            </div>
+            <div class="form-row" style="gap:10px;flex-wrap:wrap;">
+                <div class="form-group" style="flex:1;min-width:140px;">
+                    <label>Amount — <span id="at-wang-org-wobble-val">0</span>%</label>
+                    <input type="range" id="at-wang-org-wobble" min="0" max="100" value="0" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:1;min-width:140px;">
+                    <label>Scatter — <span id="at-wang-org-scatter-val">0</span>%</label>
+                    <input type="range" id="at-wang-org-scatter" min="0" max="100" value="0" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:1;min-width:140px;">
+                    <label>Detail softness — <span id="at-wang-org-feather-val">0</span>%</label>
+                    <input type="range" id="at-wang-org-feather" min="0" max="100" value="0" style="width:100%;">
+                </div>
+            </div>
+            <div class="form-row" style="gap:10px;flex-wrap:wrap;align-items:flex-end;">
+                <div class="form-group" style="flex:1;min-width:140px;">
+                    <label>Contact shadow — <span id="at-wang-org-shadow-val">0</span>%</label>
+                    <input type="range" id="at-wang-org-shadow" min="0" max="100" value="0" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:0 0 auto;" id="at-wang-shadow-opts-c">
+                    <label>Colour</label>
+                    <input type="color" id="at-wang-org-shcolor" value="#000000" style="width:56px;height:30px;padding:2px;">
+                </div>
+                <div class="form-group" style="flex:1;min-width:150px;" id="at-wang-shadow-opts-m">
+                    <label>Blend</label>
+                    <select id="at-wang-org-shmode">
+                        <option value="multiply" selected>Multiply</option>
+                        <option value="tint">Tint (can lighten)</option>
+                    </select>
+                </div>
+                <div class="form-group" style="flex:1;min-width:170px;">
+                    <label>Apply to</label>
+                    <select id="at-wang-org-shtarget">
+                        <option value="diffuse" selected>Diffuse</option>
+                        <option value="ao">AO map</option>
+                        <option value="both">Both</option>
+                    </select>
+                    <div class="sm-hint" id="at-wang-org-shtarget-hint" style="margin-top:3px;"></div>
+                </div>
+                <div class="form-group" style="flex:1;min-width:140px;">
+                    <label>Feature size — <span id="at-wang-org-scale-val">3</span></label>
+                    <input type="range" id="at-wang-org-scale" min="1" max="8" value="3" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:0 0 auto;">
+                    <button class="btn btn-secondary btn-sm" id="at-wang-org-seed" title="Reroll the organic pattern">🎲 Reroll</button>
+                </div>
+            </div>
+            <div class="sm-hint" style="margin-top:4px;">A Wang set is reused far more heavily across a level than a single island, so a strong organic edge here shows its repeat sooner. Keep <strong>Amount</strong> modest, or use it where the boundary is only laid a few times.</div>
+        </details>
         <div class="form-group">
             <label>Preview (<span id="at-wang-count">16</span> tiles)</label>
             <div id="at-wang-previews" style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;"></div>

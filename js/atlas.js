@@ -192,9 +192,71 @@ window.TRLE = window.TRLE || {};
        where the crossing happens. NOISE_ORG_PERIOD is the lattice period; it
        divides nothing in particular because the window, not periodicity, is what
        guarantees the seam. */
-    const ORG_OFF = { wobble: 0, drift: 0, scatter: 0, feather: 0, shadow: 0, seed: 1, driftSeed: 1, scale: 3 };
+    const ORG_OFF = { style: 'blobs', wobble: 0, drift: 0, scatter: 0, feather: 0,
+                      shadow: 0, seed: 1, driftSeed: 1, scale: 3 };
     const ORG_PERIOD = 16;
     const orgIsOff = o => !o || (!o.wobble && !o.drift && !o.scatter);
+
+    /* ============ EDGE STYLES ============
+       Adding a scalar field to g displaces the CONTOUR along its own normal, by
+       roughly delta/|grad g|. So the character of an edge is nothing more than
+       the choice of which field gets added — no per-style geometry, works on any
+       mask built as ramp(g), and inherits the seam guarantee for free as long as
+       the addition is windowed to zero at the border like everything else here.
+
+       `blobs` is the odd one out and warps the COORDINATES instead (that is what
+       shipped first, and it stays byte-identical for projects saved before
+       styles existed — an el.organic with no `style` is a blobs edge).
+
+       The rest add a field sampled in the LOCAL BOUNDARY FRAME. grad g is
+       analytic for a bilinear field, so tangent and normal come free; sampling
+       high-frequency ALONG the boundary and low across it gives narrow teeth
+       that stay perpendicular to the boundary wherever it happens to point. That
+       matters because a TRLE texture can be rotated freely — a world-aligned
+       "down" would be wrong the moment the tile is turned. Fingers point AWAY
+       from the overlay, so a transition running bottom-to-top spikes upward.
+
+       `add` fields are positive-only on purpose: the overlay grows fingers into
+       the base rather than wobbling symmetrically, which is what reads as snow
+       or drips rather than a fuzzy edge.
+
+       `crisp` narrows the blend band where the style's detail lives (negative
+       feather, in effect). A finger thinner than the blend width reads as a pale
+       rim instead of a spike, and coupling this to the global Hardness slider
+       would mean changing a control outside the panel behind the user's back. */
+    const ORG_STYLES = {
+        blobs: {
+            label: 'Blobs', hint: 'Soft rounded lobes. The general-purpose one — sand, moss, worn paint.',
+            defaults: { wobble: 55, scale: 3, feather: 0 }, crisp: 0, warp: 0.20, add: null
+        },
+        spikes: {
+            label: 'Spikes', hint: 'Short tapered teeth pointing away from the overlay. Frost, snow crusting over rock, crystal growth.',
+            defaults: { wobble: 80, scale: 5, feather: 0 }, crisp: 0.55, warp: 0.02,
+            add: (n, t, c, f, teeth) => teeth(n, t * f * 7.0, c * f * 0.8, 0.58, 0.6) * 1.10
+        },
+        drips: {
+            label: 'Drips', hint: 'Long tapered fingers reaching away from the overlay. Melting snow, slime, sand spilling down a wall.',
+            defaults: { wobble: 85, scale: 3, feather: 15 }, crisp: 0.4, warp: 0.03,
+            add: (n, t, c, f, teeth) => teeth(n, t * f * 3.4, c * f * 0.30, 0.52, 1.4) * 1.40
+        },
+        clumps: {
+            label: 'Clumps', hint: 'Chunky lobes pushing out with notches bitten back in. Moss, lichen, rubble, gravel creeping over stone.',
+            defaults: { wobble: 90, scale: 3, feather: 10 }, crisp: 0.35, warp: 0.13,
+            /* The only SIGNED field here. A positive-only one just bulges the
+               boundary and is then hard to tell from Blobs — the gaps are what
+               makes a clump read as a clump, so this is one tooth field pushing
+               out minus a second, offset one biting back in. */
+            add: (n, t, c, f, teeth) =>
+                (teeth(n, t * f * 1.8, c * f * 1.8, 0.38, 1.8)
+               - teeth(n, t * f * 1.8 + 11.3, c * f * 1.8 + 7.1, 0.42, 1.8)) * 1.2
+        },
+        fray: {
+            label: 'Fray', hint: 'A fine ragged fringe rather than a change of shape. Cloth, rust creep, grass meeting a path.',
+            defaults: { wobble: 45, scale: 4, feather: 0 }, crisp: 0.45, warp: 0.02,
+            add: (n, t, c, f, teeth) => teeth(n, t * f * 13, c * f * 3.0, 0.48, 0.9) * 0.42
+        }
+    };
+    const orgStyle = o => ORG_STYLES[(o && o.style) || 'blobs'] || ORG_STYLES.blobs;
     /* One shared monotone reparametrisation, u(0)=0 and u(1)=1 so the corners
        stay put. Sampled from a 1-D slice of the periodic lattice and windowed by
        sin(pi*t), which is what keeps the endpoints exact. */
@@ -203,6 +265,128 @@ window.TRLE = window.TRLE || {};
         return t => {
             const d = (noise(t * 2.7, 0.5) - 0.5) * 2 * amt * Math.sin(Math.PI * t);
             return t + d < 0 ? 0 : t + d > 1 ? 1 : t + d;
+        };
+    }
+
+    /* Shared organic sampler. Extracted from buildCornerMask so buildWangMask can
+       use the identical machinery — both masks are ramp(g) over a scalar field,
+       which is the only thing any of this needs. The caller supplies the field
+       and its gradient; everything seam-critical (the sin*sin border window, the
+       shared drift reparametrisation, the feather band) lives here so there is
+       one place to get it right rather than two to keep in step. */
+    function makeOrganic(org, S) {
+        if (orgIsOff(org)) return null;
+        const o = Object.assign({}, ORG_OFF, org);
+        const ST = orgStyle(org);
+        const sd = (o.seed >>> 0) || 1;
+        const n1 = makePeriodicNoise(sd, ORG_PERIOD);
+        const n2 = makePeriodicNoise((sd ^ 0x9e3779b9) >>> 0, ORG_PERIOD);
+        const n3 = makePeriodicNoise((sd ^ 0x85ebca6b) >>> 0, ORG_PERIOD * 2);
+        const n4 = makePeriodicNoise((sd ^ 0x27d4eb2f) >>> 0, ORG_PERIOD * 2);
+        /* Drift is seeded SEPARATELY and deliberately not from `seed`. It is the
+           one organic control that reaches the tile border — it warps the edge
+           profile itself rather than being windowed away — so every tile that
+           might sit next to another has to share it. Re-rolling `seed` to make a
+           second alternate must not move it, or the alternates stop being
+           seamless with each other. */
+        const uu = orgReparam(makePeriodicNoise(((o.driftSeed >>> 0) || 1) ^ 0xc2b2ae35, ORG_PERIOD),
+                              o.drift * 0.28);
+        const freq = Math.max(1, o.scale || 3);
+        const fbm = (f, x, y, oct) => {
+            let a = 1, fr = 1, s = 0, nn = 0;
+            for (let i = 0; i < (oct || 3); i++) { s += a * f(x * fr, y * fr); nn += a; a *= 0.5; fr *= 2; }
+            return s / nn;
+        };
+        /* Isolated tapered teeth: threshold smooth noise high, rescale what is
+           left, taper it. Mostly ZERO with narrow peaks, so adding it grows a few
+           narrow fingers of overlay into the base.
+
+           Ridged noise (1 - |2n-1|) is the obvious choice here and is the wrong
+           one: it is mostly HIGH with narrow creases, so adding it shifts the
+           whole boundary over and leaves narrow BASE-coloured fingers behind
+           instead — the inverse of what was asked for, and it reads as the base
+           dripping into the overlay. */
+        const teeth = (f, x, y, thr, pow) => {
+            const v = fbm(f, x, y, 2);
+            return v <= thr ? 0 : Math.pow((v - thr) / (1 - thr), pow);
+        };
+        /* Normalise each noise field to zero mean / unit spread over the region
+           this tile actually samples. Raw fbm over a small lattice window is
+           measurably off-centre (mean 0.52-0.58 depending on seed and feature
+           size), and an uncentred warp doesn't roughen the boundary, it shifts
+           it — the island quietly grows or shrinks as you raise the slider. The
+           estimate is a 12x12 probe, negligible against the S^2 main loop. */
+        const calibrate = (f, fx, fy) => {
+            let sum = 0, sq = 0;
+            for (let j = 0; j < 12; j++) for (let i = 0; i < 12; i++) {
+                const v = fbm(f, (i / 11) * freq + fx, (j / 11) * freq + fy);
+                sum += v; sq += v * v;
+            }
+            const mean = sum / 144;
+            return { mean, inv: 1 / Math.max(1e-4, Math.sqrt(Math.max(0, sq / 144 - mean * mean))) };
+        };
+        const k1 = calibrate(n1, 0, 0), k2 = calibrate(n2, 3.1, 7.7), k3 = calibrate(n3, 0, 0);
+
+        return {
+            style: ST,
+            /* Drift + the blobs coordinate warp. `win` is sin(pi*nx)*sin(pi*ny),
+               zero on every border — the single reason any of this stays
+               seamless. uxP/uyP are the drift-only coordinates, kept as the
+               feather's reference field. */
+            coords(nx, ny) {
+                const win = Math.sin(Math.PI * nx) * Math.sin(Math.PI * ny);
+                let ux = uu(nx), uy = uu(ny);
+                const uxP = ux, uyP = uy;
+                if (o.wobble && ST.warp) {
+                    // blobs: 0.20 => roughly +/-20% of a tile at full slider,
+                    // where the boundary stops reading as a curve and starts
+                    // reading as a coastline. The add-field styles keep only a
+                    // trace of this so their teeth sit on a slightly uneven base.
+                    const a = o.wobble * ST.warp * win;
+                    ux += (fbm(n1, nx * freq, ny * freq) - k1.mean) * k1.inv * a;
+                    uy += (fbm(n2, nx * freq + 3.1, ny * freq + 7.7) - k2.mean) * k2.inv * a;
+                    ux = ux < 0 ? 0 : ux > 1 ? 1 : ux;
+                    uy = uy < 0 ? 0 : uy > 1 ? 1 : uy;
+                }
+                return { ux, uy, uxP, uyP, win };
+            },
+            /* The style's field, sampled in the LOCAL BOUNDARY FRAME built from
+               the caller's gradient: tangent along the boundary, normal across
+               it. Sampling fast along and slow across is what turns noise into
+               teeth rather than mush, and doing it in the gradient frame is why
+               the teeth stay perpendicular to the boundary wherever it points —
+               a TRLE texture can be rotated freely, so a world-aligned "down"
+               would be wrong the moment the tile is turned. */
+            shape(g, gx, gy, nx, ny, win) {
+                if (ST.add && o.wobble) {
+                    const len = Math.hypot(gx, gy) || 1e-6;
+                    const tc = nx * (-gy / len) + ny * (gx / len);
+                    const cc = nx * (gx / len) + ny * (gy / len);
+                    g += ST.add(n4, tc, cc, freq, teeth) * o.wobble * (4 * g * (1 - g)) * win;
+                }
+                if (o.scatter) {
+                    g += (fbm(n3, nx * freq * 4.3, ny * freq * 4.3) - k3.mean) * k3.inv
+                       * o.scatter * 0.30 * (4 * g * (1 - g)) * win;
+                }
+                return g;
+            },
+            /* Feather widens the blend band, the style's own crispness narrows
+               it, both only in proportion to how far the organic terms moved the
+               contour here (`act`). Global Hardness widens it everywhere, which
+               flattens the shape you just made; this leaves untouched stretches
+               alone. Symmetric about the midpoint so the 50% contour does not
+               move, and floored at the antialias width so narrowing can never
+               reintroduce a hard stair. Safe at the seam because the organic
+               terms are windowed to zero there, so act is 0 and the band reverts
+               to exactly the global one, which both neighbours compute alike. */
+            band(lower, upper, g, gPlain, aa) {
+                if (!o.feather && !ST.crisp) return { lo: lower, hi: upper };
+                const act = Math.abs(g - gPlain);
+                const extra = (o.feather - ST.crisp) * 2.0 * act;
+                const mid = (lower + upper) * 0.5;
+                const half = Math.max(aa * 0.5, (upper - lower) * 0.5 + extra * 0.5);
+                return { lo: mid - half, hi: mid + half };
+            }
         };
     }
 
@@ -215,46 +399,7 @@ window.TRLE = window.TRLE || {};
         if (upper - lower < aa) { lower = pivot - aa * 0.5; upper = pivot + aa * 0.5; }
         const c00 = bits & CORNER_NW ? 1 : 0, c10 = bits & CORNER_NE ? 1 : 0,
               c11 = bits & CORNER_SE ? 1 : 0, c01 = bits & CORNER_SW ? 1 : 0;
-
-        const o = orgIsOff(org) ? null : Object.assign({}, ORG_OFF, org);
-        let n1, n2, n3, uu, freq;
-        if (o) {
-            const sd = (o.seed >>> 0) || 1;
-            n1 = makePeriodicNoise(sd, ORG_PERIOD);
-            n2 = makePeriodicNoise((sd ^ 0x9e3779b9) >>> 0, ORG_PERIOD);
-            n3 = makePeriodicNoise((sd ^ 0x85ebca6b) >>> 0, ORG_PERIOD * 2);
-            /* Drift is seeded SEPARATELY and deliberately not from `seed`. It is
-               the one organic control that reaches the tile border — it warps the
-               edge profile itself rather than being windowed away — so every tile
-               that might sit next to another has to share it. Re-rolling `seed`
-               to make a second variant of a tile therefore must not move it, or
-               the two variants stop being seamless with each other. */
-            uu = orgReparam(makePeriodicNoise(((o.driftSeed >>> 0) || 1) ^ 0xc2b2ae35, ORG_PERIOD),
-                            o.drift * 0.28);
-            freq = Math.max(1, o.scale || 3);
-        }
-        const fbm = (f, x, y) => {
-            let a = 1, fr = 1, s = 0, nn = 0;
-            for (let i = 0; i < 3; i++) { s += a * f(x * fr, y * fr); nn += a; a *= 0.5; fr *= 2; }
-            return s / nn;
-        };
-        /* Normalise each noise field to zero mean / unit spread over the region
-           this tile actually samples. Raw fbm over a small lattice window is
-           measurably off-centre (mean 0.52–0.58 depending on seed and feature
-           size), and an uncentred warp doesn't roughen the boundary, it shifts
-           it — the island quietly grows or shrinks as you raise the slider. The
-           estimate is a 12×12 probe, negligible against the S² main loop. */
-        const calibrate = (f, fx, fy) => {
-            let sum = 0, sq = 0;
-            for (let j = 0; j < 12; j++) for (let i = 0; i < 12; i++) {
-                const v = fbm(f, (i / 11) * freq + fx, (j / 11) * freq + fy);
-                sum += v; sq += v * v;
-            }
-            const mean = sum / 144;
-            return { mean, inv: 1 / Math.max(1e-4, Math.sqrt(Math.max(0, sq / 144 - mean * mean))) };
-        };
-        let k1, k2, k3;
-        if (o) { k1 = calibrate(n1, 0, 0); k2 = calibrate(n2, 3.1, 7.7); k3 = calibrate(n3, 0, 0); }
+        const O = makeOrganic(org, S);
 
         const canvas = document.createElement('canvas');
         canvas.width = S; canvas.height = S;
@@ -266,52 +411,19 @@ window.TRLE = window.TRLE || {};
             for (let x = 0; x < S; x++) {
                 const nx = S > 1 ? x / (S - 1) : 0.5;
                 const ny = S > 1 ? y / (S - 1) : 0.5;
-                let ux = nx, uy = ny, uxP = nx, uyP = ny;
-                let win = 0;
-                if (o) {
-                    win = Math.sin(Math.PI * nx) * Math.sin(Math.PI * ny);   // 0 on every border
-                    ux = uu(nx); uy = uu(ny);
-                    uxP = ux; uyP = uy;              // drift-only, for the feather's reference field
-                    if (o.wobble) {
-                        // 0.20 => roughly +/-20% of a tile at full slider, which is
-                        // where the boundary stops reading as a curve and starts
-                        // reading as a coastline.
-                        const a = o.wobble * 0.20 * win;
-                        ux += (fbm(n1, nx * freq, ny * freq) - k1.mean) * k1.inv * a;
-                        uy += (fbm(n2, nx * freq + 3.1, ny * freq + 7.7) - k2.mean) * k2.inv * a;
-                        ux = ux < 0 ? 0 : ux > 1 ? 1 : ux;
-                        uy = uy < 0 ? 0 : uy > 1 ? 1 : uy;
-                    }
-                }
+                let ux = nx, uy = ny, uxP = nx, uyP = ny, win = 0;
+                if (O) ({ ux, uy, uxP, uyP, win } = O.coords(nx, ny));
                 let g = c00 * (1 - ux) * (1 - uy) + c10 * ux * (1 - uy)
                       + c01 * (1 - ux) * uy       + c11 * ux * uy;
-                if (o && o.scatter) {
-                    const band = 4 * g * (1 - g);          // strongest at the contour
-                    g += (fbm(n3, nx * freq * 4.3, ny * freq * 4.3) - k3.mean) * k3.inv
-                       * o.scatter * 0.30 * band * win;
-                }
                 let lo = lower, hi = upper;
-                if (o && o.feather) {
-                    /* Feather the blobbiness WITHOUT feathering the tile.
-                       Hardness widens the blend band everywhere, which turns the
-                       whole transition into one broad ramp. This widens it only
-                       in proportion to how far the organic terms actually moved
-                       the contour here: `act` is the deviation from the plain
-                       (drift-only) field, so it is 0 along a stretch the noise
-                       left alone and largest through the flecks and the deepest
-                       wobble. Widened symmetrically about the midpoint, so the
-                       50% contour does not move — it only softens.
-
-                       Safe at the seam for the same reason everything else here
-                       is: wobble and scatter are windowed to zero at the border,
-                       so `act` is 0 there and the band reverts to exactly the
-                       global one, which both neighbours compute identically. */
+                if (O) {
+                    // Analytic gradient of the bilinear field.
+                    const gx = -c00 * (1 - uy) + c10 * (1 - uy) - c01 * uy + c11 * uy;
+                    const gy = -c00 * (1 - ux) - c10 * ux + c01 * (1 - ux) + c11 * ux;
+                    g = O.shape(g, gx, gy, nx, ny, win);
                     const gPlain = c00 * (1 - uxP) * (1 - uyP) + c10 * uxP * (1 - uyP)
                                  + c01 * (1 - uxP) * uyP       + c11 * uxP * uyP;
-                    const act = Math.abs(g - gPlain);
-                    const extra = o.feather * 2.0 * act;
-                    const mid = (lower + upper) * 0.5, half = (upper - lower) * 0.5 + extra * 0.5;
-                    lo = mid - half; hi = mid + half;
+                    ({ lo, hi } = O.band(lower, upper, g, gPlain, aa));
                 }
                 const w = Math.max(0.0, Math.min(1.0, (g - lo) / Math.max(1e-6, hi - lo)));
                 const byte = Math.round(w * 255);
@@ -335,10 +447,16 @@ window.TRLE = window.TRLE || {};
        a LUT over w inherits the mask's exactness for free (and works on the
        legacy masks too). Peaks a little way onto the base side and dies at both
        ends, so full-base and full-overlay areas are untouched. */
-    function contactShadowField(maskCanvas, S) {
+    /* Band along the contour, as a pointwise function of the finished mask.
+       `pos` says where it sits: 0 = fully on the base side (a shadow cast onto
+       the base), 1 = fully on the overlay side (a rim catching light on the
+       overlay), 0.5 = straddling the boundary. */
+    const SHADOW_DEFAULTS = { color: '#000000', mode: 'multiply', pos: 0.16, target: 'diffuse' };
+    function contactShadowField(maskCanvas, S, pos) {
         const m = maskCanvas.getContext('2d').getImageData(0, 0, S, S).data;
         const f = new Float32Array(S * S);
-        const PEAK = 0.16, HALF = 0.17;
+        const PEAK = pos == null ? SHADOW_DEFAULTS.pos : Math.max(0, Math.min(1, pos));
+        const HALF = 0.17;
         for (let i = 0, p = 0; i < m.length; i += 4, p++) {
             const w = m[i] / 255;
             const t = 1 - Math.abs(w - PEAK) / HALF;
@@ -346,26 +464,100 @@ window.TRLE = window.TRLE || {};
         }
         return f;
     }
-    /* Multiply a composited diffuse down by the contact shadow. Returns src
-       untouched at amount 0 so a shadow-less tile is byte-identical. */
-    function applyContactShadow(src, maskCanvas, S, amount) {
+    /* Lay the contact band over a composited diffuse.
+
+       `multiply` scales toward the colour (rgb *= lerp(white, c, a)). It can
+       never lighten and it scales rather than replaces, so the texture under it
+       survives at any strength — the right default, and with a black colour it
+       is exactly what shipped first.
+
+       `tint` lerps toward the colour instead (rgb = lerp(rgb, c, a)). It CAN
+       lighten, which is the only way to get a pale rim out of this, but it
+       flattens the texture as the strength rises because it replaces rather than
+       scales. Two modes rather than one because a black shadow wants the first
+       and a snow rim wants the second, and neither can fake the other.
+
+       Returns src untouched at amount 0, and is byte-identical to the original
+       black multiply when the options are absent. */
+    function applyContactShadow(src, maskCanvas, S, amount, opts) {
         if (!amount || amount <= 0) return src;
-        const f = contactShadowField(maskCanvas, S);
+        const o = Object.assign({}, SHADOW_DEFAULTS, opts || {});
+        const f = contactShadowField(maskCanvas, S, o.pos);
         const out = document.createElement('canvas');
         out.width = S; out.height = S;
         const ctx = out.getContext('2d');
         const img = src.getContext('2d').getImageData(0, 0, S, S);
         const d = img.data;
-        // 0.30 at full slider. Higher reads as a drawn black outline rather than
-        // a shadow, and with Scatter on, every fleck gets its own contact band —
-        // the amplitude has to suit the busiest case, not the cleanest.
+        // 0.30 at full slider. Higher reads as a drawn outline rather than a
+        // shadow, and with Scatter on every fleck gets its own band — the
+        // amplitude has to suit the busiest case, not the cleanest.
         const k = amount * 0.30;
+        const c = hexToRgb(o.color) || [0, 0, 0];
+        const tint = o.mode === 'tint';
         for (let i = 0, p = 0; i < d.length; i += 4, p++) {
-            const s = 1 - k * f[p];
-            d[i] = d[i] * s; d[i + 1] = d[i + 1] * s; d[i + 2] = d[i + 2] * s;
+            const a = k * f[p];
+            if (a <= 0) continue;
+            for (let ch = 0; ch < 3; ch++) {
+                d[i + ch] = tint
+                    ? d[i + ch] + (c[ch] - d[i + ch]) * a          // lerp toward the colour
+                    : d[i + ch] * (1 + (c[ch] / 255 - 1) * a);     // scale toward it
+            }
         }
         ctx.putImageData(img, 0, 0);
         return out;
+    }
+    /* The shadow options carried on an el.organic, defaults filled in. */
+    const shadowOpts = o => ({
+        color:  (o && o.shadowColor) || SHADOW_DEFAULTS.color,
+        mode:   (o && o.shadowMode)  || SHADOW_DEFAULTS.mode,
+        pos:    (o && o.shadowPos  != null) ? o.shadowPos : SHADOW_DEFAULTS.pos,
+        target: (o && o.shadowTarget) || SHADOW_DEFAULTS.target
+    });
+    const shadowHitsDiffuse = o => shadowOpts(o).target !== 'ao';
+    const shadowHitsAO      = o => shadowOpts(o).target !== 'diffuse';
+
+    /* Darken an AO map by the same contact band. AO is monochrome occlusion, so
+       the colour and blend controls are meaningless here — only the amount and
+       which side of the contour it sits on carry over. Always multiplicative:
+       "less light reaches here" is what an AO map means. */
+    function applyContactShadowAO(aoCanvas, maskCanvas, S, amount, opts) {
+        if (!amount || amount <= 0) return aoCanvas;
+        const o = Object.assign({}, SHADOW_DEFAULTS, opts || {});
+        const f = contactShadowField(maskCanvas, S, o.pos);
+        const ctx = aoCanvas.getContext('2d');
+        const img = ctx.getImageData(0, 0, S, S);
+        const d = img.data;
+        const k = amount * 0.30;
+        for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+            const sc = 1 - k * f[p];
+            d[i] *= sc; d[i + 1] *= sc; d[i + 2] *= sc;
+        }
+        ctx.putImageData(img, 0, 0);
+        return aoCanvas;
+    }
+
+    /* One-line, state-aware guidance under the Apply to picker — the same idea
+       as the surface-noise advice, and for the same reason. A contact band in the
+       diffuse is just painted pixels; the moment relief maps are exported, the
+       map generator reads that darkening back out of the diffuse luminance and
+       turns it into geometry, so a shadow that looked right flat comes out as a
+       trench. Put it in AO and the engine applies it as occlusion instead, which
+       is what it actually is. */
+    function shadowAdvice(target) {
+        const relief = noiseExportsRelief();
+        if (target === 'ao') {
+            return relief
+                ? 'AO only — the engine applies this as occlusion and the diffuse stays clean. The right choice for a PBR/TEN export.'
+                : '<strong>AO only, but no relief maps are ticked for export.</strong> Nothing will carry this shadow — tick AO in Export, or switch to Diffuse.';
+        }
+        if (target === 'both') {
+            return relief
+                ? '<strong>Both — this lands twice.</strong> The map generator reads the darkening back out of the diffuse and turns it into relief, on top of the AO you just baked. Keep the amount low, or pick one.'
+                : 'Both, but no relief maps are ticked, so only the diffuse copy will ship.';
+        }
+        return relief
+            ? '<strong>Relief maps are on.</strong> They read this darkening back out of the diffuse and turn it into geometry, so a strong band becomes a trench in the normals. Go easy, or move it to AO.'
+            : 'Diffuse-only, which is what classic TRLE wants — the shadow is painted into the texture and nothing downstream amplifies it.';
     }
 
     function buildTopologyMask(S, mode, pivot, hardness, org) {
@@ -419,12 +611,21 @@ window.TRLE = window.TRLE || {};
        Hardness then sets the width of a smoothstep seam centred on the pivot
        contour: 0 = wide soft blend, 1 = crisp cut. Same white=overlay convention,
        so it drops straight into the existing compositing + material paths. */
-    function buildWangMask(S, bits, pivot, hardness) {
+    function buildWangMask(S, bits, pivot, hardness, org) {
         pivot    = Math.max(0, Math.min(1, pivot));
         hardness = Math.max(0, Math.min(1, hardness));
         const hw = (1 - hardness) * 0.5;          // smoothstep half-band in g-space
         const isHardCut = hw < 1e-4;
         const N = bits & 1, E = bits & 2, Sb = bits & 4, W = bits & 8;
+        /* Organic works here for the same reason it works on the corner masks:
+           this is also ramp(g) over a scalar field, and every organic term is
+           windowed to zero at the tile border. It therefore leaves Wang's edge
+           matching exactly as it found it — which is worth being precise about,
+           because Wang's matching was never perfect (an edge with its bit clear
+           has a profile set by the perpendicular bits). Organic neither fixes
+           that nor makes it worse. */
+        const O = makeOrganic(org, S);
+        const aa = CORNER_AA_PX / Math.max(2, S);
 
         const canvas = document.createElement('canvas');
         canvas.width = S; canvas.height = S;
@@ -432,22 +633,38 @@ window.TRLE = window.TRLE || {};
         const img = ctx.createImageData(S, S);
         const d   = img.data;
 
+        // inv = A(ny) * B(nx); the factors and their derivatives, for the
+        // boundary frame the teeth styles need.
+        const A  = t => (N ? t : 1) * (Sb ? 1 - t : 1);
+        const B  = t => (W ? t : 1) * (E ? 1 - t : 1);
+        const dA = t => (N && Sb) ? 1 - 2 * t : N ? 1 : Sb ? -1 : 0;
+        const dB = t => (W && E)  ? 1 - 2 * t : W ? 1 : E ? -1 : 0;
+
         for (let y = 0; y < S; y++) {
             for (let x = 0; x < S; x++) {
                 const nx = S > 1 ? x / (S - 1) : 0.5;
                 const ny = S > 1 ? y / (S - 1) : 0.5;
-                // Smooth union: g = 1 - Π(1 - edgeProximity) over active edges.
-                let inv = 1;
-                if (N)  inv *= ny;          // north proximity (1-ny) → factor 1-(1-ny)=ny
-                if (Sb) inv *= 1 - ny;      // south proximity ny     → factor 1-ny
-                if (W)  inv *= nx;          // west  proximity (1-nx) → factor nx
-                if (E)  inv *= 1 - nx;      // east  proximity nx     → factor 1-nx
-                const g = 1 - inv;
+                let ux = nx, uy = ny, uxP = nx, uyP = ny, win = 0;
+                if (O) ({ ux, uy, uxP, uyP, win } = O.coords(nx, ny));
+                // Smooth union: g = 1 - prod(1 - edgeProximity) over active edges.
+                let g = 1 - A(uy) * B(ux);
+                let lo, hi;
+                if (isHardCut) { lo = pivot - aa * 0.5; hi = pivot + aa * 0.5; }
+                else { lo = pivot - hw; hi = pivot + hw; }
                 let w;
-                if (isHardCut) w = g >= pivot ? 1.0 : 0.0;
-                else {
-                    const c = Math.max(0, Math.min(1, (g - (pivot - hw)) / (2 * hw)));
-                    w = c * c * (3 - 2 * c);   // smoothstep — eased seam, no linear kink
+                if (O) {
+                    const gx = -A(uy) * dB(ux);
+                    const gy = -dA(uy) * B(ux);
+                    g = O.shape(g, gx, gy, nx, ny, win);
+                    const gPlain = 1 - A(uyP) * B(uxP);
+                    ({ lo, hi } = O.band(lo, hi, g, gPlain, aa));
+                    const cc = Math.max(0, Math.min(1, (g - lo) / Math.max(1e-6, hi - lo)));
+                    w = cc * cc * (3 - 2 * cc);
+                } else if (isHardCut) {
+                    w = g >= pivot ? 1.0 : 0.0;
+                } else {
+                    const cc = Math.max(0, Math.min(1, (g - (pivot - hw)) / (2 * hw)));
+                    w = cc * cc * (3 - 2 * cc);   // smoothstep — eased seam, no linear kink
                 }
                 const byte = Math.round(w * 255);
                 const idx = (y * S + x) * 4;
@@ -456,6 +673,11 @@ window.TRLE = window.TRLE || {};
         }
         ctx.putImageData(img, 0, 0);
 
+        // The blur tail is the ratio field's corner-singularity fix and predates
+        // organic; skipped when organic is on for the same reason the corner
+        // masks skip it — it reads pixels from outside the canvas, which is the
+        // one place a mask that has to meet a neighbour must stay exact.
+        if (O) return canvas;
         const blurR = Math.max(0.75, S / 128);
         const tmp = document.createElement('canvas');
         tmp.width = S; tmp.height = S;
@@ -3270,14 +3492,14 @@ window.TRLE = window.TRLE || {};
             const mask = el.customMask
                 ? softenMask(el.customMask, S)
                 : el.wangBits != null
-                    ? buildWangMask(S, el.wangBits, el.pivot, el.hardness)
+                    ? buildWangMask(S, el.wangBits, el.pivot, el.hardness, el.organic)
                     : buildTopologyMask(S, el.mode, el.pivot, el.hardness, el.organic);
             const overlayCanvas = el.overlayGeom ? geomTransform(overlay.canvas, el.overlayGeom) : overlay.canvas;
             let comp = composeTransitionDiffuse(base.canvas, overlayCanvas, mask, S, el.blendMethod);
             // Diffuse only — it's a painted contact cue, not geometry. The maps in
             // deriveMaps stay clean so a material can still light the tile itself.
-            if (el.organic && el.organic.shadow > 0)
-                comp = applyContactShadow(comp, mask, S, el.organic.shadow);
+            if (el.organic && el.organic.shadow > 0 && shadowHitsDiffuse(el.organic))
+                comp = applyContactShadow(comp, mask, S, el.organic.shadow, shadowOpts(el.organic));
             const tctx = el.canvas.getContext('2d');
             tctx.clearRect(0, 0, S, S);   // clear so transparent transitions don't keep stale pixels
             tctx.drawImage(comp, 0, 0);
@@ -4532,9 +4754,14 @@ window.TRLE = window.TRLE || {};
     function trOrgParams() {
         if ($('at-tr-set-corners').value !== 'seamless') return null;
         const v = id => parseInt($(id).value) / 100;
-        const p = { wobble: v('at-tr-org-wobble'), drift: v('at-tr-org-drift'),
+        const p = { style: $('at-tr-org-style').value,
+                    wobble: v('at-tr-org-wobble'), drift: v('at-tr-org-drift'),
                     scatter: v('at-tr-org-scatter'), feather: v('at-tr-org-feather'),
                     shadow: v('at-tr-org-shadow'),
+                    shadowColor: $('at-tr-org-shcolor').value,
+                    shadowMode: $('at-tr-org-shmode').value,
+                    shadowPos: parseInt($('at-tr-org-shpos').value) / 100,
+                    shadowTarget: $('at-tr-org-shtarget').value,
                     scale: parseInt($('at-tr-org-scale').value) || 3,
                     seed: trOrgSeed, driftSeed: trOrgDriftSeed };
         return (p.wobble || p.drift || p.scatter || p.feather || p.shadow) ? p : null;
@@ -4558,11 +4785,17 @@ window.TRLE = window.TRLE || {};
 
     /* The accordion is only meaningful for the seamless style, so hide it rather
        than leave dead sliders that silently do nothing. */
+    function trOrgStyleHint() {
+        const h = $('at-tr-org-style-hint');
+        if (h) h.textContent = orgStyle({ style: $('at-tr-org-style').value }).hint;
+    }
+
     function trOrgVisibility() {
         const acc = $('at-tr-org-acc');
         if (!acc) return;
         const on = tr.tab === 'set' && $('at-tr-set-corners').value === 'seamless';
         acc.style.display = on ? '' : 'none';
+        if (on) trOrgStyleHint();
     }
 
     /* Tab + mask-source combined visibility (they interact: pivot/hardness is
@@ -4621,7 +4854,7 @@ window.TRLE = window.TRLE || {};
                 const mk = buildTopologyMask(P, cell, pivot, hardness, org);
                 let cmp = composeTransitionDiffuse(base, overlay, mk, P, method,
                     method === 'poisson' ? 120 : undefined);
-                if (org && org.shadow > 0) cmp = applyContactShadow(cmp, mk, P, org.shadow);
+                if (org && org.shadow > 0) cmp = applyContactShadow(cmp, mk, P, org.shadow, shadowOpts(org));
                 x.drawImage(cmp, 0, 0);
             }
             wrap.appendChild(c);
@@ -4739,7 +4972,51 @@ window.TRLE = window.TRLE || {};
                 trOrgSchedule();
             });
         });
+        /* The colour/blend/position row only appears once the shadow is actually
+           on. Three more controls in an already dense panel is worse than none
+           when the feature they configure is at zero. */
+        const trShadowOpts = () => {
+            const row = $('at-tr-shadow-opts');
+            if (row) row.style.display = (parseInt($('at-tr-org-shadow').value) > 0) ? '' : 'none';
+        };
+        $('at-tr-org-shadow').addEventListener('input', trShadowOpts);
+        trShadowOpts();
+        const trShadowAdvice = () => {
+            const h = $('at-tr-org-shtarget-hint');
+            if (h) h.innerHTML = shadowAdvice($('at-tr-org-shtarget').value);
+        };
+        ['at-tr-org-shcolor', 'at-tr-org-shmode'].forEach(id =>
+            $(id).addEventListener('input', trPreview));
+        $('at-tr-org-shtarget').addEventListener('change', () => { trShadowAdvice(); trPreview(); });
+        // The advice reads the export tick-boxes, so it has to refresh when they do.
+        document.querySelectorAll('#at-map-checks input[data-map]').forEach(cb =>
+            cb.addEventListener('change', trShadowAdvice));
+        trShadowAdvice();
+        $('at-tr-org-shpos').addEventListener('input', function () {
+            $('at-tr-org-shpos-val').textContent = this.value;
+            trOrgSchedule();
+        });
         if ($('at-tr-org-alts')) $('at-tr-org-alts').addEventListener('change', () => { trApplyVisibility(); trPreview(); });
+        /* Changing style loads that style's suggested settings and says what it
+           is for. Auto-applying follows the same pattern as the animation and
+           surface-noise preset pickers: the numbers that suit Spikes are not the
+           numbers that suit Blobs, and leaving a user to discover that from an
+           unchanged slider is how a good style gets written off as broken. Only
+           the controls inside this panel move — Hardness stays where the user put
+           it, and each style carries its own crispness instead. */
+        if ($('at-tr-org-style')) $('at-tr-org-style').addEventListener('change', function () {
+            const st = ORG_STYLES[this.value] || ORG_STYLES.blobs;
+            for (const [k, v] of Object.entries(st.defaults)) {
+                const el = $('at-tr-org-' + k);
+                if (!el) continue;
+                el.value = v;
+                const lab = $('at-tr-org-' + k + '-val');
+                if (lab) lab.textContent = v;
+            }
+            trOrgStyleHint();
+            trApplyVisibility();
+            trPreview();
+        });
         if ($('at-tr-org-seed')) $('at-tr-org-seed').addEventListener('click', () => {
             trOrgSeed = (Math.random() * 0x7fffffff) | 0 || 1;
             trOrgDriftSeed = (Math.random() * 0x7fffffff) | 0 || 1;
@@ -4902,6 +5179,26 @@ window.TRLE = window.TRLE || {};
     /* ============ WANG SET MODAL (Phase 9) ============ */
     const wang = { baseId: null, overlayId: null };
 
+    /* Organic params for the Wang modal. Drift is deliberately NOT offered here:
+       it is the one control that reaches the tile border, and a Wang set's whole
+       job is that any tile can sit next to any compatible tile. Everything else
+       is windowed away at the border and so is free. */
+    let wangOrgSeed = 1;
+    function wangOrgParams() {
+        if (!$('at-wang-org-wobble')) return null;
+        const v = id => parseInt($(id).value) / 100;
+        const p = { style: $('at-wang-org-style').value,
+                    wobble: v('at-wang-org-wobble'), drift: 0,
+                    scatter: v('at-wang-org-scatter'), feather: v('at-wang-org-feather'),
+                    shadow: v('at-wang-org-shadow'),
+                    shadowColor: $('at-wang-org-shcolor').value,
+                    shadowMode: $('at-wang-org-shmode').value,
+                    shadowTarget: $('at-wang-org-shtarget').value,
+                    scale: parseInt($('at-wang-org-scale').value) || 3,
+                    seed: wangOrgSeed, driftSeed: 1 };
+        return (p.wobble || p.scatter || p.shadow) ? p : null;
+    }
+
     function wangParams() {
         return {
             method: $('at-wang-method').value,
@@ -4946,9 +5243,11 @@ window.TRLE = window.TRLE || {};
         const wrap = $('at-wang-previews');
         wrap.style.gridTemplateColumns = `repeat(${L.width || 4},1fr)`;
         wrap.innerHTML = '';
+        const org = wangOrgParams();
         for (const bits of L.bits) {
-            const mask = buildWangMask(P, bits, pivot, hardness);
-            const comp = composeTransitionDiffuse(base, overlay, mask, P, method, method === 'poisson' ? 120 : undefined);
+            const mask = buildWangMask(P, bits, pivot, hardness, org);
+            let comp = composeTransitionDiffuse(base, overlay, mask, P, method, method === 'poisson' ? 120 : undefined);
+            if (org && org.shadow > 0) comp = applyContactShadow(comp, mask, P, org.shadow, shadowOpts(org));
             const c = document.createElement('canvas');
             c.width = P; c.height = P;
             c.style.cssText = 'width:100%;border:1px solid var(--border);border-radius:3px;image-rendering:pixelated;';
@@ -4961,6 +5260,49 @@ window.TRLE = window.TRLE || {};
     }
 
     function setupWangModal() {
+        const wangStyleHint = () => {
+            const h = $('at-wang-org-style-hint');
+            if (h) h.textContent = orgStyle({ style: $('at-wang-org-style').value }).hint;
+        };
+        let wangOrgTimer = null;
+        const wangOrgSchedule = () => { clearTimeout(wangOrgTimer); wangOrgTimer = setTimeout(wangPreview, 110); };
+        ['wobble', 'scatter', 'feather', 'shadow', 'scale'].forEach(k => {
+            const el = $('at-wang-org-' + k);
+            if (!el) return;
+            el.addEventListener('input', function () {
+                $('at-wang-org-' + k + '-val').textContent = this.value;
+                wangOrgSchedule();
+            });
+        });
+        if ($('at-wang-org-style')) $('at-wang-org-style').addEventListener('change', function () {
+            const st = ORG_STYLES[this.value] || ORG_STYLES.blobs;
+            for (const [k, v] of Object.entries(st.defaults)) {
+                const el = $('at-wang-org-' + k);
+                if (!el) continue;
+                el.value = v;
+                const lab = $('at-wang-org-' + k + '-val');
+                if (lab) lab.textContent = v;
+            }
+            wangStyleHint(); wangPreview();
+        });
+        ['at-wang-org-shcolor', 'at-wang-org-shmode'].forEach(id => {
+            const el = $(id); if (el) el.addEventListener('input', wangPreview);
+        });
+        const wangShadowAdvice = () => {
+            const h = $('at-wang-org-shtarget-hint');
+            if (h) h.innerHTML = shadowAdvice($('at-wang-org-shtarget').value);
+        };
+        if ($('at-wang-org-shtarget')) {
+            $('at-wang-org-shtarget').addEventListener('change', () => { wangShadowAdvice(); wangPreview(); });
+            document.querySelectorAll('#at-map-checks input[data-map]').forEach(cb =>
+                cb.addEventListener('change', wangShadowAdvice));
+            wangShadowAdvice();
+        }
+        if ($('at-wang-org-seed')) $('at-wang-org-seed').addEventListener('click', () => {
+            wangOrgSeed = (Math.random() * 0x7fffffff) | 0 || 1;
+            wangPreview();
+        });
+        wangStyleHint();
         $('at-wang-method').addEventListener('change', wangPreview);
         $('at-wang-layout').addEventListener('change', wangPreview);
         ['at-wang-pivot', 'at-wang-hardness'].forEach(id => {
@@ -4976,10 +5318,12 @@ window.TRLE = window.TRLE || {};
             const L = wangCurrentLayout();
             const baseId = wang.baseId, overlayId = wang.overlayId;
             // Build the tiles now, then (optionally) reflow the atlas so the block lines up.
+            const org = wangOrgParams();
             const els = L.bits.map(bits => ({
                 id: 0, kind: 'transition', canvas: blankCanvas(S), original: null,
                 seamless: false, material: null, base: baseId, overlay: overlayId,
-                mode: 'wang', wangBits: bits, pivot, hardness, blendMethod: method
+                mode: 'wang', wangBits: bits, pivot, hardness, blendMethod: method,
+                organic: org
             }));
             confirmResizeCols(L.width, () => {
                 const blk = L.width ? newBlock(L.width, `${L.width}-wide Wang set`) : null;
@@ -10605,7 +10949,7 @@ window.TRLE = window.TRLE || {};
             const mask    = el.customMask
                 ? softenMask(el.customMask, S)
                 : el.wangBits != null
-                    ? buildWangMask(S, el.wangBits, el.pivot, el.hardness)
+                    ? buildWangMask(S, el.wangBits, el.pivot, el.hardness, el.organic)
                     : buildTopologyMask(S, el.mode, el.pivot, el.hardness, el.organic);
             for (const mt of TRLE.MapOrder) {
                 if (enabledMaps[mt] && base[mt] && overlay[mt]) {
@@ -10615,6 +10959,11 @@ window.TRLE = window.TRLE || {};
                         if (mt === 'normal') normalFixGeom(om, el.overlayGeom);
                     }
                     result[mt] = compositeTransition(base[mt], om, mask, S);
+                    // Contact occlusion belongs in AO for a PBR/TEN export — see
+                    // shadowAdvice for why baking it into the diffuse instead
+                    // makes the map generator turn it into relief.
+                    if (mt === 'ao' && el.organic && el.organic.shadow > 0 && shadowHitsAO(el.organic))
+                        applyContactShadowAO(result[mt], mask, S, el.organic.shadow, shadowOpts(el.organic));
                 }
             }
         } else if (hasMatLayers(el)) {
@@ -12205,7 +12554,31 @@ window.TRLE = window.TRLE || {};
                layout actually claims are terrain-adjacent are scored. */
             // test-only: the mask builders themselves, so a validator can hash a
             // single mode's pixels rather than infer it from a composed tile.
-            buildTopologyMask, buildCornerMask, transSetCells, applyContactShadow,
+            buildTopologyMask, buildCornerMask, buildWangMask, transSetCells,
+            applyContactShadow, applyContactShadowAO, shadowHitsDiffuse, shadowHitsAO, shadowAdvice,
+            orgStyleKeys() { return Object.keys(ORG_STYLES); },
+            /* test-only: run an element through the REAL deriveMaps and hash one
+               map. Direct calls to applyContactShadowAO prove the function; this
+               proves the export path actually reaches it. */
+            derivedMapHash(idx, mapType) {
+                const el = state.elements[idx];
+                if (!el) return null;
+                const enabled = {}; for (const mt of TRLE.MapOrder) enabled[mt] = true;
+                const maps = deriveMaps(el, enabled, {});
+                const c = maps[mapType];
+                if (!c) return null;
+                const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+                let h = 2166136261;
+                for (let i = 0; i < d.length; i += 4) { h ^= d[i]; h = Math.imul(h, 16777619); }
+                return (h >>> 0).toString(16);
+            },
+            setShadowTarget(idx, target) {
+                const el = state.elements[idx];
+                if (!el || !el.organic) return false;
+                el.organic = Object.assign({}, el.organic, { shadowTarget: target });
+                return true;
+            },
+            orgStyleDefaults(k) { return ORG_STYLES[k] ? ORG_STYLES[k].defaults : null; },
             // test-only: grid-block state, so block preservation can be asserted
             // on the real element array rather than inferred from the DOM.
             blockMap() {
