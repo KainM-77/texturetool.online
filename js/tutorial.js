@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: MIT
-   TextureTool — Copyright (C) 2026 KainM-77. This file is the author's own work,
-   available under the MIT License (see LICENSE-MIT). The tool as a whole ships
-   under GPL-3.0 (see LICENSE) only because it also bundles two GPL-3.0 seamless
-   shaders derived from Materialize; this file contains none of that code. */
+   TextureTool — Copyright (c) 2026 KainM-77. Available under the MIT License
+   (see LICENSE). The whole tool is MIT as of 2026-09-13: the two GPL-3.0
+   seamless shaders ported from Materialize were removed and replaced with
+   independent implementations. */
 /* ============================================================
    TRLE Atlas Tool — Tutorial page
    Static, vertical-scroll reference. Each tool section shows an
@@ -200,7 +200,7 @@
         {
             id: 'heal', icon: '🩹', title: 'Heal / Fill',
             what: 'Paints out blemishes, logos or scratches by filling the area with surrounding colour or re-synthesised texture.',
-            how: ['<strong>Right-click</strong> a tile → <strong>Heal / Fill</strong>.', 'Paint over the <em>whole</em> blemish so the selection touches clean texture on every side.', 'Pick <strong>Neighbour-aware</strong> (default), <strong>Texture</strong> (whole-tile synthesis) or <strong>Smooth</strong> (diffusion), click <strong>Preview Fill</strong>, then <strong>Save to Tile</strong>.'],
+            how: ['<strong>Right-click</strong> a tile → <strong>Heal / Fill</strong>.', 'Paint over the <em>whole</em> blemish so the selection touches clean texture on every side.', 'Pick <strong>Neighbour-aware</strong> (default), <strong>Texture</strong> (whole-tile synthesis) or <strong>Smooth</strong> (diffusion), then <strong>Save to Tile</strong>.', 'The <strong>Before</strong> and <strong>After</strong> panes on the right update as you paint, so you can judge the fill without saving. Lower <strong>Hardness</strong> to feather the selection edge; <strong>Paint</strong> and <strong>Erase</strong> are separate buttons.'],
             before: 'heal', tip: '<strong>Neighbour-aware</strong> matches the local tone, so a dark mark on a light surface heals light (and vice-versa) instead of going grey — just be sure to paint over the entire mark.'
         },
         {
@@ -444,7 +444,7 @@
                    <p>The tool started as an attempt to recreate something simmilar to Materialize, but instead using WebGL over Unity, as the tool seems to be more or less abandoned.</p>
                    <p><a href="https://github.com/JohnnyJF10/TgaBuilder" target="_blank" rel="noopener"><strong>TGA BUILDER</strong> by JohnnyJF10</a></p>
                    <p>Originally I have drawn SVG masks for transitions which worked well for diffuse maps, but started creating problems for material transitions. The transition feature of TGA Builder alleviated this issue and preserved seamlessness.</p>
-                   <p style="font-size:0.85rem;opacity:0.85;">Atlas Tool is <strong>dual-licensed</strong>: the tool as a whole is <strong>GPL-3.0</strong> (see <code>LICENSE</code>) because it bundles two seamless-tiling shaders (<code>seamlessMaker</code>, <code>seamlessSplat</code>) ported from Materialize (GPL-3.0). All of the author's own code is <em>also</em> offered under the <strong>MIT License</strong> (see <code>LICENSE-MIT</code>) — those two shaders are the only GPL-only parts. TgaBuilder's reused code is MIT. Full notices ship in <code>THIRD-PARTY-NOTICES.md</code> and <code>Path to MIT.md</code>.</p>`
+                   <p style="font-size:0.85rem;opacity:0.85;">Atlas Tool is <strong>MIT licensed</strong> (see <code>LICENSE</code>) — all of it, including the seamless-tiling shaders. It was GPL-3.0 until 2026-09-13 because two shaders were ported from Materialize; those were replaced with independent implementations, so there are no copyleft strings on reusing anything the tool ships. TgaBuilder's reused code is MIT. Full notices ship in <code>THIRD-PARTY-NOTICES.md</code>.</p>`
         },
         {
             id: 'about-contrib', icon: '🤝', title: 'Contributions',

@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: MIT
-   TextureTool — Copyright (C) 2026 KainM-77. This file is the author's own work,
-   available under the MIT License (see LICENSE-MIT). The tool as a whole ships
-   under GPL-3.0 (see LICENSE) only because it also bundles two GPL-3.0 seamless
-   shaders derived from Materialize; this file contains none of that code. */
+   TextureTool — Copyright (c) 2026 KainM-77. Available under the MIT License
+   (see LICENSE). The whole tool is MIT as of 2026-09-13: the two GPL-3.0
+   seamless shaders ported from Materialize were removed and replaced with
+   independent implementations. */
 /* ============================================================
    TRLE Atlas Tool — "Learn about materials" page
    A static, vertical-scroll reference that explains what PBR

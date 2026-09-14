@@ -1,48 +1,51 @@
 # Licensing & third-party notices
 
-**TRLE Tools / Atlas Tool** — Copyright (C) 2026 KainM-77.
+**TRLE Tools / Atlas Tool** — Copyright (c) 2026 KainM-77. MIT licensed.
 
-## Licensing summary (dual)
+## Licensing summary
 
-This project is **dual-licensed**:
+**The whole repository is MIT licensed** — see [LICENSE](LICENSE). Every file is
+covered, including the archived v1 tool in `Archive/TextureTool-v1/`. There are no
+copyleft strings and no per-file exceptions.
 
-- **The tool as a whole is distributed under GPL-3.0** — see [LICENSE](LICENSE).
-  It has to be: the program bundles two seamless-tiling shaders derived from
-  **Materialize** (GPL-3.0), and GPL-3.0 is copyleft, so the combined/running
-  program is governed by GPL-3.0. Distributed WITHOUT ANY WARRANTY.
-- **All original code by KainM-77 is ALSO available under the MIT License** — see
-  [LICENSE-MIT](LICENSE-MIT). Every source file that is the author's own work
-  carries an `SPDX-License-Identifier: MIT` header and may be extracted and reused
-  under MIT. This is a genuine additional grant, not a downgrade of the GPL.
-- **The only GPL-only parts** are the two seamless-tiling shaders `seamlessMaker`
-  and `seamlessSplat` in `AtlasTool/js/shaders.js` (marked inline; plus their
-  equivalents in the frozen root `js/shaders.js`). They stay GPL-3.0 because they
-  are derived from Materialize.
+Until **2026-09-13** the tool as a whole shipped under GPL-3.0, because two
+seamless-tiling shaders were ported from Materialize (GPL-3.0) and copyleft
+governed the combined program. Those two shaders have been removed; see below.
 
-In short: **copy an MIT-marked file → MIT terms; use the seamless maker/splat, or
-the whole bundled tool → GPL-3.0 terms.**
+Third-party components keep their own licenses, all permissive.
 
 ---
 
-## Materialize — GPL-3.0
+## Materialize — REMOVED 2026-09-13 (no longer bundled)
 
 - Author: BoundingBoxSoftware
 - Source: https://github.com/BoundingBoxSoftware/Materialize
 - License: GNU General Public License v3.0
 
-**Exactly two** WebGL shaders in `AtlasTool/js/shaders.js` are **ported (HLSL→GLSL)**
-from Materialize's `Blit_Seamless_Texture_Maker.shader`:
+Two WebGL shaders in `AtlasTool/js/shaders.js` used to be ported (HLSL→GLSL) from
+Materialize's `Blit_Seamless_Texture_Maker.shader` — `seamlessMaker` (the `frag`
+pass) and `seamlessSplat` (the `frag_splat` pass). Being line-by-line
+translations, they were derivative of GPL-3.0 code, and they were the sole reason
+the tool shipped under GPL-3.0.
 
-- `seamlessMaker` — from the `frag` pass (the Seamless Texture Maker).
-- `seamlessSplat` — from the `frag_splat` pass (the "Splat" seamless method).
+**Both were deleted on 2026-09-13** — from the live tool and from the archived v1
+copy — and replaced with independent implementations of published techniques:
 
-These are line-by-line translations and are therefore derivative of GPL-3.0 code,
-which is why the combined work is GPL-3.0. The tool's other map-generation shaders
-(normal-from-height, Gaussian blur, ambient occlusion, roughness/high-pass, height
-combine) are **independent** implementations of standard techniques — they are
-**not** derived from Materialize and are MIT-licensed. (An earlier version of this
-notice over-stated the borrowing by also listing the normal / high-pass passes;
-see `Path to MIT.md` for the full per-shader audit.)
+| removed (GPL-3.0) | replacement (MIT) | technique |
+|---|---|---|
+| `seamlessMaker` | `wrapShift` + `seamBandMask` + `bandBlend` + `bandDiff`, orchestrated by `TRLE.Engine.seamlessMultiBand` | multi-band (Laplacian pyramid) blending — Burt & Adelson 1983; GPU formulation per "GPU-Friendly Laplacian Texture Blending", JCGT 14(1), 2025 |
+| `seamlessSplat` | `seamlessStamp` | variance-preserving ("histogram-preserving") blending of randomly rotated stamps — Heitz & Neyret, High-Performance Graphics 2018 |
+
+The replacements were written from the published descriptions of those techniques,
+not from Materialize's source, and share no code or algorithm with it. **No
+Materialize code remains anywhere in this repository.** The unmodified GPL-3.0
+originals are reachable only through git history (`git show d9abf70:js/shaders.js`).
+
+The tool's other map-generation shaders (normal-from-height, Gaussian blur,
+ambient occlusion, roughness/high-pass, height combine) were never derived from
+Materialize — they are independent implementations of standard techniques. (An
+earlier version of this notice over-stated the borrowing by also listing the
+normal / high-pass passes; see `Path to MIT.md` for the full per-shader audit.)
 
 ---
 
@@ -54,8 +57,8 @@ see `Path to MIT.md` for the full per-shader audit.)
 
 The distance-field seamless-transition **algorithm** was reimplemented from
 TgaBuilder's `TransitionHelper.cs` (no source code was copied verbatim; the
-approach was ported to WebGL/JS). MIT is compatible with GPL-3.0, and the
-upstream notice is preserved below as a courtesy and for clarity of provenance:
+approach was ported to WebGL/JS). The upstream notice is preserved below as a
+courtesy and for clarity of provenance:
 
 ```
 MIT License

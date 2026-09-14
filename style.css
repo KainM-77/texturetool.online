@@ -29,6 +29,9 @@
     --radius: 6px;
     --radius-sm: 4px;
     --transition: 0.15s ease;
+    /* Layout moves (a modal widening, a column unfolding) need longer than a hover
+       state: 0.15s across a 700px expansion is too quick to follow with the eye. */
+    --transition-lg: 220ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 /* ---- Light theme (toggle) ---- */
@@ -91,7 +94,17 @@ body {
     border-bottom: 1px solid var(--border);
 }
 
+/* The logo is a real control: testers clicked it expecting a refresh and got
+   nothing, which reads as the page having frozen. */
 .app-header .logo {
+    background: none;
+    border: none;
+    padding: 4px 6px;
+    margin-left: -6px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: background var(--transition), color var(--transition);
     font-size: 1rem;
     font-weight: 700;
     color: var(--accent);
@@ -103,6 +116,9 @@ body {
     align-items: center;
     gap: 8px;
 }
+.app-header .logo:hover { background: var(--bg-hover, rgba(255,255,255,0.07)); }
+.app-header .logo:active { transform: translateY(1px); }
+.app-header .logo:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .app-header .logo .logo-mark {
     flex-shrink: 0;
     display: block;
@@ -1640,6 +1656,19 @@ input[type="range"]::-moz-range-thumb {
     line-height: 1.4;
 }
 
+/* Material modal contrast advice — advisory only, never auto-applied.
+   Matches .tut-tip so it reads as guidance rather than as an error. */
+.at-mat-advice {
+    background: var(--accent-bg);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    padding: 8px 12px;
+    margin: 0 0 10px;
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
 /* Upload-atlas accordion (collapses once an atlas exists, to reduce clutter) */
 .at-upload-card > summary {
     list-style: none;
@@ -2157,6 +2186,10 @@ body.at-modal-open { overflow: hidden; }
     max-height: 94vh;
     max-height: calc(100dvh - 56px);
 }
+/* Width is animated because several modals widen on a toggle (Set Material's
+   advanced editor, Make Transition's organic edge). 220ms is --transition-lg.
+   The global prefers-reduced-motion block zeroes this automatically. */
+.at-modal { transition: width var(--transition-lg); }
 .at-modal.at-modal-wide { width: min(760px, 96vw); }
 
 /* Fluid width tiers — use more of a wide screen, collapse cleanly on a narrow one. */
@@ -2177,31 +2210,206 @@ body.at-modal-open { overflow: hidden; }
     padding: 2px 20px;
 }
 .at-modal-fit .at-modal-actions { margin-top: 14px; }
+/* ---- Modal zone layout (see "Modal layout" in CLAUDE.md, MODAL-LAYOUT-AUDIT.md)
+   Zones read left to right: TUNING . WORK . PREVIEWS. The middle zone is the wide
+   one: a paint surface (Organic Transition's hint canvas) OR the secondary/advanced
+   controls a modal would otherwise stack under its primary ones (Build Pattern's
+   three accordions). Either way it is the part that needs the room. The preview
+   never goes on the left -- that was .at-org-cols's mistake, which made five modals
+   read backwards. Zones stack in DOM order when they collapse, so the preview lands
+   last and no `order:` rule is needed anywhere.
+
+   .at-modal-main is the original name for the tuning zone; .at-modal-tune is the
+   name the design language uses. They are the same thing, and both are supported so
+   the four modals that already shipped with -main don't have to be rewritten.
+
+   Three arrangements:
+     .at-modal-cols                tuning flexes, preview pinned at --at-side-w
+     .at-modal-cols.at-tune-fixed  tuning pinned at 340, preview flexes (preview-heavy)
+     .at-modal-cols.at-3zone       tuning 340 | work 1fr | preview 440
+
+   NB .at-rail is taken -- it is the page's own left/right sidebars.
+   ---- */
 .at-modal-cols {
+    /* The preview rail's width is a variable, not a class, so a modal whose preview
+       is a 16-tile sheet can widen it (style="--at-side-w:620px") without spawning
+       a new modifier for every width anyone needs. */
+    --at-side-w: 430px;
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 430px);
+    grid-template-columns: minmax(0, 1fr) minmax(0, var(--at-side-w));
     gap: 18px;
     align-items: start;
+    transition: grid-template-columns var(--transition-lg);
 }
+/* Preview-heavy: a 16-tile Wang sheet or a 3x3 border set wants the room, and its
+   handful of sliders do not. Flips which column is the fixed one. */
+.at-modal-cols.at-tune-fixed   { grid-template-columns: minmax(0, 340px) minmax(0, 1fr); }
+/* Collapsing the middle zone: keep the THREE tracks and take the middle one to 0.
+
+   Two traps here, and the second one bit after the first was fixed:
+   1. `display: none` cannot be interpolated, so the column snapped in and out.
+   2. Width 0 alone is not enough either. A zone that is present is still a grid
+      CHILD, so in a TWO-track grid a third child wraps onto row 2 and drops the
+      preview underneath the tuning column -- Make Transition's Single Tiles tab
+      went from 0 to 322px of scroll exactly that way.
+   So a modal that has a work zone declares three tracks at all times, and the
+   collapsed state is a 0px middle track with the tuning column taking the slack --
+   which lands on the same proportions as the plain two-zone layout. */
+.at-modal-cols.at-3zone.at-work-collapsed {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 0px) minmax(0, 430px);
+}
+.at-modal-cols.at-work-collapsed > .at-modal-work {
+    opacity: 0;
+    pointer-events: none;
+}
+.at-modal-cols > .at-modal-work { overflow: hidden; transition: opacity var(--transition-lg); }
+.at-modal-cols.at-3zone  { grid-template-columns: minmax(0, 340px) minmax(0, 1fr) minmax(0, 440px); }
+
 /* Consistent breathing room between stacked groups (hint / form-row / details /
    preview) inside each column. gap drives the rhythm, so the per-element margins
    that used to push groups together (or leave them touching) are neutralised. */
 .at-modal-cols .at-modal-main,
+.at-modal-cols .at-modal-tune,
+.at-modal-cols .at-modal-work,
 .at-modal-cols .at-modal-side {
     display: flex;
     flex-direction: column;
     gap: 13px;
 }
 .at-modal-cols .at-modal-main > .form-row,
+.at-modal-cols .at-modal-tune > .form-row,
+.at-modal-cols .at-modal-work > .form-row,
 .at-modal-cols .at-modal-side > .form-row { margin-bottom: 0; }
 .at-modal-cols .at-modal-main > .sm-hint,
+.at-modal-cols .at-modal-tune > .sm-hint,
+.at-modal-cols .at-modal-work > .sm-hint,
 .at-modal-cols .at-modal-side > .sm-hint { margin: 0; }
 .at-modal-cols .at-modal-side { position: sticky; top: 0; }
-.at-modal-cols .at-modal-side canvas { width: 100%; max-width: 430px; }
+/* DIRECT children only. A zone holding a strip of thumbnails (Generate Variations
+   renders up to 8) nests them in a wrapper, and a blanket `canvas` selector blew
+   each thumbnail up to the full 430px rail -- 1331px of column and 630px of scroll. */
+.at-modal-cols .at-modal-side > canvas { width: 100%; max-width: var(--at-side-w); }
+/* Previews are 256px backing stores. Letting one fill the whole 430px rail is a
+   1.7x nearest-neighbour upscale -- blockier, not more informative -- and on a
+   tuning-light modal it also makes the preview column much taller than the controls
+   beside it, so the modal grows DOWN, which is the thing this rework exists to stop.
+   .at-side-1x caps a preview at roughly its native size. Use it whenever the zone's
+   canvas is 256px and the feature does not genuinely benefit from magnification. */
+.at-modal-cols .at-modal-side.at-side-1x > canvas { max-width: 300px; }
+/* In .at-rail the preview column is the flexible one, so the 430px cap that suits a
+   fixed rail would waste the space the modifier exists to hand over. */
+.at-modal-cols.at-tune-fixed .at-modal-side > canvas { max-width: 100%; }
+.at-modal-cols .at-modal-work canvas { width: 100%; display: block; }
+
+/* An accordion inside a zone must not widen it: a <details> that lays its contents
+   out in two slider columns would otherwise blow the grid track out past its track
+   size. This is what keeps "accordions expand into a column, not downward" honest. */
+.at-modal-cols .at-modal-tune > details,
+.at-modal-cols .at-modal-main > details,
+.at-modal-cols .at-modal-side > details { min-width: 0; }
+
+/* 3-zone folds to 2 before the 1360 tier starts being squeezed by its 96vw cap
+   (1360 / 0.96 = 1417), so it folds with margin in hand rather than mid-squeeze.
+   The paint surface and the previews share the second column, previews below. */
+@media (max-width: 1239px) {
+    .at-modal-cols.at-3zone:not(.at-work-collapsed) { grid-template-columns: minmax(0, 340px) minmax(0, 1fr); }
+    .at-modal-cols.at-3zone:not(.at-work-collapsed) .at-modal-side { grid-column: 2; }
+    .at-modal-cols.at-3zone.at-work-collapsed { grid-template-columns: minmax(0, 1fr) minmax(0, 0px) minmax(0, 430px); }
+}
+/* 900 is load-bearing: it is what .at-modal-cols already shipped with and what
+   validate-modal-fit.mjs exercises. Everything folds to one column, DOM order. */
 @media (max-width: 900px) {
-    .at-modal-cols { grid-template-columns: 1fr; }
+    .at-modal-cols,
+    .at-modal-cols.at-tune-fixed,
+    .at-modal-cols.at-3zone { grid-template-columns: 1fr; }
+    .at-modal-cols.at-3zone .at-modal-side { grid-column: auto; }
     .at-modal-cols .at-modal-side { position: static; }
 }
+/* ---- Set Material: the advanced editor as a column ----
+   Closed, the accordion is one summary line and the modal stays at its base 640
+   width -- the preset flow the author called "perfect" is untouched. Open, the
+   modal widens to xxl and the 21 sliders become the right column, so the Lit /
+   Map previews stay where they were instead of being pushed below the fold.
+   Both this and multi-material want the wide modal, hence matApplyWidth(). ---- */
+/* Two tracks at ALL times. A single-track closed state cannot tween to two tracks
+   -- measured: 598px -> "680px 620px" snaps with no midpoint -- so the collapsed
+   state is a 0px second track instead. */
+#at-modal-mat .at-modal-cols { grid-template-columns: minmax(0, 1fr) minmax(0, 0px); }
+#at-modal-mat.at-adv-open .at-modal-cols { grid-template-columns: minmax(0, 1fr) minmax(0, 620px); }
+#at-modal-mat .at-mat-advcol { overflow: hidden; }
+/* Sticky would pin the accordion to the top of a column it already fills. */
+#at-modal-mat .at-mat-advcol { position: static; }
+
+/* ---- .at-acc — the one modal accordion (see "Motion, accordions and affordances"
+   in CLAUDE.md). Before this there were ten accordions in three styles and no shared
+   class: seven copies of an identical inline border, two bare, one accent-coloured
+   link. Boxed wins because the border tells you where the panel begins and ends.
+
+   The padding is on the SUMMARY, not on the <details>. That is the part that was
+   actually wrong: every summary in the tool measured 21px tall regardless of style,
+   because the box's padding never belonged to the click target. ---- */
+/* The BOX belongs to the header, not to the panel. Wrapping the revealed contents
+   in a border too just draws a second frame around controls that already read as a
+   group, and nests boxes inside boxes once a slider row has its own. */
+.at-acc { border: none; background: none; }
+.at-acc > summary {
+    border: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.03);
+    cursor: pointer;
+    padding: 7px 10px;
+    /* 1rem, i.e. 14px: what 7 of the 10 accordions already had. Standardising on
+       Set Material's 0.85rem would have shrunk the majority to match the outlier. */
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+    border-radius: 4px;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    transition: background var(--transition), color var(--transition);
+}
+.at-acc > summary::-webkit-details-marker { display: none; }
+/* Own marker rather than the browser's: the default triangle sits outside the
+   padded row, so it neither rotates nor counts toward the hit area. */
+.at-acc > summary::before {
+    content: "▸";
+    display: inline-block;
+    flex: 0 0 auto;
+    color: var(--accent);
+    transition: transform var(--transition);
+}
+.at-acc[open] > summary::before { transform: rotate(90deg); }
+.at-acc > summary:hover { background: var(--bg-hover, rgba(255,255,255,0.06)); }
+.at-acc > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+/* Secondary text inside a summary (the "(blobs, spikes, drips…)" hints) stays quiet. */
+.at-acc > summary .at-acc-note { font-weight: 400; color: var(--text-secondary); font-size: 0.82rem; }
+/* Contents sit under the header with breathing room, no box of their own.
+   They live in a wrapper (built once by setupAccordions, the same trick setupModals
+   uses for .at-modal-body) purely so the unfold has something whose HEIGHT can be
+   animated -- <details> itself offers no such hook: the browser shows or hides the
+   contents outright. The spacing is padding ON the wrapper rather than a margin
+   above it, so it collapses with the rest instead of appearing instantly. */
+.at-acc-body { padding-top: 10px; }
+.at-acc > *:not(summary) { margin-left: 0; margin-right: 0; }
+
+/* Reveal by CLIPPING, not by squashing.
+   A grid track that animates 0 -> 620px re-lays-out its contents on every frame, so
+   the slider labels rewrap ("Normal Strength — 30" breaking over two lines and back)
+   and the panel visibly churns while it opens. Pinning the panel to roughly its final
+   width and letting the zone clip it means the content keeps its final layout and is
+   simply uncovered as the column sweeps open. */
+#at-modal-mat .at-mat-advcol > .at-acc { min-width: 600px; }
+.at-modal-cols .at-modal-work > .at-acc { min-width: 470px; }
+
+/* An accordion mid-FLIP: lifted above its neighbours so it reads as one object
+   travelling, not as two panels swapping. transform only -- compositor work. */
+.at-acc.at-acc-flying {
+    position: relative;
+    z-index: 5;
+    will-change: transform;
+}
+
 /* Top-right close (✕) — one of three deliberate exits (Cancel / ✕ / Esc);
    clicking the backdrop no longer closes, so in-progress work isn't lost. */
 .at-modal-x {
@@ -2433,14 +2641,11 @@ body.at-modal-open { overflow: hidden; }
 .tut-prev2x .tut-3d-status { color: var(--accent); margin-left: 4px; }
 @media (max-width: 560px) { .tut-prev2x { grid-template-columns: 1fr; } }
 
-/* Organic transition modal — two-column layout (hint | controls) */
-.at-org-cols { display: flex; gap: 18px; align-items: flex-start; }
-.at-org-left { width: 300px; flex: 0 0 auto; }
-.at-org-right { flex: 1; min-width: 0; }
-@media (max-width: 760px) {
-    .at-org-cols { flex-direction: column; }
-    .at-org-left { width: 100%; }
-}
+/* .at-org-cols / .at-org-left / .at-org-right lived here: a second, flex-based
+   column primitive whose FIXED column was the left one, which is why Adjust
+   Colours, Recolor, De-light and Animated Texture all showed their preview on the
+   left. All five users are on .at-modal-cols now, so it is gone rather than left
+   around to be copied into the next modal. See MODAL-LAYOUT-AUDIT.md. */
 #at-org-previews canvas {
     width: 100%;
     border: 2px solid var(--border);

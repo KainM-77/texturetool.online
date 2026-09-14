@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: MIT
-   TextureTool — Copyright (C) 2026 KainM-77. This file is the author's own work,
-   available under the MIT License (see LICENSE-MIT). The tool as a whole ships
-   under GPL-3.0 (see LICENSE) only because it also bundles two GPL-3.0 seamless
-   shaders derived from Materialize; this file contains none of that code. */
+   TextureTool — Copyright (c) 2026 KainM-77. Available under the MIT License
+   (see LICENSE). The whole tool is MIT as of 2026-09-13: the two GPL-3.0
+   seamless shaders ported from Materialize were removed and replaced with
+   independent implementations. */
 /* ============================================================
    TRLE Atlas Tool — all-in-one atlas workbench
    Slice an atlas into elements, then per element: make seamless,
@@ -1762,10 +1762,26 @@ window.TRLE = window.TRLE || {};
             const r = displayCanvas.getBoundingClientRect();
             return Math.max(1, opts.brushSize() * (maskCanvas.width / r.width));
         };
+        /* hardness: 1 = the original hard-edged disc, 0 = fully feathered. Optional,
+           and absent means 1, so callers that never asked for a soft brush (De-light's
+           shadow mask) keep drawing exactly the discs they always did.
+           The mask is a black/white canvas, so "erase" is painting black rather than
+           clearing to transparent -- which is what lets a soft erase leave a grey
+           (partial) edge instead of a hole punched in the selection. */
         const dab = (x, y, radius) => {
             const ctx = maskCanvas.getContext('2d');
             ctx.globalCompositeOperation = 'source-over';
-            ctx.fillStyle = opts.erase() ? '#000' : '#fff';
+            const erase = opts.erase();
+            const h = opts.hardness ? Math.max(0, Math.min(1, opts.hardness())) : 1;
+            if (h >= 0.999) {
+                ctx.fillStyle = erase ? '#000' : '#fff';
+            } else {
+                const rgb = erase ? '0,0,0' : '255,255,255';
+                const g = ctx.createRadialGradient(x, y, radius * h, x, y, radius);
+                g.addColorStop(0, `rgba(${rgb},1)`);
+                g.addColorStop(1, `rgba(${rgb},0)`);
+                ctx.fillStyle = g;
+            }
             ctx.beginPath();
             ctx.arc(x, y, radius, 0, Math.PI * 2);
             ctx.fill();
@@ -1799,6 +1815,9 @@ window.TRLE = window.TRLE || {};
             if (!drawing) return;
             drawing = false;
             try { displayCanvas.releasePointerCapture(e.pointerId); } catch { /* noop */ }
+            // Stroke-level hook. Anything expensive (Heal's live fill) belongs here
+            // rather than in onPaint, which fires on every pointermove.
+            if (opts.onStrokeEnd) opts.onStrokeEnd();
         };
         displayCanvas.addEventListener('pointerup', end);
         displayCanvas.addEventListener('pointercancel', end);
@@ -3087,6 +3106,51 @@ window.TRLE = window.TRLE || {};
         const dot = $('at-unsaved');
         if (dot) dot.style.display = state.dirty ? '' : 'none';
     }
+    /* "Start over" — the logo.
+       Testers click a logo expecting to get back to a clean page; ours did nothing,
+       which reads as the tool having hung. A reload IS the right outcome: the
+       session is autosaved and offerSessionRestore() offers it back on the way in,
+       so nothing is actually lost and "Not now" gives them the fresh start they
+       wanted.
+
+       The autosave must be FLUSHED first. It is debounced at AUTOSAVE_DELAY (900ms)
+       and runAutosave() is async, so a bare location.reload() can throw away up to
+       a second of work -- which would break the very promise that makes this safe.
+       The confirm uses the app's own dialog rather than the browser's beforeunload
+       prompt, matching requestLoadProject. */
+    /* One level of indirection purely so the "start over" path is testable:
+       location.reload is non-configurable in Chrome, so a validator cannot stub it
+       and would have to navigate away mid-run. */
+    const nav = { reload: () => location.reload() };
+    let capNavHits = 0;   // test-only counter, see TRLE._cap.stubNav
+
+    async function reloadFresh() {
+        try {
+            clearTimeout(autosave.timer);
+            await runAutosave();
+        } catch { /* storage refused: reload anyway, the guard below still applies */ }
+        // Past this point the session is on disk, so skip the native "leave site?"
+        // prompt -- the user has already answered that question in our own dialog.
+        state.dirty = false;
+        nav.reload();
+    }
+
+    function setupLogoHome() {
+        const logo = $('at-logo-home');
+        if (!logo) return;
+        logo.addEventListener('click', () => {
+            if (!state.dirty || !state.elements.length) { reloadFresh(); return; }
+            openConfirm(
+                '🔄 Start over?',
+                'This reloads the tool with an empty workbench. Your current session is '
+                + 'autosaved first, so you can restore it from the prompt on the way back in '
+                + '— or pick "Not now" there and start fresh.',
+                '🔄 Start over',
+                reloadFresh
+            );
+        });
+    }
+
     function setupUnloadGuard() {
         window.addEventListener('beforeunload', e => {
             if (!state.dirty || !state.elements.length) return;
@@ -3636,6 +3700,182 @@ window.TRLE = window.TRLE || {};
         if (primary && !primary.disabled) primary.click();
     }
 
+    /* ---- FLIP: animate an element across a layout change ----
+       A CSS transition cannot follow an element that changes parent or grid cell --
+       it jumps. FLIP measures where it was, applies the change, measures where it
+       landed, then animates the difference away with a transform.
+
+       Used for the accordions that live in the tuning column while collapsed and
+       become their own column when opened (Set Material's advanced editor, Make
+       Transition's organic edge). Without it the panel teleports from under the
+       previews to the right-hand side, which is what testers read as "why did it
+       move?".
+
+       Only `transform` is animated, so the browser composites it -- the measured
+       cost is the two forced layouts, ~0.1ms each on these modals. The modal's own
+       width and grid tracks transition in CSS over the same duration; the element's
+       column has a fixed left edge, so the two do not fight. */
+    const FLIP_MS = 220;
+    const FLIP_EASE = 'cubic-bezier(0.4, 0, 0.2, 1)';
+
+    function flipMove(el, mutate) {
+        // Honour the user's motion preference -- the CSS handles the rest globally.
+        const still = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        if (still) { mutate(); return; }
+        const first = el.getBoundingClientRect();
+        mutate();
+        const last = el.getBoundingClientRect();
+        const dx = first.left - last.left;
+        const dy = first.top - last.top;
+        // A move of a pixel or two is not worth animating (and would flicker).
+        if (Math.abs(dx) < 2 && Math.abs(dy) < 2) return;
+        el.classList.add('at-acc-flying');
+        el.style.transition = 'none';
+        el.style.transform = `translate(${dx}px, ${dy}px)`;
+        void el.offsetHeight;                       // commit the start frame
+        requestAnimationFrame(() => {
+            el.style.transition = `transform ${FLIP_MS}ms ${FLIP_EASE}`;
+            el.style.transform = '';
+        });
+        const done = e => {
+            if (e && e.propertyName !== 'transform') return;
+            el.style.transition = '';
+            el.style.transform = '';
+            el.classList.remove('at-acc-flying');
+            el.removeEventListener('transitionend', done);
+        };
+        el.addEventListener('transitionend', done);
+        setTimeout(done, FLIP_MS + 80);             // belt and braces if the event is missed
+    }
+
+    /* An accordion that is its own column when open and parked in the tuning column
+       when closed. `home` is where the collapsed summary lives; `host` is the column.
+       Reparenting is what makes the collapsed state have no empty column at all. */
+    function accDock(details, home, host, applyLayout, animate, wantOpen) {
+        const open = (wantOpen === undefined) ? details.open : wantOpen;
+        const move = () => {
+            // Order matters, and all of it must happen in ONE frame: re-home the
+            // panel first, then open it, then re-lay the grid. Letting the browser
+            // open it where it stands lays the expanded contents out in the tuning
+            // column for a frame -- they overflow downward -- before the move yanks
+            // them sideways, which is the glitch testers saw.
+            const target = open ? host : home;
+            if (details.parentElement !== target) target.appendChild(details);
+            if (details.open !== open) details.open = open;
+            applyLayout();
+        };
+        // Opening a modal docks without animation: there is no previous position for
+        // the eye to follow, and animating on open would just look like a glitch.
+        if (animate === false) { move(); return; }
+        flipMove(details, move);
+        // The unfold runs after FLIP has measured the final geometry, so the two
+        // compose: FLIP carries the panel's position, this carries its height.
+        if (open) {
+            const body = details.querySelector(':scope > .at-acc-body');
+            if (body) accUnfold(body);
+        }
+    }
+
+    /* ---- Vertical unfold ----
+       <details> has no height to animate: the contents are simply rendered or not.
+       Wrapping them gives us one box whose height can be tweened, and because the
+       modal's own height is content-driven, animating this animates the modal with
+       it for free. */
+    const ACC_MS = 200;
+
+    function setupAccordions() {
+        document.querySelectorAll('.at-acc').forEach(d => {
+            const su = d.querySelector(':scope > summary');
+            if (!su || d.querySelector(':scope > .at-acc-body')) return;
+            const body = document.createElement('div');
+            body.className = 'at-acc-body';
+            let n = su.nextSibling;
+            while (n) { const next = n.nextSibling; body.appendChild(n); n = next; }
+            d.appendChild(body);
+            // Plain accordions drive themselves; the two docking ones (Set Material,
+            // Make Transition) are bound by accBindSummary instead, because they also
+            // have to change column and modal width in the same task.
+            if (d.id !== 'at-mat-adv' && d.id !== 'at-tr-org-acc') {
+                su.addEventListener('click', e => { e.preventDefault(); accSetOpen(d, !d.open); });
+            }
+        });
+    }
+
+    function accReduced() {
+        return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+
+    /* Run `fn` when the height transition finishes, or on a timeout if the event is
+       missed (a display change mid-flight will swallow it). */
+    function accAfter(body, fn) {
+        let done = false;
+        const end = e => {
+            if (e && e.propertyName !== 'height') return;
+            if (done) return;
+            done = true;
+            body.removeEventListener('transitionend', end);
+            fn();
+        };
+        body.addEventListener('transitionend', end);
+        setTimeout(end, ACC_MS + 80);
+    }
+
+    function accClearBody(body) {
+        body.style.height = '';
+        body.style.overflow = '';
+        body.style.transition = '';
+    }
+
+    /* Open/close with the height tweened. On close the panel is kept open until the
+       animation ends, or there would be nothing left to shrink. */
+    function accSetOpen(details, open) {
+        const body = details.querySelector(':scope > .at-acc-body');
+        if (!body || accReduced()) { details.open = open; return; }
+        accClearBody(body);
+        if (open) {
+            details.open = true;
+            accUnfold(body);
+        } else {
+            const h = body.scrollHeight;
+            body.style.overflow = 'hidden';
+            body.style.height = h + 'px';
+            void body.offsetHeight;
+            body.style.transition = `height ${ACC_MS}ms ${FLIP_EASE}`;
+            body.style.height = '0px';
+            accAfter(body, () => { details.open = false; accClearBody(body); });
+        }
+    }
+
+    /* Grow a body that is already rendered at full height back up from zero. Split
+       out because the docking accordions need it AFTER their FLIP has measured the
+       final geometry. */
+    function accUnfold(body) {
+        if (accReduced()) return;
+        const h = body.scrollHeight;
+        if (!h) return;
+        body.style.overflow = 'hidden';
+        body.style.height = '0px';
+        void body.offsetHeight;
+        body.style.transition = `height ${ACC_MS}ms ${FLIP_EASE}`;
+        body.style.height = h + 'px';
+        accAfter(body, () => accClearBody(body));
+    }
+
+    /* Drive the accordion from the summary's CLICK, not from `toggle`.
+       `toggle` is queued asynchronously, so by the time it runs the browser has
+       already applied `open` and can have painted a frame with the panel expanded in
+       the wrong place. Taking the click lets us reparent and open together.
+       The toggle listener stays as a backstop for programmatic `.open = …` (the
+       restore paths and the validators); by then everything already matches, and
+       flipMove's "moved less than 2px" guard makes it a no-op. */
+    function accBindSummary(details, dock) {
+        const summary = details.querySelector('summary');
+        summary.addEventListener('click', e => {
+            e.preventDefault();          // stop the native toggle-then-paint
+            dock(true, !details.open);
+        });
+    }
+
     function setupModals() {
         document.querySelectorAll('.at-modal').forEach(modal => {
             // Responsive fit pattern for EVERY modal: wrap the content between the
@@ -3689,8 +3929,8 @@ window.TRLE = window.TRLE || {};
         scattered:   'Best all-round (default). Great for sand, grass, gravel, foliage and rough stone.',
         allsides:    'Preserves centre detail. Best for structured textures — brick, tile, panels.',
         collage:     'Simple half-offset blend. Cheapest; good for smooth, low-contrast surfaces (plaster).',
-        materialize: 'Original Materialize-style quadrant blend; may look slightly zoomed at high overlap.',
-        splat:       'Rebuilds from random height-blended stamps (Materialize "Splat"). Hides repetition on busy organic textures; loses large-scale structure.'
+        multiband:   'Blends each frequency band with its own width — keeps fine detail sharper than a single cross-fade. Good general-purpose choice for detailed surfaces.',
+        splat:       'Rebuilds the tile from random rotated stamps, blended so overlaps keep the source\'s contrast. Hides repetition on busy organic textures; loses large-scale structure.'
     };
     const SM_PREVIEW = 512;
     const SM_SEAM_COLOR = [0.91, 0.52, 0.16];
@@ -3736,13 +3976,14 @@ window.TRLE = window.TRLE || {};
         if (sm.previewFBO) { TRLE.Engine.deleteFBO(sm.previewFBO); sm.previewFBO = null; }
 
         const resultFBO = TRLE.Engine.createFBO(S, S);
-        if (method === 'materialize') {
-            const grayFBO = TRLE.Engine.createFBO(S, S); temps.push(grayFBO);
-            TRLE.Engine.blit('desaturate', { u_texture: sm.srcTex, u_gamma: 1.0 }, grayFBO);
-            TRLE.Engine.blit('seamlessMaker', {
-                u_texture: sm.srcTex, u_heightMap: grayFBO.texture,
-                u_overlapX: overlapX, u_overlapY: overlapY, u_falloff: falloff
-            }, resultFBO);
+        if (method === 'multiband') {
+            /* Multi-band (Laplacian) edge blend — the MIT replacement for the
+               old GPL Materialize quadrant-overlap pass. Writes into resultFBO
+               via a copy because seamlessMultiBand owns its own output FBO. */
+            const mb = TRLE.Engine.seamlessMultiBand(sm.srcTex, S,
+                { overlapX, overlapY, falloff });
+            temps.push(mb);
+            TRLE.Engine.blit('copy', { u_texture: mb.texture }, resultFBO);
         } else if (method === 'allsides') {
             TRLE.Engine.blit('seamlessAllSides', {
                 u_texture: sm.srcTex, u_overlapX: overlapX, u_overlapY: overlapY, u_falloff: falloff
@@ -3752,10 +3993,8 @@ window.TRLE = window.TRLE || {};
                 u_texture: sm.srcTex, u_overlapX: overlapX, u_overlapY: overlapY, u_falloff: falloff
             }, resultFBO);
         } else if (method === 'splat') {
-            const grayFBO = TRLE.Engine.createFBO(S, S); temps.push(grayFBO);
-            TRLE.Engine.blit('desaturate', { u_texture: sm.srcTex, u_gamma: 1.0 }, grayFBO);
-            TRLE.Engine.blit('seamlessSplat', {
-                u_texture: sm.srcTex, u_heightMap: grayFBO.texture,
+            TRLE.Engine.blit('seamlessStamp', {
+                u_texture: sm.srcTex,
                 u_falloff: falloff,
                 u_rotation:       parseInt($('at-sm-splat-rotation').value) / 100,
                 u_rotationRandom: parseInt($('at-sm-splat-rotrandom').value) / 100,
@@ -4795,6 +5034,13 @@ window.TRLE = window.TRLE || {};
         if (!acc) return;
         const on = tr.tab === 'set' && $('at-tr-set-corners').value === 'seamless';
         acc.style.display = on ? '' : 'none';
+        // Corner style can take the accordion away while it is open and docked. Park
+        // it, or the third column stays open around a panel nobody can see.
+        if (!on && acc.open) { acc.open = false; }
+        if (!on && acc.parentElement !== $('at-tr-org-home')) {
+            $('at-tr-org-home').appendChild(acc);
+            trApplyZones();
+        }
         if (on) trOrgStyleHint();
     }
 
@@ -4815,6 +5061,33 @@ window.TRLE = window.TRLE || {};
             ? `➕ Add ${trSetLayout().cells.length * trAltCount()} Tiles` : '➕ Add to Atlas';
     }
 
+    /* The Organic edge accordion is the modal's middle zone, and it only exists on
+       the Full Set tab -- so the third column (and the wider modal it needs) comes
+       and goes with the tab. On Single Tiles the work zone is empty and a 1fr track
+       would just leave a gap. */
+    /* The third column exists only when the Organic edge accordion is OPEN -- not
+       merely when the Full Set tab is showing. Keying it to the tab left a
+       502x640px empty column in the middle of the modal by default, which is the
+       "weird empty column" testers reported. */
+    function trApplyZones() {
+        const set = tr.tab === 'set';
+        const acc = $('at-tr-org-acc');
+        const wide = set && acc.open && acc.style.display !== 'none';
+        const m = $('at-modal-trans');
+        m.classList.toggle('at-modal-xxl', wide);
+        m.classList.toggle('at-modal-xl', !wide);
+        // .at-3zone stays on permanently: the grid must keep three tracks or the
+        // preview wraps to row 2. Only the middle track collapses.
+        m.querySelector('.at-modal-cols').classList.toggle('at-work-collapsed', !wide);
+    }
+
+    /* Same docking as Set Material: parked in the tuning column while collapsed,
+       its own column when open. */
+    function trDockOrganic(animate, wantOpen) {
+        accDock($('at-tr-org-acc'), $('at-tr-org-home'),
+                $('at-modal-trans').querySelector('.at-modal-work'), trApplyZones, animate, wantOpen);
+    }
+
     function trSetTab(name) {
         tr.tab = name;
         document.querySelectorAll('#at-modal-trans .at-anim-tab').forEach(b => {
@@ -4822,6 +5095,7 @@ window.TRLE = window.TRLE || {};
             b.classList.toggle('active', on);
             b.setAttribute('aria-selected', on ? 'true' : 'false');
         });
+        trApplyZones();
         trApplyVisibility();
         trOrgVisibility();
         trPreview();
@@ -4886,6 +5160,7 @@ window.TRLE = window.TRLE || {};
         $('at-tr-mask-source').value = 'dir';
         tr.maskMode = 'dir';
         openModal('trans');
+        trDockOrganic(false);           // a toggle only fires on CHANGE; dock for the current state
         trSetTab(tr.tab || 'single');   // restores last-used tab, refreshes the right preview
     }
 
@@ -4946,6 +5221,9 @@ window.TRLE = window.TRLE || {};
     function setupTransModal() {
         document.querySelectorAll('#at-modal-trans .at-anim-tab').forEach(b =>
             b.addEventListener('click', () => trSetTab(b.dataset.trTab)));
+        // `toggle`, not click: validators and restore paths set .open directly.
+        $('at-tr-org-acc').addEventListener('toggle', () => trDockOrganic(true));
+        accBindSummary($('at-tr-org-acc'), trDockOrganic);
         const updateCornerHint = () => {
             const h = $('at-tr-corner-hint');
             if (h) h.textContent = TR_CORNER_HINTS[$('at-tr-set-corners').value] || '';
@@ -6303,7 +6581,128 @@ window.TRLE = window.TRLE || {};
             $('at-mat-desc').textContent = p.description || '';
         }
         mat.dirty = false;
+        matRenderContrastAdvice();
         matSchedulePreview();
+    }
+
+    /* ---- Contrast advice ------------------------------------------------
+       Every map in generateMaps derives from diffuse luminance, and nothing
+       normalises for how much contrast the diffuse actually has. Measured, the
+       output normal strength tracks the input's luminance standard deviation
+       almost exactly 1:1 — halve the contrast and the normal tilt halves:
+
+         Bricks.png @ x0.5 contrast: std 23.4 -> 11.7, tiltRMS 28.52 -> 13.59
+
+       So one preset lands very differently on different source textures
+       (Sand std 9.9 -> tilt 7.0 vs Bricks std 23.4 -> tilt 28.5 — a 4x spread
+       from the same preset). A preset is only calibrated for textures near the
+       contrast it was tuned on.
+
+       This ADVISES rather than auto-corrects, deliberately. See Roadmap.md
+       "Phase 4": the previous auto-gain attempt (FailedExperiment1) normalised
+       the grayscale INPUT on a min/max statistic and amplified micro-noise into
+       every downstream map, and Materialize — the most mature tool in this
+       space — ships no auto-gain at all, only manual multi-band controls. An
+       inline note keeps the user in control and cannot regress 53 presets.
+       -------------------------------------------------------------------- */
+
+    /* Luminance std of a tile, 0-255, measured on a 64x64 downsample so this is
+       cheap enough to run on every modal open / preset change. */
+    function tileLumStd(canvas) {
+        const S = 64;
+        const d = resizeCanvas(canvas, S, S).getContext('2d').getImageData(0, 0, S, S).data;
+        let sum = 0, sumSq = 0;
+        const n = S * S;
+        for (let i = 0; i < d.length; i += 4) {
+            const l = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+            sum += l; sumSq += l * l;
+        }
+        const mean = sum / n;
+        return Math.sqrt(Math.max(0, sumSq / n - mean * mean));
+    }
+
+    /* The luminance std the built-in presets are calibrated around.
+
+       ⚠ This number is only meaningful on the SAME measurement basis as
+       tileLumStd above — a 64x64 downsample. Downsampling averages fine detail
+       away, so the same texture reads lower than it does at full resolution
+       (Bricks: 18.7 at 64px, 23.4 at 256px). Measured at 64 and 128 the figure
+       is stable (18.71 / 18.85), so 64 is the cheap, honest choice — but if you
+       ever change the downsample size, re-measure this constant too or the
+       advice silently shifts.
+
+       Calibrated from the reference textures the presets were tuned on, at 64:
+       Bricks 18.7, Stonetiles 24.7, BakedLighting 28.7. Sand 8.3 and Grass 7.5
+       are the low-contrast outliers this advice exists to catch. */
+    const MAT_REF_STD = 20;
+    /* Only speak up outside this band. FailedExperiment1's auto-gain fired on
+       nearly every photograph because its threshold was too tight; a note that
+       appears constantly is noise. At these bounds the reference textures stay
+       silent and only genuinely flat or genuinely punchy tiles trigger. */
+    const MAT_ADVICE_LO = 0.6, MAT_ADVICE_HI = 1.6;
+
+    function matContrastAdvice() {
+        /* In batch mode the material lands on every selected tile, so judge the
+           batch rather than whichever tile happened to seed the editor. */
+        const ids = (mat.batchIds && mat.batchIds.length) ? mat.batchIds
+                  : (mat.id != null ? [mat.id] : []);
+        const tiles = ids.map(byId).filter(e => e && e.canvas);
+        if (!tiles.length) return null;
+        const p = matCurrentPresetObjBase();
+        if (!p || p.normalStrength == null) return null;
+
+        const stds = tiles.map(e => tileLumStd(e.canvas)).filter(v => v >= 0.5);
+        if (!stds.length) return null;                 // flat colour: nothing to advise
+
+        /* A batch must not be averaged. A mixed selection — say half flat sand,
+           half punchy brick — averages to "about right" and the note goes quiet,
+           which is the one case where a single Normal Strength genuinely cannot
+           suit everything. Judge the tiles individually and say when they
+           disagree instead of hiding it in a mean. */
+        const band = v => (v / MAT_REF_STD < MAT_ADVICE_LO ? -1
+                        : v / MAT_REF_STD > MAT_ADVICE_HI ? 1 : 0);
+        const bands = stds.map(band);
+        if (stds.length > 1 && !bands.every(b => b === bands[0])) {
+            const lo = Math.min(...stds), hi = Math.max(...stds);
+            return `🎚 These ${stds.length} textures <strong>vary a lot in contrast</strong> `
+                 + `(luminance spread ${lo.toFixed(0)}–${hi.toFixed(0)}). Maps derive from diffuse `
+                 + `contrast, so one <strong>Normal Strength</strong> will land differently on each — `
+                 + `the flatter ones come out softer than the punchy ones. Consider applying to them in `
+                 + `groups, or set the material per tile.`;
+        }
+
+        const std = stds.reduce((s, v) => s + v, 0) / stds.length;
+        const ratio = std / MAT_REF_STD;
+        if (ratio >= MAT_ADVICE_LO && ratio <= MAT_ADVICE_HI) return null;
+
+        const row = MAT_PARAMS.find(r => r[0] === 'normalStrength') || [];
+        const min = row[2] != null ? row[2] : 1, max = row[3] != null ? row[3] : 50;
+        const ideal = p.normalStrength / ratio;
+        const suggested = Math.round(Math.min(max, Math.max(min, ideal)));
+        if (suggested === Math.round(p.normalStrength)) return null;
+
+        const low = ratio < 1;
+        const subject = stds.length > 1 ? `These ${stds.length} textures are` : 'This texture is';
+        /* Say so when the slider can't actually reach the matching value —
+           otherwise "try 50" reads as the computed ideal when it is really the
+           ceiling, and the user wonders why 50 still looks flat. */
+        const clamped = Math.round(ideal) !== suggested;
+        const advice = clamped
+            ? `even <strong>Normal Strength ${suggested}</strong> (the maximum) won't fully compensate — `
+              + `consider raising the contrast of the texture itself first, with <strong>🎚 Adjust Colours</strong> or <strong>☀ De-light</strong>`
+            : `try <strong>Normal Strength ${suggested}</strong> instead of ${p.normalStrength} in the advanced editor`;
+        return `${low ? '🔅' : '🔆'} ${subject} <strong>${low ? 'low' : 'high'}-contrast</strong> `
+             + `(luminance spread ${std.toFixed(0)} vs the ~${MAT_REF_STD} presets assume). `
+             + `Maps derive from diffuse contrast, so <strong>${p.label || 'this preset'}</strong> will land `
+             + `${low ? 'flatter' : 'stronger'} than intended here — ${advice}.`;
+    }
+
+    function matRenderContrastAdvice() {
+        const box = $('at-mat-contrast');
+        if (!box) return;
+        const msg = matContrastAdvice();
+        box.innerHTML = msg || '';
+        box.style.display = msg ? 'block' : 'none';
     }
 
     function matCurrentPresetObjBase() {
@@ -6643,7 +7042,9 @@ window.TRLE = window.TRLE || {};
 
         hidePresetName();     // reset the save/rename name field if it was left open
         mat3dSetMode('2d');   // every open starts in 2D; 3D loads Babylon only on demand
+        matDockAdvanced(false);   // a toggle only fires on CHANGE, so dock for the current state
         openModal('mat');
+        matRenderContrastAdvice();
         matSchedulePreview();
     }
 
@@ -6653,6 +7054,7 @@ window.TRLE = window.TRLE || {};
         openMatModal(ids[0]);
         mat.batchIds = ids.slice();
         $('at-mat-title').textContent = `🎨 Apply Material — ${ids.length} tiles`;
+        matRenderContrastAdvice();   // re-run now that it can see the whole batch
     }
 
     /* ============ MULTI-MATERIAL (per-region layers) ============ */
@@ -6688,8 +7090,28 @@ window.TRLE = window.TRLE || {};
 
     function mmApplyEnabledUI() {
         $('at-mat-multi').style.display = matMulti.enabled ? 'block' : 'none';
-        $('at-modal-mat').classList.toggle('at-modal-xxl', matMulti.enabled);
+        matApplyWidth();
         if (matMulti.enabled) { mmSetTool(matMulti.tool || 'brush'); mmRenderList(); }
+    }
+
+    /* Two independent things want the Material modal wide -- multi-material's
+       layer/selection UI, and the advanced editor moving into its own column --
+       so neither may own the class on its own or turning one off would narrow the
+       modal while the other is still open. */
+    function matApplyWidth() {
+        const adv = $('at-mat-adv').open;
+        const modal = $('at-modal-mat');
+        modal.classList.toggle('at-adv-open', adv);
+        modal.classList.toggle('at-modal-xxl', adv || matMulti.enabled);
+    }
+
+    /* Collapsed, the advanced editor sits at the bottom of the tuning column where
+       its summary is visible and costs no column. Opened, it docks into the side
+       column and the modal widens -- and FLIP carries it across so it reads as the
+       same panel moving rather than one vanishing and another appearing. */
+    function matDockAdvanced(animate, wantOpen) {
+        accDock($('at-mat-adv'), $('at-mat-advhome'), $('at-modal-mat').querySelector('.at-mat-advcol'),
+                matApplyWidth, animate, wantOpen);
     }
 
     function mmEnable(on) {
@@ -7040,6 +7462,13 @@ window.TRLE = window.TRLE || {};
         // that used to be a one-shot removal of ✨ Fantasy here.
         matSyncAesthetics();
 
+        // Opening the advanced editor widens the modal and moves the sliders into
+        // the right column. `toggle` (not a click handler) because the accordion is
+        // also opened programmatically -- matLoadMaterialDescriptor opens it for a
+        // custom material, and the validators set .open directly.
+        $('at-mat-adv').addEventListener('toggle', () => matDockAdvanced(true));
+        accBindSummary($('at-mat-adv'), matDockAdvanced);
+
         // Build the advanced slider grid once
         const wrap = $('at-mat-sliders');
         MAT_PARAMS.forEach(([key, label, min, max, step]) => {
@@ -7177,10 +7606,18 @@ window.TRLE = window.TRLE || {};
         diffusion: 'Smoothly interpolates surrounding colours into the painted area. Best for small blemishes, scratches or logos on smoothish surfaces.',
         texture:   'Replaces the painted area with texture re-synthesised from the whole tile. Best for uniformly busy / organic surfaces.'
     };
-    const heal = { id: null, maskCanvas: null, resultCanvas: null, brushErase: false };
+    /* resultRes is the tile size `resultCanvas` was computed at. The live preview is
+       capped (HEAL_PREVIEW_MAX) so painting stays responsive on big tiles, so Save
+       must not blindly reuse it -- it recomputes unless the cache is already
+       full-resolution. */
+    const heal = { id: null, maskCanvas: null, resultCanvas: null, resultRes: 0,
+                   brushErase: false, timer: null };
+    const HEAL_PREVIEW_MAX = 256;
 
     function healCleanup() {
         heal.id = null;
+        clearTimeout(heal.timer);
+        heal.resultRes = 0;
         heal.resultCanvas = null;
     }
 
@@ -7211,11 +7648,62 @@ window.TRLE = window.TRLE || {};
         $('at-heal-canvas-label').textContent = 'Paint the area to heal (red = selected)';
     }
 
+    function healSetTool(tool) {
+        heal.brushErase = (tool === 'erase');
+        document.querySelectorAll('#at-modal-heal [data-heal-tool]').forEach(b => {
+            const on = b.dataset.healTool === tool;
+            b.classList.toggle('active', on);
+            b.setAttribute('aria-pressed', on ? 'true' : 'false');
+        });
+    }
+
+    /* Live fill preview.
+       Measured cost of one fill, synchronous on the main thread: 94ms (patch, 256),
+       233ms (patch, 512), 77-92ms for the GPU methods. Far too slow to run per dab --
+       pointermove fires dozens of times a stroke -- so it runs once per STROKE, and
+       at a capped resolution. That keeps painting responsive, which PERFORMANCE.md
+       treats as non-negotiable, while still reading as live: you lift the brush and
+       the After pane updates. */
+    function healMaskIsEmpty() {
+        const c = heal.maskCanvas;
+        const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+        for (let i = 0; i < d.length; i += 4) if (d[i] > 128) return false;
+        return true;
+    }
+
+    function healSchedulePreview() {
+        clearTimeout(heal.timer);
+        heal.resultCanvas = null;
+        heal.resultRes = 0;
+        if (heal.id === null) return;
+        if (healMaskIsEmpty()) { healRenderResult(); return; }
+        $('at-heal-busy').style.display = '';
+        heal.timer = setTimeout(() => {
+            if (heal.id === null) return;
+            const S = Math.min(state.tileSize, HEAL_PREVIEW_MAX);
+            heal.resultCanvas = healComputeFill(S);
+            heal.resultRes = S;
+            $('at-heal-busy').style.display = 'none';
+            healRenderResult();
+        }, 120);
+    }
+
+    /* Before/after live in their OWN column now. The fill result used to be drawn
+       over the paint canvas, so seeing the fill meant losing sight of what you had
+       painted, and comparing meant undoing. */
+    function healRenderBefore() {
+        const el = byId(heal.id);
+        const c = $('at-heal-before');
+        const ctx = c.getContext('2d');
+        ctx.clearRect(0, 0, c.width, c.height);
+        if (el) ctx.drawImage(el.canvas, 0, 0, c.width, c.height);
+    }
+
     function healRenderResult() {
-        if (!heal.resultCanvas) return;
-        const disp = $('at-heal-canvas');
-        disp.getContext('2d').drawImage(heal.resultCanvas, 0, 0, disp.width, disp.height);
-        $('at-heal-canvas-label').textContent = 'Preview (filled) — Save to apply';
+        const c = $('at-heal-after');
+        const ctx = c.getContext('2d');
+        ctx.clearRect(0, 0, c.width, c.height);
+        if (heal.resultCanvas) ctx.drawImage(heal.resultCanvas, 0, 0, c.width, c.height);
     }
 
     /* Compute the filled tile at full resolution using the chosen method. */
@@ -7290,9 +7778,9 @@ window.TRLE = window.TRLE || {};
         return work;
     }
 
-    function healComputeFill() {
+    function healComputeFill(size) {
         const el = byId(heal.id);
-        const S = state.tileSize;
+        const S = size || state.tileSize;
         const E = TRLE.Engine;
         const method = $('at-heal-method').value;
         if (method === 'patch') {
@@ -7305,8 +7793,8 @@ window.TRLE = window.TRLE || {};
             const grayFBO = E.createFBO(S, S);
             E.blit('desaturate', { u_texture: origTex, u_gamma: 1.0 }, grayFBO);
             const synthFBO = E.createFBO(S, S);
-            E.blit('seamlessSplat', {
-                u_texture: origTex, u_heightMap: grayFBO.texture,
+            E.blit('seamlessStamp', {
+                u_texture: origTex,
                 u_falloff: 0.2, u_rotation: 0.0, u_rotationRandom: 0.5,
                 u_scale: 1.0, u_wobble: 0.3, u_randomize: 0.6
             }, synthFBO);
@@ -7335,50 +7823,62 @@ window.TRLE = window.TRLE || {};
         $('at-heal-tileno').textContent = indexOf(id) + 1;
         const mc = heal.maskCanvas.getContext('2d');
         mc.fillStyle = '#000'; mc.fillRect(0, 0, 256, 256);
-        const mode = $('at-heal-brush-mode');
-        mode.textContent = '🖌️ Paint'; mode.setAttribute('aria-pressed', 'false');
+        healSetTool('paint');
         updateHealHint();
+        heal.resultCanvas = null;
+        heal.resultRes = 0;
+        clearTimeout(heal.timer);
+        $('at-heal-busy').style.display = 'none';
         openModal('heal');
         healRenderPaint();
+        healRenderBefore();
+        healRenderResult();   // clears the After pane from any previous tile
     }
 
     function setupHealModal() {
         // Create the mask canvas up-front so attachMaskBrush binds a real object.
         heal.maskCanvas = document.createElement('canvas');
         heal.maskCanvas.width = 256; heal.maskCanvas.height = 256;
+        // Method and hardness both change what the fill produces, so both re-run it.
         $('at-heal-method').addEventListener('change', () => {
             updateHealHint();
-            heal.resultCanvas = null;   // method changed → previous preview invalid
             healRenderPaint();
+            healSchedulePreview();
         });
         $('at-heal-brush').addEventListener('input', function () {
             $('at-heal-brush-val').textContent = this.value;
         });
-        $('at-heal-brush-mode').addEventListener('click', function () {
-            heal.brushErase = !heal.brushErase;
-            this.textContent = heal.brushErase ? '🧽 Erase' : '🖌️ Paint';
-            this.setAttribute('aria-pressed', String(heal.brushErase));
+        $('at-heal-hardness').addEventListener('input', function () {
+            $('at-heal-hardness-val').textContent = this.value;
         });
+        // Paint and Erase are two buttons, not one that relabels itself: which mode
+        // you are in should be readable without remembering what the label means.
+        document.querySelectorAll('#at-modal-heal [data-heal-tool]').forEach(b =>
+            b.addEventListener('click', () => healSetTool(b.dataset.healTool)));
         $('at-heal-clear').addEventListener('click', () => {
             const mc = heal.maskCanvas.getContext('2d');
             mc.fillStyle = '#000'; mc.fillRect(0, 0, heal.maskCanvas.width, heal.maskCanvas.height);
-            heal.resultCanvas = null;
             healRenderPaint();
+            healSchedulePreview();
         });
-        $('at-heal-preview').addEventListener('click', () => {
-            heal.resultCanvas = healComputeFill();
-            healRenderResult();
-        });
+
         attachMaskBrush($('at-heal-canvas'), heal.maskCanvas, {
             active: () => heal.id !== null && $('at-modal-heal').style.display !== 'none',
             brushSize: () => parseInt($('at-heal-brush').value),
             erase: () => heal.brushErase,
-            onPaint: () => { heal.resultCanvas = null; healRenderPaint(); }
+            // onPaint runs per dab: paint view only, nothing expensive.
+            onPaint: () => { heal.resultCanvas = null; heal.resultRes = 0; healRenderPaint(); },
+            // The fill is recomputed once the stroke ends.
+            onStrokeEnd: healSchedulePreview,
+            hardness: () => parseInt($('at-heal-hardness').value) / 100
         });
         $('at-heal-save').addEventListener('click', () => {
             if (heal.id === null) return;
             const el = byId(heal.id);
-            const result = heal.resultCanvas || healComputeFill();
+            // The live preview may be a capped-resolution render, so only reuse it
+            // when it happens to already be full size.
+            const result = (heal.resultCanvas && heal.resultRes === state.tileSize)
+                ? heal.resultCanvas : healComputeFill(state.tileSize);
             el.canvas.getContext('2d').drawImage(result, 0, 0);
             el.edited = true;   // canvas now diverges from original → must be snapshotted
             closeModal();
@@ -9144,10 +9644,13 @@ window.TRLE = window.TRLE || {};
         const wrap = $('at-var-previews');
         wrap.innerHTML = '';
         varState.variants.forEach(v => {
+            // 128, not 64: the previews now live in the modal's preview rail, which
+            // fits three of these per row. At 64 they were the smallest previews in
+            // the tool and you could not actually see the jitter you were dialling in.
             const c = document.createElement('canvas');
-            c.width = 64; c.height = 64;
+            c.width = 128; c.height = 128;
             c.style.cssText = 'border:1px solid var(--border);border-radius:4px;image-rendering:pixelated;';
-            c.getContext('2d').drawImage(v, 0, 0, 64, 64);
+            c.getContext('2d').drawImage(v, 0, 0, 128, 128);
             wrap.appendChild(c);
         });
     }
@@ -12436,6 +12939,8 @@ window.TRLE = window.TRLE || {};
         setupClipboardPaste();
         applyPrefs();
         setupAccessibility();
+        setupLogoHome();
+        setupAccordions();
 
         // Tutorial-asset capture hook — only active with ?capture in the URL, so
         // it has zero effect on normal use. Lets tools/capture-examples.mjs drive
@@ -12478,6 +12983,16 @@ window.TRLE = window.TRLE || {};
                 };
             },
             count() { return state.elements.length; },
+            // Contrast advice (Roadmap.md Phase 4): the measured luminance std of
+            // a tile, and the advisory line the material modal would show for it.
+            lumStd(i) {
+                const el = state.elements[i];
+                return el && el.canvas ? +tileLumStd(el.canvas).toFixed(2) : null;
+            },
+            contrastAdvice() {
+                return { html: matContrastAdvice(), ref: MAT_REF_STD,
+                         band: [MAT_ADVICE_LO, MAT_ADVICE_HI] };
+            },
             // test-only: the cutout detector that drives alphaFlatten, so
             // validate-alpha-maps can assert on the same predicate the pipeline uses.
             canvasHasAlpha,
@@ -12710,6 +13225,27 @@ window.TRLE = window.TRLE || {};
                 out.wrapsRight = at(S - 4, 35);     // the copy that came round
                 return out;
             },
+            /* test-only: the Heal selection mask's value histogram. The mask is a
+               closure-private detached canvas, and the on-screen paint view composites
+               it over the tile -- so measuring "is this brush soft?" from the visible
+               canvas measures the texture's own colour spread, not the mask. */
+            healMaskStats() {
+                const c = heal.maskCanvas;
+                if (!c) return null;
+                const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+                let zero = 0, partial = 0, full = 0;
+                for (let i = 0; i < d.length; i += 4) {
+                    const v = d[i];
+                    if (v < 8) zero++;
+                    else if (v > 247) full++;
+                    else partial++;
+                }
+                return { zero, partial, full, total: d.length / 4 };
+            },
+            /* test-only: run the logo's "start over" path for real -- confirm dialog,
+               autosave flush and all -- but stop short of navigating away. */
+            stubNav() { capNavHits = 0; nav.reload = () => { capNavHits++; }; return true; },
+            navHits() { return capNavHits; },
             closeModal() { closeModal(); return true; },
             // test-only: mean luma of an element's emissive canvas (-1 if none).
             // Lets validators confirm glow baking + that Pulse varies across frames.
@@ -12752,15 +13288,13 @@ window.TRLE = window.TRLE || {};
                 for (let i = 0; i < 2; i++) for (let j = 0; j < 2; j++) x.drawImage(c, i * S, j * S);
                 return url(o);
             },
-            // materialize seamless (desaturate → seamlessMaker), tiled 2×2
+            // multi-band seamless blend, tiled 2×2
             async seamless(src, S, overlap, falloff) {
                 const E = TRLE.Engine, c = toC(await loadImg(src), S);
                 const tex = E.createTextureFromImage(c);
-                const gray = E.createFBO(S, S); E.blit('desaturate', { u_texture: tex, u_gamma: 1.0 }, gray);
-                const res = E.createFBO(S, S);
-                E.blit('seamlessMaker', { u_texture: tex, u_heightMap: gray.texture, u_overlapX: overlap, u_overlapY: overlap, u_falloff: falloff }, res);
+                const res = E.seamlessMultiBand(tex, S, { overlapX: overlap, overlapY: overlap, falloff });
                 const out = E.fboToCanvas(res);
-                E.deleteFBO(gray); E.deleteFBO(res); E.deleteTexture(tex);
+                E.deleteFBO(res); E.deleteTexture(tex);
                 const o = document.createElement('canvas'); o.width = S * 2; o.height = S * 2; const x = o.getContext('2d');
                 for (let i = 0; i < 2; i++) for (let j = 0; j < 2; j++) x.drawImage(out, i * S, j * S, S, S);
                 return url(o);
@@ -12803,11 +13337,9 @@ window.TRLE = window.TRLE || {};
             async seamlessTile(src, S, overlap, falloff) {
                 const E = TRLE.Engine, c = toC(await loadImg(src), S);
                 const tex = E.createTextureFromImage(c);
-                const gray = E.createFBO(S, S); E.blit('desaturate', { u_texture: tex, u_gamma: 1.0 }, gray);
-                const res = E.createFBO(S, S);
-                E.blit('seamlessMaker', { u_texture: tex, u_heightMap: gray.texture, u_overlapX: overlap, u_overlapY: overlap, u_falloff: falloff }, res);
+                const res = E.seamlessMultiBand(tex, S, { overlapX: overlap, overlapY: overlap, falloff });
                 const out = E.fboToCanvas(res);
-                E.deleteFBO(gray); E.deleteFBO(res); E.deleteTexture(tex);
+                E.deleteFBO(res); E.deleteTexture(tex);
                 return url(out);
             },
             // A looping pan over the tiled seamless result (frames = data URLs). Pans

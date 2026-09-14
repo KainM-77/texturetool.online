@@ -1,19 +1,25 @@
-/* SPDX-License-Identifier: GPL-3.0-only
-   TextureTool — Copyright (C) 2026 KainM-77.
-   MIXED LICENSE — read carefully:
-   • Two seamless-tiling passes below — `seamlessMaker` and `seamlessSplat`
-     (each marked inline "GPL-3.0 ONLY") — are ported (HLSL→GLSL) from Materialize
-     (BoundingBoxSoftware) and are available ONLY under GPL-3.0. They are the sole
-     reason the tool as a whole ships under GPL-3.0 (see LICENSE).
-   • EVERY OTHER shader in this file is the author's own independent implementation
-     of a standard image-processing technique and is ALSO available under the MIT
-     License (see LICENSE-MIT) when copied on its own.
-   • The file carries the GPL-3.0 SPDX tag because, as a whole unit, it contains
-     the two ported shaders.
-   See THIRD-PARTY-NOTICES.md and "Path to MIT.md" for the full per-shader audit. */
+/* SPDX-License-Identifier: MIT
+   TextureTool — Copyright (c) 2026 KainM-77. Available under the MIT License.
+
+   Every shader in this file is an independent implementation of a standard,
+   published image-processing technique. No Materialize code remains: the two
+   ported GPL-3.0 seamless passes (`seamlessMaker`, `seamlessSplat`) were removed
+   on 2026-09-13 and replaced by `wrapShift`/`seamBandMask`/`bandBlend`/`bandDiff`
+   (multi-band Laplacian blending) and `seamlessStamp` (variance-preserving stamp
+   blending). See THIRD-PARTY-NOTICES.md and "Path to MIT.md". */
 /* ============================================================
    TRLE Texture Tools — GLSL Shaders (WebGL 2.0 / GLSL ES 3.0)
    Fragment shaders for the web GPU texture pipeline.
+
+   ⚠ BEFORE DELETING AN "UNUSED" SHADER: a grep over engine.js + atlas.js only
+   is NOT enough and will lie to you. `animNoise` is used by js/animgen.js, and
+   `seamlessCrop` + `mix2` are used by js/app.js — the frozen root clone, which
+   is not loaded by AtlasTool's index.html but still backs texturetool.html.
+   Sweep every js/*.js AND the HTML files, app.js included.
+
+   Genuinely unwired, each annotated at its definition with why it is still
+   here: combineHeight, normalizeContrast, edgeEnhance, tileMaskBlur,
+   seamProtection. See Roadmap.md "Phase 2".
    ============================================================ */
 
 window.TRLE = window.TRLE || {};
@@ -92,7 +98,16 @@ TRLE.Shaders = {
 
     /* ---------- Height from Diffuse (multi-frequency) ----------
        Combines multiple blur levels with user weights.
-       Used for the advanced height pipeline.
+
+       NOT WIRED UP — but keep it: this is a direct port of Materialize's
+       `Blit_Height_From_Diffuse.shader` fragCombine pass, i.e. seven frequency
+       bands with individual weights plus a final contrast/bias. That is exactly
+       how Materialize answers the "one preset lands differently on every
+       texture" problem: manual multi-band control, no auto-gain anywhere.
+
+       Wiring this into an advanced height editor would give Materialize parity
+       by construction, and it is the escape hatch if the advisory note shipped
+       in Phase 4 turns out not to be enough. See Roadmap.md "Phase 4".
        ---------------------------------------------------------- */
     combineHeight: `#version 300 es
         precision highp float;
@@ -368,175 +383,6 @@ TRLE.Shaders = {
             float hp = lum - blur;
             float rough = u_baseValue + hp * u_contrast * 2.0;
             fragColor = vec4(vec3(clamp(rough, 0.0, 1.0)), 1.0);
-        }`,
-
-    /* ---------- Seamless Maker ----------   ⚠ GPL-3.0 ONLY — NOT under MIT
-       Makes a non-tiling texture tile seamlessly.
-       Ported (HLSL→GLSL) from Materialize's Blit_Seamless_Texture_Maker.shader
-       (frag pass) — a derivative of GPL-3.0 code, so this shader is GPL-3.0 only.
-       (Replacing it independently is the last step to a fully-MIT tool; see
-       "Path to MIT.md" §4.1.)
-
-       Algorithm per-pixel:
-       1. Compute edge-blend mask across overlap zone at origin edges (x=0, y=0).
-       2. Sample diffuse + height at 4 offset positions (wrapped via fract).
-       3. Remap each quadrant's UV so samples correctly address the texture
-          after the overlap zone is removed.  The opposite edges (x=1, y=1)
-          are healed by the remapping — their samples wrap into the mask zone.
-       4. Height-guided smoothstep blend: highest-surface-wins rule where
-          the mask bias ensures each side dominates near its own edge.
-       5. Two-pass: horizontal edges first, then vertical using the
-          intermediate result.
-       ----------------------------------------- */
-    seamlessMaker: `#version 300 es
-        precision highp float;
-        uniform sampler2D u_texture;    // original RGB diffuse
-        uniform sampler2D u_heightMap;  // grayscale luminance proxy
-        uniform float u_overlapX;       // overlap fraction (0.03–0.50)
-        uniform float u_overlapY;       // overlap fraction (0.03–0.50)
-        uniform float u_falloff;        // blend sharpness (0–1)
-        in vec2 v_uv;
-        out vec4 fragColor;
-        void main() {
-            float invOverlapX = 1.0 - u_overlapX;
-            float invOverlapY = 1.0 - u_overlapY;
-            float oneOverOverlapX = 1.0 / u_overlapX;
-            float oneOverOverlapY = 1.0 / u_overlapY;
-
-            // Four offset UVs (toroidal wrapping via fract)
-            vec2 uv  = fract(v_uv);
-            vec2 uv2 = fract(v_uv - vec2(u_overlapX, 0.0));
-            vec2 uv3 = fract(v_uv - vec2(0.0, u_overlapY));
-            vec2 uv4 = fract(v_uv - vec2(u_overlapX, u_overlapY));
-
-            // ── UV remapping (matches Materialize) ──
-            // Each quadrant is scaled so the texture is addressed correctly
-            // after the overlap zone is removed.  Without this step the
-            // right/top edge samples don't cover the correct wrap regions.
-            uv  *= vec2(invOverlapX, invOverlapY);
-
-            uv2.x += u_overlapX;
-            uv2   *= vec2(invOverlapX, invOverlapY);
-
-            uv3.y += u_overlapY;
-            uv3   *= vec2(invOverlapX, invOverlapY);
-
-            uv4  += vec2(u_overlapX, u_overlapY);
-            uv4   *= vec2(invOverlapX, invOverlapY);
-
-            // Blend mask: 0→1 ramp across the overlap zone at the origin edge
-            float maskX = clamp((1.0 - fract(v_uv.x) - invOverlapX) * oneOverOverlapX, 0.0, 1.0);
-            float maskY = clamp((1.0 - fract(v_uv.y) - invOverlapY) * oneOverOverlapY, 0.0, 1.0);
-
-            // Sample heights
-            float h  = texture(u_heightMap, uv).r;
-            float h2 = texture(u_heightMap, uv2).r;
-            float h3 = texture(u_heightMap, uv3).r;
-            float h4 = texture(u_heightMap, uv4).r;
-
-            // Sample colours
-            vec4 c  = texture(u_texture, uv);
-            vec4 c2 = texture(u_texture, uv2);
-            vec4 c3 = texture(u_texture, uv3);
-            vec4 c4 = texture(u_texture, uv4);
-
-            // Smoothstep range from falloff
-            float ssHigh = 0.01 + 0.5 * clamp(u_falloff, 0.0, 1.0);
-            float ssLow  = -0.01 - 0.5 * clamp(u_falloff, 0.0, 1.0);
-
-            // ---- Horizontal blend (left ↔ right edges) ----
-            float texBlendH = smoothstep(ssLow, ssHigh,
-                (h2 + maskX) - (h + (1.0 - maskX)));
-            vec4 colH = mix(c, c2, texBlendH);
-            float heightH = max(h + (1.0 - maskX), h2 + maskX) - 1.0
-                          + clamp(min(maskX, 1.0 - maskX), 0.0, 1.0);
-
-            // ---- Vertical blend (top ↔ bottom edges) ----
-            float texBlendV = smoothstep(ssLow, ssHigh,
-                (h4 + maskX) - (h3 + (1.0 - maskX)));
-            vec4 colV = mix(c3, c4, texBlendV);
-            float heightV = max(h3 + (1.0 - maskX), h4 + maskX) - 1.0
-                          + clamp(min(maskX, 1.0 - maskX), 0.0, 1.0);
-
-            // ---- Combine horizontal + vertical ----
-            float texBlend = smoothstep(ssLow, ssHigh,
-                (heightV + maskY) - (heightH + (1.0 - maskY)));
-            vec4 result = mix(colH, colV, texBlend);
-
-            fragColor = vec4(result.rgb, 1.0);
-        }`,
-
-    /* ---------- Seamless: Splat (random stamps) ----------   ⚠ GPL-3.0 ONLY — NOT under MIT
-       Ported (HLSL→GLSL) from Materialize's Blit_Seamless_Texture_Maker.shader
-       (frag_splat pass). Rebuilds the texture from 4 rotated/wobbled
-       stamps on a fixed square kernel, composited highest-height-wins
-       so overlaps follow surface detail instead of cross-fading.
-       Materialize accumulates one blit per stamp through ping-pong
-       buffers; TRLE textures are always square, so the square kernel
-       is hardcoded and the whole accumulation runs in a single pass.
-       Each stamp is drawn at 9 wrap offsets for toroidal tiling.
-       ------------------------------------------------------------- */
-    seamlessSplat: `#version 300 es
-        precision highp float;
-        uniform sampler2D u_texture;     // original RGB diffuse
-        uniform sampler2D u_heightMap;   // grayscale luminance proxy
-        uniform float u_falloff;         // blend sharpness (0-1)
-        uniform float u_rotation;        // base rotation, turns (0-1)
-        uniform float u_rotationRandom;  // random rotation amount (0-1)
-        uniform float u_scale;           // stamp scale (0.5-2.0)
-        uniform float u_wobble;          // random offset amount (0-1)
-        uniform float u_randomize;       // randomize seed (0-1)
-        in vec2 v_uv;
-        out vec4 fragColor;
-        void main() {
-            // Square splat kernel: xy = centre, z = stamp size
-            const vec3 KERNEL[4] = vec3[4](
-                vec3(0.0,  0.25, 0.8), vec3(0.5,  0.25, 0.8),
-                vec3(0.25, 0.75, 0.8), vec3(0.75, 0.75, 0.8));
-            const vec2 OFFSETS[9] = vec2[9](
-                vec2( 1.0,  1.0), vec2(0.0,  1.0), vec2(-1.0,  1.0),
-                vec2( 1.0,  0.0), vec2(0.0,  0.0), vec2(-1.0,  0.0),
-                vec2( 1.0, -1.0), vec2(0.0, -1.0), vec2(-1.0, -1.0));
-
-            float ssHigh =  0.01 + 0.5 * clamp(u_falloff, 0.0, 1.0);
-            float ssLow  = -0.01 - 0.5 * clamp(u_falloff, 0.0, 1.0);
-
-            vec3  accCol = vec3(0.0);
-            float accH   = 0.0;
-
-            for (int i = 0; i < 4; i++) {
-                // Per-stamp pseudo-random values (Materialize's CPU-side
-                // sin/cos hashes of the randomize seed, moved in-shader)
-                float fi  = u_randomize + 1.0 + float(i);
-                float rnd = sin(fi * 472.361);
-                vec2  wob = vec2(sin(fi * 128.352), cos(fi * 243.767));
-
-                float rot = (u_rotation + u_rotationRandom * rnd) * -6.28318530718;
-                float cr = cos(rot), sr = sin(rot);
-
-                for (int j = 0; j < 9; j++) {
-                    vec2 p = (v_uv - KERNEL[i].xy + OFFSETS[j])
-                           / (u_scale * KERNEL[i].z);
-                    p = vec2(cr * p.x - sr * p.y, sr * p.x + cr * p.y);
-
-                    // Rounded-square falloff masks over the stamp extent
-                    vec2 m = clamp(abs(p * 2.0), 0.0, 1.0);
-                    float box        = (1.0 - m.x) * (1.0 - m.y);
-                    float centerMask = pow(clamp((box - 0.1) * 2.0, 0.0, 1.0), 0.3);
-                    float uvMask     = clamp(box * 10.0, 0.0, 1.0);
-
-                    vec2 suv = fract(p / (u_wobble + 1.0) + wob * u_wobble + 0.5);
-                    float h  = texture(u_heightMap, suv).r;
-                    vec3  c  = texture(u_texture,  suv).rgb;
-
-                    // Highest surface wins, softened by falloff
-                    float stampH = (h + 0.2) * centerMask * uvMask;
-                    float blend  = smoothstep(ssLow, ssHigh, accH - stampH);
-                    accCol = mix(c, accCol, blend);
-                    accH   = max(accH, stampH);
-                }
-            }
-            fragColor = vec4(accCol, 1.0);
         }`,
 
     /* ---------- Seamless: Scattered Edges (phase 2 default) ----------
@@ -904,8 +750,11 @@ TRLE.Shaders = {
         }`,
 
     /* ---------- Mask Blur (tile-aware) ----------
-       Blurs a mask using the 3x3 tiling trick
-       for seamless edges. Samples from a 3x3 tiled version.
+       NOT WIRED UP — nothing blits this. Superseded by the mask paths in
+       atlas.js. Kept only because it is a correct, self-contained primitive;
+       no lesson is attached to it, so it is safe to delete.
+
+       Blurs a mask using the 3x3 tiling trick for seamless edges.
        ------------------------------------------------------ */
     tileMaskBlur: `#version 300 es
         precision highp float;
@@ -939,8 +788,11 @@ TRLE.Shaders = {
         }`,
 
     /* ---------- Edge Seam Protection Mask ----------
-       Creates a hard mask with inward-curving boundary
-       to ensure seamless edges on transitions.
+       NOT WIRED UP — nothing blits this. Superseded by buildTopologyMask and
+       the corner/organic mask work in atlas.js. No lesson attached; safe to
+       delete.
+
+       Creates a hard mask with inward-curving boundary.
        ------------------------------------------------ */
     seamProtection: `#version 300 es
         precision highp float;
@@ -958,9 +810,31 @@ TRLE.Shaders = {
         }`,
 
     /* ---------- Normalize Contrast (range stretch) ----------
-       Remaps grayscale from [u_min, u_max] → [0, 1].
-       Applied after desaturation so dark textures produce the
-       same gradient magnitude as bright ones in normals/AO/height.
+       ⚠ NOT WIRED UP, AND DELIBERATELY SO. This is a corpse of a failed
+       experiment, kept here as a warning rather than deleted — see
+       FailedExperiment1/README.md and Roadmap.md "Phase 4".
+
+       Remaps grayscale from [u_min, u_max] → [0, 1], the idea being that dark
+       textures would then produce the same gradient magnitude as bright ones.
+       It shipped once and was reverted:
+
+         • min/max is outlier-driven. One bright specular pixel and one dark
+           crevice pixel span the full range on nearly every photograph, so the
+           step either no-ops or fires everywhere. Thresholds of 0.05 and 0.30
+           were both wrong.
+         • It rewrites the grayscale INPUT, so amplified micro-noise propagates
+           into normal, AO, specular and roughness alike.
+         • Combined with edgeEnhance below it formed a positive feedback loop
+           on grain, and presets then got de-tuned to compensate, hiding the
+           root cause.
+
+       The underlying problem is real and measured (output normal strength
+       tracks input luminance std ~1:1). The SHIPPED answer is the advisory note
+       in the material modal — `matContrastAdvice` in atlas.js — which informs
+       instead of auto-correcting. If you are about to re-enable this shader,
+       read Roadmap.md "Phase 4" first: Materialize solves the same problem with
+       manual multi-band controls (`combineHeight`, already ported below) and
+       ships no auto-gain at all.
        ------------------------------------------------------------ */
     normalizeContrast: `#version 300 es
         precision highp float;
@@ -976,11 +850,18 @@ TRLE.Shaders = {
         }`,
 
     /* ---------- Edge Enhance (Unsharp Mask) ----------
-       Amplifies high-frequency detail in the normalized grayscale
-       before normal/AO generation. Used for architectural presets
-       (brick, tile, concrete, slate, etc.) where mortar/grout edges
-       have low absolute contrast and would otherwise produce flat normals.
-       Runs only when preset.edgeEnhance > 0.
+       ⚠ NOT WIRED UP, AND DELIBERATELY SO — the other half of the failed
+       experiment above. See FailedExperiment1/README.md.
+
+       Amplifies high-frequency detail in the normalized grayscale before
+       normal/AO generation, intended for architectural presets where mortar
+       and grout edges have low absolute contrast. What it actually did was
+       treat every pixel-level luminance variation as a surface edge, giving
+       every material a "pumice stone" embossed look — worst on exactly the
+       brick/tile presets it was meant to help, because their diffuse is a
+       photographic scan full of natural variation.
+
+       No preset declares `edgeEnhance` any more; nothing reads it.
        -------------------------------------------------- */
     edgeEnhance: `#version 300 es
         precision highp float;
@@ -1401,5 +1282,161 @@ TRLE.Shaders = {
             float c = mix(u_contrast, 1.0, eqAmt);
             v = clamp((v - 0.5) * c + 0.5, 0.0, 1.0);
             fragColor = u_useRamp > 0.5 ? texture(u_ramp, vec2(v, 0.5)) : vec4(vec3(v), 1.0);
+        }`,
+
+    /* ================================================================
+       MIT SEAMLESS PATH — clean-room replacements for the two GPL-3.0
+       Materialize ports (`seamlessMaker`, `seamlessSplat`).
+
+       These implement published, independent techniques and share no code or
+       algorithm with Materialize:
+         • wrapShift + seamBandMask + bandBlend   → multi-band (Laplacian
+           pyramid) blending, Burt & Adelson 1983; the GPU/mipmap formulation
+           is JCGT 14(1) 2025 "GPU-Friendly Laplacian Texture Blending".
+         • seamlessStamp → variance-preserving ("histogram-preserving")
+           blending of randomly rotated stamps, Heitz & Neyret, HPG 2018.
+       Both are MIT, like the rest of this file's own shaders.
+       ================================================================ */
+
+    /* Toroidal shift: sample the source at uv + offset, wrapped. Used to bring
+       the opposite edge of the texture into register with this one. */
+    wrapShift: `#version 300 es
+        precision highp float;
+        uniform sampler2D u_texture;
+        uniform vec2 u_offset;
+        in vec2 v_uv;
+        out vec4 fragColor;
+        void main() { fragColor = texture(u_texture, fract(v_uv + u_offset)); }`,
+
+    /* Blend weight for the seam band.
+       1 = take the shifted copy, 0 = keep the original.
+
+       WHY THE WEIGHT MUST REACH EXACTLY 1 AT THE BORDER — this is the whole
+       tiling guarantee, and getting it wrong makes the pass a decorative no-op:
+       the output is O(x) = mix(A(x), B(x), w(x)) where B(x) = A(fract(x + s)).
+       B is periodic by construction — B(0) = A(s) = B(1) — for ANY shift s. So
+       if w = 1 at both borders, O(0) = B(0) = B(1) = O(1) and the tile wraps no
+       matter what A looked like. Cap w below 1 (an earlier version halved it)
+       and the output inherits A's own discontinuity at the seam. */
+    seamBandMask: `#version 300 es
+        precision highp float;
+        uniform float u_bandX;   // half-width of the blend band, in uv
+        uniform float u_bandY;
+        in vec2 v_uv;
+        out vec4 fragColor;
+        float edgeW(float t, float band) {
+            // distance to the nearest border (0 or 1), normalised by the band
+            float d = min(t, 1.0 - t);
+            return 1.0 - smoothstep(0.0, max(band, 1e-4), d);
+        }
+        void main() {
+            float w = max(edgeW(v_uv.x, u_bandX), edgeW(v_uv.y, u_bandY));
+            fragColor = vec4(vec3(w), 1.0);
+        }`,
+
+    /* One band of the Laplacian blend, in float.
+       out = base + mix(a, b, w * m), where a and b are the band's detail from
+       the original and the shifted copy. Runs on RGBA16F FBOs because band
+       detail is signed and would clip to black at 8-bit. */
+    bandBlend: `#version 300 es
+        precision highp float;
+        uniform sampler2D u_base;    // accumulated result so far
+        uniform sampler2D u_a;       // this band, original
+        uniform sampler2D u_b;       // this band, shifted copy
+        uniform sampler2D u_mask;    // blend weight, blurred to this band's scale
+        uniform float u_weight;      // extra per-band weight (falloff control)
+        in vec2 v_uv;
+        out vec4 fragColor;
+        void main() {
+            vec4 base = texture(u_base, v_uv);
+            vec4 a = texture(u_a, v_uv);
+            vec4 b = texture(u_b, v_uv);
+            float m = clamp(texture(u_mask, v_uv).r * u_weight, 0.0, 1.0);
+            fragColor = vec4(base.rgb + mix(a.rgb, b.rgb, m), 1.0);
+        }`,
+
+    /* Signed difference of two float textures — one Laplacian band. */
+    bandDiff: `#version 300 es
+        precision highp float;
+        uniform sampler2D u_fine, u_coarse;
+        in vec2 v_uv;
+        out vec4 fragColor;
+        void main() {
+            fragColor = vec4(texture(u_fine, v_uv).rgb - texture(u_coarse, v_uv).rgb, 1.0);
+        }`,
+
+    /* Random rotated stamps, composited with VARIANCE-PRESERVING blending.
+       ------------------------------------------------------------------
+       Heitz & Neyret's observation: a plain weighted average of N samples of a
+       texture has variance scaled by sum(w^2), so overlapping stamps wash out
+       into mush — the contrast visibly sags wherever stamps overlap. Dividing
+       the centred sum by sqrt(sum(w^2)) instead of by sum(w) restores the
+       original variance, so overlaps keep the source's contrast.
+
+       Every stamp is drawn at 9 wrap offsets, so the result tiles. */
+    seamlessStamp: `#version 300 es
+        precision highp float;
+        uniform sampler2D u_texture;
+        uniform float u_falloff;        // stamp edge softness (0-1)
+        uniform float u_rotation;       // base rotation, turns
+        uniform float u_rotationRandom; // random rotation spread
+        uniform float u_scale;          // stamp size
+        uniform float u_wobble;         // positional jitter
+        uniform float u_randomize;      // seed
+        in vec2 v_uv;
+        out vec4 fragColor;
+
+        const int STAMPS = 4;
+
+        float hash(vec2 p) {
+            return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+        }
+        mat2 rot(float turns) {
+            float a = turns * 6.2831853;
+            return mat2(cos(a), -sin(a), sin(a), cos(a));
+        }
+        void main() {
+            // Mean of the source, so we can centre before blending. A 4-tap
+            // estimate is plenty: it only sets the level the variance is
+            // restored around, not the detail.
+            vec3 mean = 0.25 * (texture(u_texture, vec2(0.25, 0.25)).rgb
+                              + texture(u_texture, vec2(0.75, 0.25)).rgb
+                              + texture(u_texture, vec2(0.25, 0.75)).rgb
+                              + texture(u_texture, vec2(0.75, 0.75)).rgb);
+
+            vec3 acc = vec3(0.0);
+            float wSum = 0.0, wSqSum = 0.0;
+            float size = mix(0.45, 0.95, clamp(u_scale, 0.0, 1.0));
+
+            for (int i = 0; i < STAMPS; i++) {
+                float fi = float(i);
+                vec2 seed = vec2(fi + 1.0, u_randomize * 37.0 + fi * 7.0);
+                // stamp centre on a 2x2 lattice, jittered
+                vec2 cell = vec2(mod(fi, 2.0), floor(fi * 0.5)) * 0.5 + 0.25;
+                vec2 jitter = (vec2(hash(seed), hash(seed + 3.7)) - 0.5) * u_wobble * 0.5;
+                vec2 centre = cell + jitter;
+                float turns = u_rotation + (hash(seed + 11.3) - 0.5) * u_rotationRandom;
+
+                // 9 wrap offsets so a stamp crossing the border reappears
+                for (int oy = -1; oy <= 1; oy++) {
+                    for (int ox = -1; ox <= 1; ox++) {
+                        vec2 d = v_uv - centre - vec2(float(ox), float(oy));
+                        vec2 local = rot(turns) * d / size;
+                        // radial falloff -> weight; outside the stamp contributes nothing
+                        float r = length(local) * 2.0;
+                        if (r >= 1.0) continue;
+                        float w = pow(1.0 - r, mix(1.0, 4.0, clamp(u_falloff, 0.0, 1.0)));
+                        if (w <= 0.0) continue;
+                        vec3 c = texture(u_texture, fract(local + 0.5)).rgb;
+                        acc    += (c - mean) * w;
+                        wSum   += w;
+                        wSqSum += w * w;
+                    }
+                }
+            }
+            // Variance-preserving normalisation. Falling back to the mean where
+            // nothing landed keeps the output defined for any parameter set.
+            vec3 outC = (wSqSum > 1e-6) ? mean + acc / sqrt(wSqSum) : mean;
+            fragColor = vec4(clamp(outC, 0.0, 1.0), 1.0);
         }`
 };

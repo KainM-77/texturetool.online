@@ -1,10 +1,8 @@
 /* SPDX-License-Identifier: MIT
-   TextureTool — Copyright (C) 2026 KainM-77. Available under the MIT License
-   (see LICENSE-MIT). This is independent WebGL 2.0 code — no Materialize code is
-   used here; the multi-pass design was merely informed by Materialize's
-   Graphics.Blit pipeline. The tool as a whole ships under GPL-3.0 (see LICENSE)
-   because it bundles two GPL-3.0 seamless shaders in shaders.js, not this file.
-   See THIRD-PARTY-NOTICES.md and "Path to MIT.md". */
+   TextureTool — Copyright (c) 2026 KainM-77. Available under the MIT License
+   (see LICENSE). Independent WebGL 2.0 code — no Materialize code is used here;
+   the multi-pass design was merely informed by Materialize's Graphics.Blit
+   pipeline. The whole tool is MIT as of 2026-09-13. See THIRD-PARTY-NOTICES.md. */
 /* ============================================================
    TRLE Texture Tools — WebGL 2.0 Processing Engine
    GPU-accelerated texture processing via fragment shaders.
@@ -362,6 +360,107 @@ TRLE.Engine = (function() {
     }
 
     /* ---- High-Level: Generate all material maps from a diffuse ---- */
+    /* ---- Seamless: multi-band (Laplacian pyramid) edge blend — MIT ----
+       Clean-room replacement for the GPL `seamlessMaker` port. Blends the tile
+       with a toroidally half-shifted copy of itself, per frequency band.
+
+       Why multi-band rather than one cross-fade: a single blend width cannot
+       serve both ends of the spectrum. Wide enough to hide the low-frequency
+       step across the seam, and the high frequencies cross-fade into visible
+       ghosting; narrow enough to keep detail crisp, and the brightness step
+       stays. Blending each octave with a mask blurred to that octave's own
+       scale gives each band the width it needs — low bands blend wide, fine
+       bands blend narrow. (Burt & Adelson 1983; GPU formulation JCGT 14(1) 2025.)
+
+       The bands are held in RGBA16F because Laplacian detail is signed and
+       would clip to black at 8 bits.
+
+       `falloff` (0-1) scales the mask, i.e. how hard the seam is pulled toward
+       the shifted copy. `overlapX/Y` set the widest band's reach. */
+    function seamlessMultiBand(srcTexture, size, opts = {}) {
+        const LEVELS = 5;
+        // AtlasTool tiles are square, but the root tool's seamless tab can hand
+        // us a non-square source, so height is separable via opts.height.
+        const width = size, height = opts.height || size;
+        const overlapX = opts.overlapX != null ? opts.overlapX : 0.25;
+        const overlapY = opts.overlapY != null ? opts.overlapY : 0.25;
+        const falloff  = opts.falloff  != null ? opts.falloff  : 0.5;
+        const temps = [];
+        const F = () => { const f = createFBO(width, height, { float: true }); temps.push(f); return f; };
+
+        /* A = original. B = a toroidally shifted copy, which supplies the
+           content that replaces the seam.
+
+           THE SHIFT MUST NOT BE 0.5. A half-shift looks like the obvious choice
+           ("bring the opposite corner into register") and is degenerate on a
+           large class of real inputs: many tiling source textures are already
+           periodic at half-width, so B comes out pixel-identical to A and the
+           whole pass silently becomes a no-op. Measured on Examples/Bricks.png,
+           a 0.5 shift gives a mean absolute difference of exactly 0, while
+           0.137 gives 29.2 and 0.25 gives 18.1.
+
+           0.381966 = 1 - 1/phi, the "most irrational" fraction, so it cannot
+           land on 1/2, 1/3, 1/4 or any other low-order periodicity a tiling
+           texture is likely to have. The two axes use different offsets so a
+           texture periodic along one axis still gets a real shift on the other. */
+        const SHIFT_X = 0.381966, SHIFT_Y = 0.618034;
+        const A = F(); blit('copy', { u_texture: srcTexture }, A);
+        const B = F(); blit('wrapShift', { u_texture: srcTexture, u_offset: [SHIFT_X, SHIFT_Y] }, B);
+
+        const mask = F();
+        blit('seamBandMask', { u_bandX: overlapX, u_bandY: overlapY }, mask);
+
+        /* Gaussian pyramids. gaussianBlur() allocates 8-bit internally, so the
+           blurs are done here against float targets instead. */
+        const blurF = (tex, radius) => {
+            const t = F(), o = F();
+            blit('gaussianBlur', { u_texture: tex, u_direction: [1 / width, 0], u_radius: radius }, t);
+            blit('gaussianBlur', { u_texture: t.texture, u_direction: [0, 1 / height], u_radius: radius }, o);
+            return o;
+        };
+        const radii = [];
+        for (let i = 0; i < LEVELS; i++) radii.push(Math.max(1, Math.round(2 * Math.pow(2, i))));
+
+        const pyrA = [A], pyrB = [B], pyrM = [mask];
+        for (let i = 0; i < LEVELS; i++) {
+            pyrA.push(blurF(pyrA[i].texture, radii[i]));
+            pyrB.push(blurF(pyrB[i].texture, radii[i]));
+            // The mask is blurred to the SAME scale as the band it weights —
+            // this is what gives each octave its own blend width.
+            pyrM.push(blurF(pyrM[i].texture, radii[i]));
+        }
+
+        // Start from the coarsest level, blended with the coarsest mask.
+        let acc = F();
+        blit('bandBlend', {
+            u_base: F().texture,              // zero-initialised
+            u_a: pyrA[LEVELS].texture,
+            u_b: pyrB[LEVELS].texture,
+            u_mask: pyrM[LEVELS].texture,
+            u_weight: 1.0
+        }, acc);
+
+        // Add each finer band back, weighted by the mask at that band's scale.
+        for (let i = LEVELS - 1; i >= 0; i--) {
+            const la = F(); blit('bandDiff', { u_fine: pyrA[i].texture, u_coarse: pyrA[i + 1].texture }, la);
+            const lb = F(); blit('bandDiff', { u_fine: pyrB[i].texture, u_coarse: pyrB[i + 1].texture }, lb);
+            const next = F();
+            blit('bandBlend', {
+                u_base: acc.texture, u_a: la.texture, u_b: lb.texture,
+                u_mask: pyrM[i].texture,
+                // Fine bands follow the mask less, which is what suppresses
+                // ghosting where the two copies disagree on detail.
+                u_weight: 0.35 + 0.65 * falloff * (i / LEVELS)
+            }, next);
+            acc = next;
+        }
+
+        const out = createFBO(width, height);
+        blit('copy', { u_texture: acc.texture }, out);
+        temps.forEach(f => deleteFBO(f));
+        return out;
+    }
+
     function generateMaps(diffuseTexture, width, height, preset, enabledMaps) {
         const results = {};
         const texel = 1.0 / Math.max(width, height);
@@ -791,6 +890,7 @@ TRLE.Engine = (function() {
         fboToCanvas,
         blitToScreen,
         gaussianBlur,
+        seamlessMultiBand,
         poissonBlend,
         inpaintDiffusion,
         generateMaps,

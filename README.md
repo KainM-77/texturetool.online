@@ -49,10 +49,11 @@ Then open <http://localhost:8080>.
 
 ## License
 
-**GNU General Public License v3.0 (GPL-3.0).** See [LICENSE](LICENSE).
+**MIT — all of it.** See [LICENSE](LICENSE). No copyleft strings; reuse any part.
 
-The project is GPL-3.0 because its WebGL shaders are adapted from
-[Materialize](https://github.com/BoundingBoxSoftware/Materialize) (GPL-3.0), and
-its seamless-transition algorithm was reimplemented from
+The project was GPL-3.0 until 2026-09-13, when the two seamless-tiling shaders
+adapted from [Materialize](https://github.com/BoundingBoxSoftware/Materialize)
+(GPL-3.0) were removed and replaced with independent implementations of published
+techniques. Its seamless-transition algorithm was reimplemented from
 [TgaBuilder](https://github.com/JohnnyJF10/TgaBuilder) (MIT). Full attribution is
 in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

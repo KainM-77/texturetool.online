@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<!-- TextureTool — Copyright (C) 2026 KainM-77. Licensed under GPL-3.0-only. See LICENSE & THIRD-PARTY-NOTICES.md. -->
+<!-- TextureTool — Copyright (c) 2026 KainM-77. MIT Licensed. See LICENSE & THIRD-PARTY-NOTICES.md. -->
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -22,14 +22,15 @@
 <!-- ============ HEADER ============ -->
 <header class="app-header">
     <div class="header-top">
-        <div class="logo">
+        <button type="button" class="logo" id="at-logo-home"
+                title="Start over — reloads the tool. Your session is autosaved, and you'll be offered it on the way back in.">
             <svg class="logo-mark" viewBox="0 0 32 32" width="20" height="20" aria-hidden="true" focusable="false">
                 <rect width="32" height="32" rx="4" fill="#1e1e1e"/>
                 <path d="M16 4L27 16L16 28L5 16Z" fill="#e8852a"/>
                 <path d="M16 8L23 16L16 24L9 16Z" fill="#f09030" opacity="0.4"/>
             </svg>
             TRLE Atlas Tool <span class="logo-beta">(Beta)</span>
-        </div>
+        </button>
         <span class="header-blurb">
             <span class="header-blurb-text">All-in-one atlas workbench.</span>
             <span class="learn-btns">
@@ -384,15 +385,17 @@
 <div class="at-overlay" id="at-overlay" style="display:none;">
 
     <!-- ── Seamless modal ───────────────────────────── -->
-    <div class="at-modal at-modal-wide" id="at-modal-seamless" role="dialog" aria-modal="true" aria-label="Make Seamless" style="display:none;">
+    <div class="at-modal at-modal-xl" id="at-modal-seamless" role="dialog" aria-modal="true" aria-label="Make Seamless" style="display:none;">
         <div class="at-modal-title">🔄 Make Seamless — Tile <span id="at-sm-tileno"></span></div>
+        <div class="at-modal-cols">
+            <div class="at-modal-tune">
         <div class="form-group">
             <label>Method</label>
             <select id="at-sm-method">
                 <option value="scattered" selected>Scattered edges</option>
                 <option value="allsides">Smoothed copies of all sides</option>
                 <option value="collage">Smoothed collage</option>
-                <option value="materialize">Materialize (quadrant overlap)</option>
+                <option value="multiband">Multi-band edge blend</option>
                 <option value="splat">Splat (random stamps)</option>
             </select>
             <div id="at-sm-hint" class="sm-hint"></div>
@@ -443,8 +446,11 @@
         <label class="checkbox-row" style="margin:8px 0;">
             <input type="checkbox" id="at-sm-seam-marker"> Show seam marker
         </label>
-        <canvas id="at-sm-preview" class="sm-preview-canvas" width="512" height="512"></canvas>
-        <div class="at-modal-actions">
+            </div>
+            <div class="at-modal-side"><canvas id="at-sm-preview" class="sm-preview-canvas" width="512" height="512"></canvas>
+            </div>
+        </div>
+    <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
             <button class="btn btn-primary" id="at-sm-save">💾 Save to Atlas</button>
         </div>
@@ -453,7 +459,7 @@
     <!-- ── Transition modal ─────────────────────────── -->
     <div class="at-modal at-modal-xl at-modal-fit" id="at-modal-trans" role="dialog" aria-modal="true" aria-label="Make Transition" style="display:none;">
         <div class="at-modal-title">🔀 Make Transition — Tile <span id="at-tr-base-no"></span> → Tile <span id="at-tr-overlay-no"></span></div>
-        <div class="at-modal-body"><div class="at-modal-cols"><div class="at-modal-main">
+        <div class="at-modal-body"><div class="at-modal-cols at-3zone at-work-collapsed"><div class="at-modal-main">
         <div class="form-row" style="align-items:center;gap:14px;">
             <div class="at-tr-thumb"><canvas id="at-tr-base-thumb" width="96" height="96"></canvas><span>Base (A)</span></div>
             <span style="font-size:1.4rem;">→</span>
@@ -536,8 +542,13 @@
                 <div class="sm-hint" id="at-tr-corner-hint" style="margin-top:4px;"></div>
             </div>
         </div>
-        <details data-tr-panel="set" id="at-tr-org-acc" style="display:none;margin-top:6px;">
-            <summary style="cursor:pointer;">🌿 Organic edge <span style="color:var(--text-secondary);font-size:0.72rem;">(blobby, hand-painted boundary)</span></summary>
+        
+        <div class="sm-hint" data-tr-panel="set" style="display:none;">The whole arrangement is added to the atlas laid out <strong>exactly like the preview</strong>, so it reads as one connected terrain patch when picking in Tomb Editor. Pivot &amp; Hardness above shape every edge; plain cells stay linked to their source tiles.</div>
+        <!-- Parking slot for the Organic edge accordion while collapsed; it docks
+             into .at-modal-work on open. See trDockOrganic. -->
+        <div id="at-tr-org-home">
+<details class="at-acc" data-tr-panel="set" id="at-tr-org-acc" style="display:none;">
+            <summary>🌿 Organic edge <span style="color:var(--text-secondary);font-size:0.72rem;">(blobby, hand-painted boundary)</span></summary>
             <div class="sm-hint" id="at-tr-org-hint" style="margin-top:6px;">Off by default — <strong>Amount</strong> at 0 gives the clean geometric boundary. Raising it keeps the set exactly seamless; the detail is faded out at each tile border, which is the only place a neighbouring tile's pixels would be needed.</div>
             <div class="form-row" style="gap:10px;flex-wrap:wrap;margin-top:6px;">
                 <div class="form-group" style="flex:1;min-width:200px;">
@@ -628,8 +639,12 @@
                 </div>
             </div>
         </details>
-        <div class="sm-hint" data-tr-panel="set" style="display:none;">The whole arrangement is added to the atlas laid out <strong>exactly like the preview</strong>, so it reads as one connected terrain patch when picking in Tomb Editor. Pivot &amp; Hardness above shape every edge; plain cells stay linked to their source tiles.</div>
+        </div>
         </div><!-- /.at-modal-main -->
+        <!-- Organic edge is the middle zone, not another accordion stacked under
+             the Full Set controls. It only exists on the set tab, so trSetTab
+             toggles .at-3zone + xxl with the tab (see trApplyZones). -->
+        <div class="at-modal-work"></div>
         <div class="at-modal-side">
         <div class="form-group" data-tr-panel="single" style="margin:0;">
             <label id="at-tr-preview-label">Preview (last clicked direction)</label>
@@ -649,30 +664,60 @@
     </div>
 
     <!-- ── Heal / Fill modal (Phase 6) ──────────────── -->
-    <div class="at-modal at-modal-wide" id="at-modal-heal" role="dialog" aria-modal="true" aria-label="Heal / Fill" style="display:none;">
+    <div class="at-modal at-modal-xxl" id="at-modal-heal" role="dialog" aria-modal="true" aria-label="Heal / Fill" style="display:none;">
         <div class="at-modal-title">🩹 Heal / Fill — Tile <span id="at-heal-tileno"></span></div>
-        <div class="form-group">
-            <label>Fill Method</label>
-            <select id="at-heal-method">
-                <option value="patch" selected>Neighbour-aware (samples around the spot)</option>
-                <option value="texture">Texture (samples the whole tile)</option>
-                <option value="diffusion">Smooth (diffusion — flat fill)</option>
-            </select>
-            <div id="at-heal-hint" class="sm-hint"></div>
-        </div>
-        <div class="form-row" style="align-items:flex-end;">
-            <div class="form-group" style="flex:1;min-width:140px;">
-                <label>Brush Size — <span id="at-heal-brush-val">28</span>px</label>
-                <input type="range" id="at-heal-brush" min="4" max="96" value="28" style="width:100%;">
+        <div class="at-modal-cols at-3zone">
+            <div class="at-modal-tune">
+                <div class="form-group">
+                    <label>Fill Method</label>
+                    <select id="at-heal-method">
+                        <option value="patch" selected>Neighbour-aware (samples around the spot)</option>
+                        <option value="texture">Texture (samples the whole tile)</option>
+                        <option value="diffusion">Smooth (diffusion — flat fill)</option>
+                    </select>
+                    <div id="at-heal-hint" class="sm-hint"></div>
+                </div>
+                <div class="form-group">
+                    <label>Tool</label>
+                    <div class="at-seg-group">
+                        <button type="button" class="at-seg active" id="at-heal-paint" data-heal-tool="paint">🖌️ Paint</button>
+                        <button type="button" class="at-seg" id="at-heal-erase" data-heal-tool="erase">🧽 Erase</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Brush Size — <span id="at-heal-brush-val">28</span>px</label>
+                    <input type="range" id="at-heal-brush" min="4" max="96" value="28" style="width:100%;">
+                </div>
+                <div class="form-group">
+                    <label>Hardness — <span id="at-heal-hardness-val">100</span>%</label>
+                    <input type="range" id="at-heal-hardness" min="0" max="100" value="100" style="width:100%;"
+                           title="100% is a hard-edged brush. Lower feathers the selection edge, so the fill blends out instead of stopping at a line.">
+                </div>
+                <div class="form-row" style="align-items:center;gap:8px;flex-wrap:wrap;">
+                    <button class="btn btn-secondary btn-sm" id="at-heal-clear">Clear</button>
+                    <span id="at-heal-busy" class="sm-hint" style="margin:0;display:none;">Filling…</span>
+                </div>
             </div>
-            <button class="btn btn-secondary btn-sm" id="at-heal-brush-mode" aria-pressed="false" title="Toggle paint / erase">🖌️ Paint</button>
-            <button class="btn btn-secondary btn-sm" id="at-heal-clear">Clear</button>
-            <button class="btn btn-secondary btn-sm" id="at-heal-preview">👁️ Preview Fill</button>
-        </div>
-        <div class="form-group">
-            <label id="at-heal-canvas-label">Paint the area to heal (red = selected)</label>
-            <canvas id="at-heal-canvas" width="256" height="256"
-                style="border-radius:6px;border:1px solid var(--border);display:block;image-rendering:pixelated;touch-action:none;cursor:crosshair;"></canvas>
+            <!-- The paint surface keeps showing the PAINT view at all times now.
+                 It used to be overwritten by the fill result, which meant the only
+                 way to compare was to undo. -->
+            <div class="at-modal-work">
+                <label id="at-heal-canvas-label">Paint the area to heal (red = selected)</label>
+                <canvas id="at-heal-canvas" width="256" height="256"
+                    style="width:100%;border-radius:6px;border:1px solid var(--border);display:block;image-rendering:pixelated;touch-action:none;cursor:crosshair;"></canvas>
+            </div>
+            <div class="at-modal-side at-side-1x">
+                <div>
+                    <label>Before</label>
+                    <canvas id="at-heal-before" width="256" height="256"
+                        style="width:100%;max-width:300px;border-radius:6px;border:1px solid var(--border);display:block;image-rendering:pixelated;background:#111;"></canvas>
+                </div>
+                <div>
+                    <label>After <span style="color:var(--text-secondary);font-size:0.75rem;">(updates as you paint)</span></label>
+                    <canvas id="at-heal-after" width="256" height="256"
+                        style="width:100%;max-width:300px;border-radius:6px;border:1px solid var(--border);display:block;image-rendering:pixelated;background:#111;"></canvas>
+                </div>
+            </div>
         </div>
         <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
@@ -681,9 +726,11 @@
     </div>
 
     <!-- ── Fade to Transparent modal (Phase T3) ─────── -->
-    <div class="at-modal at-modal-wide" id="at-modal-fade" role="dialog" aria-modal="true" aria-label="Fade to Transparent" style="display:none;">
+    <div class="at-modal at-modal-xl" id="at-modal-fade" role="dialog" aria-modal="true" aria-label="Fade to Transparent" style="display:none;">
         <div class="at-modal-title">🫥 Fade to Transparent — Tile <span id="at-fade-tileno"></span></div>
         <div class="sm-hint">Fades part of the tile to nothing (alpha → 0). Great for decals — cobwebs, dust, leaves, foliage — that should blend into the surface instead of ending at a hard edge.</div>
+        <div class="at-modal-cols">
+            <div class="at-modal-tune">
         <div class="form-row" style="align-items:flex-end;">
             <div class="form-group" style="min-width:160px;">
                 <label>Fade shape</label>
@@ -719,24 +766,29 @@
             </div>
             <div class="sm-hint">Paint where the tile should fade to transparent.</div>
         </div>
-        <div class="form-group">
+            </div>
+            <div class="at-modal-side at-side-1x"><div class="form-group">
             <label>Preview <span style="color:var(--text-secondary);font-size:0.75rem;">(checkerboard = transparent)</span></label>
             <canvas id="at-fade-preview" width="256" height="256" class="at-fade-canvas"></canvas>
         </div>
-        <div class="at-modal-actions">
+            </div>
+        </div>
+    <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
             <button class="btn btn-primary" id="at-fade-apply">💾 Apply Fade</button>
         </div>
     </div>
 
     <!-- ── Emissive modal (Emissive phases E1–E3) ───── -->
-    <div class="at-modal at-modal-wide" id="at-modal-emissive" role="dialog" aria-modal="true" aria-label="Make Emissive" style="display:none;">
+    <div class="at-modal at-modal-xl" id="at-modal-emissive" role="dialog" aria-modal="true" aria-label="Make Emissive" style="display:none;">
         <div class="at-modal-title">✨ Make Emissive — Tile <span id="at-em-tileno"></span></div>
         <div class="sm-hint">Authors a glow (emissive) map for this tile — areas that shine on their own, independent of scene lighting. Pick what glows, then how it's coloured. Black = no emission.</div>
         <!-- Current state of the tile, not of the controls: the preview below always
              shows the glow you'd get if you hit Apply, which is indistinguishable
              from a glow that's already on the tile. This line is the difference. -->
         <div class="sm-hint" id="at-em-state"></div>
+        <div class="at-modal-cols at-tune-fixed">
+            <div class="at-modal-tune">
         <div class="form-row" style="align-items:flex-end;">
             <div class="form-group" style="min-width:170px;">
                 <label>What glows</label>
@@ -838,8 +890,8 @@
                 <input type="range" id="at-em-feather" min="0" max="24" value="0" style="width:100%;">
             </div>
         </div>
-
-        <div class="form-row">
+            </div>
+            <div class="at-modal-side"><div class="form-row">
             <div class="form-group" style="flex:1;">
                 <label>Source <span style="color:var(--text-secondary);font-size:0.75rem;">(click to pick / paint)</span></label>
                 <canvas id="at-em-source-canvas" width="256" height="256" style="width:100%;border:1px solid var(--border);border-radius:var(--radius-sm);cursor:crosshair;"></canvas>
@@ -849,7 +901,9 @@
                 <canvas id="at-em-preview" width="256" height="256" style="width:100%;border:1px solid var(--border);border-radius:var(--radius-sm);background:#000;"></canvas>
             </div>
         </div>
-        <div class="at-modal-actions">
+            </div>
+        </div>
+    <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
             <button class="btn btn-secondary" id="at-em-remove">🗑️ Remove glow</button>
             <button class="btn btn-primary" id="at-em-apply">💾 Apply Emissive</button>
@@ -969,8 +1023,8 @@
                 <input type="range" id="at-ht-hardness" min="0" max="100" value="50" style="width:100%;">
             </div>
         </div>
-        <details class="form-group" style="border:1px solid var(--border);border-radius:4px;padding:6px 10px;">
-            <summary style="cursor:pointer;">⛰️ Height field</summary>
+        <details class="form-group at-acc">
+            <summary>⛰️ Height field</summary>
             <div class="form-row" style="align-items:flex-end;margin-top:8px;">
                 <div class="form-group" style="flex:1;min-width:120px;">
                     <label>Detail — <span id="at-ht-detail-val">40</span>%</label>
@@ -982,8 +1036,8 @@
                 </div>
             </div>
         </details>
-        <details class="form-group" style="border:1px solid var(--border);border-radius:4px;padding:6px 10px;">
-            <summary style="cursor:pointer;">🌿 Organic breakup <span style="color:var(--text-secondary);font-size:0.72rem;">(wobble the fill edges)</span></summary>
+        <details class="form-group at-acc">
+            <summary>🌿 Organic breakup <span style="color:var(--text-secondary);font-size:0.72rem;">(wobble the fill edges)</span></summary>
             <div class="form-row" style="align-items:flex-end;margin-top:8px;">
                 <div class="form-group" style="flex:1;min-width:140px;">
                     <label>Amount — <span id="at-ht-organic-val">0</span>%</label>
@@ -992,15 +1046,15 @@
                 <button class="btn btn-secondary btn-sm" id="at-ht-organic-seed" title="Reroll the breakup pattern">🎲</button>
             </div>
         </details>
-        <details class="form-group" style="border:1px solid var(--border);border-radius:4px;padding:6px 10px;">
-            <summary style="cursor:pointer;">📈 Response curve <span style="color:var(--text-secondary);font-size:0.72rem;">(reshape height → fill)</span></summary>
+        <details class="form-group at-acc">
+            <summary>📈 Response curve <span style="color:var(--text-secondary);font-size:0.72rem;">(reshape height → fill)</span></summary>
             <label class="checkbox-row" style="margin-top:8px;"><input type="checkbox" id="at-ht-curve-on"> Enable</label>
             <div style="color:var(--text-secondary);font-size:0.72rem;margin:4px 0;">Left→right = height; up = more fill. Drag anchors / drag the line to move them all / click to add / right-click remove / scroll or middle-click to smooth.</div>
             <canvas id="at-ht-curve" width="220" height="150" style="width:100%;max-width:260px;border:1px solid var(--border);border-radius:4px;touch-action:none;cursor:crosshair;background:#1a1a1a;"></canvas>
             <div style="margin-top:6px;"><button class="btn btn-secondary btn-sm" id="at-ht-curve-reset">↺ Reset curve</button></div>
         </details>
-        <details class="form-group" style="border:1px solid var(--border);border-radius:4px;padding:6px 10px;">
-            <summary style="cursor:pointer;">🗺️ Spatial drift <span style="color:var(--text-secondary);font-size:0.72rem;">(bias the fill across the tile)</span></summary>
+        <details class="form-group at-acc">
+            <summary>🗺️ Spatial drift <span style="color:var(--text-secondary);font-size:0.72rem;">(bias the fill across the tile)</span></summary>
             <div class="form-row" style="align-items:flex-end;margin-top:8px;">
                 <div class="form-group" style="width:140px;">
                     <label>Mode</label>
@@ -1165,24 +1219,12 @@
     </div>
 
     <!-- ── Organic transition modal (Phase 13) ─────── -->
-    <div class="at-modal at-modal-wide" id="at-modal-organic" role="dialog" aria-modal="true" aria-label="Organic Transition" style="display:none;">
+    <div class="at-modal at-modal-xxl" id="at-modal-organic" role="dialog" aria-modal="true" aria-label="Organic Transition" style="display:none;">
         <div class="at-modal-title">🌿 Organic Transition — Tile <span id="at-org-base-no"></span> → Tile <span id="at-org-overlay-no"></span></div>
         <div class="sm-hint">Scatter the overlay into the base as organic, noise-driven patches. Optionally <strong>brush a hint</strong> for where the overlay should land, then generate seeded variations. Keep <strong>“Edge-safe”</strong> on so patches never touch the tile border — that keeps neighbouring tiles seamless.</div>
-        <div class="at-org-cols">
-            <div class="at-org-left">
-                <label>Hint <span style="color:var(--text-secondary);font-size:0.75rem;">(paint where the overlay goes — optional)</span></label>
-                <canvas id="at-org-hint" width="256" height="256" style="width:100%;max-width:300px;display:block;border:1px solid var(--border);border-radius:var(--radius-sm);cursor:crosshair;touch-action:none;background:#111;"></canvas>
-                <div class="form-row" style="align-items:center;margin-top:8px;gap:8px;flex-wrap:wrap;">
-                    <label style="display:flex;align-items:center;gap:5px;font-size:0.78rem;cursor:pointer;"><input type="radio" name="at-org-brush" value="paint" checked> Paint</label>
-                    <label style="display:flex;align-items:center;gap:5px;font-size:0.78rem;cursor:pointer;"><input type="radio" name="at-org-brush" value="erase"> Erase</label>
-                    <button class="btn btn-secondary btn-sm" id="at-org-clear">Clear hint</button>
-                </div>
-                <div class="form-group" style="margin-top:6px;">
-                    <label>Brush size — <span id="at-org-brushsize-val">40</span>px</label>
-                    <input type="range" id="at-org-brushsize" min="8" max="120" value="40" style="width:100%;">
-                </div>
-            </div>
-            <div class="at-org-right">
+        <div class="at-modal-cols at-3zone">
+            <!-- The flagship three-zone case: tuning . hint canvas . variations. -->
+            <div class="at-modal-tune">
                 <div class="form-row" style="align-items:flex-end;gap:10px;flex-wrap:wrap;">
                     <div class="form-group" style="width:84px;">
                         <label>Variations</label>
@@ -1239,7 +1281,21 @@
                     <button class="btn btn-secondary btn-sm" id="at-org-randomize">🎲 Randomize</button>
                     <span style="font-size:0.75rem;color:var(--text-secondary);">Click a preview to toggle it in/out of the export set.</span>
                 </div>
-                <div class="form-group">
+            </div>
+            <div class="at-modal-work">
+                <label>Hint <span style="color:var(--text-secondary);font-size:0.75rem;">(paint where the overlay goes — optional)</span></label>
+                <canvas id="at-org-hint" width="256" height="256" style="width:100%;display:block;border:1px solid var(--border);border-radius:var(--radius-sm);cursor:crosshair;touch-action:none;background:#111;"></canvas>
+                <div class="form-row" style="align-items:center;margin-top:8px;gap:8px;flex-wrap:wrap;">
+                    <label style="display:flex;align-items:center;gap:5px;font-size:0.78rem;cursor:pointer;"><input type="radio" name="at-org-brush" value="paint" checked> Paint</label>
+                    <label style="display:flex;align-items:center;gap:5px;font-size:0.78rem;cursor:pointer;"><input type="radio" name="at-org-brush" value="erase"> Erase</label>
+                    <button class="btn btn-secondary btn-sm" id="at-org-clear">Clear hint</button>
+                </div>
+                <div class="form-group" style="margin-top:6px;">
+                    <label>Brush size — <span id="at-org-brushsize-val">40</span>px</label>
+                    <input type="range" id="at-org-brushsize" min="8" max="120" value="40" style="width:100%;">
+                </div>
+            </div>
+            <div class="at-modal-side"><div class="form-group">
                     <label>Variations <span style="color:var(--text-secondary);font-size:0.75rem;">(<span id="at-org-selcount">0</span> selected)</span></label>
                     <div id="at-org-previews" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;"></div>
                 </div>
@@ -1252,41 +1308,11 @@
     </div>
 
     <!-- ── Animated Texture modal ───────────────────── -->
-    <div class="at-modal at-modal-wide" id="at-modal-anim" role="dialog" aria-modal="true" aria-label="Animated Texture" style="display:none;">
+    <div class="at-modal at-modal-xxl" id="at-modal-anim" role="dialog" aria-modal="true" aria-label="Animated Texture" style="display:none;">
         <div class="at-modal-title">🎞️ <span id="at-anim-title">Animated Texture</span></div>
         <div class="sm-hint">Generate a procedural, seamlessly-<strong>looping</strong> animation (water, lava, clouds…). Each frame also tiles on its own. Pick a preset, tweak, and add the frames to the atlas as a group. In Tomb Editor, select the frames as an <strong>animated range</strong> — or use <strong>Single seamless tile</strong> for UV-rotate.</div>
-        <div class="at-org-cols">
-            <div class="at-org-left">
-                <div class="form-row" style="gap:14px;flex-wrap:wrap;">
-                    <div>
-                        <label>Live preview</label>
-                        <canvas id="at-anim-preview" width="256" height="256" style="width:256px;height:256px;display:block;border:1px solid var(--border);border-radius:var(--radius-sm);image-rendering:pixelated;background:#111;"></canvas>
-                    </div>
-                    <div>
-                        <label>2×2 tiled (seam check)</label>
-                        <canvas id="at-anim-tiled" width="256" height="256" style="width:256px;height:256px;display:block;border:1px solid var(--border);border-radius:var(--radius-sm);image-rendering:pixelated;background:#111;"></canvas>
-                    </div>
-                </div>
-                <div class="form-row" style="gap:10px;flex-wrap:wrap;margin-top:8px;">
-                    <div class="form-group" style="flex:1;min-width:150px;">
-                        <label>Preview speed — <span id="at-anim-fps-val">12</span> fps</label>
-                        <input type="range" id="at-anim-fps" min="2" max="30" value="12" style="width:100%;">
-                    </div>
-                    <div class="form-group" style="width:150px;">
-                        <label>Preview at</label>
-                        <select id="at-anim-preview-size">
-                            <option value="auto" selected>Tile size</option>
-                            <option value="32">32 × 32</option>
-                            <option value="64">64 × 64</option>
-                            <option value="128">128 × 128</option>
-                            <option value="256">256 × 256</option>
-                        </select>
-                    </div>
-                </div>
-                <div id="at-anim-preview-note" style="font-size:0.75rem;color:var(--text-secondary);margin-top:2px;"></div>
-                <div id="at-anim-status" style="font-size:0.78rem;color:var(--text-secondary);margin-top:4px;"></div>
-            </div>
-            <div class="at-org-right">
+        <div class="at-modal-cols" style="--at-side-w:560px;">
+            <div class="at-modal-tune">
                 <div class="form-group">
                     <label>Preset</label>
                     <select id="at-anim-preset"></select>
@@ -1553,6 +1579,38 @@
                     </div>
                 </div>
             </div>
+            <!-- The two 256px previews sit side by side, so this rail is 560
+                 rather than the 430 default. -->
+            <div class="at-modal-side">
+                <div class="form-row" style="gap:14px;flex-wrap:wrap;">
+                    <div>
+                        <label>Live preview</label>
+                        <canvas id="at-anim-preview" width="256" height="256" style="width:256px;height:256px;display:block;border:1px solid var(--border);border-radius:var(--radius-sm);image-rendering:pixelated;background:#111;"></canvas>
+                    </div>
+                    <div>
+                        <label>2×2 tiled (seam check)</label>
+                        <canvas id="at-anim-tiled" width="256" height="256" style="width:256px;height:256px;display:block;border:1px solid var(--border);border-radius:var(--radius-sm);image-rendering:pixelated;background:#111;"></canvas>
+                    </div>
+                </div>
+                <div class="form-row" style="gap:10px;flex-wrap:wrap;margin-top:8px;">
+                    <div class="form-group" style="flex:1;min-width:150px;">
+                        <label>Preview speed — <span id="at-anim-fps-val">12</span> fps</label>
+                        <input type="range" id="at-anim-fps" min="2" max="30" value="12" style="width:100%;">
+                    </div>
+                    <div class="form-group" style="width:150px;">
+                        <label>Preview at</label>
+                        <select id="at-anim-preview-size">
+                            <option value="auto" selected>Tile size</option>
+                            <option value="32">32 × 32</option>
+                            <option value="64">64 × 64</option>
+                            <option value="128">128 × 128</option>
+                            <option value="256">256 × 256</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="at-anim-preview-note" style="font-size:0.75rem;color:var(--text-secondary);margin-top:2px;"></div>
+                <div id="at-anim-status" style="font-size:0.78rem;color:var(--text-secondary);margin-top:4px;"></div>
+            </div>
         </div>
         <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
@@ -1561,17 +1619,17 @@
     </div>
 
     <!-- ── Colour Adjust modal ──────────────────────── -->
-    <div class="at-modal at-modal-wide" id="at-modal-coloradj" role="dialog" aria-modal="true" aria-label="Adjust Colours" style="display:none;">
+    <div class="at-modal at-modal-xl" id="at-modal-coloradj" role="dialog" aria-modal="true" aria-label="Adjust Colours" style="display:none;">
         <div class="at-modal-title">🎚 Adjust Colours — Tile <span id="at-ca-tileno"></span></div>
         <div class="sm-hint">Non-destructive colour grade for the whole tile. Handy for rebalancing presets that blow out, or matching a texture to a level's mood.</div>
-        <div class="at-org-cols">
-            <div class="at-org-left">
-                <label>Preview</label>
-                <canvas id="at-ca-preview" width="256" height="256" style="width:100%;max-width:300px;display:block;border:1px solid var(--border);border-radius:var(--radius-sm);image-rendering:pixelated;background:#111;"></canvas>
-            </div>
-            <div class="at-org-right">
+        <div class="at-modal-cols">
+            <div class="at-modal-tune">
                 <div class="at-ca-sliders" id="at-ca-sliders"></div>
-                <button class="btn btn-secondary btn-sm" id="at-ca-reset" style="margin-top:8px;">↺ Reset</button>
+                <button class="btn btn-secondary btn-sm" id="at-ca-reset" style="align-self:start;">↺ Reset</button>
+            </div>
+            <div class="at-modal-side at-side-1x">
+                <label>Preview</label>
+                <canvas id="at-ca-preview" width="256" height="256" style="display:block;border:1px solid var(--border);border-radius:var(--radius-sm);image-rendering:pixelated;background:#111;"></canvas>
             </div>
         </div>
         <div class="at-modal-actions">
@@ -1581,18 +1639,23 @@
     </div>
 
     <!-- ── Recolor from Texture modal ───────────────── -->
-    <div class="at-modal at-modal-wide" id="at-modal-recolor" role="dialog" aria-modal="true" aria-label="Recolor from Texture" style="display:none;">
+    <div class="at-modal at-modal-xl" id="at-modal-recolor" role="dialog" aria-modal="true" aria-label="Recolor from Texture" style="display:none;">
         <div class="at-modal-title">🖌 Recolor — Tile <span id="at-rc-base-no"></span> from Tile <span id="at-rc-ref-no"></span></div>
         <div class="sm-hint">Samples the colour palette of the reference tile and shifts this tile's colours toward it (mean/standard-deviation transfer). Adjust the strength and fine-tune below.</div>
-        <div class="at-org-cols">
-            <div class="at-org-left">
-                <label>Result</label>
-                <canvas id="at-rc-preview" width="256" height="256" style="width:100%;max-width:280px;display:block;border:1px solid var(--border);border-radius:var(--radius-sm);image-rendering:pixelated;background:#111;"></canvas>
-                <label style="margin-top:8px;">Reference palette</label>
-                <canvas id="at-rc-ref" width="128" height="128" style="width:50%;max-width:140px;display:block;border:1px solid var(--border);border-radius:var(--radius-sm);image-rendering:pixelated;background:#111;"></canvas>
-            </div>
-            <div class="at-org-right">
+        <div class="at-modal-cols">
+            <div class="at-modal-tune">
                 <div class="at-ca-sliders" id="at-rc-sliders"></div>
+                <!-- The reference palette is an INPUT (what the colours are sampled
+                     from), not a result, so it belongs beside the controls rather
+                     than stacked under the result preview. -->
+                <div>
+                    <label>Reference palette</label>
+                    <canvas id="at-rc-ref" width="128" height="128" style="width:140px;display:block;border:1px solid var(--border);border-radius:var(--radius-sm);image-rendering:pixelated;background:#111;"></canvas>
+                </div>
+            </div>
+            <div class="at-modal-side at-side-1x">
+                <label>Result</label>
+                <canvas id="at-rc-preview" width="256" height="256" style="display:block;border:1px solid var(--border);border-radius:var(--radius-sm);image-rendering:pixelated;background:#111;"></canvas>
             </div>
         </div>
         <div class="at-modal-actions">
@@ -1602,20 +1665,16 @@
     </div>
 
     <!-- ── De-light modal (whole texture or inpaint shadow) ── -->
-    <div class="at-modal at-modal-wide" id="at-modal-delight" role="dialog" aria-modal="true" aria-label="De-light" style="display:none;">
+    <div class="at-modal at-modal-xl" id="at-modal-delight" role="dialog" aria-modal="true" aria-label="De-light" style="display:none;">
         <div class="at-modal-title">☀ De-light — Tile <span id="at-dl-tileno"></span></div>
         <div class="sm-hint">Flatten baked lighting so the texture reacts to Tomb Engine's dynamic lights. De-light the <strong>whole texture</strong>, or <strong>paint over a single baked shadow</strong> and inpaint it away from the surrounding texture.</div>
-        <div class="form-row at-tg-tools" style="align-items:center;gap:14px;flex-wrap:wrap;">
-            <span style="font-size:0.78rem;color:var(--text-secondary);">Mode:</span>
-            <label style="display:flex;align-items:center;gap:5px;font-size:0.82rem;cursor:pointer;"><input type="radio" name="at-dl-mode" value="whole" checked> ☀ Whole texture</label>
-            <label style="display:flex;align-items:center;gap:5px;font-size:0.82rem;cursor:pointer;"><input type="radio" name="at-dl-mode" value="inpaint"> 🩹 Paint shadow → inpaint</label>
-        </div>
-        <div class="at-org-cols">
-            <div class="at-org-left">
-                <label id="at-dl-canvas-label">Preview</label>
-                <canvas id="at-dl-canvas" width="256" height="256" style="width:100%;max-width:300px;display:block;border:1px solid var(--border);border-radius:var(--radius-sm);image-rendering:pixelated;background:#111;touch-action:none;"></canvas>
-            </div>
-            <div class="at-org-right">
+        <div class="at-modal-cols">
+            <div class="at-modal-tune">
+                <div class="form-row at-tg-tools" style="align-items:center;gap:14px;flex-wrap:wrap;">
+                    <span style="font-size:0.78rem;color:var(--text-secondary);">Mode:</span>
+                    <label style="display:flex;align-items:center;gap:5px;font-size:0.82rem;cursor:pointer;"><input type="radio" name="at-dl-mode" value="whole" checked> ☀ Whole texture</label>
+                    <label style="display:flex;align-items:center;gap:5px;font-size:0.82rem;cursor:pointer;"><input type="radio" name="at-dl-mode" value="inpaint"> 🩹 Paint shadow → inpaint</label>
+                </div>
                 <div id="at-dl-whole-controls">
                     <div class="form-group">
                         <label>Strength — <span id="at-dl-strength-val">85</span>%</label>
@@ -1634,6 +1693,10 @@
                     <button class="btn btn-secondary btn-sm" id="at-dl-preview-btn">👁 Preview inpaint</button>
                     <div class="sm-hint">Paint over the whole shadow so the selection touches clean texture on every side, then Preview.</div>
                 </div>
+            </div>
+            <div class="at-modal-side at-side-1x">
+                <label id="at-dl-canvas-label">Preview</label>
+                <canvas id="at-dl-canvas" width="256" height="256" style="display:block;border:1px solid var(--border);border-radius:var(--radius-sm);image-rendering:pixelated;background:#111;touch-action:none;"></canvas>
             </div>
         </div>
         <div class="at-modal-actions">
@@ -1691,9 +1754,11 @@
     </div>
 
     <!-- ── Wang set modal (Phase 9) ─────────────────── -->
-    <div class="at-modal" id="at-modal-wang" role="dialog" aria-modal="true" aria-label="Make Wang Set" style="display:none;">
+    <div class="at-modal at-modal-xxl" id="at-modal-wang" role="dialog" aria-modal="true" aria-label="Make Wang Set" style="display:none;">
         <div class="at-modal-title">🧩 Wang Set — Tile <span id="at-wang-base-no"></span> → Tile <span id="at-wang-overlay-no"></span></div>
         <div class="sm-hint">Generates an edge set so the overlay terrain connects on every side. Pick how the tiles are <strong>arranged in the atlas</strong> below — a readable grid makes them easy to place in the editor. Tiles inherit materials from the two sources.</div>
+        <div class="at-modal-cols" style="--at-side-w:620px;">
+            <div class="at-modal-tune">
         <div class="form-group">
             <label>Blend Method <span style="color:var(--text-secondary);font-size:0.75rem;">(diffuse)</span></label>
             <select id="at-wang-method">
@@ -1720,8 +1785,8 @@
                 <input type="range" id="at-wang-hardness" min="0" max="100" value="0" style="width:100%;">
             </div>
         </div>
-        <details id="at-wang-org-acc" style="margin-top:6px;">
-            <summary style="cursor:pointer;">🌿 Organic edge <span style="color:var(--text-secondary);font-size:0.72rem;">(blobs, spikes, drips…)</span></summary>
+        <details class="at-acc" id="at-wang-org-acc">
+            <summary>🌿 Organic edge <span style="color:var(--text-secondary);font-size:0.72rem;">(blobs, spikes, drips…)</span></summary>
             <div class="sm-hint" style="margin-top:6px;">Off at <strong>Amount</strong> 0. The detail is faded out at each tile border, so the set joins up exactly as well as it did without it.</div>
             <div class="form-row" style="gap:10px;flex-wrap:wrap;margin-top:6px;">
                 <div class="form-group" style="flex:1;min-width:200px;">
@@ -1785,11 +1850,14 @@
             </div>
             <div class="sm-hint" style="margin-top:4px;">A Wang set is reused far more heavily across a level than a single island, so a strong organic edge here shows its repeat sooner. Keep <strong>Amount</strong> modest, or use it where the boundary is only laid a few times.</div>
         </details>
-        <div class="form-group">
+            </div>
+            <div class="at-modal-side"><div class="form-group">
             <label>Preview (<span id="at-wang-count">16</span> tiles)</label>
             <div id="at-wang-previews" style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;"></div>
         </div>
-        <div class="at-modal-actions">
+            </div>
+        </div>
+    <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
             <button class="btn btn-primary" id="at-wang-add">➕ Add <span id="at-wang-addcount">16</span> Tiles</button>
         </div>
@@ -1800,6 +1868,8 @@
         <div class="at-modal-title">🧱 Borders &amp; Corners — <span id="at-bset-title-src">Tile <span id="at-bset-base-no"></span> + trim Tile <span id="at-bset-overlay-no"></span></span></div>
         <div class="sm-hint" id="at-bset-origami-hint" style="display:none;background:rgba(232,133,42,.12);border-radius:4px;padding:6px 8px;margin-bottom:6px;">🪞 <strong>Origami mode</strong> — one texture only. The trim is the same texture rotated so its detail runs <em>parallel to each edge</em> and folds through the corners, so a ridge/plank texture reads as a continuous concentric frame.</div>
         <div class="sm-hint">Builds a <strong>reusable border tile set</strong>: the trim texture runs along the boundary of areas filled with the base texture. Place the tiles in the editor like a frame — edges, corners and fill all connect. <strong>Click any slot</strong> in the preview to change how it's made (own mask → rotated ↻ → mirrored ↔/↕ → an atlas tile 🖼) — handy when baked lighting makes a rotated edge look wrong. Tiles inherit materials from the two sources and stay editable (change a source tile and the set follows).</div>
+        <div class="at-modal-cols at-tune-fixed">
+            <div class="at-modal-tune">
         <div class="form-row">
             <div class="form-group" style="flex:1.4;min-width:200px;">
                 <label>Set type</label>
@@ -1835,7 +1905,8 @@
                 <div style="color:var(--text-secondary);font-size:0.72rem;">Rotates the trim texture along vertical borders (mitred corners).</div>
             </div>
         </div>
-        <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start;">
+            </div>
+            <div class="at-modal-side"><div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start;">
             <div class="form-group" style="flex:1.3;min-width:280px;">
                 <label>Tile set (<span id="at-bset-count">9</span> tiles — click a slot to change how it's made)</label>
                 <div id="at-bset-previews" style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;"></div>
@@ -1845,16 +1916,20 @@
                 <canvas id="at-bset-demo" width="220" height="132" style="width:100%;border:1px solid var(--border);border-radius:3px;image-rendering:pixelated;background:#111;"></canvas>
             </div>
         </div>
-        <div class="at-modal-actions">
+            </div>
+        </div>
+    <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
             <button class="btn btn-primary" id="at-bset-add">➕ Add <span id="at-bset-addcount">9</span> Tiles</button>
         </div>
     </div>
 
     <!-- ── Variations modal (Phase 7) ───────────────── -->
-    <div class="at-modal" id="at-modal-var" role="dialog" aria-modal="true" aria-label="Generate Variations" style="display:none;">
+    <div class="at-modal at-modal-xl" id="at-modal-var" role="dialog" aria-modal="true" aria-label="Generate Variations" style="display:none;">
         <div class="at-modal-title">✨ Generate Variations — Tile <span id="at-var-tileno"></span></div>
         <div class="sm-hint">Creates jittered copies (hue / brightness / saturation / contrast / grain / rotation / wrap shift) appended to the atlas — handy for breaking up obvious tiling repetition. Same seed reproduces the same set.</div>
+        <div class="at-modal-cols">
+            <div class="at-modal-tune">
         <div class="form-row" style="align-items:flex-end;">
             <div class="form-group" style="width:90px;">
                 <label>Count</label>
@@ -1895,11 +1970,14 @@
                 <button class="btn btn-secondary btn-sm" id="at-var-shuffle">🎲 Shuffle</button>
             </div>
         </div>
-        <div class="form-group">
+            </div>
+            <div class="at-modal-side"><div class="form-group">
             <label>Preview</label>
             <div id="at-var-previews" style="display:flex;flex-wrap:wrap;gap:8px;"></div>
         </div>
-        <div class="at-modal-actions">
+            </div>
+        </div>
+    <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
             <button class="btn btn-primary" id="at-var-generate">➕ Add Variations</button>
         </div>
@@ -1968,9 +2046,11 @@
     </div>
 
     <!-- ── Build Pattern modal (texture-from-texture structure synthesis) ── -->
-    <div class="at-modal at-modal-wide" id="at-modal-build" role="dialog" aria-modal="true" aria-label="Build Pattern" style="display:none;">
+    <div class="at-modal at-modal-xxl" id="at-modal-build" role="dialog" aria-modal="true" aria-label="Build Pattern" style="display:none;">
         <div class="at-modal-title">🏗️ Build Pattern — Tile <span id="at-bp-tileno"></span></div>
         <div class="sm-hint">Arranges this texture into a built surface — brick, coursed / cobbled stone, tile, herringbone, planks, a plank floor, shingles or pipes — by laying it into cells split by recessed joints, each cell a jittered sample so it doesn't read as repeats. The result is a fresh, seamlessly tiling tile; the dark joints become real depth in the material maps.</div>
+        <div class="at-modal-cols at-3zone">
+            <div class="at-modal-tune">
         <div class="form-row" style="align-items:flex-end;">
             <div class="form-group" style="flex:1;min-width:130px;">
                 <label>Pattern</label>
@@ -2043,8 +2123,29 @@
                        title="Wobble the joint edges with seeded noise so they read hand-laid, not ruler-drawn. Stays seamless.">
             </div>
         </div>
-        <details class="form-group" id="at-bp-deform-wrap" style="border:1px solid var(--border);border-radius:4px;padding:6px 10px;">
-            <summary style="cursor:pointer;">🏚️ Age &amp; deformation</summary>
+<div class="form-row" style="align-items:flex-end;">
+            <div class="form-group" style="flex:1;min-width:120px;">
+                <label>Hue jitter — <span id="at-bp-hue-val">8</span>°</label>
+                <input type="range" id="at-bp-hue" min="0" max="40" value="8" style="width:100%;">
+            </div>
+            <div class="form-group" style="flex:1;min-width:120px;">
+                <label>Brightness jitter — <span id="at-bp-val-val">14</span>%</label>
+                <input type="range" id="at-bp-val" min="0" max="40" value="14" style="width:100%;">
+            </div>
+            <div class="form-group" style="width:150px;">
+                <label>Seed</label>
+                <div style="display:flex;gap:6px;">
+                    <input type="number" id="at-bp-seed" value="1" min="0" style="flex:1;min-width:0;">
+                    <button class="btn btn-secondary btn-sm" id="at-bp-random" title="Randomize seed">🎲</button>
+                </div>
+            </div>
+        </div>
+            </div>
+            <!-- The three accordions are the middle zone. Stacked under the core
+                 controls they pushed the preview clean off the bottom: 464px of
+                 scroll at 1920 with all three open, preview not visible at all. -->
+            <div class="at-modal-work"><details class="form-group at-acc" id="at-bp-deform-wrap">
+            <summary>🏚️ Age &amp; deformation</summary>
             <div class="sm-hint" style="margin:6px 0 2px;">Breaks up the machine-perfect grid for ruins and old stonework. Everything here is seeded and stays seamless — a flush city wall is all zeroes.</div>
             <div class="form-row" style="align-items:flex-end;">
                 <div class="form-group" data-bp="brick tile coursed" style="flex:1;min-width:120px;">
@@ -2083,8 +2184,8 @@
                 </div>
             </div>
         </details>
-        <details class="form-group" style="border:1px solid var(--border);border-radius:4px;padding:6px 10px;">
-            <summary style="cursor:pointer;">🧱 Behind the cells</summary>
+        <details class="form-group at-acc">
+            <summary>🧱 Behind the cells</summary>
             <div class="sm-hint" style="margin:6px 0 2px;">What shows through the joints — and through anything <strong>Missing pieces</strong> takes out. Pick another atlas tile here to lay blocks over a wall, instead of over a blur.</div>
             <div class="form-row" style="align-items:flex-end;margin-top:8px;">
                 <div class="form-group" style="flex:1.4;min-width:170px;">
@@ -2137,8 +2238,8 @@
              building bricks from an already-bricky texture, which usually has all
              the grain it needs. Switching pattern suggests a preset but never
              ticks the box. -->
-        <details class="form-group" style="border:1px solid var(--border);border-radius:4px;padding:6px 10px;">
-            <summary style="cursor:pointer;">🌾 Surface noise <span id="at-bp-sn-state" style="opacity:.55;font-size:11px;">— off</span></summary>
+        <details class="form-group at-acc">
+            <summary>🌾 Surface noise <span id="at-bp-sn-state" style="opacity:.55;font-size:11px;">— off</span></summary>
             <div class="sm-hint" style="margin-top:8px;">Grain, pitting and grain-direction laid over the pattern itself. Your texture probably has its own already — this is for flat or over-cleaned sources.</div>
             <div class="form-group">
                 <label class="checkbox-row"><input type="checkbox" id="at-bp-sn-on"> Add surface noise</label>
@@ -2196,40 +2297,28 @@
                 </div>
             </div>
         </details>
-        <div class="form-row" style="align-items:flex-end;">
-            <div class="form-group" style="flex:1;min-width:120px;">
-                <label>Hue jitter — <span id="at-bp-hue-val">8</span>°</label>
-                <input type="range" id="at-bp-hue" min="0" max="40" value="8" style="width:100%;">
             </div>
-            <div class="form-group" style="flex:1;min-width:120px;">
-                <label>Brightness jitter — <span id="at-bp-val-val">14</span>%</label>
-                <input type="range" id="at-bp-val" min="0" max="40" value="14" style="width:100%;">
-            </div>
-            <div class="form-group" style="width:150px;">
-                <label>Seed</label>
-                <div style="display:flex;gap:6px;">
-                    <input type="number" id="at-bp-seed" value="1" min="0" style="flex:1;min-width:0;">
-                    <button class="btn btn-secondary btn-sm" id="at-bp-random" title="Randomize seed">🎲</button>
-                </div>
-            </div>
-        </div>
-        <div class="form-group">
+            <div class="at-modal-side at-side-1x"><div class="form-group">
             <label>Preview</label>
             <canvas id="at-bp-preview" width="256" height="256" style="border:1px solid var(--border);border-radius:4px;image-rendering:pixelated;width:256px;height:256px;background:#111;"></canvas>
         </div>
         <div class="form-group">
             <label class="checkbox-row"><input type="checkbox" id="at-bp-assign" checked> <span id="at-bp-assign-label">Assign material preset</span></label>
         </div>
-        <div class="at-modal-actions">
+            </div>
+        </div>
+    <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
             <button class="btn btn-primary" id="at-bp-add">➕ Add Tile</button>
         </div>
     </div>
 
     <!-- ── Surface Noise modal (grain/pitting/grain-direction onto a tile) ── -->
-    <div class="at-modal at-modal-wide" id="at-modal-noise" role="dialog" aria-modal="true" aria-label="Surface Noise" style="display:none;">
+    <div class="at-modal at-modal-xl" id="at-modal-noise" role="dialog" aria-modal="true" aria-label="Surface Noise" style="display:none;">
         <div class="at-modal-title">🌾 Surface Noise — Tile <span id="at-sn-tileno"></span></div>
         <div class="sm-hint">Lays procedural grain into the texture itself, seamlessly. Material maps are generated <em>from</em> the diffuse, so this is what gives a flat or over-cleaned texture something for them to read.</div>
+        <div class="at-modal-cols">
+            <div class="at-modal-tune">
         <div class="form-row" style="align-items:flex-end;">
             <div class="form-group" style="flex:1.6;min-width:180px;">
                 <label>Preset</label>
@@ -2280,26 +2369,32 @@
                 </div>
             </div>
         </div>
-        <div class="form-group">
+                <div class="form-group">
+                    <label class="checkbox-row"><input type="checkbox" id="at-sn-newtile"> Add as a new tile instead of changing this one</label>
+                </div>
+            </div>
+            <div class="at-modal-side"><div class="form-group">
             <label>Preview — before / after</label>
             <div style="display:flex;gap:10px;flex-wrap:wrap;">
                 <canvas id="at-sn-before" width="256" height="256" style="border:1px solid var(--border);border-radius:4px;image-rendering:pixelated;width:200px;height:200px;background:#111;"></canvas>
                 <canvas id="at-sn-preview" width="256" height="256" style="border:1px solid var(--border);border-radius:4px;image-rendering:pixelated;width:200px;height:200px;background:#111;"></canvas>
             </div>
         </div>
-        <div class="form-group">
-            <label class="checkbox-row"><input type="checkbox" id="at-sn-newtile"> Add as a new tile instead of changing this one</label>
+        
+            </div>
         </div>
-        <div class="at-modal-actions">
+    <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
             <button class="btn btn-primary" id="at-sn-apply">🌾 Apply Noise</button>
         </div>
     </div>
 
     <!-- ── Stained Glass modal (leaded glass from texture or palette) ── -->
-    <div class="at-modal at-modal-wide" id="at-modal-stainedglass" role="dialog" aria-modal="true" aria-label="Stained Glass" style="display:none;">
+    <div class="at-modal at-modal-xl" id="at-modal-stainedglass" role="dialog" aria-modal="true" aria-label="Stained Glass" style="display:none;">
         <div class="at-modal-title">🪟 Stained Glass — Tile <span id="at-sg-tileno"></span></div>
         <div class="sm-hint">Splits the tile into glass cells separated by lead came. Cell colours come from the texture itself or a palette. The result carries a glass + metal multi-material and an emissive map, so the window glows in the dark.</div>
+        <div class="at-modal-cols">
+            <div class="at-modal-tune">
         <div class="form-row" style="align-items:flex-end;">
             <div class="form-group" style="flex:1.4;min-width:170px;">
                 <label>Cell pattern</label>
@@ -2376,11 +2471,14 @@
             <label class="checkbox-row"><input type="checkbox" id="at-sg-frame" checked> Square frame border</label>
             <span class="sm-hint" style="margin:0;">Rose windows are centred — the tile won't repeat seamlessly.</span>
         </div>
-        <div class="form-group">
+            </div>
+            <div class="at-modal-side at-side-1x"><div class="form-group">
             <label>Preview</label>
             <canvas id="at-sg-preview" width="256" height="256" style="border:1px solid var(--border);border-radius:4px;image-rendering:pixelated;width:256px;height:256px;background:#111;"></canvas>
         </div>
-        <div class="at-modal-actions">
+            </div>
+        </div>
+    <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
             <button class="btn btn-primary" id="at-sg-add">➕ Add Stained Glass Tile</button>
         </div>
@@ -2389,6 +2487,8 @@
     <!-- ── Material modal ───────────────────────────── -->
     <div class="at-modal" id="at-modal-mat" role="dialog" aria-modal="true" aria-label="Set Material" style="display:none;">
         <div class="at-modal-title" id="at-mat-title">🎨 Set Material</div>
+        <div class="at-modal-cols">
+            <div class="at-modal-tune">
         <!-- Your saved presets, one click away (they otherwise hide behind the
              "⭐ My presets" aesthetic). Only rendered once you have some. -->
         <div class="at-mat-chips" id="at-mat-chips" style="display:none;">
@@ -2419,6 +2519,10 @@
             </div>
         </div>
         <p id="at-mat-desc" style="color:var(--text-secondary);font-size:0.8rem;margin:4px 0 10px;"></p>
+        <!-- Contrast advice: maps derive from diffuse contrast, so a preset lands
+             differently on a flat texture than on a punchy one. Advisory only —
+             nothing is auto-corrected. See Roadmap.md "Phase 4". -->
+        <p id="at-mat-contrast" class="at-mat-advice" style="display:none;"></p>
 
         <!-- Multi-material: paint different materials onto regions of one tile -->
         <label class="checkbox-row" id="at-mm-toggle-row" style="margin:2px 0 8px;">
@@ -2477,15 +2581,7 @@
             <button type="button" class="btn btn-primary at-btn-sm" id="at-mat-nameok">Save</button>
             <button type="button" class="btn btn-secondary at-btn-sm" id="at-mat-namecancel">Cancel</button>
         </div>
-
-        <details id="at-mat-adv">
-            <summary style="cursor:pointer;color:var(--accent);font-size:0.85rem;margin-bottom:8px;">
-                ⚙️ Advanced editor (tweaking creates a custom material)
-            </summary>
-            <div class="at-mat-sliders" id="at-mat-sliders"></div>
-        </details>
-
-        <div class="form-row" style="margin-top:10px;align-items:flex-start;gap:16px;">
+<div class="form-row" style="margin-top:10px;align-items:flex-start;gap:16px;">
             <div class="form-group at-lit-group">
                 <label style="color:var(--accent);font-weight:600;">🔦 Lit preview
                     <span class="at-lit-badge" id="at-mat-prev-hint">drag to move the light</span>
@@ -2527,8 +2623,19 @@
                 <div class="at-mat-previews" id="at-mat-previews"></div>
             </div>
         </div>
-
-        <div class="at-modal-actions">
+            <!-- Parking slot: the advanced editor lives here while collapsed, so the
+                 side column can sit at 0px and there is no empty column. It docks into
+                 .at-mat-advcol on open, and FLIP carries it across. -->
+                <div id="at-mat-advhome">
+                    <details class="at-acc" id="at-mat-adv">
+                        <summary>⚙️ Advanced editor <span class="at-acc-note">(tweaking creates a custom material)</span></summary>
+                        <div class="at-mat-sliders" id="at-mat-sliders"></div>
+                    </details>
+                </div>
+            </div>
+            <div class="at-modal-side at-mat-advcol"></div>
+        </div>
+    <div class="at-modal-actions">
             <button class="btn btn-secondary" data-close>Cancel</button>
             <button class="btn btn-primary" id="at-mat-save">💾 Assign Material</button>
         </div>
