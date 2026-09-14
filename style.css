@@ -1669,6 +1669,21 @@ input[type="range"]::-moz-range-thumb {
     line-height: 1.5;
 }
 
+/* "Applying to all N selected tiles" — sits directly under a batchable modal's
+   title so the scope of the Apply button is stated before it is pressed. Same
+   accent treatment as .at-mat-advice: informational, never an error. */
+.at-batch-note {
+    background: var(--accent-bg);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    padding: 7px 12px;
+    margin: 0 0 10px;
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    flex: none;
+}
+
 /* Upload-atlas accordion (collapses once an atlas exists, to reduce clutter) */
 .at-upload-card > summary {
     list-style: none;
@@ -2265,6 +2280,28 @@ body.at-modal-open { overflow: hidden; }
 .at-modal-cols > .at-modal-work { overflow: hidden; transition: opacity var(--transition-lg); }
 .at-modal-cols.at-3zone  { grid-template-columns: minmax(0, 340px) minmax(0, 1fr) minmax(0, 440px); }
 
+/* ---- Borders & Corners: Organic edge as a middle column ----
+   Same mechanism as Make Transition (keep the tracks, take the middle one to 0),
+   but a bespoke rule rather than .at-3zone: this modal is preview-heavy and its
+   rail must stay FLEXIBLE — a 16-slot Lines sheet does not fit .at-3zone's fixed
+   440px. So it is at-tune-fixed's 340 | 1fr with a collapsible track inserted. ---- */
+#at-modal-bset .at-modal-cols.at-tune-fixed {
+    grid-template-columns: minmax(0, 340px) minmax(0, 0px) minmax(0, 1fr);
+}
+/* 470, not a smaller number that would "fit": the docked panel is pinned to
+   min-width 470px on purpose (see "Reveal by CLIPPING" above) so it does not
+   rewrap while the column sweeps open. A narrower track does not squash it, it
+   CLIPS it at rest — measured: a 360px track left the slider labels cut off mid
+   word. The modal widens to xxl alongside this so the preview rail keeps its
+   room; at xl there would be only ~172px left for a 13-slot sheet. */
+#at-modal-bset .at-modal-cols.at-tune-fixed.at-bset-wide {
+    grid-template-columns: minmax(0, 340px) minmax(0, 470px) minmax(0, 1fr);
+}
+@media (max-width: 900px) {
+    #at-modal-bset .at-modal-cols.at-tune-fixed,
+    #at-modal-bset .at-modal-cols.at-tune-fixed.at-bset-wide { grid-template-columns: 1fr; }
+}
+
 /* Consistent breathing room between stacked groups (hint / form-row / details /
    preview) inside each column. gap drives the rhythm, so the per-element margins
    that used to push groups together (or leave them touching) are neutralised. */
@@ -2304,6 +2341,9 @@ body.at-modal-open { overflow: hidden; }
 /* An accordion inside a zone must not widen it: a <details> that lays its contents
    out in two slider columns would otherwise blow the grid track out past its track
    size. This is what keeps "accordions expand into a column, not downward" honest. */
+   The WORK zone is deliberately NOT in this list: a docked accordion there is
+   pinned to a min-width instead (see "Reveal by CLIPPING" below), and the zone it
+   lands in has to be at least that wide or the panel is clipped at rest. */
 .at-modal-cols .at-modal-tune > details,
 .at-modal-cols .at-modal-main > details,
 .at-modal-cols .at-modal-side > details { min-width: 0; }

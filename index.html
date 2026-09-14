@@ -331,7 +331,6 @@
         <div class="at-ctx-title">Transitions</div>
         <button data-action="transition" role="menuitem" data-animhide>🔀 Make Transition with Texture…</button>
         <button data-action="wang" role="menuitem" data-animhide>🧩 Make Wang Set with Texture…</button>
-        <button data-action="borderset" role="menuitem" data-animhide>🧱 Add Borders &amp; Corners…</button>
         <button data-action="anchor" role="menuitem" data-animhide>📐 Make Anchored Transition…</button>
         <button data-action="transgrid" role="menuitem" data-animhide>🗺️ Make Transition Grid…</button>
         <button data-action="organic" role="menuitem" data-animhide>🌿 Make Organic Transition…</button>
@@ -339,25 +338,31 @@
     </div>
     <div class="at-ctx-col" data-col="generate">
         <div class="at-ctx-title">Generate</div>
-        <button data-action="seamless" role="menuitem" data-animhide>🔄 Make Seamless…</button>
+        <button data-action="seamless" role="menuitem" data-animhide data-batch="noanim">🔄 Make Seamless…</button>
+        <!-- Borders &amp; Corners is a GENERATOR (one fill + one trim -> a reusable
+             connectivity set), not a blend between two terrains, so it lives here
+             rather than under Transitions. It keeps data-animhide — unlike its
+             tileonly siblings it is deliberately offered on transition tiles too,
+             because a transition makes a perfectly good fill or trim. -->
+        <button data-action="borderset" role="menuitem" data-animhide>🧱 Add Borders &amp; Corners…</button>
         <button data-action="variations" role="menuitem" data-tileonly>✨ Generate Variations…</button>
         <button data-action="buildpattern" role="menuitem" data-tileonly>🏗️ Build Pattern…</button>
         <button data-action="origami" role="menuitem" data-tileonly>🪞 Origami Frame (fold to rings)</button>
         <button data-action="stainedglass" role="menuitem" data-tileonly>🪟 Stained Glass…</button>
-        <button data-action="surfacenoise" role="menuitem" data-tileonly>🌾 Surface Noise…</button>
+        <button data-action="surfacenoise" role="menuitem" data-tileonly data-batch>🌾 Surface Noise…</button>
     </div>
     <div class="at-ctx-col" data-col="transform">
         <div class="at-ctx-title">Transform</div>
-        <button data-action="rotate" role="menuitem" data-tileonly>↻ Rotate 90°</button>
-        <button data-action="fliph"  role="menuitem" data-tileonly>↔ Flip Horizontal</button>
-        <button data-action="flipv"  role="menuitem" data-tileonly>↕ Flip Vertical</button>
-        <button data-action="offset" role="menuitem" data-tileonly>⊹ Offset ½ (roll)</button>
+        <button data-action="rotate" role="menuitem" data-tileonly data-batch>↻ Rotate 90°</button>
+        <button data-action="fliph"  role="menuitem" data-tileonly data-batch>↔ Flip Horizontal</button>
+        <button data-action="flipv"  role="menuitem" data-tileonly data-batch>↕ Flip Vertical</button>
+        <button data-action="offset" role="menuitem" data-tileonly data-batch>⊹ Offset ½ (roll)</button>
     </div>
     <div class="at-ctx-col" data-col="adjust">
         <div class="at-ctx-title">Adjust</div>
-        <button data-action="coloradj" role="menuitem" data-tileonly>🎚 Adjust Colours…</button>
-        <button data-action="recolor" role="menuitem" data-tileonly>🖌 Recolor from Texture…</button>
-        <button data-action="delight" role="menuitem" data-tileonly>☀ De-light…</button>
+        <button data-action="coloradj" role="menuitem" data-tileonly data-batch>🎚 Adjust Colours…</button>
+        <button data-action="recolor" role="menuitem" data-tileonly data-batch>🖌 Recolor from Texture…</button>
+        <button data-action="delight" role="menuitem" data-tileonly data-batch>☀ De-light…</button>
         <button data-action="heal" role="menuitem" data-tileonly>🩹 Heal / Fill…</button>
         <button data-action="fade" role="menuitem" data-tileonly>🫥 Fade to Transparent…</button>
         <button data-action="emissive" role="menuitem" data-tileonly>✨ Make Emissive…</button>
@@ -374,10 +379,10 @@
     </div>
     <div class="at-ctx-col" data-col="file">
         <div class="at-ctx-title">File</div>
-        <button data-action="download" role="menuitem">⬇️ Download PNG</button>
+        <button data-action="download" role="menuitem" data-batch="any">⬇️ Download PNG</button>
         <button data-action="replace" role="menuitem" data-tileonly>🖼 Replace Image…</button>
-        <button data-action="reset" role="menuitem" data-tileonly>↩️ Reset to Original</button>
-        <button data-action="delete" role="menuitem" class="at-ctx-danger">🗑️ Delete…</button>
+        <button data-action="reset" role="menuitem" data-tileonly data-batch>↩️ Reset to Original</button>
+        <button data-action="delete" role="menuitem" class="at-ctx-danger" data-batch="any">🗑️ Delete…</button>
     </div>
 </div>
 
@@ -522,6 +527,75 @@
                 <button class="btn btn-secondary btn-sm" id="at-tr-mask-invert">Invert</button>
             </div>
             <div class="sm-hint">Paint <strong>white</strong> where the overlay (B) should show through. The mask is softened automatically. One tile is added.</div>
+        </div>
+        <!-- Parking slot for the Single Tiles organic accordion; it docks into
+             .at-modal-work on open, exactly like the Full Set one. See trDockSingleOrganic. -->
+        <div id="at-tr-sorg-home">
+<details class="at-acc" id="at-tr-sorg-acc" data-tr-panel="single" style="display:none;">
+            <summary>🌿 Organic edge <span style="color:var(--text-secondary);font-size:0.72rem;">(blobs, spikes, drips…)</span></summary>
+            <div class="sm-hint" style="margin-top:6px;">Off at <strong>Amount</strong> 0. The detail is faded out at each tile border, so the tile still meets its neighbours exactly where it did before — a <strong>Top</strong> transition laid in a row stays seamless left-to-right however high you push it.</div>
+            <div class="form-row" style="gap:10px;flex-wrap:wrap;margin-top:6px;">
+                <div class="form-group" style="flex:1;min-width:200px;">
+                    <label>Edge style</label>
+                    <select id="at-tr-sorg-style">
+                        <option value="blobs" selected>Blobs — soft rounded lobes</option>
+                        <option value="spikes">Spikes — narrow tapered teeth</option>
+                        <option value="drips">Drips — long reaching fingers</option>
+                        <option value="clumps">Clumps — chunky lobes with gaps</option>
+                        <option value="fray">Fray — fine ragged fringe</option>
+                    </select>
+                    <div class="sm-hint" id="at-tr-sorg-style-hint" style="margin-top:4px;"></div>
+                </div>
+            </div>
+            <div class="form-row" style="gap:10px;flex-wrap:wrap;">
+                <div class="form-group" style="flex:1;min-width:140px;">
+                    <label>Amount — <span id="at-tr-sorg-wobble-val">0</span>%</label>
+                    <input type="range" id="at-tr-sorg-wobble" min="0" max="100" value="0" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:1;min-width:140px;">
+                    <label>Scatter — <span id="at-tr-sorg-scatter-val">0</span>%</label>
+                    <input type="range" id="at-tr-sorg-scatter" min="0" max="100" value="0" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:1;min-width:140px;">
+                    <label>Detail softness — <span id="at-tr-sorg-feather-val">0</span>%</label>
+                    <input type="range" id="at-tr-sorg-feather" min="0" max="100" value="0" style="width:100%;">
+                </div>
+            </div>
+            <div class="form-row" style="gap:10px;flex-wrap:wrap;align-items:flex-end;">
+                <div class="form-group" style="flex:1;min-width:140px;">
+                    <label>Contact shadow — <span id="at-tr-sorg-shadow-val">0</span>%</label>
+                    <input type="range" id="at-tr-sorg-shadow" min="0" max="100" value="0" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:0 0 auto;">
+                    <label>Colour</label>
+                    <input type="color" id="at-tr-sorg-shcolor" value="#000000" style="width:56px;height:30px;padding:2px;">
+                </div>
+                <div class="form-group" style="flex:1;min-width:150px;">
+                    <label>Blend</label>
+                    <select id="at-tr-sorg-shmode">
+                        <option value="multiply" selected>Multiply</option>
+                        <option value="tint">Tint (can lighten)</option>
+                    </select>
+                </div>
+                <div class="form-group" style="flex:1;min-width:170px;">
+                    <label>Apply to</label>
+                    <select id="at-tr-sorg-shtarget">
+                        <option value="diffuse" selected>Diffuse</option>
+                        <option value="ao">AO map</option>
+                        <option value="both">Both</option>
+                    </select>
+                    <div class="sm-hint" id="at-tr-sorg-shtarget-hint" style="margin-top:3px;"></div>
+                </div>
+                <div class="form-group" style="flex:1;min-width:140px;">
+                    <label>Feature size — <span id="at-tr-sorg-scale-val">3</span></label>
+                    <input type="range" id="at-tr-sorg-scale" min="1" max="8" value="3" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:0 0 auto;">
+                    <button class="btn btn-secondary btn-sm" id="at-tr-sorg-seed" title="Reroll the organic pattern">🎲 Reroll</button>
+                </div>
+            </div>
+            <div class="sm-hint" style="margin-top:4px;">Applies to the <strong>Directions</strong> presets. A hand-painted <strong>Custom</strong> mask is already whatever shape you drew, so the panel is hidden for it.</div>
+        </details>
         </div>
         <div class="form-row" data-tr-panel="set" style="display:none;gap:10px;flex-wrap:wrap;">
             <div class="form-group" style="flex:1;min-width:210px;">
@@ -963,10 +1037,10 @@
         </div>
         <div class="form-row" style="align-items:flex-end;gap:10px;">
             <div class="form-group" style="flex:1;">
-                <label>🌿 Organic edge — <span id="at-anchor-organic-val">0</span>% <span style="color:var(--text-secondary);font-size:0.72rem;">(ragged, noise-warped border)</span></label>
+                <label>🌊 Border warp — <span id="at-anchor-organic-val">0</span>% <span style="color:var(--text-secondary);font-size:0.72rem;">(bends the whole seam into a slow wave)</span></label>
                 <input type="range" id="at-anchor-organic" min="0" max="100" value="0" style="width:100%;">
             </div>
-            <button class="btn btn-secondary btn-sm" id="at-anchor-organic-seed" title="Reroll the organic edge pattern">🎲</button>
+            <button class="btn btn-secondary btn-sm" id="at-anchor-organic-seed" title="Reroll the warp pattern">🎲</button>
         </div>
         </div><!-- /.at-modal-main -->
         <div class="at-modal-side">
@@ -1037,13 +1111,13 @@
             </div>
         </details>
         <details class="form-group at-acc">
-            <summary>🌿 Organic breakup <span style="color:var(--text-secondary);font-size:0.72rem;">(wobble the fill edges)</span></summary>
+            <summary>🌊 Border warp <span style="color:var(--text-secondary);font-size:0.72rem;">(bends the fill edges into a slow wave)</span></summary>
             <div class="form-row" style="align-items:flex-end;margin-top:8px;">
                 <div class="form-group" style="flex:1;min-width:140px;">
                     <label>Amount — <span id="at-ht-organic-val">0</span>%</label>
                     <input type="range" id="at-ht-organic" min="0" max="100" value="0" style="width:100%;">
                 </div>
-                <button class="btn btn-secondary btn-sm" id="at-ht-organic-seed" title="Reroll the breakup pattern">🎲</button>
+                <button class="btn btn-secondary btn-sm" id="at-ht-organic-seed" title="Reroll the warp pattern">🎲</button>
             </div>
         </details>
         <details class="form-group at-acc">
@@ -1165,10 +1239,10 @@
                 <input type="range" id="at-tg-hardness" min="0" max="100" value="50" style="width:100%;">
             </div>
             <div class="form-group" style="flex:1;">
-                <label>🌿 Organic edge — <span id="at-tg-organic-val">0</span>%</label>
+                <label>🌊 Border warp — <span id="at-tg-organic-val">0</span>% <span style="color:var(--text-secondary);font-size:0.72rem;">(bends the whole wall's seam)</span></label>
                 <input type="range" id="at-tg-organic" min="0" max="100" value="0" style="width:100%;">
             </div>
-            <button class="btn btn-secondary btn-sm" id="at-tg-organic-seed" title="Reroll the organic edge pattern">🎲</button>
+            <button class="btn btn-secondary btn-sm" id="at-tg-organic-seed" title="Reroll the warp pattern">🎲</button>
             <label style="display:flex;align-items:center;gap:5px;font-size:0.78rem;color:var(--text-secondary);white-space:nowrap;cursor:pointer;">
                 <input type="checkbox" id="at-tg-hide"> Hide handles
             </label>
@@ -1645,6 +1719,17 @@
         <div class="at-modal-cols">
             <div class="at-modal-tune">
                 <div class="at-ca-sliders" id="at-rc-sliders"></div>
+                <!-- Only shown for a multi-tile selection: the two sensible ways to
+                     spread one transfer over several tiles give visibly different
+                     results, so it is a choice rather than a default. -->
+                <div class="form-group" id="at-rc-batch-mode" style="display:none;">
+                    <label for="at-rc-match">Across the selection</label>
+                    <select id="at-rc-match">
+                        <option value="each" selected>Match each tile to the reference</option>
+                        <option value="same">Apply the same shift to every tile</option>
+                    </select>
+                    <div class="sm-hint" id="at-rc-match-hint"></div>
+                </div>
                 <!-- The reference palette is an INPUT (what the colours are sampled
                      from), not a result, so it belongs beside the controls rather
                      than stacked under the result preview. -->
@@ -1905,7 +1990,77 @@
                 <div style="color:var(--text-secondary);font-size:0.72rem;">Rotates the trim texture along vertical borders (mitred corners).</div>
             </div>
         </div>
+        <!-- Parking slot: the accordion docks into .at-modal-work on open so the
+             slot grid and sample wall keep their height. See bsetDockOrganic. -->
+        <div id="at-bset-org-home">
+<details class="at-acc" id="at-bset-org-acc">
+            <summary>🌿 Organic edge <span style="color:var(--text-secondary);font-size:0.72rem;">(ragged, hand-painted trim edge)</span></summary>
+            <div class="sm-hint" style="margin-top:6px;">Off at <strong>Amount</strong> 0. Only the <em>inner</em> contour moves — the edge sitting on the tile border stays flush, so the set still joins up exactly. A border down the left of a tile therefore goes ragged on its <em>right</em>.</div>
+            <div class="form-row" style="gap:10px;flex-wrap:wrap;margin-top:6px;">
+                <div class="form-group" style="flex:1;min-width:200px;">
+                    <label>Edge style</label>
+                    <select id="at-bset-org-style">
+                        <option value="blobs" selected>Blobs — soft rounded lobes</option>
+                        <option value="spikes">Spikes — narrow tapered teeth</option>
+                        <option value="drips">Drips — long reaching fingers</option>
+                        <option value="clumps">Clumps — chunky lobes with gaps</option>
+                        <option value="fray">Fray — fine ragged fringe</option>
+                    </select>
+                    <div class="sm-hint" id="at-bset-org-style-hint" style="margin-top:4px;"></div>
+                </div>
             </div>
+            <div class="form-row" style="gap:10px;flex-wrap:wrap;">
+                <div class="form-group" style="flex:1;min-width:140px;">
+                    <label>Amount — <span id="at-bset-org-wobble-val">0</span>%</label>
+                    <input type="range" id="at-bset-org-wobble" min="0" max="100" value="0" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:1;min-width:140px;">
+                    <label>Scatter — <span id="at-bset-org-scatter-val">0</span>%</label>
+                    <input type="range" id="at-bset-org-scatter" min="0" max="100" value="0" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:1;min-width:140px;">
+                    <label>Detail softness — <span id="at-bset-org-feather-val">0</span>%</label>
+                    <input type="range" id="at-bset-org-feather" min="0" max="100" value="0" style="width:100%;">
+                </div>
+            </div>
+            <div class="form-row" style="gap:10px;flex-wrap:wrap;align-items:flex-end;">
+                <div class="form-group" style="flex:1;min-width:140px;">
+                    <label>Contact shadow — <span id="at-bset-org-shadow-val">0</span>%</label>
+                    <input type="range" id="at-bset-org-shadow" min="0" max="100" value="0" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:0 0 auto;">
+                    <label>Colour</label>
+                    <input type="color" id="at-bset-org-shcolor" value="#000000" style="width:56px;height:30px;padding:2px;">
+                </div>
+                <div class="form-group" style="flex:1;min-width:150px;">
+                    <label>Blend</label>
+                    <select id="at-bset-org-shmode">
+                        <option value="multiply" selected>Multiply</option>
+                        <option value="tint">Tint (can lighten)</option>
+                    </select>
+                </div>
+                <div class="form-group" style="flex:1;min-width:170px;">
+                    <label>Apply to</label>
+                    <select id="at-bset-org-shtarget">
+                        <option value="diffuse" selected>Diffuse</option>
+                        <option value="ao">AO map</option>
+                        <option value="both">Both</option>
+                    </select>
+                    <div class="sm-hint" id="at-bset-org-shtarget-hint" style="margin-top:3px;"></div>
+                </div>
+                <div class="form-group" style="flex:1;min-width:140px;">
+                    <label>Feature size — <span id="at-bset-org-scale-val">3</span></label>
+                    <input type="range" id="at-bset-org-scale" min="1" max="8" value="3" style="width:100%;">
+                </div>
+                <div class="form-group" style="flex:0 0 auto;">
+                    <button class="btn btn-secondary btn-sm" id="at-bset-org-seed" title="Reroll the organic pattern">🎲 Reroll</button>
+                </div>
+            </div>
+            <div class="sm-hint" style="margin-top:4px;">Seamless here comes from the noise repeating over the tile, not from fading it out at the borders — so unlike a transition set, the detail keeps its full strength right up to the edge.</div>
+        </details>
+        </div>
+            </div>
+            <div class="at-modal-work"></div>
             <div class="at-modal-side"><div style="display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start;">
             <div class="form-group" style="flex:1.3;min-width:280px;">
                 <label>Tile set (<span id="at-bset-count">9</span> tiles — click a slot to change how it's made)</label>

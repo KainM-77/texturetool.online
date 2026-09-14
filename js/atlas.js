@@ -564,9 +564,46 @@ window.TRLE = window.TRLE || {};
         if (CORNER_BITS[mode] !== undefined) return buildCornerMask(S, CORNER_BITS[mode], pivot, hardness, org);
         pivot    = Math.max(0, Math.min(1, pivot));
         hardness = Math.max(0, Math.min(1, hardness));
-        const lower     = pivot * hardness;
-        const upper     = 1.0 - (1.0 - pivot) * hardness;
+        let lower       = pivot * hardness;
+        let upper       = 1.0 - (1.0 - pivot) * hardness;
         const isHardCut = upper <= lower + 1e-5;
+
+        /* Organic on the RATIO field (the single-tile direction presets). This
+           branch used to take `org` and silently drop it — 0 of the 20 presets
+           honoured a recipe while all 12 corner modes did.
+
+           It is safe for exactly the reason the corner masks are: every organic
+           term is multiplied by the sin(pi*nx)*sin(pi*ny) border window, so the
+           organic CONTRIBUTION at a tile border is zero. That matters here because
+           a directional preset IS already seamless along its own boundary axis —
+           `TopFull` and `Top` are functions of ny alone, so a row of them joins
+           exactly — and organic must not spend that.
+
+           Note what that does and does not promise. The border PIXELS do change,
+           because this path also skips the blur tail below (same reason the corner
+           and Wang builders skip it); what is preserved is the SEAM, since both
+           borders change alike. Measured: the mask moves mid-tile while no seam of
+           any of the 20 presets gets worse, and `Left` improves by a grey level
+           that was the blur's own asymmetry. validate-transseam.mjs pins it.
+           The corollary is that an organic tile and a plain tile of the SAME mode
+           no longer meet perfectly — true of Wang and corner masks already.
+
+           The gradient is a central difference rather than analytic: the boundary
+           frame the teeth styles need only wants a direction, and computeTopology
+           mixes min() and clamps across 20 modes, so an analytic form would be 20
+           special cases to keep in step with the switch. */
+        const O  = makeOrganic(org, S);
+        const aa = CORNER_AA_PX / Math.max(2, S);
+        // Floor the band the same way buildCornerMask does, but ONLY with organic
+        // on: a hard cut has no band for the style's detail to displace, and
+        // widening it unconditionally would move every existing plain mask.
+        if (O && upper - lower < aa) { lower = pivot - aa * 0.5; upper = pivot + aa * 0.5; }
+        const ratio = (rx, ry) => {
+            const [d1, d2] = computeTopology(mode, rx, ry);
+            const sum = d1 + d2;
+            return sum < 1e-10 ? 0.5 : d1 / sum;
+        };
+        const h = 1 / Math.max(2, S - 1);
 
         const canvas = document.createElement('canvas');
         canvas.width = S; canvas.height = S;
@@ -578,18 +615,34 @@ window.TRLE = window.TRLE || {};
             for (let x = 0; x < S; x++) {
                 const nx = S > 1 ? x / (S - 1) : 0.5;
                 const ny = S > 1 ? y / (S - 1) : 0.5;
-                const [d1, d2] = computeTopology(mode, nx, ny);
-                const sum = d1 + d2;
-                const v   = sum < 1e-10 ? 0.5 : d1 / sum;
                 let w;
-                if (isHardCut) w = v >= pivot ? 1.0 : 0.0;
-                else w = Math.max(0.0, Math.min(1.0, (v - lower) / (upper - lower)));
+                if (O) {
+                    const { ux, uy, uxP, uyP, win } = O.coords(nx, ny);
+                    let g = ratio(ux, uy);
+                    const gx = (ratio(ux + h, uy) - ratio(ux - h, uy)) / (2 * h);
+                    const gy = (ratio(ux, uy + h) - ratio(ux, uy - h)) / (2 * h);
+                    g = O.shape(g, gx, gy, nx, ny, win);
+                    const b = O.band(lower, upper, g, ratio(uxP, uyP), aa);
+                    const cc = Math.max(0, Math.min(1, (g - b.lo) / Math.max(1e-6, b.hi - b.lo)));
+                    w = cc * cc * (3 - 2 * cc);
+                } else {
+                    const [d1, d2] = computeTopology(mode, nx, ny);
+                    const sum = d1 + d2;
+                    const v   = sum < 1e-10 ? 0.5 : d1 / sum;
+                    if (isHardCut) w = v >= pivot ? 1.0 : 0.0;
+                    else w = Math.max(0.0, Math.min(1.0, (v - lower) / (upper - lower)));
+                }
                 const byte = Math.round(w * 255);
                 const idx = (y * S + x) * 4;
                 d[idx] = byte; d[idx+1] = byte; d[idx+2] = byte; d[idx+3] = 255;
             }
         }
         ctx.putImageData(img, 0, 0);
+
+        // The blur tail reads pixels from outside the canvas, which is the one
+        // place a mask that has to meet a neighbour must stay exact — so it is
+        // skipped with organic on, exactly as buildCornerMask/buildWangMask do.
+        if (O) return canvas;
 
         // Smooth corner singularities (sub-pixel relative radius)
         const blurR = Math.max(0.75, S / 128);
@@ -936,9 +989,35 @@ window.TRLE = window.TRLE || {};
         return out;
     }
 
-    /* Roughen a mask's edges by domain-warping it with seeded noise — turns a
-       clean straight/curved A→B boundary into an organic, ragged one. Applied
-       to the whole (global) mask before slicing, so grid tiles stay seamless.
+    /* Domain-warp a mask with seeded noise. Used by the Anchored Transition, the
+       Transition Grid and the Height Transition, where the control is now called
+       "🌊 Border warp" rather than "Organic edge".
+
+       ⚠️ DEFERRED REFACTOR — measured 2026-09-14, see Roadmap.md. This is NOT a
+       weaker setting of the `makeOrganic` edge; it is a different operation with
+       two defects, and it is left alone ON PURPOSE so that every project already
+       saved with a non-zero slider keeps its exact pixels.
+
+       1. It does not roughen — it BENDS. `freq = 4` over the whole canvas is a
+          single octave, so on a 3x3 grid that is 1.33 cycles per cell: one swell
+          per tile and no fine detail. Splitting the contour into low- and
+          high-frequency parts (RMS px, normalised to a 256px tile) at 100%:
+          Grid  = swell 27.0 / ragged 4.3  -> 6.3:1, swell-dominated
+          blobs = swell  6.2 / ragged 17.9 -> 0.3:1, ragged-dominated
+          WARP_OCTAVES below already fixed exactly this for Build Pattern's joint
+          edges ("this used to be a bare freq=4") and was never back-ported.
+       2. On a SINGLE tile it breaks the wrap, because makeValueNoise is not
+          periodic and `sample` clamps at the border. Scoring each column by its
+          max delta to its neighbour and ranking the wrap column: the Anchored
+          Transition goes from rank 63/256 at 0% to rank 1/256 — the sharpest edge
+          in the tile — at just 10%. The Height Transition does the same by 20%.
+          The Grid escapes this for its INTERIOR seams only, because it warps the
+          whole wall before slicing; the wall as a unit stops wrapping.
+
+       The fix when someone picks this up is `makePeriodicNoise` + toroidal
+       sampling + a WARP_OCTAVES-style octave set — but it will change the pixels
+       of existing saved tiles, so it needs a version flag on the recipe.
+
        amount 0..1; returns src unchanged when amount <= 0. */
     function warpMaskOrganic(src, W, H, amount, seed) {
         if (!amount || amount <= 0) return src;
@@ -3281,6 +3360,55 @@ window.TRLE = window.TRLE || {};
         return state.selSet.size >= 2 && state.selSet.has(id);
     }
 
+    /* Targets for a context-menu action: the whole selection when the
+       right-clicked tile is part of one, otherwise just that tile.
+
+       Set Material was for a long time the ONLY action that honoured this, and it
+       relabels itself to say so — which taught people the rule and then broke it
+       on the next entry down the menu. A beta report ("recolor from texture with
+       multiple selected only applied to the first one") is what that costs: the
+       selection was intact all the way into the modal, the modal just never
+       looked at it. Every action that CAN batch now routes through here.
+
+       `kinds` mirrors the menu's own visibility rule for that entry, so a batch
+       never reaches an element a single right-click would have refused:
+       'tile' matches data-tileonly, 'noanim' matches data-animhide (a transition
+       tile is a perfectly good thing to make seamless; an animation frame is
+       not, since its pixels are regenerated from the group's params), and 'any'
+       matches an entry with neither. A mixed selection does the eligible ones
+       and reports how many it skipped rather than refusing outright. */
+    const CTX_KINDS = { tile: ['tile'], noanim: ['tile', 'transition'], any: null };
+    function ctxTargets(id, kinds = 'tile') {
+        const ids = ctxActsOnSelection(id) ? selectedIdsInOrder() : [id];
+        const allow = CTX_KINDS[kinds];
+        return allow ? ids.filter(i => { const e = byId(i); return e && allow.includes(e.kind); }) : ids;
+    }
+
+    /* "3 transition tiles were skipped" — said once, at the point of action, so a
+       count that doesn't match the selection isn't a silent mystery. */
+    function noteSkipped(all, targets, why) {
+        const n = all.length - targets.length;
+        if (n > 0) showToast(`${n} tile${n !== 1 ? 's' : ''} skipped — ${why}`, 'info', 3500);
+    }
+
+    /* "Applying to all N selected tiles" under a batchable modal's title.
+       Inserted rather than marked up in five places, so the wording stays in one
+       spot; hidden entirely for a single target, which is the common case. */
+    function setBatchNote(modalId, n, previewNo) {
+        const modal = $(modalId);
+        if (!modal) return;
+        let note = modal.querySelector('.at-batch-note');
+        if (!note) {
+            note = document.createElement('div');
+            note.className = 'at-batch-note';
+            modal.querySelector('.at-modal-title').after(note);
+        }
+        note.style.display = n > 1 ? '' : 'none';
+        note.textContent = n > 1
+            ? `🎯 Applying to all ${n} selected tiles — the preview shows tile ${previewNo}.`
+            : '';
+    }
+
     function openCtxMenu(id, x, y) {
         const el = byId(id);
         if (!el) return;
@@ -3316,6 +3444,17 @@ window.TRLE = window.TRLE || {};
                 + (many ? ` — ${state.selSet.size} tiles` : '');
             lastBtn.title = 'Re-apply the last material you assigned, without opening the editor';
         }
+        // Every other action that can run over the selection says so too. Only
+        // Set Material used to, which is exactly why "Recolor applied to one
+        // tile" read as a bug rather than as a limitation — see ctxTargets.
+        // The base label is stashed on first use: these get rewritten on every
+        // open, and re-suffixing an already-suffixed label compounds.
+        menu.querySelectorAll('[data-batch]').forEach(b => {
+            if (!b.dataset.baseLabel) b.dataset.baseLabel = b.textContent;
+            const n = many ? ctxTargets(id, b.dataset.batch || 'tile').length : 1;
+            b.textContent = b.dataset.baseLabel + (n > 1 ? ` — ${n} tiles` : '');
+        });
+
         // Transition-only helpers: jump to the tiles this transition was built from.
         menu.querySelectorAll('[data-transonly]').forEach(b => {
             b.style.display = (el.kind === 'transition' && el.base != null) ? '' : 'none';
@@ -3389,7 +3528,7 @@ window.TRLE = window.TRLE || {};
         const el = byId(id);
         if (!el) return;
         switch (action) {
-            case 'seamless':   openSeamlessModal(id); break;
+            case 'seamless':   openSeamlessModal(ctxTargets(id, 'noanim')); break;
             case 'transition': enterPickMode(id, 'transition'); showToast('Now click the second texture', 'info'); break;
             case 'wang': enterPickMode(id, 'wang'); showToast('Now click the second texture for the Wang set', 'info'); break;
             case 'borderset': enterPickMode(id, 'borderset'); showToast('Click a second texture for the trim — or “Use same texture” for an origami fold', 'info'); break;
@@ -3428,22 +3567,28 @@ window.TRLE = window.TRLE || {};
                 if (el.kind !== 'tile') { showToast('Emissive works on source tiles only', 'info'); return; }
                 openEmissiveModal(id);
                 break;
-            case 'rotate': applyTileTransform(id, c => rotateTile90(c), 'Rotated 90°'); break;
-            case 'fliph':  applyTileTransform(id, c => flipTile(c, true), 'Flipped horizontally'); break;
-            case 'flipv':  applyTileTransform(id, c => flipTile(c, false), 'Flipped vertically'); break;
-            case 'offset': applyTileTransform(id, c => offsetTileHalf(c), 'Offset by ½'); break;
-            case 'coloradj':
+            case 'rotate': applyTileTransform(ctxTargets(id), c => rotateTile90(c), 'Rotated 90°'); break;
+            case 'fliph':  applyTileTransform(ctxTargets(id), c => flipTile(c, true), 'Flipped horizontally'); break;
+            case 'flipv':  applyTileTransform(ctxTargets(id), c => flipTile(c, false), 'Flipped vertically'); break;
+            case 'offset': applyTileTransform(ctxTargets(id), c => offsetTileHalf(c), 'Offset by ½'); break;
+            case 'coloradj': {
                 if (el.kind !== 'tile') { showToast('Adjust Colours works on source tiles only', 'info'); return; }
-                openColorAdjModal(id);
+                const t = ctxTargets(id);
+                noteSkipped(ctxTargets(id, 'any'), t, 'Adjust Colours works on source tiles only');
+                openColorAdjModal(t);
                 break;
+            }
             case 'recolor':
                 if (el.kind !== 'tile') { showToast('Recolor works on source tiles only', 'info'); return; }
                 enterPickMode(id, 'recolor'); showToast('Now click the reference texture to sample colours from', 'info');
                 break;
-            case 'delight':
+            case 'delight': {
                 if (el.kind !== 'tile') { showToast('De-light works on source tiles only', 'info'); return; }
-                openDelightModal(id);
+                const t = ctxTargets(id);
+                noteSkipped(ctxTargets(id, 'any'), t, 'De-light works on source tiles only');
+                openDelightModal(t);
                 break;
+            }
             case 'variations':
                 if (el.kind !== 'tile') { showToast('Variations work on source tiles only', 'info'); return; }
                 openVarModal(id);
@@ -3456,39 +3601,62 @@ window.TRLE = window.TRLE || {};
                 if (el.kind !== 'tile') { showToast('Stained Glass works on source tiles only', 'info'); return; }
                 openStainedGlassModal(id);
                 break;
-            case 'surfacenoise':
+            case 'surfacenoise': {
                 if (el.kind !== 'tile') { showToast('Surface Noise works on source tiles only', 'info'); return; }
-                openNoiseModal(id);
+                const t = ctxTargets(id);
+                noteSkipped(ctxTargets(id, 'any'), t, 'Surface Noise works on source tiles only');
+                openNoiseModal(t);
                 break;
+            }
             case 'editstainedglass': if (el.sgParams) editStainedGlassModal(el); break;
             case 'replace':
                 if (el.kind !== 'tile') { showToast('Replace works on source tiles only', 'info'); return; }
                 replaceTileImage(id);
                 break;
-            case 'download':
-                TRLE.Engine.canvasToBlob(el.canvas).then(b => downloadBlob(b, `tile_${indexOf(id) + 1}.png`));
-                showToast('Downloading tile PNG', 'info', 1500);
+            case 'download': {
+                const dls = ctxTargets(id, 'any');
+                // Sequentially, not Promise.all: a browser drops the later files
+                // of a burst of simultaneous downloads.
+                (async () => {
+                    for (const tid of dls) {
+                        const t = byId(tid);
+                        if (!t) continue;
+                        const b = await TRLE.Engine.canvasToBlob(t.canvas);
+                        downloadBlob(b, `tile_${indexOf(tid) + 1}.png`);
+                    }
+                })();
+                showToast(dls.length > 1 ? `Downloading ${dls.length} tile PNGs` : 'Downloading tile PNG', 'info', 1500);
                 break;
+            }
             case 'reset': {
                 if (el.kind !== 'tile') return;
+                const targets = ctxTargets(id).map(byId).filter(e => e && e.kind === 'tile');
+                if (!targets.length) return;
                 // Say what went with it. The glow lives off-canvas, so a silent
                 // "restored to original" leaves no way to tell it was cleared.
-                const hadGlow = !!el.emissive;
-                el.canvas.getContext('2d').drawImage(el.original, 0, 0);
-                el.seamless = false;
-                el.edited = false;
-                el.emissive = null;
+                const hadGlow = targets.some(t => !!t.emissive);
+                targets.forEach(t => {
+                    t.canvas.getContext('2d').drawImage(t.original, 0, 0);
+                    t.seamless = false;
+                    t.edited = false;
+                    t.emissive = null;
+                });
                 refreshTransitions();
                 renderGrid();
                 const unticked = hadGlow && syncEmissiveExport();
-                pushHistory('Reset tile');
-                showToast('Tile restored to original'
+                const n = targets.length;
+                pushHistory(n > 1 ? `Reset ${n} tiles` : 'Reset tile');
+                showToast((n > 1 ? `${n} tiles restored to original` : 'Tile restored to original')
                     + (hadGlow ? ' — glow removed' : '')
                     + (unticked ? ' (Emissive export map off)' : ''), 'success');
                 break;
             }
             case 'delete':
-                confirmDelete([id]);
+                // Same rule as everything else in the menu, and it was already the
+                // bulk bar's behaviour — confirmDelete takes a list, counts the
+                // dependency closure and asks first, so batching it adds no new
+                // destructive path.
+                confirmDelete(ctxTargets(id, 'any'));
                 break;
         }
     }
@@ -3795,7 +3963,8 @@ window.TRLE = window.TRLE || {};
             // Plain accordions drive themselves; the two docking ones (Set Material,
             // Make Transition) are bound by accBindSummary instead, because they also
             // have to change column and modal width in the same task.
-            if (d.id !== 'at-mat-adv' && d.id !== 'at-tr-org-acc') {
+            if (d.id !== 'at-mat-adv' && d.id !== 'at-tr-org-acc' && d.id !== 'at-tr-sorg-acc'
+                && d.id !== 'at-bset-org-acc') {
                 su.addEventListener('click', e => { e.preventDefault(); accSetOpen(d, !d.open); });
             }
         });
@@ -3935,20 +4104,26 @@ window.TRLE = window.TRLE || {};
     const SM_PREVIEW = 512;
     const SM_SEAM_COLOR = [0.91, 0.52, 0.16];
 
-    const sm = { id: null, srcTex: null, resultFBO: null, previewFBO: null };
+    const sm = { id: null, srcTex: null, resultFBO: null, previewFBO: null, batchIds: [] };
 
     function smCleanup() {
         if (sm.srcTex)     { TRLE.Engine.deleteTexture(sm.srcTex); sm.srcTex = null; }
         if (sm.resultFBO)  { TRLE.Engine.deleteFBO(sm.resultFBO); sm.resultFBO = null; }
         if (sm.previewFBO) { TRLE.Engine.deleteFBO(sm.previewFBO); sm.previewFBO = null; }
         sm.id = null;
+        sm.batchIds = [];
     }
 
-    function openSeamlessModal(id) {
+    function openSeamlessModal(ids) {
+        const list = Array.isArray(ids) ? ids : [ids];
+        const id = list[0];
+        const el = byId(id);
+        if (!el) return;
         smCleanup();
         sm.id = id;
-        const el = byId(id);
+        sm.batchIds = list.slice();
         $('at-sm-tileno').textContent = indexOf(id) + 1;
+        setBatchNote('at-modal-seamless', list.length, indexOf(id) + 1);
         sm.srcTex = TRLE.Engine.createTextureFromImage(el.canvas);
         openModal('seamless');
         smUpdateControls();
@@ -3962,9 +4137,11 @@ window.TRLE = window.TRLE || {};
         $('at-sm-splat-controls').style.display  = (m === 'splat') ? '' : 'none';
     }
 
-    function smProcess() {
-        if (sm.id === null) return;
-        const S = state.tileSize;
+    /* One tile through the seamless pipeline with the modal's current settings.
+       Split out of smProcess so the Save path can run the SAME settings over
+       every selected tile — each needs its own source texture, so nothing here
+       may read sm.srcTex. Caller owns the returned FBO. */
+    function smBuildResult(srcTex, S) {
         const temps = [];
 
         const method   = $('at-sm-method').value;
@@ -3972,29 +4149,26 @@ window.TRLE = window.TRLE || {};
         const overlapX = parseInt($('at-sm-overlapx').value) / 100;
         const overlapY = parseInt($('at-sm-overlapy').value) / 100;
 
-        if (sm.resultFBO)  { TRLE.Engine.deleteFBO(sm.resultFBO); sm.resultFBO = null; }
-        if (sm.previewFBO) { TRLE.Engine.deleteFBO(sm.previewFBO); sm.previewFBO = null; }
-
         const resultFBO = TRLE.Engine.createFBO(S, S);
         if (method === 'multiband') {
             /* Multi-band (Laplacian) edge blend — the MIT replacement for the
                old GPL Materialize quadrant-overlap pass. Writes into resultFBO
                via a copy because seamlessMultiBand owns its own output FBO. */
-            const mb = TRLE.Engine.seamlessMultiBand(sm.srcTex, S,
+            const mb = TRLE.Engine.seamlessMultiBand(srcTex, S,
                 { overlapX, overlapY, falloff });
             temps.push(mb);
             TRLE.Engine.blit('copy', { u_texture: mb.texture }, resultFBO);
         } else if (method === 'allsides') {
             TRLE.Engine.blit('seamlessAllSides', {
-                u_texture: sm.srcTex, u_overlapX: overlapX, u_overlapY: overlapY, u_falloff: falloff
+                u_texture: srcTex, u_overlapX: overlapX, u_overlapY: overlapY, u_falloff: falloff
             }, resultFBO);
         } else if (method === 'collage') {
             TRLE.Engine.blit('seamlessCollage', {
-                u_texture: sm.srcTex, u_overlapX: overlapX, u_overlapY: overlapY, u_falloff: falloff
+                u_texture: srcTex, u_overlapX: overlapX, u_overlapY: overlapY, u_falloff: falloff
             }, resultFBO);
         } else if (method === 'splat') {
             TRLE.Engine.blit('seamlessStamp', {
-                u_texture: sm.srcTex,
+                u_texture: srcTex,
                 u_falloff: falloff,
                 u_rotation:       parseInt($('at-sm-splat-rotation').value) / 100,
                 u_rotationRandom: parseInt($('at-sm-splat-rotrandom').value) / 100,
@@ -4004,10 +4178,22 @@ window.TRLE = window.TRLE || {};
             }, resultFBO);
         } else { // 'scattered'
             TRLE.Engine.blit('seamlessScattered', {
-                u_texture: sm.srcTex, u_overlapX: overlapX, u_overlapY: overlapY,
+                u_texture: srcTex, u_overlapX: overlapX, u_overlapY: overlapY,
                 u_falloff: falloff, u_scatterScale: S
             }, resultFBO);
         }
+        temps.forEach(f => TRLE.Engine.deleteFBO(f));
+        return resultFBO;
+    }
+
+    function smProcess() {
+        if (sm.id === null) return;
+        const S = state.tileSize;
+
+        if (sm.resultFBO)  { TRLE.Engine.deleteFBO(sm.resultFBO); sm.resultFBO = null; }
+        if (sm.previewFBO) { TRLE.Engine.deleteFBO(sm.previewFBO); sm.previewFBO = null; }
+
+        const resultFBO = smBuildResult(sm.srcTex, S);
         sm.resultFBO = resultFBO;
 
         // 2×2 tiled preview with optional seam marker
@@ -4023,8 +4209,6 @@ window.TRLE = window.TRLE || {};
 
         const previewCanvas = $('at-sm-preview');
         previewCanvas.getContext('2d').drawImage(TRLE.Engine.fboToCanvas(previewFBO), 0, 0);
-
-        temps.forEach(f => TRLE.Engine.deleteFBO(f));
     }
 
     function setupSeamlessModal() {
@@ -4061,15 +4245,33 @@ window.TRLE = window.TRLE || {};
 
         $('at-sm-save').addEventListener('click', () => {
             if (!sm.resultFBO || sm.id === null) return;
-            const el = byId(sm.id);
-            const out = TRLE.Engine.fboToCanvas(sm.resultFBO);
-            el.canvas.getContext('2d').drawImage(out, 0, 0);
-            el.seamless = true;
+            const S = state.tileSize;
+            const targets = sm.batchIds.map(byId).filter(e => e && e.canvas);
+            if (!targets.length) return;
+            targets.forEach(el => {
+                let out;
+                if (el.id === sm.id) {
+                    // The tile that was previewed writes the preview's own FBO, so
+                    // what lands in the atlas is exactly what was on screen.
+                    out = TRLE.Engine.fboToCanvas(sm.resultFBO);
+                } else {
+                    const tex = TRLE.Engine.createTextureFromImage(el.canvas);
+                    const fbo = smBuildResult(tex, S);
+                    out = TRLE.Engine.fboToCanvas(fbo);
+                    TRLE.Engine.deleteFBO(fbo);
+                    TRLE.Engine.deleteTexture(tex);
+                }
+                el.canvas.getContext('2d').drawImage(out, 0, 0);
+                el.seamless = true;
+            });
+            const n = targets.length;
             closeModal();
             refreshTransitions();
             renderGrid();
-            pushHistory('Make seamless');
-            showToast('Tile updated in atlas — transitions refreshed', 'success');
+            pushHistory(n > 1 ? `Make seamless — ${n} tiles` : 'Make seamless');
+            showToast(n > 1
+                ? `${n} tiles updated in atlas — transitions refreshed`
+                : 'Tile updated in atlas — transitions refreshed', 'success');
         });
     }
 
@@ -4985,6 +5187,89 @@ window.TRLE = window.TRLE || {};
         return transSetCells($('at-tr-set-layout').value, $('at-tr-set-corners').value);
     }
 
+    /* ============ TRIMMED ORGANIC PANEL — shared reader + wiring ============
+       Three modals now carry the same cut-down organic panel (Wang, Single Tiles,
+       Borders & Corners): every style plus Amount / Scatter / Detail softness /
+       Contact shadow / Feature size, but NO Drift and no Alternates. Drift is the
+       one control that reaches the tile border, so it is only safe where the whole
+       set is generated together; Alternates is a set concept with no meaning on a
+       single tile or a border slot.
+
+       `pre` is the control-id prefix ('at-wang-org', 'at-tr-sorg', 'at-bset-org').
+       The markup for all of them is identical by construction — there were once
+       seven hand-copied accordions in this file and they drifted, so this is the
+       one place the behaviour lives.
+
+       (Make Transition's Full Set panel is deliberately NOT on this helper: it has
+       Drift, Alternates and a shadow-position slider the others do not. Folding it
+       in would mean making the helper take an option bag for every difference.) */
+    function readOrgPanel(pre, seed) {
+        if (!$(pre + '-wobble')) return null;
+        const v = id => parseInt($(pre + '-' + id).value) / 100;
+        const p = { style: $(pre + '-style').value,
+                    wobble: v('wobble'), drift: 0,
+                    scatter: v('scatter'), feather: v('feather'),
+                    shadow: v('shadow'),
+                    shadowColor: $(pre + '-shcolor').value,
+                    shadowMode: $(pre + '-shmode').value,
+                    shadowTarget: $(pre + '-shtarget').value,
+                    scale: parseInt($(pre + '-scale').value) || 3,
+                    seed: seed, driftSeed: 1 };
+        // Detail softness alone does nothing — it only widens or narrows a band
+        // around detail the other sliders create — so it does not arm the panel.
+        return (p.wobble || p.scatter || p.shadow) ? p : null;
+    }
+    /* Wire one up. Returns a handle owning the reroll seed, which the caller
+       passes back into readOrgPanel. */
+    function wireOrgPanel(pre, onPreview) {
+        const h = { seed: 1 };
+        if (!$(pre + '-wobble')) return h;
+        const styleHint = () => {
+            const e = $(pre + '-style-hint');
+            if (e) e.textContent = orgStyle({ style: $(pre + '-style').value }).hint;
+        };
+        let timer = null;
+        const schedule = () => { clearTimeout(timer); timer = setTimeout(onPreview, 110); };
+        ['wobble', 'scatter', 'feather', 'shadow', 'scale'].forEach(k => {
+            const e = $(pre + '-' + k);
+            if (!e) return;
+            e.addEventListener('input', function () {
+                $(pre + '-' + k + '-val').textContent = this.value;
+                schedule();
+            });
+        });
+        $(pre + '-style').addEventListener('change', function () {
+            const st = ORG_STYLES[this.value] || ORG_STYLES.blobs;
+            for (const [k, v] of Object.entries(st.defaults)) {
+                const e = $(pre + '-' + k);
+                if (!e) continue;
+                e.value = v;
+                const lab = $(pre + '-' + k + '-val');
+                if (lab) lab.textContent = v;
+            }
+            styleHint(); onPreview();
+        });
+        [pre + '-shcolor', pre + '-shmode'].forEach(id => {
+            const e = $(id); if (e) e.addEventListener('input', onPreview);
+        });
+        const advice = () => {
+            const e = $(pre + '-shtarget-hint');
+            if (e) e.innerHTML = shadowAdvice($(pre + '-shtarget').value);
+        };
+        if ($(pre + '-shtarget')) {
+            $(pre + '-shtarget').addEventListener('change', () => { advice(); onPreview(); });
+            document.querySelectorAll('#at-map-checks input[data-map]').forEach(cb =>
+                cb.addEventListener('change', advice));
+            advice();
+        }
+        if ($(pre + '-seed')) $(pre + '-seed').addEventListener('click', () => {
+            h.seed = (Math.random() * 0x7fffffff) | 0 || 1;
+            onPreview();
+        });
+        styleHint();
+        return h;
+    }
+
     /* Organic-edge params from the modal, or null when every slider is at 0 —
        null means buildCornerMask takes its original path and the output is
        byte-identical to a pre-organic build. Also null for the legacy corner
@@ -5005,6 +5290,16 @@ window.TRLE = window.TRLE || {};
                     seed: trOrgSeed, driftSeed: trOrgDriftSeed };
         return (p.wobble || p.drift || p.scatter || p.feather || p.shadow) ? p : null;
     }
+    /* Single Tiles organic. Same trimmed panel as Wang (no Drift: it is the one
+       control that reaches the tile border, and a lone directional tile is laid
+       next to arbitrary neighbours). Null unless a slider is armed, so a preset
+       built with the panel untouched is byte-identical to a pre-organic build. */
+    let trSingleOrg = { seed: 1 };
+    function trSingleOrgParams() {
+        if (tr.maskMode === 'custom') return null;   // a painted mask never reaches buildTopologyMask
+        return readOrgPanel('at-tr-sorg', trSingleOrg.seed);
+    }
+
     /* How many copies of the set to add. Only meaningful with organic on — with
        a clean boundary every copy would be the same nine tiles. */
     function trAltCount() {
@@ -5029,19 +5324,31 @@ window.TRLE = window.TRLE || {};
         if (h) h.textContent = orgStyle({ style: $('at-tr-org-style').value }).hint;
     }
 
+    /* Show/park each Organic edge accordion. Shared by both, because the failure
+       mode is the same for either: a panel can be taken away (by a tab switch, a
+       legacy corner style, or picking a Custom mask) while it is OPEN and DOCKED,
+       and then the middle column stays expanded around something nobody can see. */
+    function trOrgPark(acc, home, on) {
+        if (!acc) return;
+        acc.style.display = on ? '' : 'none';
+        if (!on && acc.open) acc.open = false;
+        if (!on && acc.parentElement !== $(home)) {
+            $(home).appendChild(acc);
+            trApplyZones();
+        }
+    }
     function trOrgVisibility() {
         const acc = $('at-tr-org-acc');
         if (!acc) return;
         const on = tr.tab === 'set' && $('at-tr-set-corners').value === 'seamless';
-        acc.style.display = on ? '' : 'none';
-        // Corner style can take the accordion away while it is open and docked. Park
-        // it, or the third column stays open around a panel nobody can see.
-        if (!on && acc.open) { acc.open = false; }
-        if (!on && acc.parentElement !== $('at-tr-org-home')) {
-            $('at-tr-org-home').appendChild(acc);
-            trApplyZones();
-        }
+        trOrgPark(acc, 'at-tr-org-home', on);
         if (on) trOrgStyleHint();
+
+        /* Single Tiles. Only for the Directions presets: a Custom mask is whatever
+           the user painted and never goes through buildTopologyMask, so an organic
+           panel there would be dead controls. */
+        const sacc = $('at-tr-sorg-acc');
+        if (sacc) trOrgPark(sacc, 'at-tr-sorg-home', tr.tab === 'single' && tr.maskMode !== 'custom');
     }
 
     /* Tab + mask-source combined visibility (they interact: pivot/hardness is
@@ -5071,8 +5378,10 @@ window.TRLE = window.TRLE || {};
        "weird empty column" testers reported. */
     function trApplyZones() {
         const set = tr.tab === 'set';
-        const acc = $('at-tr-org-acc');
-        const wide = set && acc.open && acc.style.display !== 'none';
+        // Both tabs now own an Organic edge accordion, and either can claim the
+        // middle column — but only the one belonging to the visible tab.
+        const live = a => !!a && a.open && a.style.display !== 'none';
+        const wide = set ? live($('at-tr-org-acc')) : live($('at-tr-sorg-acc'));
         const m = $('at-modal-trans');
         m.classList.toggle('at-modal-xxl', wide);
         m.classList.toggle('at-modal-xl', !wide);
@@ -5085,6 +5394,10 @@ window.TRLE = window.TRLE || {};
        its own column when open. */
     function trDockOrganic(animate, wantOpen) {
         accDock($('at-tr-org-acc'), $('at-tr-org-home'),
+                $('at-modal-trans').querySelector('.at-modal-work'), trApplyZones, animate, wantOpen);
+    }
+    function trDockSingleOrganic(animate, wantOpen) {
+        accDock($('at-tr-sorg-acc'), $('at-tr-sorg-home'),
                 $('at-modal-trans').querySelector('.at-modal-work'), trApplyZones, animate, wantOpen);
     }
 
@@ -5161,6 +5474,7 @@ window.TRLE = window.TRLE || {};
         tr.maskMode = 'dir';
         openModal('trans');
         trDockOrganic(false);           // a toggle only fires on CHANGE; dock for the current state
+        trDockSingleOrganic(false);
         trSetTab(tr.tab || 'single');   // restores last-used tab, refreshes the right preview
     }
 
@@ -5174,13 +5488,14 @@ window.TRLE = window.TRLE || {};
         if (tr.maskMode === 'custom') return softenMask(tr.customMask, P);
         const pivot    = parseInt($('at-tr-pivot').value) / 100;
         const hardness = parseInt($('at-tr-hardness').value) / 100;
-        return buildTopologyMask(P, tr.activeMode, pivot, hardness);
+        return buildTopologyMask(P, tr.activeMode, pivot, hardness, trSingleOrgParams());
     }
 
     function trSetMaskSource(mode) {
         tr.maskMode = mode;
         const custom = mode === 'custom';
         trApplyVisibility();
+        trOrgVisibility();   // Custom has no topology mask, so the panel parks
         $('at-tr-preview-label').textContent =
             custom ? 'Paint mask — white = overlay (B) shows through' : 'Preview (last clicked direction)';
         $('at-tr-preview').style.cursor = custom ? 'crosshair' : 'default';
@@ -5214,7 +5529,10 @@ window.TRLE = window.TRLE || {};
         const overlay = resizeCanvas(trOverlayCanvas(), P, P);
         const mask    = trCurrentMask(P);
         // Lighter Poisson iteration count keeps the live preview responsive.
-        const comp    = composeTransitionDiffuse(base, overlay, mask, P, method, method === 'poisson' ? 220 : undefined);
+        let comp      = composeTransitionDiffuse(base, overlay, mask, P, method, method === 'poisson' ? 220 : undefined);
+        const sorg    = trSingleOrgParams();
+        if (sorg && sorg.shadow > 0 && shadowHitsDiffuse(sorg))
+            comp = applyContactShadow(comp, mask, P, sorg.shadow, shadowOpts(sorg));
         $('at-tr-preview').getContext('2d').drawImage(comp, 0, 0);
     }
 
@@ -5224,6 +5542,9 @@ window.TRLE = window.TRLE || {};
         // `toggle`, not click: validators and restore paths set .open directly.
         $('at-tr-org-acc').addEventListener('toggle', () => trDockOrganic(true));
         accBindSummary($('at-tr-org-acc'), trDockOrganic);
+        $('at-tr-sorg-acc').addEventListener('toggle', () => trDockSingleOrganic(true));
+        accBindSummary($('at-tr-sorg-acc'), trDockSingleOrganic);
+        trSingleOrg = wireOrgPanel('at-tr-sorg', trPreview);
         const updateCornerHint = () => {
             const h = $('at-tr-corner-hint');
             if (h) h.textContent = TR_CORNER_HINTS[$('at-tr-set-corners').value] || '';
@@ -5432,6 +5753,7 @@ window.TRLE = window.TRLE || {};
             if (!modes.length) { showToast('Select at least one direction!', 'error'); return; }
             const pivot    = parseInt($('at-tr-pivot').value) / 100;
             const hardness = parseInt($('at-tr-hardness').value) / 100;
+            const sorg     = trSingleOrgParams();
 
             modes.forEach(mode => {
                 state.elements.push({
@@ -5443,6 +5765,10 @@ window.TRLE = window.TRLE || {};
                     material: null,
                     base: tr.baseId, overlay: tr.overlayId,
                     mode, pivot, hardness, blendMethod: method,
+                    // Every direction gets the SAME organic recipe. Rerolling per
+                    // tile would be wrong: a Top and a Left picked from one panel
+                    // are meant to read as the same material edge.
+                    organic: sorg,
                     overlayGeom: geomIsIdentity(tr.overlayGeom) ? null : { ...tr.overlayGeom }
                 });
             });
@@ -5700,58 +6026,248 @@ window.TRLE = window.TRLE || {};
     const bsetLineVal = (d, w, f) => (w / 2 + f / 2 - d) / f;
     const bsetBitDirs = bits => ['N', 'E', 'S', 'W'].filter((_, i) => bits & (1 << i));
 
+    /* ============ BORDER-SET ORGANIC INNER CONTOUR ============
+       The trim band is a ramp over distance-to-edge, so displacing that DISTANCE
+       moves the inner contour and leaves the outer edge flush against the tile
+       border. That asymmetry is the whole point: a border laid down the left of a
+       tile gets its ragged edge on the right, so two bordered rooms placed side by
+       side still meet exactly.
+
+       ⚠️ The seam rule here is NOT the one `makeOrganic` uses. That windows its
+       detail to zero at all four borders; doing that here would erase the effect,
+       because the contour sits at d ≈ w where sin(pi*ny) is still small. What
+       makes a border set seamless instead is PERIODICITY: the displacement is a
+       function of (x, y) alone, sampled from a lattice whose period divides the
+       tile, so any two slots compute the same value either side of a shared edge
+       whatever roles they play. The window here is over DISTANCE, and it protects
+       the OUTER edge rather than the seam.
+
+       Two consequences worth knowing before touching this:
+
+       - Every frequency multiplier must be an INTEGER. The lattice only wraps at
+         integer multiples of its period, so the transition styles' fractional
+         multipliers (7.0, 0.8, 3.4 …) cannot be reused verbatim — BSET_ORG_STYLE
+         is those same characters rounded onto the lattice.
+       - Because grad(distance) is a unit vector, adding ANY scalar field displaces
+         the contour along the band's own normal. The teeth come out perpendicular
+         for free; no local boundary frame is needed, which is what lets one
+         precomputed field serve every slot.
+
+       Cost: the field is a function of (x, y) only, so it is built ONCE per render
+       and shared by all 9/13/16 slots — 1.14-1.38x a plain set instead of the 5.5x
+       it costs to evaluate the noise per slot (measured; PERFORMANCE.md). */
+    const BSET_ORG_STYLE = {
+        blobs:  { along: 1, across: 1, thr: 0,    pow: 1,   amp: 1.00, kind: 'signed' },
+        spikes: { along: 6, across: 1, thr: 0.58, pow: 0.6, amp: 1.10, kind: 'teeth'  },
+        drips:  { along: 3, across: 1, thr: 0.52, pow: 1.4, amp: 1.40, kind: 'teeth'  },
+        clumps: { along: 2, across: 2, thr: 0.38, pow: 1.8, amp: 1.20, kind: 'bite'   },
+        fray:   { along: 9, across: 3, thr: 0.48, pow: 0.9, amp: 0.45, kind: 'teeth'  }
+    };
+
+    /* Build the displacement fields for one render. Returns null when the panel is
+       off, which is what makes the feature inert: every caller then takes the
+       original code path and the output is byte-identical to a pre-organic build.
+
+       TWO fields, not one: a band whose contour runs horizontally wants its noise
+       sampled fast ALONG x and slow across y (that is what makes a tooth a tooth
+       rather than a blob), and a vertical band wants the transpose. Both are still
+       functions of (x, y) periodic on both axes, so the seam argument above is
+       unchanged — `vertical` only selects which of the two to read. */
+    /* One-entry memo. `refreshTransitions` rebuilds all 9/13/16 slots of a set
+       one element at a time, so without this the identical field is built once per
+       slot. Safe to share: the rot/mirror transform is applied at LOOKUP time, not
+       baked into the arrays. */
+    let bsetOrgMemo = null;
+    function bsetOrgFields(S, w, org) {
+        if (!org || !org.wobble) return null;
+        const key = S + '|' + w + '|' + JSON.stringify(org);
+        if (bsetOrgMemo && bsetOrgMemo.key === key) return bsetOrgMemo.val;
+        const val = bsetOrgFieldsBuild(S, w, org);
+        bsetOrgMemo = { key, val };
+        return val;
+    }
+    function bsetOrgFieldsBuild(S, w, org) {
+        const ST = BSET_ORG_STYLE[(org && org.style) || 'blobs'] || BSET_ORG_STYLE.blobs;
+        const P  = Math.max(2, Math.round((org.scale || 3) * 2));   // lattice cells per tile
+        const sd = (org.seed >>> 0) || 1;
+        const n1 = makePeriodicNoise(sd, P);
+        const n2 = makePeriodicNoise((sd ^ 0x9e3779b9) >>> 0, P);
+        const n3 = makePeriodicNoise((sd ^ 0x85ebca6b) >>> 0, P);
+        const fbm = (f, x, y, oct) => {
+            let a = 1, fr = 1, acc = 0, nn = 0;
+            for (let i = 0; i < oct; i++) { acc += a * f(x * fr, y * fr); nn += a; a *= 0.5; fr *= 2; }
+            return acc / nn;
+        };
+        const teeth = (f, x, y) => {
+            const v = fbm(f, x, y, 2);
+            return v <= ST.thr ? 0 : Math.pow((v - ST.thr) / (1 - ST.thr), ST.pow);
+        };
+        const amp     = w * 0.55 * ST.amp * org.wobble;
+        const scatAmp = w * 0.30 * (org.scatter || 0);
+
+        /* Centre AND normalise to unit spread. Both halves matter, and the second
+           one is easy to leave out: raw fbm over a small lattice is off-centre, so
+           an uncentred field SHIFTS the contour instead of roughening it (the band
+           quietly thickens as the slider goes up) — and its spread is only ~0.1, so
+           without the rescale the full slider moves the contour by well under a
+           pixel. Measured before the rescale: 0.68px of contour raggedness at
+           Amount 60, which reads as no effect at all. makeOrganic calibrates from a
+           12x12 probe for the same reason; here the whole field is already in hand,
+           so the statistics are exact rather than estimated. */
+        const normalise = (a) => {
+            let sum = 0, sq = 0;
+            for (let i = 0; i < a.length; i++) { sum += a[i]; sq += a[i] * a[i]; }
+            const mean = sum / a.length;
+            const inv = 1 / Math.max(1e-4, Math.sqrt(Math.max(0, sq / a.length - mean * mean)));
+            for (let i = 0; i < a.length; i++) a[i] = (a[i] - mean) * inv;
+        };
+
+        const build = (vertical) => {
+            // along = the axis the contour runs down; across = the other one.
+            const aAlong = ST.along * P, aAcross = ST.across * P;
+            const fx = vertical ? aAcross : aAlong;
+            const fy = vertical ? aAlong  : aAcross;
+            const N = S * S;
+            const shape = new Float32Array(N);
+            const scat  = scatAmp ? new Float32Array(N) : null;
+            for (let y = 0; y < S; y++) {
+                for (let x = 0; x < S; x++) {
+                    const i = y * S + x;
+                    const u = (x / S) * fx, v = (y / S) * fy;
+                    if (ST.kind === 'signed')    shape[i] = fbm(n1, u, v, 3);
+                    else if (ST.kind === 'bite') shape[i] = teeth(n1, u, v) - teeth(n2, u + 11.3, v + 7.1);
+                    else                         shape[i] = teeth(n1, u, v);
+                    if (scat) scat[i] = fbm(n3, u * 4, v * 4, 2);
+                }
+            }
+            /* The teeth fields are positive-only ON PURPOSE — the trim grows fingers
+               into the fill rather than wobbling symmetrically, which is what reads
+               as drips or spikes rather than a fuzzy edge — so they are left alone.
+               `bite` is already signed by construction (one tooth field minus a
+               second, offset one) and is centred like blobs. */
+            if (ST.kind === 'signed' || ST.kind === 'bite') normalise(shape);
+            if (scat) normalise(scat);
+            const out = new Float32Array(N);
+            for (let i = 0; i < N; i++) out[i] = shape[i] * amp + (scat ? scat[i] * scatAmp : 0);
+            return out;
+        };
+
+        const fH = build(false), fV = build(true);
+        /* `xf` re-maps the lookup for slots produced by rotating or mirroring the
+           canonical family member. renderBsetVariant transforms the FINISHED
+           canvas, so without this the displacement rotates with it and a rotated
+           slot stops agreeing with its auto-built neighbours — measured 239/255.
+           Pre-composing the field with the same transform brings that to exactly 0. */
+        return {
+            feather: org.feather || 0,
+            at(x, y, vertical, xf, swap) {
+                if (xf) { const q = xf(x, y); x = q[0]; y = q[1]; }
+                // `swap` XORs the orientation: after an odd number of quarter
+                // turns the band that was built horizontal ends up vertical, so it
+                // has to read the other field. Without this the two isotropic
+                // styles (blobs, clumps) happen to pass and the three anisotropic
+                // ones are off by the full 255.
+                return ((swap ? !vertical : vertical) ? fV : fH)[y * S + x];
+            }
+        };
+    }
+
+    /* Window over distance: 0 at the outer edge so the band stays solid and flush
+       there, full by the time the contour is reached. Any function of d alone is
+       automatically seam-safe, because both sides of a seam see the same d. */
+    const bsetOrgWin = (d, w) => {
+        const t = Math.min(1, Math.max(0, d / Math.max(1, w * 0.55)));
+        return t * t * (3 - 2 * t);
+    };
+
+    /* Does this direction's band run its contour vertically? Edge bands on the E/W
+       sides do; line bands to N/S do (the pipe runs up and down). It happens to be
+       the same predicate `bsetPasses` already uses to decide whether the trim
+       texture needs rotating, which is why there is only one of it. */
+    const bsetDirVertical = (topo, dir) => topo === 'lines'
+        ? (dir === 'N' || dir === 'S')
+        : (dir === 'E' || dir === 'W');
+
+    /* THE one place a band value is computed. Everything — the diffuse passes,
+       the mitred corners, and the union mask that drives material-map compositing
+       — goes through here, so the maps can never disagree with the pixels about
+       where the trim is. `og` is null when the organic panel is off, and then this
+       is exactly the arithmetic it replaced. */
+    function bsetBand(topo, dir, x, y, S, w, f, og, xf, swap) {
+        const line = topo === 'lines';
+        const d0 = line ? bsetLineDist(dir, x, y, S) : bsetEdgeDist(dir, x, y, S);
+        if (!og) return line ? bsetLineVal(d0, w, f) : bsetEdgeVal(d0, w, f);
+        /* The window is over distance to the TILE BORDER this band meets, which for
+           a frame band is d0 itself but for a `lines` band is NOT: there d0 is the
+           perpendicular distance across the pipe, so windowing by it would protect
+           the pipe's centreline and leave the border free to move — pinching the
+           pipe exactly where it has to meet its neighbour. Measured before the fix:
+           trim coverage where the pipe crosses its edge fell from 255 to 33-64.
+           Using the edge distance instead also makes the seam exact rather than
+           merely periodic: both tiles see 0 there, so both draw the plain profile. */
+        const guard = bsetEdgeDist(dir, x, y, S);
+        const pert = og.at(x, y, bsetDirVertical(topo, dir), xf, swap) * bsetOrgWin(guard, w);
+        // Detail softness widens the blend only where the contour actually moved,
+        // so flat stretches keep the Softness slider's width. A function of the
+        // (periodic) displacement, so it carries the same seam guarantee.
+        const ff = og.feather
+            ? f * (1 + og.feather * 2 * Math.min(1, Math.abs(pert) / Math.max(1, w)))
+            : f;
+        const d = d0 - pert;
+        return line ? bsetLineVal(d, w, ff) : bsetEdgeVal(d, w, ff);
+    }
+
     /* Union mask of every trim region for a slot (white = trim). Used for the
        non-directional single-pass composite and for material-map compositing —
        the region is the same however the diffuse pixels were derived. */
-    function bsetUnionMask(S, topo, spec, w, f) {
+    function bsetUnionMask(S, topo, spec, w, f, og, xf, swap) {
+        const B = (dir, x, y) => bsetBand(topo, dir, x, y, S, w, f, og, xf, swap);
         if (topo === 'lines') {
             const dirs = bsetBitDirs(spec);
             if (!dirs.length) return bsetMakeMask(S, () => 0);
-            return bsetMakeMask(S, (x, y) =>
-                Math.max(...dirs.map(d => bsetLineVal(bsetLineDist(d, x, y, S), w, f))));
+            return bsetMakeMask(S, (x, y) => Math.max(...dirs.map(d => B(d, x, y))));
         }
         const e = BSET_ROLE_EDGES[spec];
         if (typeof e === 'string') {   // inner corner: intersection of the two edge bands
             const [a, b] = e.split('');
-            return bsetMakeMask(S, (x, y) => Math.min(
-                bsetEdgeVal(bsetEdgeDist(a, x, y, S), w, f),
-                bsetEdgeVal(bsetEdgeDist(b, x, y, S), w, f)));
+            return bsetMakeMask(S, (x, y) => Math.min(B(a, x, y), B(b, x, y)));
         }
         if (!e || !e.length) return bsetMakeMask(S, () => 0);
-        return bsetMakeMask(S, (x, y) =>
-            Math.max(...e.map(d => bsetEdgeVal(bsetEdgeDist(d, x, y, S), w, f))));
+        return bsetMakeMask(S, (x, y) => Math.max(...e.map(d => B(d, x, y))));
     }
 
     /* Composite passes for one slot. When the trim "follows direction",
        vertical runs get the trim texture rotated 90°, and two-edge corners are
        split along a mitre diagonal (picture-frame joint) so each half keeps
        its own trim orientation. `vertical` marks passes wanting rotated trim. */
-    function bsetPasses(S, topo, spec, w, f, follow) {
+    function bsetPasses(S, topo, spec, w, f, follow, og, xf, swap) {
+        const B = (dir, x, y) => bsetBand(topo, dir, x, y, S, w, f, og, xf, swap);
         if (!follow) {
-            const mask = bsetUnionMask(S, topo, spec, w, f);
+            const mask = bsetUnionMask(S, topo, spec, w, f, og, xf, swap);
             const empty = (topo === 'lines') ? spec === 0 : !BSET_ROLE_EDGES[spec] || BSET_ROLE_EDGES[spec].length === 0;
             return (empty && typeof BSET_ROLE_EDGES[spec] !== 'string') ? [] : [{ mask, vertical: false }];
         }
         if (topo === 'lines') {
             return bsetBitDirs(spec).map(d => ({
-                mask: bsetMakeMask(S, (x, y) => bsetLineVal(bsetLineDist(d, x, y, S), w, f)),
+                mask: bsetMakeMask(S, (x, y) => B(d, x, y)),
                 vertical: d === 'N' || d === 'S'
             }));
         }
         const e = BSET_ROLE_EDGES[spec];
         if (typeof e === 'string') {   // inner corner patch — one pass, horizontal trim
             const [a, b] = e.split('');
-            return [{ mask: bsetMakeMask(S, (x, y) => Math.min(
-                bsetEdgeVal(bsetEdgeDist(a, x, y, S), w, f),
-                bsetEdgeVal(bsetEdgeDist(b, x, y, S), w, f))), vertical: false }];
+            return [{ mask: bsetMakeMask(S, (x, y) => Math.min(B(a, x, y), B(b, x, y))), vertical: false }];
         }
         if (!e || !e.length) return [];
         if (e.length === 1) {
             const d = e[0];
-            return [{ mask: bsetMakeMask(S, (x, y) => bsetEdgeVal(bsetEdgeDist(d, x, y, S), w, f)),
+            return [{ mask: bsetMakeMask(S, (x, y) => B(d, x, y)),
                       vertical: d === 'E' || d === 'W' }];
         }
-        // Outer corner: two bands, cross-faded along the mitre diagonal.
+        // Outer corner: two bands, cross-faded along the mitre diagonal. The mitre
+        // itself stays a function of the UNPERTURBED distances — it is a join
+        // between two trim orientations, not part of the silhouette, and warping it
+        // would make the two halves cross-fade in the wrong place.
         const fm = Math.max(2, f);
         return e.map((d, i) => {
             const other = e[1 - i];
@@ -5759,7 +6275,7 @@ window.TRLE = window.TRLE || {};
                 mask: bsetMakeMask(S, (x, y) => {
                     const dt = bsetEdgeDist(d, x, y, S), doth = bsetEdgeDist(other, x, y, S);
                     const c = Math.max(0, Math.min(1, 0.5 + (doth - dt) / (2 * fm)));
-                    return bsetEdgeVal(dt, w, f) * c;
+                    return B(d, x, y) * c;
                 }),
                 vertical: d === 'E' || d === 'W'
             };
@@ -5769,26 +6285,40 @@ window.TRLE = window.TRLE || {};
     /* Render one slot's diffuse. `b` = { topo, role|bits, width (0..0.5 of S),
        soft (0..1 of width), follow, slotMode }. Rot/mirror slots re-render the
        canonical/partner slot's mask version, then transform the whole tile. */
-    function renderBsetVariant(b, fillC, trimC, S, method) {
+    function renderBsetVariant(b, fillC, trimC, S, method, og) {
         let spec = b.topo === 'lines' ? b.bits : b.role;
         let post = null;
+        /* A rot/mirror slot is rendered as the canonical family member and then the
+           FINISHED canvas is transformed. With an organic contour that drags the
+           displacement field along with it, and the slot stops agreeing with its
+           auto-built neighbours (measured 239 of 255). Fix: pre-compose the field
+           lookup with the same transform, so after `post` puts the pixels where
+           they belong the displacement is back in tile-local orientation. Exact —
+           validate-borderset.mjs asserts 0, not a threshold.
+           `swap` goes with an odd number of quarter turns: the band that was
+           horizontal ends up vertical, so it must read the other field. */
+        let xf = null, swap = false;
         const rotN = (cv, k) => { for (let i = 0; i < k; i++) cv = rotateTile90(cv); return cv; };
+        // rotateTile90 maps source (x,y) -> (S-1-y, x).
+        const xfRot = k => (x, y) => { for (let i = 0; i < k; i++) { const t = x; x = S - 1 - y; y = t; } return [x, y]; };
         if (b.slotMode === 'rot') {
             if (b.topo === 'lines') {
                 const c = bsetCanonicalBits(b.bits);
                 spec = c.from;
-                if (c.steps) post = cv => rotN(cv, c.steps);
+                if (c.steps) { post = cv => rotN(cv, c.steps); xf = xfRot(c.steps); swap = (c.steps & 1) === 1; }
             } else {
                 const [from, k] = BSET_ROT[b.role] || [b.role, 0];
                 spec = from;
-                if (k) post = cv => rotN(cv, k);
+                if (k) { post = cv => rotN(cv, k); xf = xfRot(k); swap = (k & 1) === 1; }
             }
         } else if (b.slotMode === 'mirh') {
             spec = b.topo === 'lines' ? bsetMirBitsH(b.bits) : (BSET_MIRH[b.role] || b.role);
             post = cv => flipTile(cv, true);
+            xf = (x, y) => [S - 1 - x, y];      // a mirror keeps each axis, so no swap
         } else if (b.slotMode === 'mirv') {
             spec = b.topo === 'lines' ? bsetMirBitsV(b.bits) : (BSET_MIRV[b.role] || b.role);
             post = cv => flipTile(cv, false);
+            xf = (x, y) => [x, S - 1 - y];
         }
         const w = Math.max(2, Math.round(b.width * S));
         const f = Math.max(1, b.soft * w);
@@ -5796,7 +6326,8 @@ window.TRLE = window.TRLE || {};
         let out = document.createElement('canvas');
         out.width = S; out.height = S;
         out.getContext('2d').drawImage(fill, 0, 0);
-        const passes = bsetPasses(S, b.topo, spec, w, f, !!b.follow);
+        const orgF = og || bsetOrgFields(S, w, b.org);
+        const passes = bsetPasses(S, b.topo, spec, w, f, !!b.follow, orgF, xf, swap);
         if (passes.length) {
             // Origami (single-texture) sets: the trim IS the fill, rotated 90° so
             // its detail runs parallel to each edge. With "follow" on, vertical
@@ -5809,6 +6340,19 @@ window.TRLE = window.TRLE || {};
             for (const p of passes) {
                 const t = p.vertical ? (trimV = trimV || rotateTile90(trim)) : trim;
                 out = composeTransitionDiffuse(out, t, p.mask, S, method, method === 'poisson' ? 120 : undefined);
+            }
+            /* Contact shadow, so the trim reads as sitting ON the fill rather than
+               inlaid into it. Applied BEFORE `post`, with the same xf/swap the
+               passes used, so it rotates with the tile and lands under the trim
+               either way. The union mask, not a pass mask: with "Trim follows
+               direction" a corner is two mitred passes and each one alone would
+               cast a shadow along the mitre line. Diffuse only — deriveMaps puts
+               it in AO instead when the target says so, which is the case that
+               keeps the map generator from turning the band into relief. */
+            const sh = b.org;
+            if (sh && sh.shadow > 0 && shadowHitsDiffuse(sh)) {
+                const um = bsetUnionMask(S, b.topo, spec, w, f, orgF, xf, swap);
+                out = applyContactShadow(out, um, S, sh.shadow, shadowOpts(sh));
             }
         }
         return post ? post(out) : out;
@@ -5984,12 +6528,14 @@ window.TRLE = window.TRLE || {};
     };
 
     function bsetTopoKey() { return $('at-bset-topo').value; }
+    let bsetOrg = { seed: 1 };
     function bsetParams() {
         return {
             method: $('at-bset-method').value,
             width:  parseInt($('at-bset-width').value) / 100,
             soft:   parseInt($('at-bset-soft').value) / 100,
-            follow: $('at-bset-follow').checked
+            follow: $('at-bset-follow').checked,
+            org:    readOrgPanel('at-bset-org', bsetOrg.seed)
         };
     }
     function bsetSlotState(key) {
@@ -6000,6 +6546,9 @@ window.TRLE = window.TRLE || {};
         const b = { topo: L.topo, width: p.width, soft: p.soft, follow: p.follow,
                     slotMode: s.mode, srcId: s.srcId,
                     origami: bset.baseId === bset.overlayId };
+        // Only written when armed, so a project saved before this existed — and any
+        // set built with the panel untouched — round-trips with no `org` key at all.
+        if (p.org) b.org = p.org;
         if (L.topo === 'lines') b.bits = key; else b.role = key;
         return b;
     }
@@ -6020,6 +6569,7 @@ window.TRLE = window.TRLE || {};
             if (origamiHint) origamiHint.style.display = 'none';
         }
         openModal('bset');
+        bsetDockOrganic(false);   // a toggle only fires on CHANGE; dock for the current state
         bsetPreview();
     }
 
@@ -6038,11 +6588,15 @@ window.TRLE = window.TRLE || {};
         wrap.style.gridTemplateColumns = `repeat(${L.width},1fr)`;
         wrap.innerHTML = '';
         const keys = [...new Set(L.slots.filter(k => k !== null))];
+        // One field for the whole sheet: it is a function of (x, y) only, so
+        // rebuilding it per slot would be 13 copies of the same array (5.5x vs
+        // 1.2x on the slot loop — PERFORMANCE.md).
+        const og = bsetOrgFields(P, Math.max(2, Math.round(p.width * P)), p.org);
         for (const key of keys) {
             const s = bsetSlotState(key);
             let tile;
             if (s.mode === 'tile' && byId(s.srcId)) tile = resizeCanvas(byId(s.srcId).canvas, P, P);
-            else tile = renderBsetVariant(bsetRecipeFor(key, L, p), fill, trim, P, p.method);
+            else tile = renderBsetVariant(bsetRecipeFor(key, L, p), fill, trim, P, p.method, og);
             bset.canvases[key] = tile;
         }
         // Slot grid in layout order (spacers render as empty cells).
@@ -6118,7 +6672,32 @@ window.TRLE = window.TRLE || {};
         bset.regenTimer = setTimeout(bsetPreview, 90);
     }
 
+    /* The Organic edge accordion is parked in the tuning column while closed and
+       becomes the middle column when open — the same docking Make Transition and
+       Set Material use, and for the same reason: this modal already sits at ~0
+       scroll at 1920, so an accordion that grew DOWNWARD would push the slot grid
+       and the sample wall below the fold. */
+    function bsetApplyZones() {
+        const acc  = $('at-bset-org-acc');
+        const m    = $('at-modal-bset');
+        const cols = m.querySelector('.at-modal-cols');
+        const wide = !!(acc && acc.open);
+        if (cols) cols.classList.toggle('at-bset-wide', wide);
+        // Widen the modal with the column, the way Set Material does. The panel is
+        // pinned at 470px so it does not rewrap mid-animation, and at xl that would
+        // leave the slot sheet about 172px.
+        m.classList.toggle('at-modal-xxl', wide);
+        m.classList.toggle('at-modal-xl', !wide);
+    }
+    function bsetDockOrganic(animate, wantOpen) {
+        accDock($('at-bset-org-acc'), $('at-bset-org-home'),
+                $('at-modal-bset').querySelector('.at-modal-work'), bsetApplyZones, animate, wantOpen);
+    }
+
     function setupBsetModal() {
+        $('at-bset-org-acc').addEventListener('toggle', () => bsetDockOrganic(true));
+        accBindSummary($('at-bset-org-acc'), bsetDockOrganic);
+        bsetOrg = wireOrgPanel('at-bset-org', bsetPreviewSoon);
         $('at-bset-topo').addEventListener('change', () => { bset.slots = {}; bsetPreview(); });
         $('at-bset-method').addEventListener('change', bsetPreview);
         $('at-bset-follow').addEventListener('change', bsetPreview);
@@ -9229,18 +9808,25 @@ window.TRLE = window.TRLE || {};
     }
 
     /* Apply a canvas→canvas transform to a tile, then refresh dependents + undo. */
-    function applyTileTransform(id, fn, label) {
-        const el = byId(id);
-        if (!el || el.kind !== 'tile') return;
-        const out = fn(el.canvas);
-        const ctx = el.canvas.getContext('2d');
-        ctx.clearRect(0, 0, el.canvas.width, el.canvas.height);
-        ctx.drawImage(out, 0, 0);
-        el.edited = true;
+    /* Rotate / flip / offset over one tile or a whole selection. `ids` is what
+       ctxTargets handed back, so a lone right-click is just the 1-element case —
+       and one pushHistory covers the lot, which is what makes Ctrl+Z undo a
+       32-tile flip in one step. */
+    function applyTileTransform(ids, fn, label) {
+        const targets = (Array.isArray(ids) ? ids : [ids]).map(byId).filter(el => el && el.kind === 'tile');
+        if (!targets.length) return;
+        targets.forEach(el => {
+            const out = fn(el.canvas);
+            const ctx = el.canvas.getContext('2d');
+            ctx.clearRect(0, 0, el.canvas.width, el.canvas.height);
+            ctx.drawImage(out, 0, 0);
+            el.edited = true;
+        });
         refreshTransitions();
         renderGrid();
-        pushHistory(label);
-        showToast(label, 'success');
+        const n = targets.length;
+        pushHistory(n > 1 ? `${label} — ${n} tiles` : label);
+        showToast(n > 1 ? `${label} — ${n} tiles` : label, 'success');
     }
 
     /* Replace a tile's source image (keeps its position, material + transitions). */
@@ -9323,10 +9909,11 @@ window.TRLE = window.TRLE || {};
         ['tint',     'Tint',        -100, 100,   0, ''],
         ['vibrance', 'Vibrance',    -100, 100,   0, '']
     ];
-    const ca = { id: null, tex: null };
+    const ca = { id: null, tex: null, batchIds: [] };
     function caCleanup() {
         if (ca.tex) { TRLE.Engine.deleteTexture(ca.tex); ca.tex = null; }
         ca.id = null;
+        ca.batchIds = [];
     }
     function caUniforms() {
         const v = k => parseInt($('at-ca-' + k).value);
@@ -9355,11 +9942,20 @@ window.TRLE = window.TRLE || {};
         $('at-ca-preview').getContext('2d').drawImage(out, 0, 0, P, P);
         E.deleteFBO(fbo);
     }
-    function openColorAdjModal(id) {
+    /* `ids` is the whole selection when the right-click landed inside one. The
+       preview shows ids[0] (the tile that was right-clicked, since selectedIds
+       are in atlas order and ctxTargets puts it in the list); the same slider
+       values are blitted over every target on Apply. */
+    function openColorAdjModal(ids) {
+        const list = Array.isArray(ids) ? ids : [ids];
+        const id = list[0];
         const el = byId(id);
+        if (!el) return;
         ca.id = id;
+        ca.batchIds = list.slice();
         ca.tex = TRLE.Engine.createTextureFromImage(el.canvas);
         $('at-ca-tileno').textContent = indexOf(id) + 1;
+        setBatchNote('at-modal-coloradj', list.length, indexOf(id) + 1);
         resetSliderGrid(CA_PARAMS, 'ca');
         openModal('coloradj');
         caRender();
@@ -9369,15 +9965,19 @@ window.TRLE = window.TRLE || {};
         $('at-ca-reset').addEventListener('click', () => { resetSliderGrid(CA_PARAMS, 'ca'); caRender(); });
         $('at-ca-apply').addEventListener('click', () => {
             if (ca.id === null) return;
-            const el = byId(ca.id);
-            const out = caApplyTo(el.canvas, state.tileSize);
-            el.canvas.getContext('2d').drawImage(out, 0, 0);
-            el.edited = true;
+            const targets = ca.batchIds.map(byId).filter(el => el && el.kind === 'tile');
+            if (!targets.length) return;
+            targets.forEach(el => {
+                const out = caApplyTo(el.canvas, state.tileSize);
+                el.canvas.getContext('2d').drawImage(out, 0, 0);
+                el.edited = true;
+            });
+            const n = targets.length;
             closeModal();
             refreshTransitions();
             renderGrid();
-            pushHistory('Adjust colours');
-            showToast('Colours adjusted', 'success');
+            pushHistory(n > 1 ? `Adjust colours — ${n} tiles` : 'Adjust colours');
+            showToast(n > 1 ? `Colours adjusted on ${n} tiles` : 'Colours adjusted', 'success');
         });
     }
 
@@ -9390,8 +9990,8 @@ window.TRLE = window.TRLE || {};
         ['contrast', 'Contrast',     0, 200, 100, '%'],
         ['sat',      'Saturation',   0, 200, 100, '%']
     ];
-    const rc = { baseId: null, refId: null, stats: null };
-    function rcCleanup() { rc.baseId = null; rc.refId = null; rc.stats = null; }
+    const rc = { baseId: null, refId: null, stats: null, batchIds: [] };
+    function rcCleanup() { rc.baseId = null; rc.refId = null; rc.stats = null; rc.batchIds = []; }
     /* Per-channel mean + std (0..1) of a canvas, sampled at a small size. */
     function computeColorStats(canvas, size) {
         const s = resizeCanvas(canvas, size, size);
@@ -9405,13 +10005,28 @@ window.TRLE = window.TRLE || {};
         const std = sumSq.map((sq, c) => Math.sqrt(Math.max(1e-6, sq / n - mean[c] * mean[c])));
         return { mean, std };
     }
-    function rcTransferUniforms() {
-        const A = rc.stats.A, B = rc.stats.B;
+    function rcTransferUniforms(stats) {
+        const A = stats.A, B = stats.B;
         const scale = [0, 1, 2].map(c => Math.max(0.2, Math.min(3, B.std[c] / A.std[c])));
         return {
             u_meanA: A.mean, u_meanB: B.mean, u_scale: scale,
             u_strength: parseInt($('at-rc-strength').value) / 100
         };
+    }
+    function rcMatchMode() { return $('at-rc-match') ? $('at-rc-match').value : 'each'; }
+    /* Which mean/std pair a given tile is transferred with.
+
+       "each" measures the tile itself, so every target lands ON the reference's
+       tone — three bricks that started at different tones all end up matching,
+       which is the "repurpose these for my environment" job. The cost is that
+       their differences FROM EACH OTHER are normalised away.
+
+       "same" measures the tile that was right-clicked once and applies that same
+       shift everywhere, so a set of deliberate variants keeps its spread — but a
+       tile that started somewhere else won't actually reach the reference. */
+    function rcStatsFor(el) {
+        if (rcMatchMode() === 'same' || el.id === rc.baseId) return rc.stats;
+        return { A: computeColorStats(el.canvas, 64), B: rc.stats.B };
     }
     function rcGradeUniforms() {
         return {
@@ -9422,11 +10037,11 @@ window.TRLE = window.TRLE || {};
         };
     }
     /* Two-pass: colour transfer → light grade. Returns a canvas. */
-    function rcApplyTo(srcCanvas, S) {
+    function rcApplyTo(srcCanvas, S, stats) {
         const E = TRLE.Engine;
         const tex = E.createTextureFromImage(srcCanvas);
         const t1 = E.createFBO(S, S);
-        E.blit('colorTransfer', Object.assign({ u_texture: tex }, rcTransferUniforms()), t1);
+        E.blit('colorTransfer', Object.assign({ u_texture: tex }, rcTransferUniforms(stats || rc.stats)), t1);
         const t2 = E.createFBO(S, S);
         E.blit('colorAdjust', Object.assign({ u_texture: t1.texture }, rcGradeUniforms()), t2);
         const out = E.fboToCanvas(t2);
@@ -9439,39 +10054,68 @@ window.TRLE = window.TRLE || {};
         const out = rcApplyTo(byId(rc.baseId).canvas, P);
         $('at-rc-preview').getContext('2d').drawImage(out, 0, 0, P, P);
     }
+    /* The selection is read HERE, not when the menu entry was clicked, and that
+       is safe: pick mode swallows cell clicks without touching the selection,
+       and its Escape path exits the mode without clearing it. The reference tile
+       drops out of the targets if it happens to be selected too — recolouring it
+       against itself is an identity transfer, and "make these match that one"
+       plainly doesn't include "that one". */
     function openRecolorModal(baseId, refId) {
+        const targets = ctxTargets(baseId).filter(i => i !== refId);
         exitPickMode();
         rc.baseId = baseId; rc.refId = refId;
+        rc.batchIds = targets.length ? targets : [baseId];
         rc.stats = { A: computeColorStats(byId(baseId).canvas, 64), B: computeColorStats(byId(refId).canvas, 64) };
         $('at-rc-base-no').textContent = indexOf(baseId) + 1;
         $('at-rc-ref-no').textContent = indexOf(refId) + 1;
         const rp = $('at-rc-ref');
         rp.getContext('2d').drawImage(byId(refId).canvas, 0, 0, rp.width, rp.height);
         resetSliderGrid(RC_PARAMS, 'rc');
+        $('at-rc-batch-mode').style.display = rc.batchIds.length > 1 ? '' : 'none';
+        $('at-rc-match').value = 'each';
+        rcSyncMatchHint();
+        setBatchNote('at-modal-recolor', rc.batchIds.length, indexOf(baseId) + 1);
         openModal('recolor');
         rcRender();
     }
+    function rcSyncMatchHint() {
+        const hint = $('at-rc-match-hint');
+        if (!hint) return;
+        const no = rc.baseId === null ? '' : indexOf(rc.baseId) + 1;
+        hint.textContent = rcMatchMode() === 'each'
+            ? 'Each tile is measured on its own, so they all land on the reference’s tone — even if they started at different tones. Their differences from each other are evened out.'
+            : `The shift measured from tile ${no} is applied to every tile, so deliberate variants keep their spread — but tiles that started elsewhere won’t fully reach the reference.`;
+    }
     function setupRecolorModal() {
         buildSliderGrid('at-rc-sliders', RC_PARAMS, 'rc', rcRender);
+        $('at-rc-match').addEventListener('change', rcSyncMatchHint);
         $('at-rc-apply').addEventListener('click', () => {
             if (rc.baseId === null) return;
-            const el = byId(rc.baseId);
-            const out = rcApplyTo(el.canvas, state.tileSize);
-            el.canvas.getContext('2d').drawImage(out, 0, 0);
-            el.edited = true;
+            const targets = rc.batchIds.map(byId).filter(el => el && el.kind === 'tile');
+            if (!targets.length) return;
+            // Stats are read off the live canvases, so measure every tile BEFORE
+            // writing any of them — otherwise a target that is also, say, further
+            // down the list gets measured against its own recoloured self.
+            const stats = targets.map(rcStatsFor);
+            targets.forEach((el, i) => {
+                const out = rcApplyTo(el.canvas, state.tileSize, stats[i]);
+                el.canvas.getContext('2d').drawImage(out, 0, 0);
+                el.edited = true;
+            });
+            const n = targets.length;
             closeModal();
             refreshTransitions();
             renderGrid();
-            pushHistory('Recolor');
-            showToast('Recoloured from reference', 'success');
+            pushHistory(n > 1 ? `Recolor — ${n} tiles` : 'Recolor');
+            showToast(n > 1 ? `Recoloured ${n} tiles from reference` : 'Recoloured from reference', 'success');
         });
     }
 
     /* ============ DE-LIGHT MODAL ============
        Whole-texture flatten (divide by blur) OR paint a baked shadow and
        inpaint it away (neighbour-aware fill, reusing healPatchFill). */
-    const dl = { id: null, maskCanvas: null, brushErase: false, resultCanvas: null };
-    function dlCleanup() { dl.id = null; dl.resultCanvas = null; }
+    const dl = { id: null, maskCanvas: null, brushErase: false, resultCanvas: null, batchIds: [] };
+    function dlCleanup() { dl.id = null; dl.resultCanvas = null; dl.batchIds = []; }
     function dlMode() { return document.querySelector('input[name="at-dl-mode"]:checked').value; }
     function dlRender() {
         const el = byId(dl.id);
@@ -9505,15 +10149,24 @@ window.TRLE = window.TRLE || {};
         ctx.putImageData(od, 0, 0);
         $('at-dl-canvas-label').textContent = 'Paint the shadow to remove (red = selected)';
     }
+    /* Whole-texture mode is a per-pixel op with no per-tile input, so it batches;
+       the inpaint mode's mask is painted over ONE tile's features and means
+       nothing on its neighbours, so the note goes away with the mode. */
+    function dlBatchIds() { return dlMode() === 'whole' ? dl.batchIds : [dl.id]; }
     function dlSyncModeUI() {
         const inpaint = dlMode() === 'inpaint';
         $('at-dl-whole-controls').style.display = inpaint ? 'none' : '';
         $('at-dl-inpaint-controls').style.display = inpaint ? '' : 'none';
+        setBatchNote('at-modal-delight', dlBatchIds().length, indexOf(dl.id) + 1);
         dl.resultCanvas = null;
         dlRender();
     }
-    function openDelightModal(id) {
+    function openDelightModal(ids) {
+        const list = Array.isArray(ids) ? ids : [ids];
+        const id = list[0];
+        if (!byId(id)) return;
         dl.id = id;
+        dl.batchIds = list.slice();
         dl.resultCanvas = null;
         dl.brushErase = false;
         $('at-dl-tileno').textContent = indexOf(id) + 1;
@@ -9556,20 +10209,25 @@ window.TRLE = window.TRLE || {};
         });
         $('at-dl-apply').addEventListener('click', () => {
             if (dl.id === null) return;
-            const el = byId(dl.id);
-            let out;
-            if (dlMode() === 'whole') {
-                out = delightWhole(el.canvas, state.tileSize, parseInt($('at-dl-strength').value) / 100);
-            } else {
-                out = dl.resultCanvas || healPatchFill(el.canvas, dl.maskCanvas, state.tileSize);
-            }
-            el.canvas.getContext('2d').drawImage(out, 0, 0);
-            el.edited = true;
+            const whole = dlMode() === 'whole';
+            const targets = dlBatchIds().map(byId).filter(el => el && el.kind === 'tile');
+            if (!targets.length) return;
+            const strength = parseInt($('at-dl-strength').value) / 100;
+            targets.forEach(el => {
+                const out = whole
+                    ? delightWhole(el.canvas, state.tileSize, strength)
+                    : (dl.resultCanvas || healPatchFill(el.canvas, dl.maskCanvas, state.tileSize));
+                el.canvas.getContext('2d').drawImage(out, 0, 0);
+                el.edited = true;
+            });
+            const n = targets.length;
             closeModal();
             refreshTransitions();
             renderGrid();
-            pushHistory('De-light');
-            showToast(dlMode() === 'whole' ? 'De-lit (baked lighting flattened)' : 'Shadow inpainted', 'success');
+            pushHistory(n > 1 ? `De-light — ${n} tiles` : 'De-light');
+            showToast(whole
+                ? (n > 1 ? `De-lit ${n} tiles (baked lighting flattened)` : 'De-lit (baked lighting flattened)')
+                : 'Shadow inpainted', 'success');
         });
     }
 
@@ -11286,7 +11944,7 @@ window.TRLE = window.TRLE || {};
        autosave snapshot. That is a real cost for a feature you normally set once.
        `el.original` is deliberately left alone so Reset to Original still undoes
        it long after the undo stack has rolled past. */
-    const noiseState = { id: null, seed: 1, canvas: null };
+    const noiseState = { id: null, seed: 1, canvas: null, batchIds: [] };
 
     function snParams() {
         return {
@@ -11340,7 +11998,9 @@ window.TRLE = window.TRLE || {};
     let snTimer = null;
     function snScheduleRegen() { clearTimeout(snTimer); snTimer = setTimeout(snRender, 80); }
 
-    function openNoiseModal(id) {
+    function openNoiseModal(ids) {
+        const list = Array.isArray(ids) ? ids : [ids];
+        const id = list[0];
         const el = byId(id);
         if (!el || !el.canvas) return;
         // The generators build a square toroidal lattice. Every tile in AtlasTool
@@ -11353,7 +12013,14 @@ window.TRLE = window.TRLE || {};
         }
         noiseState.id = id;
         noiseState.canvas = null;
+        // A square-tile refusal is per tile, so filter rather than bail: the rest
+        // of the selection is still perfectly noisable.
+        noiseState.batchIds = list.filter(i => {
+            const e = byId(i);
+            return e && e.canvas && e.canvas.width === e.canvas.height;
+        });
         $('at-sn-tileno').textContent = indexOf(id) + 1;
+        setBatchNote('at-modal-noise', noiseState.batchIds.length, indexOf(id) + 1);
         $('at-sn-newtile').checked = false;
         const bf = $('at-sn-before');
         bf.getContext('2d').clearRect(0, 0, bf.width, bf.height);
@@ -11389,30 +12056,50 @@ window.TRLE = window.TRLE || {};
             snRender();
         });
         $('at-sn-apply').addEventListener('click', () => {
-            const el = byId(noiseState.id);
-            if (!el || !noiseState.canvas) return;
-            const gen = cloneCanvas(noiseState.canvas);
+            const base = byId(noiseState.id);
+            if (!base || !noiseState.canvas) return;
+            const targets = noiseState.batchIds.map(byId).filter(e => e && e.kind === 'tile');
+            if (!targets.length) return;
+            const p = snParams();
+            // The noise FIELD is a function of the params + seed alone, so every
+            // tile gets the same grain — but it has to be laid into each tile's
+            // own pixels. The base tile reuses the preview canvas so a single
+            // target stays byte-identical to what was on screen.
+            const noised = el => {
+                if (el.id === base.id) return cloneCanvas(noiseState.canvas);
+                const out = cloneCanvas(el.canvas);
+                applySurfaceNoise(out, out.width, p, null);
+                return out;
+            };
+            const n = targets.length;
             if ($('at-sn-newtile').checked) {
-                const tile = {
-                    id: state.nextId++, kind: 'tile',
-                    canvas: gen, original: cloneCanvas(gen),
-                    seamless: !!el.seamless, edited: false,
-                    material: el.material ? JSON.parse(JSON.stringify(el.material)) : null,
-                    matLayers: hasMatLayers(el) ? cloneMatLayers(el.matLayers) : null,
-                    emissive: el.emissive ? cloneCanvas(el.emissive) : null
-                };
-                state.elements.splice(indexOf(el.id) + 1, 0, tile);
-                state.selectedId = tile.id;
+                // Insert each copy straight after its source, back to front, so
+                // the earlier splices don't shift the indices still to come.
+                [...targets].reverse().forEach(el => {
+                    const gen = noised(el);
+                    const tile = {
+                        id: state.nextId++, kind: 'tile',
+                        canvas: gen, original: cloneCanvas(gen),
+                        seamless: !!el.seamless, edited: false,
+                        material: el.material ? JSON.parse(JSON.stringify(el.material)) : null,
+                        matLayers: hasMatLayers(el) ? cloneMatLayers(el.matLayers) : null,
+                        emissive: el.emissive ? cloneCanvas(el.emissive) : null
+                    };
+                    state.elements.splice(indexOf(el.id) + 1, 0, tile);
+                    state.selectedId = tile.id;
+                });
                 closeModal(); renderGrid();
-                pushHistory('Surface noise (new tile)');
-                showToast('Added a noised copy', 'success');
+                pushHistory(n > 1 ? `Surface noise (${n} new tiles)` : 'Surface noise (new tile)');
+                showToast(n > 1 ? `Added ${n} noised copies` : 'Added a noised copy', 'success');
                 return;
             }
-            el.canvas = gen;
-            el.edited = true;              // `original` untouched → Reset still works
+            targets.forEach(el => {
+                el.canvas = noised(el);
+                el.edited = true;          // `original` untouched → Reset still works
+            });
             closeModal(); renderGrid();
-            pushHistory('Surface noise');
-            showToast('Surface noise applied', 'success');
+            pushHistory(n > 1 ? `Surface noise — ${n} tiles` : 'Surface noise');
+            showToast(n > 1 ? `Surface noise applied to ${n} tiles` : 'Surface noise applied', 'success');
         });
     }
 
@@ -11438,12 +12125,24 @@ window.TRLE = window.TRLE || {};
             // The trim region is identical however the diffuse was derived
             // (rot/mirror land the trim in the same place), so the union mask
             // of the slot's own role/bits composites the material maps.
+            //
+            // That still holds with an organic contour, but only because
+            // renderBsetVariant pre-composes the displacement field with the
+            // rot/mirror transform: a rotated slot then matches the mask its OWN
+            // role builds, which is the one used here. Build it untransformed —
+            // this is already the final role.
             const w = Math.max(2, Math.round(b.width * S));
             const f = Math.max(1, b.soft * w);
-            const mask = bsetUnionMask(S, b.topo, b.topo === 'lines' ? b.bits : b.role, w, f);
+            const mask = bsetUnionMask(S, b.topo, b.topo === 'lines' ? b.bits : b.role, w, f,
+                                       bsetOrgFields(S, w, b.org), null, false);
             for (const mt of TRLE.MapOrder) {
                 if (enabledMaps[mt] && base[mt] && overlay[mt]) {
                     result[mt] = compositeTransition(base[mt], overlay[mt], mask, S);
+                    // Same reasoning as the transition branch: contact occlusion
+                    // belongs in AO for a PBR/TEN export, or the map generator
+                    // reads the darkened diffuse back out as relief.
+                    if (mt === 'ao' && b.org && b.org.shadow > 0 && shadowHitsAO(b.org))
+                        applyContactShadowAO(result[mt], mask, S, b.org.shadow, shadowOpts(b.org));
                 }
             }
         } else if (el.kind === 'transition') {
@@ -13001,6 +13700,19 @@ window.TRLE = window.TRLE || {};
             // leave the other intact (which is what keeps Reset to Original honest).
             tileSig(i) { return capSig(state.elements[i] && state.elements[i].canvas); },
             originalSig(i) { return capSig(state.elements[i] && state.elements[i].original); },
+            // test-only: a tile's mean RGB. A signature says *whether* pixels
+            // moved; the batch-edit checks need to know *where to* — that a
+            // recoloured tile landed on the reference's tone rather than merely
+            // changing.
+            tileMean(i) {
+                const el = state.elements[i];
+                if (!el || !el.canvas) return null;
+                const s = resizeCanvas(el.canvas, 32, 32);
+                const d = s.getContext('2d').getImageData(0, 0, 32, 32).data;
+                const sum = [0, 0, 0];
+                for (let k = 0; k < d.length; k += 4) for (let c = 0; c < 3; c++) sum[c] += d[k + c];
+                return sum.map(v => +(v / (32 * 32)).toFixed(2));
+            },
             // test-only: the surface-noise engine, headless. Returns the raw
             // grayscale field so validate-noise.mjs can assert seamlessness and
             // determinism directly, without a UI in the way.
@@ -13072,6 +13784,129 @@ window.TRLE = window.TRLE || {};
             buildTopologyMask, buildCornerMask, buildWangMask, transSetCells,
             applyContactShadow, applyContactShadowAO, shadowHitsDiffuse, shadowHitsAO, shadowAdvice,
             orgStyleKeys() { return Object.keys(ORG_STYLES); },
+            bsetOrgStyleKeys() { return Object.keys(BSET_ORG_STYLE); },
+            /* test-only: the invariants that make a border set's organic contour
+               safe. Exact by construction, so these assert against 0 / a ranking
+               rather than a tuned threshold — an image-level "does it look ragged"
+               score was explicitly not wanted (see TESTING.md).
+
+                 outerMin   trim coverage along the band's OWN edge; must stay 255,
+                            which is what keeps two bordered rooms meeting cleanly.
+                 wrapRank   the wrap column's rank among all column steps. Seamless
+                            here comes from PERIODICITY, so the wrap is an ordinary
+                            interior step, not a duplicate — an equality test is the
+                            wrong instrument and reports a false failure.
+                 rotDelta   max |delta| between the mask a rot/mirror slot renders
+                            and the one its target role builds directly. 0 when the
+                            displacement field is pre-composed with the transform,
+                            239 when it is not. */
+            bsetOrgProbe(S, org, opts) {
+                S = S || 128;
+                const o = Object.assign({ topo: 'frame', width: 0.2, soft: 0.3 }, opts || {});
+                const w = Math.max(2, Math.round(o.width * S));
+                const f = Math.max(1, o.soft * w);
+                const og = bsetOrgFields(S, w, org || null);
+                const mask = (spec, xf, swap) =>
+                    bsetUnionMask(S, o.topo, spec, w, f, og, xf || null, !!swap)
+                        .getContext('2d').getImageData(0, 0, S, S).data;
+                const at = (d, x, y) => d[(y * S + x) * 4];
+                /* Coverage along the band's own edge, measured ONLY where the
+                   unperturbed band put trim. A plain min over the whole edge is a
+                   frame-topology statistic: a `lines` pipe only crosses the middle
+                   of its edge, so most of that edge is legitimately fill and the
+                   min is 0 whether anything is broken or not. `plain` is the
+                   stencil of where trim belongs. */
+                const outerMin = (d, plain, dir) => {
+                    let mn = 255, seen = 0;
+                    for (let t = 0; t < S; t++) {
+                        const px = dir === 'N' ? [t, 0] : dir === 'S' ? [t, S - 1]
+                                 : dir === 'W' ? [0, t] : [S - 1, t];
+                        if (at(plain, px[0], px[1]) < 128) continue;
+                        seen++;
+                        mn = Math.min(mn, at(d, px[0], px[1]));
+                    }
+                    return seen ? mn : null;
+                };
+                const wrapRank = (d, axis) => {
+                    const st = [];
+                    for (let i = 0; i < S; i++) {
+                        let acc = 0;
+                        for (let t = 0; t < S; t++) {
+                            const a = axis === 'x' ? at(d, i, t) : at(d, t, i);
+                            const b = axis === 'x' ? at(d, (i + 1) % S, t) : at(d, t, (i + 1) % S);
+                            acc += Math.abs(a - b);
+                        }
+                        st.push(acc / S);
+                    }
+                    const wrap = st[S - 1], sorted = [...st].sort((p2, q) => q - p2);
+                    return { wrap: +wrap.toFixed(3), max: +sorted[0].toFixed(3),
+                             rank: sorted.indexOf(wrap) + 1, n: S };
+                };
+                /* How ragged the inner contour got, in px. Only meaningful for the
+                   frame topology, where the band spans the whole edge and the
+                   contour is a single-valued y(x); a `lines` pipe's "first fill
+                   pixel scanning down" is a step function and its spread measures
+                   the pipe's width, not its raggedness. */
+                const contourStd = d => {
+                    if (o.topo === 'lines') return null;
+                    const ys = [];
+                    for (let x = 0; x < S; x++) { let yy = 0;
+                        for (let y = 0; y < S; y++) if (at(d, x, y) < 128) { yy = y; break; }
+                        ys.push(yy); }
+                    const m = ys.reduce((a, b) => a + b, 0) / ys.length;
+                    return +Math.sqrt(ys.reduce((a, b) => a + (b - m) * (b - m), 0) / ys.length).toFixed(2);
+                };
+                // rot: render canonical T with the field pre-composed by one CW
+                // turn, transform it, and compare with the R slot's own mask.
+                const rotCW = (x, y) => [S - 1 - y, x];
+                const rotCanvasCW = d => {
+                    const out = new Uint8ClampedArray(d.length);
+                    for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+                        const src = (y * S + x) * 4, dst = ((x) * S + (S - 1 - y)) * 4;
+                        out[dst] = d[src]; out[dst + 1] = d[src + 1]; out[dst + 2] = d[src + 2]; out[dst + 3] = 255;
+                    }
+                    return out;
+                };
+                const maxd = (a, b) => { let m = 0;
+                    for (let i = 0; i < a.length; i += 4) m = Math.max(m, Math.abs(a[i] - b[i]));
+                    return m; };
+                const specT = o.topo === 'lines' ? 1 : 'T';
+                const specR = o.topo === 'lines' ? 2 : 'R';
+                const specL = o.topo === 'lines' ? 8 : 'L';
+                const T = mask(specT), L = mask(specL);
+                const plainOg = null;
+                const plainT = bsetUnionMask(S, o.topo, specT, w, f, plainOg, null, false)
+                    .getContext('2d').getImageData(0, 0, S, S).data;
+                const plainL = bsetUnionMask(S, o.topo, specL, w, f, plainOg, null, false)
+                    .getContext('2d').getImageData(0, 0, S, S).data;
+                const rotFixed = rotCanvasCW(mask(specT, rotCW, true));
+                const rotNaive = rotCanvasCW(mask(specT));
+                const R = mask(specR);
+                /* EXACT check, no threshold: the displacement is windowed by distance
+                   to the border the band meets, and that window is 0 there — so the
+                   whole border line must come out bit-for-bit identical to the plain
+                   mask however hard the sliders are pushed. This is the assertion
+                   that actually protects a neighbouring tile; the wrap ranking below
+                   covers the two PERPENDICULAR borders, where the guarantee is
+                   periodicity rather than exactness and so cannot be exact. */
+                const borderDelta = (d, plain, dir) => {
+                    let m = 0;
+                    for (let t = 0; t < S; t++) {
+                        const px = dir === 'N' ? [t, 0] : dir === 'S' ? [t, S - 1]
+                                 : dir === 'W' ? [0, t] : [S - 1, t];
+                        m = Math.max(m, Math.abs(at(d, px[0], px[1]) - at(plain, px[0], px[1])));
+                    }
+                    return m;
+                };
+                return {
+                    outerMin: { T_N: outerMin(T, plainT, 'N'), L_W: outerMin(L, plainL, 'W') },
+                    borderDelta: { T_N: borderDelta(T, plainT, 'N'), L_W: borderDelta(L, plainL, 'W') },
+                    wrapX: wrapRank(T, 'x'), wrapY: wrapRank(L, 'y'),
+                    contourStd: contourStd(T),
+                    rotDelta: maxd(rotFixed, R),
+                    rotDeltaNaive: maxd(rotNaive, R)
+                };
+            },
             /* test-only: run an element through the REAL deriveMaps and hash one
                map. Direct calls to applyContactShadowAO prove the function; this
                proves the export path actually reaches it. */
