@@ -229,9 +229,11 @@
                 <label class="checkbox-row"><input type="checkbox" data-map="height">    Height</label>
             </div>
             <div id="at-height-warning" class="at-inline-warning" style="display:none;">
-                ⚠️ <strong>Height (parallax) maps are GPU-expensive in Tomb Engine.</strong>
-                Prefer applying height to <strong>individual textures</strong> rather than a whole atlas, so you can
-                measure the performance impact per texture and drop it where it isn’t worth the cost.
+                ⚠️ <strong>Height (parallax) maps are expensive in Tomb Engine, and they change more than performance.</strong>
+                A height map also switches <strong>SSAO off</strong> for that material and disables <strong>bullet holes,
+                explosion marks and other decals</strong> on it. Parallax is also incompatible with animated, double-sided
+                and mirror textures. Prefer applying height to <strong>individual textures</strong> rather than a whole
+                atlas, so you can judge each one and drop it where it isn’t worth the cost.
             </div>
             <div id="at-height-alpha-warning" class="at-inline-warning" style="display:none;">
                 ⚠️ <strong><span id="at-height-alpha-count">Some</span> of your tiles have transparency.</strong>
@@ -240,10 +242,16 @@
                 edge, which can read as a milky fringe or let you see straight through. Check fences, grates and
                 foliage in-game, and drop Height for those textures if it looks wrong.
             </div>
-            <label class="checkbox-row" id="at-height-seamless-row" style="display:none;margin-top:8px;"
-                   title="Blur the height map toward continuity in a border band so a tiling texture doesn't show a parallax 'cliff' at the repeat seam. Interior detail is preserved.">
-                <input type="checkbox" id="at-export-height-seamless" checked> Seamless height edges — blur the border so parallax doesn’t cliff at the seam
+            <!-- Replaces the old "Seamless height edges" feather. That blended the
+                 border toward a wrap-blurred copy so a TILING texture had no parallax
+                 cliff at its repeat seam -- a real problem, but not this one, and
+                 measured at 6.45% -> 6.25% edge bleed. Tomb Engine needs the border
+                 WHITE, not continuous. See AtlasTool/HEIGHT-MAP-AUDIT.md. -->
+            <label class="checkbox-row" id="at-height-white-row" style="display:none;margin-top:8px;"
+                   title="Tomb Engine's parallax marches the UV out of the texture's own box in the atlas page, dragging the edge pixels with it — the black bars along texture borders. White is the surface plane, so a white border stops the march dead.">
+                <input type="checkbox" id="at-export-height-white" checked> Fade height edges to white — required by Tomb Engine, stops the black bars at texture borders
             </label>
+            <div id="at-height-white-note" class="sm-hint" style="display:none;margin:4px 0 0 24px;"></div>
             <div class="notice notice-info" style="margin-top:12px;">
                 <span class="notice-icon">📐</span>
                 <span><strong>Every map atlas must share the same dimensions.</strong>
@@ -365,12 +373,18 @@
         <button data-action="delight" role="menuitem" data-tileonly data-batch>☀ De-light…</button>
         <button data-action="heal" role="menuitem" data-tileonly>🩹 Heal / Fill…</button>
         <button data-action="fade" role="menuitem" data-tileonly>🫥 Fade to Transparent…</button>
-        <button data-action="emissive" role="menuitem" data-tileonly>✨ Make Emissive…</button>
     </div>
     <div class="at-ctx-col" data-col="material">
         <div class="at-ctx-title">Material</div>
         <button data-action="material" role="menuitem">🎨 Set Material…</button>
         <button data-action="lastmaterial" role="menuitem" style="display:none;">🎨 Apply Last Material</button>
+        <!-- Emissive and height both author ONE map for ONE texture, which is why
+             they are dedicated editors rather than preset sliders — and why they
+             belong under Set Material rather than in Adjust with the colour tools.
+             Neither is data-batch: each needs something picked or painted on a
+             specific texture (validate-batch-edit asserts they stay uncounted). -->
+        <button data-action="emissive" role="menuitem" data-tileonly>✨ Make Emissive…</button>
+        <button data-action="heightmap" role="menuitem" data-tileonly>🏔️ Make Height Map…</button>
     </div>
     <div class="at-ctx-col" data-col="goto">
         <div class="at-ctx-title">Go to</div>
@@ -512,20 +526,12 @@
                 <input type="range" id="at-tr-pivot" min="0" max="100" value="50" style="width:100%;">
             </div>
             <div class="form-group" style="flex:1;">
-                <label>Hardness — <span id="at-tr-hardness-val">0</span>%</label>
-                <input type="range" id="at-tr-hardness" min="0" max="100" value="0" style="width:100%;">
+                <label>Hardness — <span id="at-tr-edgehard-val">0</span>%</label>
+                <input type="range" id="at-tr-edgehard" min="0" max="100" value="0" style="width:100%;">
             </div>
         </div>
         <div id="at-tr-custom-controls" data-tr-panel="single" style="display:none;">
-            <div class="form-row" style="align-items:flex-end;">
-                <div class="form-group" style="flex:1;min-width:140px;">
-                    <label>Brush Size — <span id="at-tr-brush-val">32</span>px</label>
-                    <input type="range" id="at-tr-brush" min="4" max="96" value="32" style="width:100%;">
-                </div>
-                <button class="btn btn-secondary btn-sm" id="at-tr-brush-mode" aria-pressed="false" title="Toggle paint / erase">🖌️ Paint</button>
-                <button class="btn btn-secondary btn-sm" id="at-tr-mask-clear">Clear</button>
-                <button class="btn btn-secondary btn-sm" id="at-tr-mask-invert">Invert</button>
-            </div>
+            <div class="at-mask-tools" id="at-tr-tools"></div>
             <div class="sm-hint">Paint <strong>white</strong> where the overlay (B) should show through. The mask is softened automatically. One tile is added.</div>
         </div>
         <!-- Parking slot for the Single Tiles organic accordion; it docks into
@@ -751,26 +757,8 @@
                     </select>
                     <div id="at-heal-hint" class="sm-hint"></div>
                 </div>
-                <div class="form-group">
-                    <label>Tool</label>
-                    <div class="at-seg-group">
-                        <button type="button" class="at-seg active" id="at-heal-paint" data-heal-tool="paint">🖌️ Paint</button>
-                        <button type="button" class="at-seg" id="at-heal-erase" data-heal-tool="erase">🧽 Erase</button>
-                    </div>
-                </div>
-                <div class="form-group">
-                    <label>Brush Size — <span id="at-heal-brush-val">28</span>px</label>
-                    <input type="range" id="at-heal-brush" min="4" max="96" value="28" style="width:100%;">
-                </div>
-                <div class="form-group">
-                    <label>Hardness — <span id="at-heal-hardness-val">100</span>%</label>
-                    <input type="range" id="at-heal-hardness" min="0" max="100" value="100" style="width:100%;"
-                           title="100% is a hard-edged brush. Lower feathers the selection edge, so the fill blends out instead of stopping at a line.">
-                </div>
-                <div class="form-row" style="align-items:center;gap:8px;flex-wrap:wrap;">
-                    <button class="btn btn-secondary btn-sm" id="at-heal-clear">Clear</button>
-                    <span id="at-heal-busy" class="sm-hint" style="margin:0;display:none;">Filling…</span>
-                </div>
+                <div class="at-mask-tools" id="at-heal-tools"></div>
+                <div class="sm-hint" style="margin-top:0;">Raise <strong>Edge softness</strong> to feather the selection so the fill blends out instead of stopping at a line. <strong>🪄 Wand</strong> grabs a watermark or logo by colour.</div>
             </div>
             <!-- The paint surface keeps showing the PAINT view at all times now.
                  It used to be overwritten by the fill result, which meant the only
@@ -780,17 +768,23 @@
                 <canvas id="at-heal-canvas" width="256" height="256"
                     style="width:100%;border-radius:6px;border:1px solid var(--border);display:block;image-rendering:pixelated;touch-action:none;cursor:crosshair;"></canvas>
             </div>
+            <!-- Before and After used to be two canvases stacked one above the
+                 other, which is the one arrangement that makes them hard to
+                 compare: the eye has to travel, and a smeared fill or a seam only
+                 shows when the two land on the SAME pixels. Now they are one frame
+                 with a wipe, plus hold-to-flick for whole-tile A/B. -->
             <div class="at-modal-side at-side-1x">
-                <div>
-                    <label>Before</label>
-                    <canvas id="at-heal-before" width="256" height="256"
-                        style="width:100%;max-width:300px;border-radius:6px;border:1px solid var(--border);display:block;image-rendering:pixelated;background:#111;"></canvas>
+                <label>Result <span style="color:var(--text-secondary);font-size:0.75rem;">(drag to compare)</span></label>
+                <div class="at-cmp-frame" id="at-heal-cmp" style="--pos:50%;">
+                    <canvas id="at-heal-before" width="256" height="256"></canvas>
+                    <canvas id="at-heal-after" width="256" height="256"></canvas>
+                    <div class="at-cmp-divider"></div>
                 </div>
-                <div>
-                    <label>After <span style="color:var(--text-secondary);font-size:0.75rem;">(updates as you paint)</span></label>
-                    <canvas id="at-heal-after" width="256" height="256"
-                        style="width:100%;max-width:300px;border-radius:6px;border:1px solid var(--border);display:block;image-rendering:pixelated;background:#111;"></canvas>
-                </div>
+                <input type="range" id="at-heal-cmp-range" min="0" max="100" value="50"
+                       aria-label="Reveal amount — drag to compare before and after" style="width:100%;max-width:300px;">
+                <div class="at-cmp-foot"><span>Before</span><span>After (updates as you paint)</span></div>
+                <button type="button" class="btn btn-secondary at-btn-sm" id="at-heal-hold"
+                        style="margin-top:6px;" title="Press and hold to flick back to the untouched tile">👁 Hold to see the original</button>
             </div>
         </div>
         <div class="at-modal-actions">
@@ -819,25 +813,22 @@
                 <select id="at-fade-dir"></select>
             </div>
         </div>
-        <div class="form-row">
+        <!-- Hidden in Custom mode: fadeBuildMask ignores both of these for a
+             painted shape, so they sat there doing nothing next to the brush's own
+             Edge softness -- two sliders with near-identical names, one of them
+             inert. That is the collision the naming rework exists to stop. -->
+        <div class="form-row" id="at-fade-shapeopts">
             <div class="form-group" style="flex:1;">
                 <label>Fade amount — <span id="at-fade-amount-val">35</span>%</label>
                 <input type="range" id="at-fade-amount" min="2" max="100" value="35" style="width:100%;">
             </div>
             <div class="form-group" style="flex:1;">
-                <label>Hardness — <span id="at-fade-hardness-val">0</span>%</label>
-                <input type="range" id="at-fade-hardness" min="0" max="100" value="0" style="width:100%;">
+                <label>Shape edge hardness — <span id="at-fade-edgehard-val">0</span>%</label>
+                <input type="range" id="at-fade-edgehard" min="0" max="100" value="0" style="width:100%;">
             </div>
         </div>
         <div id="at-fade-custom" style="display:none;">
-            <div class="form-row" style="align-items:flex-end;">
-                <div class="form-group" style="flex:1;min-width:140px;">
-                    <label>Brush Size — <span id="at-fade-brush-val">32</span>px</label>
-                    <input type="range" id="at-fade-brush" min="4" max="96" value="32" style="width:100%;">
-                </div>
-                <button class="btn btn-secondary btn-sm" id="at-fade-brush-mode" aria-pressed="false" title="Toggle paint / erase">🖌️ Paint</button>
-                <button class="btn btn-secondary btn-sm" id="at-fade-clear">Clear</button>
-            </div>
+            <div class="at-mask-tools" id="at-fade-tools"></div>
             <div class="sm-hint">Paint where the tile should fade to transparent.</div>
         </div>
             </div>
@@ -853,6 +844,197 @@
         </div>
     </div>
 
+    <!-- ── Height map modal ──────────────────────────
+         The dedicated editor for parallax, alongside the Height sliders in Set
+         Material for the same reason Make Emissive exists alongside the emissive
+         ones: height belongs on a handful of hero textures, not on a preset that
+         every tile in the atlas shares. Three zones — tuning, paint, previews. -->
+    <div class="at-modal at-modal-xxl" id="at-modal-heightmap" role="dialog" aria-modal="true" aria-label="Make Height Map" style="display:none;">
+        <div class="at-modal-title">🏔️ <span id="at-hg-title">Make Height Map</span> — Tile <span id="at-hg-tileno"></span></div>
+        <div class="sm-hint">
+            A <strong>height map</strong> drives real <strong>parallax</strong> in Tomb Engine: high points shift in front of
+            low ones as you move, so joints and carvings genuinely recede. White is the surface, black is deepest.
+        </div>
+        <div class="sm-hint" id="at-hg-state"></div>
+        <div class="at-modal-cols at-3zone">
+
+            <!-- ── tuning ── -->
+            <div class="at-modal-tune">
+                <!-- What the relief is READ FROM. Height used to be luminance and
+                     nothing else, with a bare "Invert" checkbox as the only say in
+                     it. Picking a colour or a hue range means the mortar can carve
+                     in while the stones stay flat, which luminance alone cannot do
+                     on a texture whose stones are darker than its joints. -->
+                <div class="form-group">
+                    <label for="at-hg-source">What the relief is read from</label>
+                    <select id="at-hg-source">
+                        <option value="lum" selected>Light &amp; dark (the whole texture)</option>
+                        <option value="color">A colour I pick</option>
+                        <option value="hue">A hue range</option>
+                    </select>
+                </div>
+                <div class="form-group" id="at-hg-grp-color" style="display:none;">
+                    <div class="form-row" style="align-items:flex-end;">
+                        <div class="form-group" style="min-width:90px;">
+                            <label for="at-hg-target">Colour <span style="color:var(--text-secondary);font-size:0.72rem;">(or click the tile)</span></label>
+                            <input type="color" id="at-hg-target" value="#8a8175" style="width:100%;height:30px;padding:0;">
+                        </div>
+                        <div class="form-group" style="flex:1;">
+                            <label>Tolerance — <span id="at-hg-srctol-val">25</span>%</label>
+                            <input type="range" id="at-hg-srctol" min="1" max="100" value="25" style="width:100%;">
+                        </div>
+                    </div>
+                </div>
+                <div class="form-group" id="at-hg-grp-hue" style="display:none;">
+                    <div class="form-row">
+                        <div class="form-group" style="flex:1;">
+                            <label>Hue — <span id="at-hg-hue-val">30</span>° <span style="color:var(--text-secondary);font-size:0.72rem;">(or click the tile)</span></label>
+                            <input type="range" id="at-hg-hue" min="0" max="360" value="30" style="width:100%;">
+                        </div>
+                        <div class="form-group" style="flex:1;">
+                            <label>Hue width — <span id="at-hg-huewidth-val">30</span>°</label>
+                            <input type="range" id="at-hg-huewidth" min="2" max="180" value="30" style="width:100%;">
+                        </div>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Which side sinks</label>
+                    <div class="at-seg-group" id="at-hg-side">
+                        <button type="button" class="at-seg active" id="at-hg-sink" aria-pressed="true">↓ It carves in</button>
+                        <button type="button" class="at-seg" id="at-hg-raise" aria-pressed="false">↑ It stays on top</button>
+                    </div>
+                    <!-- The whole point of the picker, per the report: say out loud
+                         which part ends up where. Tomb Engine reads depth = 1 - ORSH.w
+                         and only ever carves IN, so "raised" is never proud of the
+                         wall -- it is the polygon plane. The copy has to be honest
+                         about that or people expect geometry to pop out. -->
+                    <div class="sm-hint" id="at-hg-side-note"></div>
+                </div>
+                <div class="form-group">
+                    <!-- "Relief depth", not "Depth": the paint toolbar's own
+                         per-stroke slider is called Depth, and two sliders called
+                         Depth in one modal is the exact confusion this round is
+                         fixing. This one is the depth of the relief read from the
+                         texture; that one is how deep a single stroke digs. -->
+                    <label>Relief depth — <span id="at-hg-strength-val">20</span></label>
+                    <input type="range" id="at-hg-strength" min="1" max="50" value="20" style="width:100%;"
+                           title="How far the recesses sit below the surface. The high points stay on the polygon plane whatever this says — Tomb Engine's parallax only carves in, it never pops out.">
+                </div>
+                <div class="form-group">
+                    <label>Smoothing — <span id="at-hg-blur-val">2</span></label>
+                    <input type="range" id="at-hg-blur" min="0" max="10" value="2" style="width:100%;"
+                           title="Blurs the texture before reading it as elevation. Higher gives clean relief instead of pixel jitter; parallax on fine noise looks like the surface is swimming.">
+                </div>
+
+                <details class="at-acc" id="at-hg-edge-acc" open
+                         title="Tomb Engine's parallax marches the UV out of the texture's own box in the atlas page, dragging the border pixels with it — the black bars along texture edges. White is the surface plane, so a white border stops the march dead.">
+                    <summary>⬜ Edges — fade to white</summary>
+                    <div class="form-group">
+                        <label>Profile</label>
+                        <select id="at-hg-profile">
+                            <option value="0" selected>Smooth — soft ramp (default)</option>
+                            <option value="1">Linear — straight ramp</option>
+                            <option value="2">Tight — narrow and steep</option>
+                            <option value="3">Rough — ragged, for rubble</option>
+                            <option value="4">Joint-aware — end on a mortar line</option>
+                        </select>
+                        <div class="sm-hint" id="at-hg-profile-hint" style="margin-top:4px;"></div>
+                    </div>
+                    <div class="form-group">
+                        <label>Band — <span id="at-hg-band-val">14</span>% <span style="color:var(--text-secondary);font-size:0.72rem;">(<span id="at-hg-band-px">36</span>px)</span></label>
+                        <input type="range" id="at-hg-band" min="2" max="40" value="14" style="width:100%;">
+                        <div class="at-inline-warning" id="at-hg-band-advice" style="display:none;margin-top:6px;"></div>
+                    </div>
+                    <div class="form-group">
+                        <label>Amount — <span id="at-hg-amount-val">100</span>%</label>
+                        <input type="range" id="at-hg-amount" min="0" max="100" value="100" style="width:100%;"
+                               title="How far toward white the border goes. Below 100% the march is only slowed, not stopped — leave it at 100 unless you know the edge is never visible.">
+                    </div>
+                    <div class="form-group">
+                        <label>Fade these edges <span style="color:var(--text-secondary);font-size:0.72rem;">(an edge the texture never shows keeps its detail)</span></label>
+                        <div class="at-seg-group" id="at-hg-edges">
+                            <button type="button" class="at-seg active" data-edge="1" aria-pressed="true">↑ Top</button>
+                            <button type="button" class="at-seg active" data-edge="2" aria-pressed="true">→ Right</button>
+                            <button type="button" class="at-seg active" data-edge="4" aria-pressed="true">↓ Bottom</button>
+                            <button type="button" class="at-seg active" data-edge="8" aria-pressed="true">← Left</button>
+                        </div>
+                    </div>
+                </details>
+
+                <!-- "Raise or lower a region" used to be a third accordion here,
+                     holding the brush AND its master slider, in a different column
+                     from the canvas they drive. All of it now lives in the work
+                     zone beside the tile. It also stops being hidden-by-default,
+                     so the "reopen it if this tile has a painted mask" behaviour
+                     it needed has nothing left to do. -->
+            </div>
+
+            <!-- ── paint surface ── -->
+            <!-- `at-hg-canvas`, not `at-hg-paint`: buildMaskToolbar generates
+                 <prefix>-paint for its Paint button, and the id collision made
+                 hgRenderPaint draw into a <button>. Heal's at-heal-canvas /
+                 at-heal-paint pair is the convention. -->
+            <div class="at-modal-work">
+                <!-- Side by side, not stacked: you paint on the left and read the
+                     height map it produces on the right without scrolling between
+                     them. Stacked, this column was 753px against a 750px body. -->
+                <div class="at-hg-pair">
+                    <div>
+                        <label>Tile <span style="color:var(--text-secondary);font-size:0.75rem;">(paint here)</span></label>
+                        <canvas id="at-hg-canvas" width="256" height="256" class="at-mm-canvas at-hg-work" style="touch-action:none;"></canvas>
+                    </div>
+                    <div>
+                        <label>Height map <span style="color:var(--text-secondary);font-size:0.75rem;">(white = surface)</span></label>
+                        <canvas id="at-hg-map" width="256" height="256" class="at-mm-canvas at-hg-work"></canvas>
+                    </div>
+                </div>
+                <!-- The brush lives HERE, not in the tuning accordion it used to sit
+                     in. Two reasons, and the layout one is the lesser: the controls
+                     and the canvas they drive were in different COLUMNS, which is the
+                     opposite of the zone model in MODAL-LAYOUT-AUDIT.md. It also takes
+                     191px out of a tuning column that was 868px against an 881px
+                     budget, i.e. the thing that made this the one modal already
+                     pinned at the ceiling. -->
+                <div class="at-mask-tools" id="at-hg-tools"></div>
+                <div class="form-group" style="margin-bottom:0;">
+                    <label>Raise or lower the painted area (master) — <span id="at-hg-lift-val">-40</span>%</label>
+                    <input type="range" id="at-hg-lift" min="-100" max="100" value="-40" style="width:100%;"
+                           title="Negative sinks the painted area (an alcove, a deep joint); positive raises it toward the surface plane.">
+                    <div class="sm-hint">Nothing happens until you paint something. This scales every painted region at once — for a shallow dent <em>and</em> a deep alcove on one tile, paint them at different <strong>Depth</strong>s.</div>
+                </div>
+            </div>
+
+            <!-- ── previews ── -->
+            <div class="at-modal-side">
+                <div class="form-group">
+                    <label>In Tomb Engine <span style="color:var(--text-secondary);font-size:0.75rem;">(real parallax shader)</span></label>
+                    <!-- Still TombEngine's own march, but on a surface you can turn.
+                         Flat-on with one reach value for the whole image told you
+                         almost nothing about how the relief reads as you walk past.
+                         NOT a displaced mesh: TEN fakes depth per-pixel and never
+                         moves geometry, so a mesh would show bumpy silhouettes and
+                         real occlusion the engine does not draw. -->
+                    <canvas id="at-hg-pom" width="420" height="420" class="at-hg-prev at-hg-orbit"
+                            tabindex="0" role="img"
+                            aria-label="Tomb Engine parallax preview. Drag, or use the arrow keys, to turn the surface."
+                            style="touch-action:none;cursor:grab;"></canvas>
+                    <div class="sm-hint" style="margin-top:4px;">Grab it and turn it. The relief flattens as you rotate away — that is parallax doing what it does in game, not a fault in the map.</div>
+                </div>
+                <!-- No Turn/Tilt sliders. People asked what they meant, which is the
+                     answer: you rotate a 3D view by grabbing it. The angle is state,
+                     not a control, and the line below reports it. Arrow keys on the
+                     focused canvas keep it reachable without a pointer. -->
+                <button type="button" class="btn btn-secondary at-btn-sm" id="at-hg-view-reset" style="margin-bottom:8px;">⟳ Reset view</button>
+                <div class="sm-hint" id="at-hg-pom-note"></div>
+            </div>
+        </div>
+        <div class="at-modal-actions">
+            <button class="btn btn-secondary" data-close>Cancel</button>
+            <button class="btn btn-secondary" id="at-hg-remove">🗑️ Remove height map</button>
+            <button class="btn btn-primary" id="at-hg-apply">💾 Apply Height Map</button>
+        </div>
+    </div>
+
     <!-- ── Emissive modal (Emissive phases E1–E3) ───── -->
     <div class="at-modal at-modal-xl" id="at-modal-emissive" role="dialog" aria-modal="true" aria-label="Make Emissive" style="display:none;">
         <div class="at-modal-title">✨ Make Emissive — Tile <span id="at-em-tileno"></span></div>
@@ -861,7 +1043,11 @@
              shows the glow you'd get if you hit Apply, which is indistinguishable
              from a glow that's already on the tile. This line is the difference. -->
         <div class="sm-hint" id="at-em-state"></div>
-        <div class="at-modal-cols at-tune-fixed">
+        <!-- Tuning FLEXES and the preview rail is pinned, rather than the other way
+             round: two 256px previews do not need 700px, and with the paint toolbar
+             in the tuning column a 340px `at-tune-fixed` starved it -- seven tool
+             buttons wrapped to three rows and orphaned undo/redo on a row of its own. -->
+        <div class="at-modal-cols" style="--at-side-w:600px;">
             <div class="at-modal-tune">
         <div class="form-row" style="align-items:flex-end;">
             <div class="form-group" style="min-width:170px;">
@@ -936,15 +1122,8 @@
 
         <!-- Paint controls -->
         <div id="at-em-grp-paint" style="display:none;">
-            <div class="form-row" style="align-items:flex-end;">
-                <div class="form-group" style="flex:1;min-width:140px;">
-                    <label>Brush size — <span id="at-em-brush-val">32</span>px</label>
-                    <input type="range" id="at-em-brush" min="4" max="96" value="32" style="width:100%;">
-                </div>
-                <button class="btn btn-secondary btn-sm" id="at-em-brush-mode" aria-pressed="false" title="Toggle paint / erase">🖌️ Paint</button>
-                <button class="btn btn-secondary btn-sm" id="at-em-clear">Clear</button>
-            </div>
-            <div class="sm-hint">Paint directly on the source preview where the tile should glow.</div>
+            <div class="sm-hint" style="margin-top:0;">Paint on the source preview, on the right, where the tile should glow.</div>
+            <div class="at-mask-tools" id="at-em-tools"></div>
         </div>
 
         <!-- Shared selection softness -->
@@ -953,10 +1132,14 @@
             <input type="range" id="at-em-softness" min="0" max="100" value="30" style="width:100%;">
         </div>
 
-        <!-- Shared intensity / bloom -->
+        <!-- Shared intensity / bloom. These are MASTER controls: they scale the
+             whole map, painted areas included. Before the Value slider existed
+             that was the only intensity there was, and dropping Strength to paint
+             a dimmer second region silently took the first one down with it
+             (measured 68.0 -> 23.8). -->
         <div class="form-row">
             <div class="form-group" style="flex:1;">
-                <label>Strength — <span id="at-em-strength-val">100</span>%</label>
+                <label>Master strength — <span id="at-em-strength-val">100</span>%</label>
                 <input type="range" id="at-em-strength" min="0" max="100" value="100" style="width:100%;">
             </div>
             <div class="form-group" style="flex:1;">
@@ -964,6 +1147,7 @@
                 <input type="range" id="at-em-feather" min="0" max="24" value="0" style="width:100%;">
             </div>
         </div>
+        <div class="sm-hint" id="at-em-master-note" style="display:none;">These scale the <em>whole</em> glow map, painted areas included. To make one region dimmer than another, paint it at a lower <strong>Brightness</strong>.</div>
             </div>
             <div class="at-modal-side"><div class="form-row">
             <div class="form-group" style="flex:1;">
@@ -1767,14 +1951,7 @@
                     </div>
                 </div>
                 <div id="at-dl-inpaint-controls" style="display:none;">
-                    <div class="form-row" style="align-items:center;gap:8px;flex-wrap:wrap;">
-                        <button class="btn btn-secondary btn-sm" id="at-dl-brush-mode">🖌️ Paint</button>
-                        <button class="btn btn-secondary btn-sm" id="at-dl-clear">Clear mask</button>
-                    </div>
-                    <div class="form-group" style="margin-top:8px;">
-                        <label>Brush size — <span id="at-dl-brush-val">28</span>px</label>
-                        <input type="range" id="at-dl-brush" min="4" max="96" value="28" style="width:100%;">
-                    </div>
+                    <div class="at-mask-tools" id="at-dl-tools"></div>
                     <button class="btn btn-secondary btn-sm" id="at-dl-preview-btn">👁 Preview inpaint</button>
                     <div class="sm-hint">Paint over the whole shadow so the selection touches clean texture on every side, then Preview.</div>
                 </div>
@@ -2693,23 +2870,12 @@
                     <ul class="at-mm-list" id="at-mm-list"></ul>
                 </div>
                 <div class="at-mm-select">
-                    <div class="at-mm-tools">
-                        <div class="at-seg-group">
-                            <button type="button" class="at-seg active" id="at-mm-tool-brush" data-tool="brush" title="Paint the selection by hand">🖌 Brush</button>
-                            <button type="button" class="at-seg" id="at-mm-tool-lasso" data-tool="lasso" title="Click points to outline a region; double-click or Enter to close it">🪢 Lasso</button>
-                            <button type="button" class="at-seg" id="at-mm-tool-rect" data-tool="rect" title="Drag a rectangle">▭ Rect</button>
-                            <button type="button" class="at-seg" id="at-mm-tool-ellipse" data-tool="ellipse" title="Drag an ellipse">⬭ Ellipse</button>
-                            <button type="button" class="at-seg" id="at-mm-tool-wand" data-tool="wand" title="Click a colour to select similar pixels (bricks, door, …)">🪄 Wand</button>
-                        </div>
-                        <button type="button" class="btn btn-secondary at-btn-sm" id="at-mm-erase" aria-pressed="false" title="Toggle paint vs erase">🖌 Paint</button>
-                        <label class="at-mm-brushsize" id="at-mm-brushwrap" title="Brush size">⚪<input type="range" id="at-mm-brush" min="2" max="80" value="18"></label>
-                        <label class="at-mm-wandopts" id="at-mm-wandwrap" style="display:none;" title="Colour tolerance — how close a pixel's colour must be to the one you click">Tol<input type="range" id="at-mm-tol" min="2" max="100" value="28"></label>
-                        <label class="at-mm-wandopts" id="at-mm-contigwrap" style="display:none;" title="Only select the connected region you click (off = every matching pixel in the tile)"><input type="checkbox" id="at-mm-wand-contig" checked> Contiguous</label>
-                        <button type="button" class="btn btn-secondary at-btn-sm" id="at-mm-fill" title="Select the whole tile for this layer">▦ Fill</button>
-                        <button type="button" class="btn btn-secondary at-btn-sm" id="at-mm-invert" title="Invert this layer's selection">⇄ Invert</button>
-                        <button type="button" class="btn btn-secondary at-btn-sm" id="at-mm-clear" title="Clear this layer's selection">✕ Clear</button>
-                        <label class="at-mm-feather" title="Soften this layer's selection edge (px)">Feather<input type="range" id="at-mm-feather" min="0" max="24" value="2"></label>
-                    </div>
+                    <!-- Toolbar is generated by buildMaskToolbar('at-mm', …) so this
+                         surface and the Height-map editor cannot drift apart. The ids
+                         it produces are the ones this panel always used. Feather is
+                         NOT part of the editor — it softens the finished layer mask at
+                         composite time, not the brush — so it rides in as extraHTML. -->
+                    <div class="at-mask-tools" id="at-mm-tools"></div>
                     <canvas id="at-mat-select" width="256" height="256" class="at-mm-canvas" style="touch-action:none;"></canvas>
                     <p class="sm-hint" id="at-mm-selhint">Select the area where the active layer's material applies.</p>
                 </div>

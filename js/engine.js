@@ -94,7 +94,14 @@ TRLE.Engine = (function() {
         const vert = TRLE.Shaders.vertex;
         const shaderNames = Object.keys(TRLE.Shaders).filter(k => k !== 'vertex');
         for (const name of shaderNames) {
-            const prog = _linkProgram(vert, TRLE.Shaders[name]);
+            /* A shader is normally a fragment source drawn over the shared
+               fullscreen quad. `{vert, frag}` is the escape hatch for one that
+               needs its own vertex stage -- pomPreview3D has to transform the quad
+               and hand the fragment stage a per-vertex view vector. */
+            const src = TRLE.Shaders[name];
+            const prog = (src && typeof src === 'object')
+                ? _linkProgram(src.vert, src.frag)
+                : _linkProgram(vert, src);
             if (prog) {
                 programs[name] = prog;
             } else {
@@ -203,6 +210,7 @@ TRLE.Engine = (function() {
                 if (value.length === 2) gl.uniform2fv(loc, value);
                 else if (value.length === 3) gl.uniform3fv(loc, value);
                 else if (value.length === 4) gl.uniform4fv(loc, value);
+                else if (value.length === 16) gl.uniformMatrix4fv(loc, false, value);
             }
         }
 
@@ -219,6 +227,245 @@ TRLE.Engine = (function() {
         gl.readPixels(0, 0, fboObj.width, fboObj.height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
         gl.bindFramebuffer(gl.FRAMEBUFFER, null);
         return pixels;
+    }
+
+    /* ---- Height-map geometry, from TombEngine's own parallax shader ----
+       POM marches the UV by POM_HEIGHT_SCALE (0.0035) over the ATLAS PAGE, divided
+       by the view's tangent-space Z which is clamped at POM_MIN_ANGLE (0.4)
+       -- Materials.hlsli:17-23, 143-150. Over a 4096 page (the minimum; Tomb Editor
+       takes the level's larger setting when set) that is 14.3px at a 45 degree view
+       and 35.8px at the grazing limit, against 8px of edge bleed.
+
+       The reach is an ABSOLUTE distance in page pixels, so the fraction of a TILE
+       that has to fade to white grows as the tile shrinks: 3.5% at 1024, 14% at 256,
+       and more than half a 64px tile -- which is why parallax does not survive on
+       small textures at all. See HEIGHT-MAP-AUDIT.md. */
+    const POM_REACH_PX = 0.0035 * 4096 / 0.4;      // 35.84
+    function heightEdgeBandFor(tileSize) {
+        return Math.max(0.03, Math.min(0.30, POM_REACH_PX / Math.max(1, tileSize)));
+    }
+
+    /* ---- Joint-aware band widths (the "bricks" edge profile) ----
+       A uniform white border slices whatever it lands on, which on a laid-brick or
+       cobble texture means half-eaten stones all the way round. This finds, for each
+       position along each edge, the first MORTAR LINE inward of it -- the darkest
+       row/column inside a search window -- and ends the fade there instead. The
+       whiteout then stops on a joint, which is where a real wall's texture would be
+       cut anyway.
+
+       Returns a `size x 4` RGBA texture: rows N, E, S, W, red channel holding the
+       local band as a fraction of `bandMax`.
+
+       Read off the UNBLURRED gray, at up to full resolution. Both matter and both
+       were wrong first time: mortar joints on a 256px brick texture are ~2px wide
+       and about 9px apart, so the height blur (2px) plus a half-resolution readback
+       flattened a 22-vs-78 luminance trough into nothing and the scan picked noise. */
+    function jointBandTexture(grayFBO, size, band, bandMax) {
+        const N = Math.min(256, size);
+        const small = createFBO(N, N);
+        blit('copy', { u_texture: grayFBO.texture }, small);
+        const px = readPixels(small);
+        deleteFBO(small);
+        /* Stay in GL space. readPixels is bottom-up and so is v_uv, so `y` here is
+           the shader's v_uv.y directly -- no flip. Flipping it here (the first
+           version did) silently swapped the N and S band maps and mirrored E and W,
+           which put every joint lookup on the wrong edge. */
+        const at = (x, y) => px[(y * N + x) * 4];
+
+        /* Never search shorter than the safe band -- the fade has to cover TEN's
+           reach whatever the texture looks like -- and never longer than bandMax. */
+        const lo = Math.max(1, Math.round(band * N));
+        const hi = Math.max(lo + 1, Math.min(N - 1, Math.round(bandMax * N)));
+        const out = new Uint8Array(N * 4 * 4);
+
+        /* Score each candidate depth by darkness AVERAGED ALONG THE EDGE, not by the
+           single darkest pixel under each position. A mortar course is a line: the
+           average finds it, while a per-pixel minimum finds whichever speck of grout
+           happens to be darkest and produces a sawtooth. The window is local rather
+           than the whole edge so staggered vertical joints (the E/W edges of a
+           brick bond) are still followed instead of averaged away. */
+        const scan = (row, sample) => {
+            const W = Math.max(1, Math.round(N / 10));
+            const best = new Int32Array(N).fill(lo);
+            const bestV = new Float32Array(N).fill(1e9);
+            const sumV = new Float32Array(N);       // for the "is there a joint at all" test
+            const line = new Float32Array(N);
+            let depths = 0;
+            for (let d = lo; d <= hi; d++) {
+                depths++;
+                for (let a = 0; a < N; a++) line[a] = sample(a, d);
+                let acc = 0, n = 0;
+                for (let a = 0; a <= Math.min(W, N - 1); a++) { acc += line[a]; n++; }
+                for (let a = 0; a < N; a++) {
+                    if (a > W) { acc -= line[a - W - 1]; n--; }
+                    if (a + W < N) { acc += line[a + W]; n++; }
+                    const v = acc / n;
+                    sumV[a] += v;
+                    if (v < bestV[a]) { bestV[a] = v; best[a] = d; }
+                }
+            }
+            for (let a = 0; a < N; a++) {
+                /* Only follow the trough when there IS one. On a coursed texture the
+                   dip is enormous (brick: 22 against a face mean of 78, a 72% dip);
+                   on irregular stone with no edge-parallel joints the profile drifts
+                   by a few percent and the "darkest" depth is arbitrary. Measured:
+                   without this, Stonetiles got a worse contour than plain smooth.
+                   Below the threshold we fall back to the nominal band, so choosing
+                   joint-aware can never be worse than not choosing it.
+
+                   0.25 is where the two behaviours actually separate, measured:
+                   Bricks dips 72%, Stonetiles (irregular, no coursed lines) 12%,
+                   Sand ~0. A real grout line is far darker than a quarter. */
+                const mean = sumV[a] / Math.max(1, depths);
+                const dip = (mean - bestV[a]) / Math.max(1, mean);
+                const d = dip > 0.25 ? best[a] / N : band;
+                const frac = Math.max(band, d) / bandMax;
+                out[(row * N + a) * 4] = Math.round(Math.max(0, Math.min(1, frac)) * 255);
+                out[(row * N + a) * 4 + 3] = 255;
+            }
+        };
+        // Rows are the shader's edge order: v_uv.y->0, v_uv.x->1, v_uv.y->1, v_uv.x->0.
+        scan(0, (x, d) => at(x, d));
+        scan(1, (y, d) => at(N - 1 - d, y));         // E
+        scan(2, (x, d) => at(x, N - 1 - d));         // S
+        scan(3, (y, d) => at(d, y));                 // W
+
+        return createTexture(N, 4, out, { filter: gl.LINEAR, wrap: gl.CLAMP_TO_EDGE });
+    }
+
+    /* ---- Percentiles of a framebuffer's red channel ----
+       Read back at 64x64 (16 KB) rather than full size: this runs once per tile per
+       generate, and generateMaps already reads every finished map back at full
+       resolution, so it is noise against what is already there.
+
+       Percentiles, not min/max: one white speck would otherwise decide where the
+       whole tile's surface plane sits. */
+    function fboPercentiles(fboObj, ps) {
+        const S = 64;
+        const small = createFBO(S, S);
+        blit('copy', { u_texture: fboObj.texture }, small);
+        const px = readPixels(small);
+        deleteFBO(small);
+        const v = new Uint8Array(S * S);
+        for (let i = 0; i < S * S; i++) v[i] = px[i * 4];
+        v.sort();
+        return ps.map(p => v[Math.min(S * S - 1, Math.max(0, Math.round(p * (S * S - 1))))] / 255);
+    }
+
+    /* ---- Live parallax preview ----
+       Renders `diffuse` as TombEngine's POM would sample it through `height`, at a
+       given view angle. Preview only -- it never touches an exported map -- but it
+       is the real shader's arithmetic, so what it shows (including a black bar at
+       the border) is what the engine will draw.
+
+       `tileSize` matters and is not cosmetic: the march is a fixed distance in
+       ATLAS-PAGE pixels, so the same height map eats a bigger share of a small
+       texture. */
+    function pomPreview(diffuseCanvas, heightCanvas, tileSize, viewDeg) {
+        const th = (viewDeg || 60) * Math.PI / 180;
+        const vXY = Math.sin(th), vZraw = Math.cos(th);
+        const vZ = Math.max(0.4, Math.min(1, vZraw));
+        const factor = Math.max(0, Math.min(1, (vZraw - 0.4) / 0.6));
+        const steps = Math.max(1, Math.ceil(16 + (1 - 16) * factor));
+        const reachPx = (vXY / vZ) * 0.0035 * 4096;
+        const S = Math.min(512, Math.max(64, tileSize));
+        const dTex = createTextureFromImage(diffuseCanvas, { wrap: gl.CLAMP_TO_EDGE });
+        const hTex = createTextureFromImage(heightCanvas, { wrap: gl.CLAMP_TO_EDGE });
+        const out = createFBO(S, S);
+        blit('pomPreview', {
+            u_diffuse: dTex, u_height: hTex,
+            u_reach: reachPx / Math.max(1, tileSize),
+            u_steps: steps,
+            u_padPx: 8 / Math.max(1, tileSize),
+            u_dir: 1.0
+        }, out);
+        const cv = fboToCanvas(out);
+        deleteFBO(out); deleteTexture(dTex); deleteTexture(hTex);
+        return cv;
+    }
+
+    /* ---- The same TombEngine march, on a surface you can turn ----------------
+       `pomPreview` above renders the wall face-on with one reach for the whole
+       image. This draws the quad in PERSPECTIVE and lets each fragment work out its
+       own tangent-space view vector, which is what TEN actually does -- so the
+       parallax strengthens toward the grazing end of the surface and eases off
+       head-on, in one picture, as it will in game.
+
+       Why not a displaced mesh (we already ship Babylon for the material preview):
+       TombEngine does not move geometry. It fakes depth per pixel, so a
+       parallax-mapped wall keeps a dead-flat silhouette and the relief collapses as
+       you rotate away from it. A displaced mesh shows bumpy edges and true
+       occlusion that the engine never draws -- it would look better and be wrong.
+       Nothing here needs the Tomb Engine renderer; the march IS TEN's.
+
+       yaw/pitch in degrees, dist in quad half-widths. */
+    function pomPreview3D(diffuseCanvas, heightCanvas, tileSize, opts) {
+        const o = Object.assign({ yaw: 38, pitch: 24, dist: 3.1, size: 420, light: 1 }, opts || {});
+        const S = Math.max(64, Math.min(768, o.size));
+        const yaw = o.yaw * Math.PI / 180, pitch = o.pitch * Math.PI / 180;
+        // Camera orbits the quad, which sits in the z = 0 plane spanning [-1,1].
+        const cam = [
+            Math.sin(yaw) * Math.cos(pitch) * o.dist,
+            Math.sin(pitch) * o.dist,
+            Math.cos(yaw) * Math.cos(pitch) * o.dist
+        ];
+        const mvp = _perspectiveLookAt(cam, [0, 0, 0], 42, 1, 0.05, 50);
+        const dTex = createTextureFromImage(diffuseCanvas, { wrap: gl.CLAMP_TO_EDGE });
+        const hTex = createTextureFromImage(heightCanvas, { wrap: gl.CLAMP_TO_EDGE });
+        const out = createFBO(S, S);
+        gl.clearColor(0, 0, 0, 1);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, out.fbo);
+        gl.viewport(0, 0, S, S);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        blit('pomPreview3D', {
+            u_diffuse: dTex, u_height: hTex,
+            u_mvp: mvp,
+            u_camPos: cam,
+            // POM_HEIGHT_SCALE over the atlas page, expressed in this tile's UVs --
+            // the same absolute reach the flat preview uses.
+            u_scale: 0.0035 * 4096 / Math.max(1, tileSize),
+            u_minAngle: 0.4,
+            u_steps: 24,
+            u_padPx: 8 / Math.max(1, tileSize),
+            u_light: o.light
+        }, out);
+        const cv = fboToCanvas(out);
+        deleteFBO(out); deleteTexture(dTex); deleteTexture(hTex);
+        return cv;
+    }
+
+    /* Column-major perspective * lookAt, just enough for the preview above. Kept
+       local rather than pulling in a matrix library -- CDN-only deps, and this is
+       twenty lines. */
+    function _perspectiveLookAt(eye, target, fovDeg, aspect, near, far) {
+        const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        const norm = a => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+        const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+        const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        const z = norm(sub(eye, target));
+        const x = norm(cross([0, 1, 0], z));
+        const y = cross(z, x);
+        const view = [
+            x[0], y[0], z[0], 0,
+            x[1], y[1], z[1], 0,
+            x[2], y[2], z[2], 0,
+            -dot(x, eye), -dot(y, eye), -dot(z, eye), 1
+        ];
+        const f = 1 / Math.tan(fovDeg * Math.PI / 360);
+        const nf = 1 / (near - far);
+        const proj = [
+            f / aspect, 0, 0, 0,
+            0, f, 0, 0,
+            0, 0, (far + near) * nf, -1,
+            0, 0, 2 * far * near * nf, 0
+        ];
+        const out = new Float32Array(16);
+        for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+            let v = 0;
+            for (let k = 0; k < 4; k++) v += proj[k * 4 + r] * view[c * 4 + k];
+            out[c * 4 + r] = v;
+        }
+        return out;
     }
 
     /* ---- Convert FBO to Canvas (for display/download) ---- */
@@ -487,35 +734,109 @@ TRLE.Engine = (function() {
             u_alphaFlatten: flatten ? 1.0 : 0.0
         }, grayFBO);
 
-        // Step 2: Blur grayscale for height base
-        const heightBlurred = gaussianBlur(grayFBO.texture, width, height, preset.heightBlur);
+        /* Step 2: what the relief is READ FROM, then blur it.
+
+           Normally that is the tile's own luminance. `preset.heightSource` swaps in
+           a colour / hue SELECTION instead, so the mortar can carve in while the
+           stones stay flat -- which luminance cannot express on a texture whose
+           stones are darker than its joints. It reuses the emissiveMask shader
+           rather than adding one, and the selection (1 where matched) is turned the
+           right way up by simpleHeight's EXISTING u_invert, XOR'd with the user's
+           own "which side sinks" choice. Zero new GLSL, zero new uniforms. */
+        let heightBase = grayFBO, heightSelFBO = null;
+        let heightInvert = !!preset.heightInvert;
+        const hSrc = preset.heightSource;
+        if (enabledMaps.height && hSrc && typeof hSrc.mode === 'number') {
+            heightSelFBO = createFBO(width, height);
+            blit('emissiveMask', {
+                u_texture:   diffuseTexture,
+                u_mode:      hSrc.mode,
+                u_threshold: 0.5,
+                u_softness:  hSrc.softness != null ? hSrc.softness : 0.3,
+                u_target:    hSrc.target || [1, 1, 1],
+                u_tolerance: hSrc.tolerance != null ? hSrc.tolerance : 0.25,
+                u_hueCenter: hSrc.hueCenter != null ? hSrc.hueCenter : 0.08,
+                u_hueWidth:  hSrc.hueWidth != null ? hSrc.hueWidth : 0.08,
+                u_satMin:    hSrc.satMin != null ? hSrc.satMin : 0.3,
+                u_valMin:    hSrc.valMin != null ? hSrc.valMin : 0.2
+            }, heightSelFBO);
+            heightBase = heightSelFBO;
+            // The selection reads as "this is the thing", and the thing carves IN
+            // by default -- so the default for a selection is the inverted sense.
+            heightInvert = !heightInvert;
+        }
+        const heightBlurred = gaussianBlur(heightBase.texture, width, height, preset.heightBlur);
 
         // Step 3: Create height map
         if (enabledMaps.height) {
+            const strength = preset.heightStrength / 25.0;
+            const invert = heightInvert;
+            /* Where the surface plane sits. The shader slides the whole map so its
+               98th percentile lands on `top`; measure that percentile here, on the
+               blurred gray, and push it through the same affine the shader applies.
+               Order-preserving, so no second render pass is needed -- and under
+               inversion the high end comes from the LOW percentile. */
+            const [p02, p98] = fboPercentiles(heightBlurred, [0.02, 0.98]);
+            const scaled = v => (v - 0.5) * strength + 0.5;
+            const ref = invert ? 1.0 - scaled(p02) : scaled(p98);
+            const top = (typeof preset.heightTop === 'number') ? preset.heightTop : 1.0;
+
             const heightFBO = createFBO(width, height);
             blit('simpleHeight', {
                 u_texture: heightBlurred.texture,
-                u_strength: preset.heightStrength / 25.0,
-                u_bias: 0.0,
-                u_invert: 0.0
+                u_strength: strength,
+                u_ref: ref,
+                u_top: top,
+                u_invert: invert ? 1.0 : 0.0
             }, heightFBO);
-            // Optional seamless edges: feather the border toward a wrap-blurred
-            // copy so the height (parallax) doesn't cliff at the repeat seam.
-            if (preset.heightSeamless) {
-                const band = (typeof preset.heightSeamlessBand === 'number') ? preset.heightSeamlessBand : 0.12;
-                const radius = Math.max(4, band * Math.max(width, height));
-                const blurred = gaussianBlur(heightFBO.texture, width, height, radius);
-                const feathered = createFBO(width, height);
-                blit('edgeFeather', {
-                    u_sharp: heightFBO.texture,
-                    u_blurred: blurred.texture,
-                    u_band: band
-                }, feathered);
-                deleteFBO(blurred);
+
+            /* A painted raise/lower, if the tile carries one. Deliberately BEFORE the
+               white border: a stroke near the edge must not be able to punch a hole
+               in it and hand the march its way back out of the texture. */
+            let heightSrc = heightFBO;
+            const paint = preset.heightPaint;
+            if (paint && paint.mask && Math.abs(paint.lift || 0) > 0.001) {
+                const mTex = createTextureFromImage(paint.mask, { wrap: gl.CLAMP_TO_EDGE });
+                const painted = createFBO(width, height);
+                blit('heightPaint', {
+                    u_texture: heightFBO.texture, u_mask: mTex, u_lift: paint.lift
+                }, painted);
+                deleteTexture(mTex);
                 deleteFBO(heightFBO);
-                results.height = feathered;
+                heightSrc = painted;
+            }
+
+            /* Fade the border to white so TEN's parallax cannot march out of the
+               texture's own box in the atlas page. On by default: the height map is
+               measurably wrong for TEN without it (HEIGHT-MAP-AUDIT.md), and the
+               band it needs is a property of the tile size, not a taste setting. */
+            const edge = preset.heightEdge;
+            const amount = edge && typeof edge.amount === 'number' ? edge.amount : 1.0;
+            if (amount > 0.001) {
+                const band = (edge && typeof edge.band === 'number')
+                    ? edge.band : heightEdgeBandFor(Math.min(width, height));
+                const profile = (edge && typeof edge.profile === 'number') ? edge.profile : 0;
+                const bandMax = Math.min(0.45, band * 2.2);
+                const jointTex = (profile === 4)
+                    ? jointBandTexture(grayFBO, Math.min(width, height), band, bandMax) : null;
+                const white = createFBO(width, height);
+                blit('heightEdgeWhite', {
+                    u_texture: heightSrc.texture,
+                    u_bandMap: jointTex || heightSrc.texture,   // unused when off, but must bind
+                    u_useBandMap: jointTex ? 1.0 : 0.0,
+                    u_band: band,
+                    u_bandMax: bandMax,
+                    u_amount: amount,
+                    u_profile: profile,
+                    u_edges: (edge && typeof edge.edges === 'number') ? edge.edges : 15,
+                    u_seed: (edge && typeof edge.seed === 'number') ? edge.seed : 0,
+                    u_texel: 1.0 / Math.max(1, Math.min(width, height))
+                }, white);
+                if (jointTex) deleteTexture(jointTex);
+                deleteFBO(heightSrc);
+                results.height = white;
             } else {
-                results.height = heightFBO;
+                results.height = heightSrc;
             }
         }
 
@@ -556,10 +877,18 @@ TRLE.Engine = (function() {
             } else {
                 // Single-pass path (default, unchanged).
                 const normalHeightFBO = createFBO(width, height);
+                /* u_ref == u_top means "no plane shift": this is the normal path's
+                   internal height, not an exported one. Both MUST be passed even
+                   though the difference is zero -- blit() leaves uniforms set on the
+                   program, so omitting them inherits whatever the exported height
+                   map set a moment earlier, and the normal map silently changes
+                   depending on whether Height happened to be ticked. That is exactly
+                   the regression validate-multilevel-normal caught. */
                 blit('simpleHeight', {
                     u_texture: normalBlurred.texture,
                     u_strength: 1.0,
-                    u_bias: 0.0,
+                    u_ref: 0.0,
+                    u_top: 0.0,
                     u_invert: 0.0
                 }, normalHeightFBO);
 
@@ -582,10 +911,12 @@ TRLE.Engine = (function() {
         // The shader now uses max-per-direction to keep shadows sharp.
         if (enabledMaps.ao) {
             const aoHeightFBO = createFBO(width, height);
+            // Same as above: no plane shift, and both uniforms set explicitly.
             blit('simpleHeight', {
                 u_texture: grayFBO.texture,
                 u_strength: 1.0,
-                u_bias: 0.0,
+                u_ref: 0.0,
+                u_top: 0.0,
                 u_invert: 0.0
             }, aoHeightFBO);
 
@@ -663,6 +994,7 @@ TRLE.Engine = (function() {
 
         // Cleanup temporary FBOs
         deleteFBO(grayFBO);
+        if (heightSelFBO) deleteFBO(heightSelFBO);   // the colour/hue height source
         deleteFBO(heightBlurred);
         deleteFBO(normalBlurred);
 
@@ -894,6 +1226,12 @@ TRLE.Engine = (function() {
         poissonBlend,
         inpaintDiffusion,
         generateMaps,
+        // The safe white-edge band for a tile size, so the UI can default and advise
+        // from the same number the pipeline uses.
+        heightEdgeBandFor,
+        POM_REACH_PX,
+        pomPreview,
+        pomPreview3D,
         emissiveFromDiffuse,
         loadImageAsTexture,
         canvasToBlob,

@@ -204,9 +204,9 @@
         {
             id: 'height', icon: '⬆️', title: 'Height / Parallax (real depth)',
             what: `Where a normal map <em>fakes</em> bumps, a <strong>height</strong> map drives real <strong>parallax</strong>. High points actually shift in front of low ones as the camera moves, so mortar joints genuinely look recessed. It’s the most convincing depth you can get, and also the most expensive.`,
-            derive: `Same brightness-as-elevation reading as the normal map, just written out as grayscale (white is high, black is low). <strong>Height Blur</strong> smooths the source first so you get clean relief instead of pixel jitter.`,
+            derive: `Same brightness-as-elevation reading as the normal map, written out as grayscale. <strong>White is the polygon surface</strong> and darker is deeper, because Tomb Engine's parallax only carves <em>in</em> — nothing is ever pushed out in front of the wall. The tool puts the texture's high points on white for you, so the whole depth range goes on relief instead of sinking the surface. <strong>Height Blur</strong> smooths the source first so you get clean relief instead of pixel jitter.`,
             sliders: [
-                ['Height Strength', 'how deep the parallax pushes.'],
+                ['Height Strength', 'how far the recesses sit below the surface.'],
                 ['Height Blur', 'smooths the source first so the relief isn’t noisy.']
             ],
             tuning: [
@@ -214,7 +214,7 @@
                 ['Wood planks / tile', 'moderate, just enough to sink the joints.'],
                 ['Sand / fabric / smooth surfaces', 'low. There’s barely any real relief, and parallax on fine noise makes the surface look like it’s swimming.']
             ],
-            tip: `Height is GPU-heavy in Tomb Engine, since every pixel does extra samples. Use it on a handful of hero textures per level rather than the whole atlas, and keep <strong>Seamless height edges</strong> ticked so a tiling texture doesn’t show a parallax “cliff” where it repeats. The tool warns you if you switch it on atlas-wide.`
+            tip: `Height costs more than framerate. It is GPU-heavy, and it also switches <strong>SSAO off</strong> for that material and disables <strong>decals</strong> — bullet holes, explosion marks — on it. Use it on a handful of hero textures per level rather than the whole atlas. Leave <strong>Fade height edges to white</strong> ticked: parallax marches the UV out of the texture's own box in the atlas page, and a white border is what stops the black bars along texture edges. For per-texture control of the fade — and a preview of the real in-engine shader — use <strong>🏔️ Make Height Map</strong> from the right-click menu.`
         },
         {
             id: 'transparency', icon: '🕳️', title: 'Transparency (fences, grates, foliage)',

@@ -921,6 +921,66 @@ window.TRLE = window.TRLE || {};
                         lerp(hash(xi, yi + 1), hash(xi + 1, yi + 1), u), v);
         };
     }
+    /* ---- Stamp alpha (the mask editor's Stamp tool) -------------------------
+       Pencil and Brush were byte-identical at the shipped Hardness, so one of the
+       two buttons was doing nothing. Rather than delete a tool, Stamp is the one
+       that earns its place: a single click lays an irregular blob instead of a
+       disc, which is what moss, rubble, lichen, rust and pitting actually want.
+
+       The contour is polar -- r(theta) = 1 + roughness * fbm(cos, sin) -- and it is
+       periodic in theta FOR FREE, because sampling a closed circle in the 2D noise
+       field returns to where it started. A 1D noise over theta would need its
+       lattice to divide 2*PI or every stamp would have a seam at 3 o'clock.
+
+       NOT periodic over the tile, and that is deliberate: a stamp is a local mark,
+       like every brush stroke here. `size` is the diameter in mask pixels.
+       `seed` makes a given click reproducible while ten clicks stay ten shapes. */
+    const MASK_STAMP_SEGMENTS = 96;
+    function buildStampAlpha(size, roughness, seed) {
+        const S = Math.max(4, Math.ceil(size));
+        const cv = document.createElement('canvas'); cv.width = cv.height = S;
+        const ctx = cv.getContext('2d');
+        const noise = makeValueNoise(seed >>> 0);
+        /* Steep amplitude falloff (0.35, not 0.5) so the detail octaves stay
+           SUBORDINATE to the big lobes. At 0.5 the third octave is loud enough to
+           dominate, and the contour reads as fur rather than as a shape. */
+        const fbm = (x, y) => {
+            let amp = 1, f = 1, sum = 0, norm = 0;
+            for (let i = 0; i < 3; i++) { sum += amp * noise(x * f, y * f); norm += amp; amp *= 0.35; f *= 2.3; }
+            return sum / norm - 0.5;
+        };
+        /* The radius of the loop we sample in noise space, which sets HOW MANY
+           lobes go round the contour -- not how deep they are. Keep it low: a few
+           big lobes is moss and rubble, and that is what the tool is for. An
+           earlier version ran this to 5.6 and multiplied it again through the
+           octaves, and every rough stamp came out a starburst. Depth is `amp`
+           below, which is the knob Roughness should actually be turning. */
+        const lobes = 1.25 + roughness * 1.35;
+        const amp = roughness * 0.52;
+        const raw = [];
+        let maxR = 0;
+        for (let i = 0; i < MASK_STAMP_SEGMENTS; i++) {
+            const a = i / MASK_STAMP_SEGMENTS * Math.PI * 2;
+            const r = 1 + amp * fbm(Math.cos(a) * lobes + 13.7, Math.sin(a) * lobes + 7.1) * 2;
+            raw.push([a, r]);
+            if (r > maxR) maxR = r;
+        }
+        /* NORMALISE to the canvas, don't trust the radius to stay inside it. A
+           contour reaching r = 1.37 against a fixed 0.46*S scale lands at 0.63*S
+           from the centre, i.e. outside a canvas whose half-width is 0.5*S -- and
+           the clip is straight, so every rough stamp came out as a blurry SQUARE.
+           Scaling by the measured maximum also makes Size mean the same extent
+           whatever Roughness is set to. */
+        const k = (S * 0.48) / Math.max(0.001, maxR);
+        const pts = raw.map(([a, r]) => [S / 2 + Math.cos(a) * r * k, S / 2 + Math.sin(a) * r * k]);
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+        ctx.closePath();
+        ctx.fill();
+        return cv;
+    }
+
     /* Build an organic grayscale mask (white = overlay shows).
        opts: { seed, scale (0..1, larger = bigger patches), coverage (0..1
        overlay fraction), roughness (0..1 edge raggedness), edgeSafe (fade to
@@ -1804,7 +1864,7 @@ window.TRLE = window.TRLE || {};
         const alphaFlatten = canvasHasAlpha(diffuseCanvas);   // once, not per layer
         const genLayer = (layer) => {
             const preset = Object.assign({}, presetFromMaterial(layer.material),
-                { flipNormalY: state.flipNormalY, heightSeamless: heightSeamlessOn(), alphaFlatten });
+                Object.assign({ flipNormalY: state.flipNormalY, alphaFlatten }, heightPresetOverrides(null)));
             const maps = TRLE.Engine.generateMaps(tex, S, S, preset, enabledMaps);
             const out = {};
             for (const mt of TRLE.MapOrder) if (maps[mt]) { out[mt] = TRLE.Engine.fboToCanvas(maps[mt]); TRLE.Engine.deleteFBO(maps[mt]); }
@@ -1823,83 +1883,864 @@ window.TRLE = window.TRLE || {};
         return result;
     }
 
-    /* ============ REUSABLE MASK BRUSH (Phase 5) ============
-       Wires pointer painting on a display canvas into an offscreen grayscale
-       mask canvas (white = paint, black = erase). Generic so the Phase-6 heal
-       tool can reuse it. opts: { active, brushSize, erase, onPaint }. */
-    function attachMaskBrush(displayCanvas, maskCanvas, opts) {
-        let drawing = false, lastX = 0, lastY = 0;
+    /* ============ SHARED MASK EDITOR ============
+       One selection/paint surface for every modal that has one. Before this there
+       were TWO implementations and neither had undo:
 
-        const pos = (ev) => {
-            const r = displayCanvas.getBoundingClientRect();
-            return [
-                (ev.clientX - r.left) / r.width  * maskCanvas.width,
-                (ev.clientY - r.top)  / r.height * maskCanvas.height
-            ];
+         - attachMaskBrush (deleted): size + erase, and hardness in exactly one of
+           its five call sites. No shapes, no wand, no undo.
+         - multi-material: the full brush/lasso/rect/ellipse/wand toolkit, welded to
+           the matMulti globals so nothing else could reach it.
+
+       All SEVEN surfaces now run on this one: multi-material, Make Emissive, Heal,
+       Fade, De-light, the transition custom mask and Make Height Map.
+
+       createMaskEditor owns the interaction and the history; the caller still owns
+       DRAWING the display canvas (every modal composites its mask differently) and
+       calls drawOverlay() at the end of its own render to get the lasso outline and
+       the rubber band. buildMaskToolbar generates the controls so a fourth surface
+       is a function call rather than another hand-copied block of markup — the same
+       reason readOrgPanel exists.
+
+       Two mask conventions are in use and both are supported via `mode`:
+         'alpha' — selection masks (multi-material). Erase is destination-out.
+         'luma'  — black/white masks (emissive, heal, fade, de-light). Erase paints
+                   BLACK, so a soft erase leaves a grey edge rather than a hole.
+       ------------------------------------------------------------------------- */
+
+    /* Undo depth is capped by BYTES, not by entries: a 256² mask snapshot is 256 KB
+       but a 1024² one is 4 MB, so a flat "20 steps" would be 80 MB on a big atlas.
+       MASK_UNDO_MIN guarantees a usable stack however large the tile is. */
+    const MASK_UNDO_BUDGET = 32 * 1024 * 1024;
+    const MASK_UNDO_MIN = 4;
+    const MASK_UNDO_MAX = 24;
+
+    /* [id, label, title, hint] — order is the order they appear in the toolbar.
+       The HINT is shown in the toolbar's own `<prefix>-toolhint` line and is written by
+       setTool. Before this there was exactly one per-tool hint in the whole tool --
+       multi-material's `#at-mm-selhint` -- and it was STALE: mmSetTool is the only
+       thing that wrote it and is called once, from mmEnable, because the shared
+       editor wires the tool buttons straight to ed.setTool. Measured with Lasso
+       active, it still read "Paint where Layer 1 applies". Hence opts.onTool. */
+    const MASK_TOOLS = [
+        ['brush',   '🖌 Brush',   'Freehand; raise Edge softness to feather the stroke',
+                    'Drag to paint. <strong>Edge softness</strong> feathers the stroke — 0% is a crisp edge. Hold Alt to erase.'],
+        ['stamp',   '🪨 Stamp',   'Lays an irregular blob instead of a disc — moss, rubble, rust, pitting',
+                    'Click to lay a blob, or drag to scatter a run of them. Every one is a different shape.'],
+        ['lasso',   '🪢 Lasso',   'Click for straight corners, or drag to trace freehand; closes and fills',
+                    'Click to place corners, or drag to trace freehand. Click the start dot, or press Enter, to close and fill.'],
+        ['rect',    '▭ Rect',     'Drag a rectangle',
+                    'Drag a rectangle. Hold Alt to cut one out.'],
+        ['ellipse', '⬭ Ellipse',  'Drag an ellipse',
+                    'Drag an ellipse. Hold Alt to cut one out.'],
+        ['wand',    '🪄 Wand',    'Click a colour to select similar pixels (bricks, door, …)',
+                    'Click a colour to select it. <strong>Shift</strong>+click adds a region, <strong>Alt</strong>+click removes one. Untick <strong>Only the patch I click</strong> to take that colour everywhere.']
+    ];
+    const MASK_FREEHAND = new Set(['brush', 'stamp']);
+    /* Tools whose dab is a SMOOTH disc, so a stroke is interpolated between
+       samples. Stamp is deliberately not one: it places discrete marks. */
+    const MASK_CONTINUOUS = new Set(['brush']);
+    /* The edge control is EDGE SOFTNESS, not "Hardness": 0 is the crisp edge the
+       old Pencil tool drew, 100 is fully feathered. Renamed and inverted because
+       "Hardness" sat in a run with "Value" and "Master strength" and users read all
+       three as flavours of how-strong -- naming it after the edge is what stops
+       that. The slider's element id stays `-hardness` so nothing that looked it up
+       breaks; only the label, the scale and the default changed.
+
+       Ships at 0 (crisp). Pencil and Brush used to be separate buttons with
+       hardness() forced to 1 for Pencil -- i.e. Pencil WAS Brush at the hard end --
+       so with Pencil gone this default is what preserves its behaviour. */
+    const MASK_SOFT_DEFAULT = 0;
+    /* Wand tolerance is a fraction of the FULL RGB diagonal (441.673), so the old
+       default of 28 was a radius of 124 -- measured at 99.5% of Bricks.png on the
+       FIRST click, and 9/9 Examples textures saturated past 90%.
+
+       8 was picked by sweeping 4..28 over every Examples/ texture, five click
+       points each, contiguous (the shipped setting), and taking the median
+       first-click coverage:
+
+           tol        4     6     8    10    12    15    20    28
+           median   1.2  12.4  20.0  37.3  69.8  82.0  91.5  98.8
+           >90%     0/9   0/9   1/9   3/9   3/9   3/9   5/9   9/9
+
+       8 is the only value whose median lands in a usable 15-35% band. It is
+       deliberately on the conservative side: under-selecting is recoverable by
+       dragging the slider up and watching the selection grow, whereas a first
+       click that takes the whole tile reads as broken. A default cannot serve
+       both Bricks (high contrast, 0.4% here) and Grass (fine and low contrast,
+       floods at any tolerance). */
+    const MASK_TOL_DEFAULT = 8;
+
+    /* Build the toolbar for a mask editor into `container`, with every control id
+       prefixed. Multi-material's original hand-written ids are exactly this scheme
+       with prefix 'at-mm', so converting it keeps every id (and its validator).
+
+       opts.tools     — subset of MASK_TOOLS ids, in MASK_TOOLS order. Default: all.
+       opts.actions   — subset of ['fill','invert','clear']. Default: all.
+       opts.hardness  — false to omit the Hardness slider.
+       opts.brushMax  — top of the size slider (default 80).
+       opts.value     — true to add the Value slider (paint at an intensity). LUMA
+                        surfaces only; see createMaskEditor's compositing note.
+       opts.extraHTML — appended after the actions, for per-surface controls that
+                        are not part of the editor (multi-material's layer Feather).
+
+       LAYOUT: buttons first, then a SLIDER GRID, then the hint line. The sliders
+       used to be inline `<label>`s wedged between the button runs, which measured
+       an 84px track against the 164px a `.form-group` slider gets in the same
+       modal, a 10.08px label against 11.2px, and NO value readout at all -- the
+       only sliders in these modals that would not tell you their own value. The
+       toolbar wrapped to two rows (61px) largely because they were in it, so
+       promoting them is close to height-neutral; see MASK-EDITOR-PLAN.md. */
+    function buildMaskToolbar(container, prefix, opts) {
+        opts = opts || {};
+        const tools = MASK_TOOLS.filter(t => !opts.tools || opts.tools.includes(t[0]));
+        const actions = opts.actions || ['fill', 'invert', 'clear'];
+        const seg = tools.map(([id, label, title], i) =>
+            `<button type="button" class="at-seg${i === 0 ? ' active' : ''}" id="${prefix}-tool-${id}" data-tool="${id}" title="${title}">${label}</button>`).join('');
+        const actionLabels = {
+            fill:   ['▦ Fill',   'Select the whole tile'],
+            invert: ['⇄ Invert', 'Invert the selection'],
+            clear:  ['✕ Clear',  'Clear the selection']
         };
-        const radiusPx = () => {
-            const r = displayCanvas.getBoundingClientRect();
-            return Math.max(1, opts.brushSize() * (maskCanvas.width / r.width));
-        };
-        /* hardness: 1 = the original hard-edged disc, 0 = fully feathered. Optional,
-           and absent means 1, so callers that never asked for a soft brush (De-light's
-           shadow mask) keep drawing exactly the discs they always did.
-           The mask is a black/white canvas, so "erase" is painting black rather than
-           clearing to transparent -- which is what lets a soft erase leave a grey
-           (partial) edge instead of a hole punched in the selection. */
-        const dab = (x, y, radius) => {
-            const ctx = maskCanvas.getContext('2d');
-            ctx.globalCompositeOperation = 'source-over';
-            const erase = opts.erase();
-            const h = opts.hardness ? Math.max(0, Math.min(1, opts.hardness())) : 1;
-            if (h >= 0.999) {
-                ctx.fillStyle = erase ? '#000' : '#fff';
-            } else {
-                const rgb = erase ? '0,0,0' : '255,255,255';
-                const g = ctx.createRadialGradient(x, y, radius * h, x, y, radius);
-                g.addColorStop(0, `rgba(${rgb},1)`);
-                g.addColorStop(1, `rgba(${rgb},0)`);
-                ctx.fillStyle = g;
+        const actionBtns = actions.map(a =>
+            `<button type="button" class="btn btn-secondary at-btn-sm" id="${prefix}-${a}" title="${actionLabels[a][1]}">${actionLabels[a][0]}</button>`).join('');
+        /* One slider row. `wrapId` is what setTool shows/hides, and it keeps the
+           id the inline `<label>` carried so nothing that looked it up breaks. */
+        const slider = (wrapId, label, id, min, max, val, unit, title, hidden, cls) => `
+            <div class="form-group at-mask-slider${cls ? ' ' + cls : ''}" id="${prefix}-${wrapId}"${hidden ? ' style="display:none;"' : ''}${title ? ` title="${title}"` : ''}>
+                <label for="${prefix}-${id}">${label} — <span id="${prefix}-${id}-val">${val}</span>${unit}</label>
+                <input type="range" id="${prefix}-${id}" min="${min}" max="${max}" value="${val}">
+            </div>`;
+        container.innerHTML = `
+            <div class="at-mask-btns">
+                <div class="at-seg-group at-mask-toolgroup">${seg}</div>
+                <div class="at-seg-group">
+                    <button type="button" class="at-seg active" id="${prefix}-paint" data-mask-mode="paint" aria-pressed="true" title="Add to the selection">🖌️ Paint</button>
+                    <button type="button" class="at-seg" id="${prefix}-erase" data-mask-mode="erase" aria-pressed="false" title="Take away from the selection (or hold Alt)">🧽 Erase</button>
+                </div>
+                <label class="at-mask-opt" id="${prefix}-contigwrap" style="display:none;" title="On: only the patch you click. Off: every pixel of that colour anywhere in the tile."><input type="checkbox" id="${prefix}-wand-contig" checked> Only the patch I click</label>
+                ${actionBtns}
+                <span class="at-mask-undo">
+                    <button type="button" class="btn btn-secondary at-btn-sm" id="${prefix}-undo" title="Undo (Ctrl+Z)" disabled>↶</button>
+                    <button type="button" class="btn btn-secondary at-btn-sm" id="${prefix}-redo" title="Redo (Ctrl+Shift+Z)" disabled>↷</button>
+                </span>
+                ${opts.extraHTML || ''}
+            </div>
+            <div class="at-mask-sliders">
+                ${/* FIRST and full width, whatever tool is active. It is the one
+                      control that means the same thing for every tool, so it must
+                      not shuffle position and change size as you switch between
+                      them -- with Brush it shared a row and with Lasso it became a
+                      full-width bar on its own, which read as two different
+                      controls. `at-mask-wide` spans the grid. */ ''}
+                ${opts.value ? slider('valuewrap', opts.value, 'value', 1, 100, 100, '%',
+                    `How much ${opts.value.toLowerCase()} this stroke lays down. Paint one area weaker than another.`,
+                    false, 'at-mask-wide') : ''}
+                ${slider('brushwrap', 'Brush size', 'brush', 2, opts.brushMax || 80, 18, ' px', 'How wide the brush is, in screen pixels')}
+                ${opts.hardness === false ? '' :
+                  slider('hardwrap', 'Edge softness', 'hardness', 0, 100, MASK_SOFT_DEFAULT, '%', '0% is a crisp edge; raise it to feather the stroke')}
+                ${slider('roughwrap', 'Roughness', 'rough', 0, 100, 55, '%', 'How ragged the blob is — 0 is a dented disc, 100 is a clump', true)}
+                ${slider('scatterwrap', 'Scatter', 'scatter', 0, 100, 35, '%', 'How far apart dragged stamps land', true)}
+                ${slider('wandwrap', 'Tolerance', 'tol', 2, 100, MASK_TOL_DEFAULT, '%', "How close a pixel's colour must be to the one you click", true)}
+            </div>
+            <div class="sm-hint at-mask-hint" id="${prefix}-toolhint"></div>`;
+        maskToolbarIdGuard(container, prefix);
+    }
+
+    /* Every generated control is looked up by `${prefix}-<suffix>` through
+       getElementById, which returns the FIRST match in the document -- so a
+       surface whose own markup already owns one of those ids silently steals it.
+       Three shipped bugs were found this way, all of them invisible:
+
+         at-fade-hardness / at-tr-hardness — the modal's own edge-hardness slider
+           is declared before the toolbar, so the BRUSH's Hardness slider read it
+           instead. Measured: the toolbar slider sat at 60 while hardness() was
+           reading the shape slider's 0, i.e. the brush was permanently at its
+           softest in both modals and its own slider did nothing.
+         at-hg-invert — the Height recipe's "Invert (dark is high)" checkbox took
+           the toolbar's ⇄ Invert button's id, so ticking it also inverted the
+           PAINT MASK, and the Invert button itself was dead.
+         at-heal-hint — Heal's method explanation took the tool hint's id.
+
+       This is the same failure as the documented `${prefix}-paint`/canvas
+       collision. Cheap to check, so check it rather than rely on remembering. */
+    function maskToolbarIdGuard(container, prefix) {
+        container.querySelectorAll('[id]').forEach(el => {
+            if (document.querySelectorAll(`[id="${el.id}"]`).length > 1) {
+                console.warn(`[mask editor] duplicate id "${el.id}" — the ${prefix} toolbar`
+                    + ' will resolve it to whichever element comes first. Rename the'
+                    + " surface's own element, not the toolbar's.");
             }
-            ctx.beginPath();
-            ctx.arc(x, y, radius, 0, Math.PI * 2);
-            ctx.fill();
+        });
+    }
+
+    /* Wire a display canvas to a mask. Returns a controller; see the header above.
+
+       opts.canvas      — the display canvas the user interacts with
+       opts.getMask     — () => canvas|null. Null refuses interaction (multi-material's
+                          Base layer has no paintable mask) via opts.onNoMask.
+       opts.getSource   — () => canvas|null, the DIFFUSE the wand samples colours from
+       opts.mode        — 'alpha' (default) | 'luma'
+       opts.active      — () => bool, e.g. "this modal is open and on the right tab"
+       opts.onChange    — after every mutation; cheap redraw only
+       opts.onStrokeEnd — after a stroke/shape/wand completes; the expensive work
+       opts.onNoMask    — called instead of painting when getMask() returns null   */
+    function createMaskEditor(prefix, opts) {
+        const id = s => $(prefix + '-' + s);
+        const ed = {
+            tool: 'brush', erase: false, altErase: false, wandAdd: false, cursor: null, overCanvas: false,
+            lassoPts: [], drag: { active: false, x0: 0, y0: 0, x1: 0, y1: 0 },
+            undo: [], redo: []
         };
-        const strokeTo = (x, y) => {
+        const mode = opts.mode || 'alpha';
+        const num = (s, d) => { const e = id(s); return e ? (parseInt(e.value, 10) || 0) : d; };
+        const erasing = () => ed.erase !== ed.altErase;   // Alt momentarily inverts
+
+        /* ---- history ------------------------------------------------------
+           Snapshots are taken BEFORE a mutation and live only as long as the
+           modal. They are never written to a project file or an autosave
+           snapshot — buildProjectData serialises el.matLayers[].mask, not this. */
+        const snapBytes = im => im.data.length;
+        const trim = stack => {
+            let bytes = stack.reduce((a, s) => a + snapBytes(s), 0);
+            while (stack.length > MASK_UNDO_MIN &&
+                   (stack.length > MASK_UNDO_MAX || bytes > MASK_UNDO_BUDGET)) {
+                bytes -= snapBytes(stack.shift());
+            }
+        };
+        const grab = () => {
+            const m = opts.getMask();
+            return m ? m.getContext('2d').getImageData(0, 0, m.width, m.height) : null;
+        };
+        const put = im => {
+            const m = opts.getMask();
+            if (m && im) m.getContext('2d').putImageData(im, 0, 0);
+        };
+        /* Call before any mutation. Taking the snapshot also kills the redo
+           branch, which is what every undo stack does after a fresh edit. */
+        ed.snapshot = () => {
+            const im = grab();
+            if (!im) return;
+            ed.undo.push(im);
+            ed.redo.length = 0;
+            trim(ed.undo);
+            ed.syncButtons();
+        };
+        ed.resetHistory = () => { ed.undo.length = 0; ed.redo.length = 0; ed.syncButtons(); };
+        ed.canUndo = () => ed.undo.length > 0;
+        ed.canRedo = () => ed.redo.length > 0;
+        ed.syncButtons = () => {
+            const u = id('undo'), r = id('redo');
+            if (u) u.disabled = !ed.canUndo();
+            if (r) r.disabled = !ed.canRedo();
+        };
+        ed.doUndo = () => {
+            if (!ed.undo.length || !opts.getMask()) return false;
+            const cur = grab();
+            put(ed.undo.pop());
+            if (cur) { ed.redo.push(cur); trim(ed.redo); }
+            ed.lassoPts = []; ed.cursor = null;
+            ed.syncButtons(); opts.onChange(); if (opts.onStrokeEnd) opts.onStrokeEnd();
+            return true;
+        };
+        ed.doRedo = () => {
+            if (!ed.redo.length || !opts.getMask()) return false;
+            const cur = grab();
+            put(ed.redo.pop());
+            if (cur) { ed.undo.push(cur); trim(ed.undo); }
+            ed.lassoPts = []; ed.cursor = null;
+            ed.syncButtons(); opts.onChange(); if (opts.onStrokeEnd) opts.onStrokeEnd();
+            return true;
+        };
+
+        /* ---- painting -----------------------------------------------------
+           The two mask conventions differ only here. 'alpha' erases with
+           destination-out; 'luma' paints black, so a soft erase leaves grey
+           instead of punching a hole in an opaque mask.
+
+           VALUE (opts.value, luma surfaces only) is what unhooks the global
+           Strength/Lift from what has already been painted. Nothing downstream
+           changes: `emissiveApply` already does `src * m * u_strength` and
+           `heightPaint` already does `h + u_lift * m`, both CONTINUOUS in the
+           mask, so a grey pixel has always meant a weaker result -- there was
+           just no way to paint one. Measured before this: dropping Strength from
+           100 to 35 to paint a dimmer second blob took the FIRST blob from 68.0
+           to 23.8 as well, and the two could never differ.
+
+           The composite op is the whole trick. At Value 100 it stays source-over
+           with #fff, byte-identical to before. Below 100 it switches to LIGHTEN,
+           because a stroke is a run of overlapping dabs: with source-over at 35%
+           a second dab over the first lands on 89 + (255-89)*0.35 = 147, so a
+           stroke brightens along its own overlaps and the value you asked for is
+           not the value you get. `lighten` makes an overlap max(existing, v), so
+           the stroke is flat at the value you set. The feathered rim still works
+           -- over black, lighten at source-alpha a gives v*a, exactly as
+           source-over does.
+
+           Consequence, and the hint says so: you cannot paint a LOWER value over
+           a higher one. Erase first. That is inherent to max(), and it is the
+           right trade for "add glow here, at this brightness". */
+        /* Keyed off the CONTROL, not a second opts flag: buildMaskToolbar and
+           createMaskEditor take separate options objects at every call site, so a
+           duplicated `value:true` is one edit away from disagreeing -- and it did,
+           on the first run of this. The toolbar decides; the editor follows. */
+        const valueOn = () => mode === 'luma' && !!id('value');
+        const paintValue = () => valueOn() ? Math.max(0, Math.min(1, num('value', 100) / 100)) : 1;
+        const lumCss = v => { const n = Math.round(255 * v); return `rgb(${n},${n},${n})`; };
+        function paintCtx(mask) {
+            const ctx = mask.getContext('2d');
+            const er = erasing();
+            const v = er ? 1 : paintValue();
+            ctx.globalCompositeOperation = (mode === 'alpha' && er) ? 'destination-out'
+                : (v < 0.999 ? 'lighten' : 'source-over');
+            return { ctx, er, v };
+        }
+        /* The flat colour a non-feathered fill uses, for every tool. */
+        const solidStyle = (er, v) => (mode === 'luma' && er) ? '#000'
+            : (v >= 0.999 ? '#fff' : lumCss(v));
+        function fillStyleFor(ctx, er, x, y, radius, hard, v) {
+            if (hard >= 0.999) return solidStyle(er, v);
+            const n = Math.round(255 * (er ? 1 : v));
+            const rgb = (mode === 'luma' && er) ? '0,0,0' : `${n},${n},${n}`;
+            const g = ctx.createRadialGradient(x, y, radius * hard, x, y, radius);
+            g.addColorStop(0, `rgba(${rgb},1)`);
+            g.addColorStop(1, `rgba(${rgb},0)`);
+            return g;
+        }
+        /* One freehand tool, one meaning for Hardness. Pencil used to sit beside
+           Brush with hardness() forced to 1 for it -- i.e. it WAS Brush at
+           Hardness 100, which is why nobody could tell them apart. Dropping the
+           default to 60 made them differ on paper (14% rim vs 32%) and users still
+           reported the difference as too small, so the button is gone and Hardness
+           is the control: 100 is the hard edge Pencil used to be. */
+        const hardness = () => 1 - Math.max(0, Math.min(1, num('hardness', MASK_SOFT_DEFAULT) / 100));
+        const radiusPx = () => {
+            const m = opts.getMask();
+            const r = opts.canvas.getBoundingClientRect();
+            const scale = (m && r.width) ? (m.width / r.width) : 1;
+            return Math.max(0.5, num('brush', 18) / 2 * scale);
+        };
+        function dab(mask, x, y, radius) {
+            const { ctx, er, v } = paintCtx(mask);
+            ctx.fillStyle = fillStyleFor(ctx, er, x, y, radius, hardness(), v);
+            ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2); ctx.fill();
+            ctx.globalCompositeOperation = 'source-over';
+        }
+        /* One stamp. Composited exactly like a dab -- same Value/lighten rule, same
+           erase convention -- so nothing about the mask conventions is special-cased
+           for it. Hardness feathers the rim by blurring the alpha through a shadow,
+           which is cheap and does not need a second canvas. */
+        let stampSeed = (Math.random() * 0x7fffffff) | 0;
+        function stamp(mask, x, y, radius) {
+            const { ctx, er, v } = paintCtx(mask);
+            const rough = num('rough', 55) / 100;
+            const hard = hardness();
+            const size = Math.max(4, radius * 2);
+            const alpha = buildStampAlpha(size, rough, (stampSeed = (stampSeed * 1103515245 + 12345) & 0x7fffffff));
+            /* Feather = draw the shape through a blur. The blur spreads OUTWARD, so
+               the scratch canvas needs a margin or the soft rim is clipped square
+               by the same edge that used to clip the contour itself. */
+            const blurPx = (1 - hard) * size * 0.16;
+            const pad = Math.ceil(blurPx * 3) + 1;
+            const tint = document.createElement('canvas');
+            tint.width = alpha.width + pad * 2; tint.height = alpha.height + pad * 2;
+            const tc = tint.getContext('2d');
+            if (blurPx > 0.4) tc.filter = `blur(${blurPx.toFixed(2)}px)`;
+            tc.drawImage(alpha, pad, pad);
+            tc.filter = 'none';
+            tc.globalCompositeOperation = 'source-in';
+            tc.fillStyle = solidStyle(er, v);
+            tc.fillRect(0, 0, tint.width, tint.height);
+            const a = Math.random() * Math.PI * 2;
+            ctx.save();
+            ctx.translate(x, y);
+            ctx.rotate(a);                 // so a repeated click is never the same mark twice
+            ctx.drawImage(tint, -tint.width / 2, -tint.height / 2);
+            ctx.restore();
+            ctx.globalCompositeOperation = 'source-over';
+        }
+        function fillPath(mask, build) {
+            const { ctx, er, v } = paintCtx(mask);
+            ctx.fillStyle = solidStyle(er, v);
+            ctx.beginPath(); build(ctx); ctx.fill();
+            ctx.globalCompositeOperation = 'source-over';
+        }
+
+        /* ---- wand ----
+           Same measure as multi-material's original: euclidean RGB distance from
+           the clicked pixel, contiguous (flood fill) or global.
+
+           MODES. The wand used to only ever union into whatever was already
+           selected, with no counterpart -- so "keep clicking veins" walked the
+           selection to the whole tile and the only way back was Clear. Measured on
+           Bricks at the shipped tolerance: 99.5% of the tile on the FIRST click,
+           100% by the second. It now follows the convention every editor uses:
+
+             click        REPLACE
+             Shift+click  ADD       (the old behaviour, now on purpose)
+             Alt+click    SUBTRACT  (this already worked, via ed.altErase --
+                                     it just had no name and nothing said so)
+
+           Lasso/Rect/Ellipse deliberately keep painting cumulatively: nobody
+           reported them, and building a region out of three rectangles is a habit
+           worth not breaking. */
+        function wand(px, py) {
+            const mask = opts.getMask(), source = opts.getSource && opts.getSource();
+            if (!mask || !source) return;
+            const S = mask.width;
+            const ix = Math.max(0, Math.min(S - 1, Math.floor(px)));
+            const iy = Math.max(0, Math.min(S - 1, Math.floor(py)));
+            const src = resizeCanvas(source, S, S).getContext('2d').getImageData(0, 0, S, S).data;
+            const o = (iy * S + ix) * 4, tr = src[o], tg = src[o + 1], tb = src[o + 2];
+            const thr = (num('tol', 28) / 100) * 441.673;
+            const contigEl = id('wand-contig');
+            const contiguous = contigEl ? contigEl.checked : true;
+            const ctx = mask.getContext('2d');
+            const md = ctx.getImageData(0, 0, S, S);
+            const add = !erasing();
+            /* Replace clears INSIDE the caller's snapshot, so one Ctrl+Z restores
+               the whole previous selection rather than half of it. */
+            if (add && !ed.wandAdd) {
+                for (let i = 0; i < md.data.length; i += 4) {
+                    md.data[i] = md.data[i + 1] = md.data[i + 2] = 0;
+                    md.data[i + 3] = mode === 'alpha' ? 0 : 255;
+                }
+            }
+            const match = p => { const i = p * 4, dr = src[i] - tr, dg = src[i + 1] - tg, db = src[i + 2] - tb;
+                                 return Math.sqrt(dr * dr + dg * dg + db * db) <= thr; };
+            /* Adding uses max(), not assignment, so the wand obeys the same rule
+               as the brush: a second selection at a lower Value cannot dim a
+               region already selected at a higher one. */
+            const lvl = Math.round(255 * paintValue());
+            const set = p => {
+                const i = p * 4;
+                const v = add ? (lvl > md.data[i] ? lvl : md.data[i]) : 0;
+                md.data[i] = md.data[i + 1] = md.data[i + 2] = v;
+                md.data[i + 3] = mode === 'alpha' ? v : 255;
+            };
+            if (contiguous) {
+                const seen = new Uint8Array(S * S), stack = [iy * S + ix];
+                while (stack.length) {
+                    const p = stack.pop();
+                    if (seen[p]) continue;
+                    seen[p] = 1;
+                    if (!match(p)) continue;
+                    set(p);
+                    const x = p % S, y = (p / S) | 0;
+                    if (x > 0) stack.push(p - 1); if (x < S - 1) stack.push(p + 1);
+                    if (y > 0) stack.push(p - S); if (y < S - 1) stack.push(p + S);
+                }
+            } else {
+                for (let p = 0; p < S * S; p++) if (match(p)) set(p);
+            }
+            ctx.putImageData(md, 0, 0);
+        }
+
+        /* ---- whole-mask actions ---- */
+        ed.fillAll = () => {
+            const m = opts.getMask(); if (!m) return;
+            ed.snapshot();
+            const { ctx, er, v } = paintCtx(m);
+            ctx.fillStyle = solidStyle(er, v);
+            ctx.fillRect(0, 0, m.width, m.height);
+            ctx.globalCompositeOperation = 'source-over';
+            after();
+        };
+        ed.invert = () => {
+            const m = opts.getMask(); if (!m) return;
+            ed.snapshot();
+            const S = m.width, ctx = m.getContext('2d');
+            if (mode === 'luma') {
+                const im = ctx.getImageData(0, 0, S, m.height);
+                for (let i = 0; i < im.data.length; i += 4) {
+                    im.data[i] = 255 - im.data[i];
+                    im.data[i + 1] = 255 - im.data[i + 1];
+                    im.data[i + 2] = 255 - im.data[i + 2];
+                }
+                ctx.putImageData(im, 0, 0);
+            } else {
+                const inv = document.createElement('canvas'); inv.width = S; inv.height = m.height;
+                const ix = inv.getContext('2d');
+                ix.fillStyle = '#fff'; ix.fillRect(0, 0, S, m.height);
+                ix.globalCompositeOperation = 'destination-out'; ix.drawImage(m, 0, 0);
+                ctx.clearRect(0, 0, S, m.height); ctx.drawImage(inv, 0, 0);
+            }
+            after();
+        };
+        ed.clear = () => {
+            const m = opts.getMask(); if (!m) return;
+            ed.snapshot();
+            const ctx = m.getContext('2d');
+            if (mode === 'luma') { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, m.width, m.height); }
+            else ctx.clearRect(0, 0, m.width, m.height);
+            ed.lassoPts = [];
+            after();
+        };
+        const after = () => { opts.onChange(); if (opts.onStrokeEnd) opts.onStrokeEnd(); };
+
+        /* ---- tool selection ---- */
+        ed.setTool = tool => {
+            ed.tool = tool;
+            ed.lassoPts = [];
+            ed.cursor = null;
+            lassoDown = null;
+            ed.drag.active = false;
+            MASK_TOOLS.forEach(([t]) => { const b = id('tool-' + t); if (b) b.classList.toggle('active', t === tool); });
+            const show = (el, on) => { if (el) el.style.display = on ? '' : 'none'; };
+            show(id('brushwrap'), MASK_FREEHAND.has(tool));
+            show(id('hardwrap'), tool === 'brush' || tool === 'stamp');
+            show(id('roughwrap'), tool === 'stamp');
+            show(id('scatterwrap'), tool === 'stamp');
+            show(id('wandwrap'), tool === 'wand');
+            show(id('contigwrap'), tool === 'wand');
+            const hint = id('toolhint');
+            if (hint) {
+                const row = MASK_TOOLS.find(t => t[0] === tool);
+                hint.innerHTML = row ? row[3] : '';
+            }
+            /* MASK_CONTINUOUS, not MASK_FREEHAND: this class is `cursor: none` and
+               nothing is drawn in its place (see the note in CLAUDE.md), so keep it
+               on exactly the two tools that always had it rather than handing the
+               defect to Stamp as well. */
+            /* No longer hides the OS cursor -- see the note on `.at-mask-cursor`.
+               The class is kept so a surface can still style its paint mode. */
+            opts.canvas.classList.toggle('at-mm-brushmode', MASK_FREEHAND.has(tool));
+            syncCursorRing();
+            /* The hook whose absence let multi-material's hint go stale: the tool
+               buttons are wired to ed.setTool, so a caller that needs to know a
+               tool changed has to be told from here. */
+            if (opts.onTool) opts.onTool(tool);
+            opts.onChange();
+        };
+        /* Paint and Erase are two buttons rather than one that relabels itself:
+           which mode you are in should be readable without remembering what the
+           label means. That was Heal's rule before the editor was shared, and it
+           is the right one for all six surfaces. */
+        ed.setErase = on => {
+            ed.erase = !!on;
+            setTimeout(syncCursorRing, 0);   // the ring turns red while erasing
+            [['paint', !ed.erase], ['erase', ed.erase]].forEach(([k, active]) => {
+                const b = id(k);
+                if (b) { b.classList.toggle('active', active); b.setAttribute('aria-pressed', String(active)); }
+            });
+        };
+
+        /* ---- the brush-size ring ------------------------------------------
+           A DOM element above the canvas, NOT pixels in it. The canvas is what
+           every surface reads its own mask back from, so anything drawn there is
+           measured as if it were paint -- an earlier version drew the ring into it
+           and moved Heal's red-pixel count from ~270 to 199 against a >200
+           threshold. Fixed positioning so it needs no positioned ancestor, and
+           `pointer-events: none` so it never eats a click. */
+        let ring = null;
+        const ringEl = () => {
+            if (!ring) {
+                ring = document.createElement('div');
+                ring.className = 'at-mask-cursor';
+                document.body.appendChild(ring);
+            }
+            return ring;
+        };
+        const hideRing = () => { if (ring) ring.style.display = 'none'; };
+        function syncCursorRing(ev) {
+            if (!MASK_FREEHAND.has(ed.tool) || (opts.active && !opts.active())) { hideRing(); return; }
+            const r = ringEl();
+            /* The Size slider is in DISPLAY pixels (radiusPx scales it into the
+               mask), so the ring's CSS size is the slider value, full stop. */
+            const d = Math.max(2, num('brush', 18));
+            r.style.width = d + 'px';
+            r.style.height = d + 'px';
+            r.classList.toggle('at-mask-cursor-erase', erasing());
+            if (ev) { r.style.left = ev.clientX + 'px'; r.style.top = ev.clientY + 'px'; }
+            r.style.display = ed.overCanvas ? 'block' : 'none';
+        }
+        opts.canvas.addEventListener('pointerenter', e => { ed.overCanvas = true; syncCursorRing(e); });
+        opts.canvas.addEventListener('pointerleave', () => { ed.overCanvas = false; hideRing(); });
+
+        /* ---- overlay the caller draws on top of its own render ---- */
+        ed.drawOverlay = ctx => {
+            const m = opts.getMask();
+            if (!m) return;
+            ctx.save();
+            ctx.strokeStyle = '#fff';
+            ctx.lineWidth = Math.max(1, m.width / 200);
+            if (ed.tool === 'lasso' && ed.lassoPts.length) {
+                const pts = ed.lassoPts, cur = ed.cursor, last = pts[pts.length - 1];
+                ctx.beginPath();
+                pts.forEach((p, k) => k ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+                ctx.stroke();
+                /* The outline used to be drawn open and unmarked, which reads as a
+                   failed drawing rather than a pending one. Dashed = not committed
+                   yet: the rubber band to the pointer, and the segment that will
+                   close the shape. */
+                const u = Math.max(1, m.width / 64);
+                ctx.save();
+                ctx.setLineDash([u, u]);
+                ctx.globalAlpha = 0.75;
+                if (cur && !lassoDown) {
+                    ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(cur.x, cur.y); ctx.stroke();
+                }
+                if (pts.length >= 2) {
+                    const from = (cur && !lassoDown) ? cur : last;
+                    ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(pts[0].x, pts[0].y); ctx.stroke();
+                }
+                ctx.restore();
+                /* The start dot is the affordance: it fills in when the pointer is
+                   close enough to land on it, so "click here to finish" is visible
+                   rather than something you have to have been told. */
+                const hot = !!cur && pts.length >= 3 && dist(cur, pts[0]) <= snapDist();
+                ctx.beginPath();
+                ctx.arc(pts[0].x, pts[0].y, hot ? u * 2.4 : u * 1.5, 0, Math.PI * 2);
+                ctx.fillStyle = hot ? '#e8852a' : 'rgba(255,255,255,0.35)';
+                ctx.fill();
+                ctx.stroke();
+            }
+            if (ed.drag.active && (ed.tool === 'rect' || ed.tool === 'ellipse')) {
+                const d = ed.drag;
+                const x = Math.min(d.x0, d.x1), y = Math.min(d.y0, d.y1);
+                const w = Math.abs(d.x1 - d.x0), h = Math.abs(d.y1 - d.y0);
+                ctx.beginPath();
+                if (ed.tool === 'ellipse') ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
+                else ctx.rect(x, y, w, h);
+                ctx.stroke();
+            }
+            ctx.restore();
+        };
+
+        /* ---- pointer handling ---- */
+        const pos = ev => {
+            const m = opts.getMask();
+            const r = opts.canvas.getBoundingClientRect();
+            const w = m ? m.width : opts.canvas.width, h = m ? m.height : opts.canvas.height;
+            return { x: (ev.clientX - r.left) / r.width * w, y: (ev.clientY - r.top) / r.height * h };
+        };
+        let painting = false, lastX = 0, lastY = 0;
+        /* ---- lasso ----------------------------------------------------------
+           It used to be click-a-vertex only, with no pointermove branch at all:
+           a press-drag-release -- the gesture every other editor trains you to
+           bring -- selected exactly 0 px, and so did three clicks, because the
+           ONLY thing that closed the outline was a double-click. Nothing on
+           screen said so.
+
+           Now: a click drops a straight-edge vertex, a drag traces freehand, and
+           both feed the same outline so one shape can mix them. It closes and
+           fills when you release or click on the start dot, press Enter, or
+           double-click. A drag alone does NOT auto-close -- that turns a slipped
+           click into a painted region. */
+        const LASSO_DRAG_MIN = 3;          // mask px before a click becomes a drag
+        const LASSO_STEP = 2;              // min spacing between freehand points
+        const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+        /* Scaled off the mask so the target is a constant size ON SCREEN: these
+           canvases are displayed at roughly 300-360 CSS px whatever the tile size,
+           so mask/32 is ~10 CSS px at 256, 512 and 1024 alike. A fixed 6 mask px
+           was ~7 CSS px on a 256 tile and under 2 on a 1024. */
+        const snapDist = () => { const m = opts.getMask(); return Math.max(8, (m ? m.width : 256) / 32); };
+        let lassoDown = null;
+        /* Hover redraws go through the caller's onChange, and Emissive's runs a GPU
+           emissive compute -- so coalesce them to one per frame. */
+        let overlayRaf = 0;
+        const scheduleOverlay = () => {
+            if (overlayRaf) return;
+            overlayRaf = requestAnimationFrame(() => { overlayRaf = 0; opts.onChange(); });
+        };
+        const stroke = (mask, x, y) => {
             const radius = radiusPx();
             const dx = x - lastX, dy = y - lastY;
-            const dist = Math.hypot(dx, dy);
-            const n = Math.max(1, Math.ceil(dist / Math.max(1, radius * 0.4)));
-            for (let i = 1; i <= n; i++) dab(lastX + dx * i / n, lastY + dy * i / n, radius);
+            if (!MASK_CONTINUOUS.has(ed.tool)) {
+                /* Stamps are discrete marks, so a drag lays a RUN of them spaced by
+                   Scatter rather than a smooth interpolated line. Below the spacing
+                   the pointer has not travelled far enough to earn another mark. */
+                const gap = Math.max(2, radius * 2 * (0.25 + num('scatter', 35) / 100 * 1.6));
+                const d = Math.hypot(dx, dy);
+                if (d < gap) return;
+                const n = Math.floor(d / gap);
+                for (let i = 1; i <= n; i++) stamp(mask, lastX + dx * (i * gap / d), lastY + dy * (i * gap / d), radius);
+                lastX += dx * (n * gap / d); lastY += dy * (n * gap / d);
+                return;
+            }
+            const n = Math.max(1, Math.ceil(Math.hypot(dx, dy) / Math.max(1, radius * 0.4)));
+            for (let i = 1; i <= n; i++) dab(mask, lastX + dx * i / n, lastY + dy * i / n, radius);
             lastX = x; lastY = y;
         };
 
-        displayCanvas.addEventListener('pointerdown', e => {
-            if (!opts.active()) return;
-            drawing = true;
-            try { displayCanvas.setPointerCapture(e.pointerId); } catch { /* noop */ }
-            [lastX, lastY] = pos(e);
-            dab(lastX, lastY, radiusPx());
-            opts.onPaint();
+        opts.canvas.addEventListener('pointerdown', e => {
+            if (opts.active && !opts.active()) return;
+            const mask = opts.getMask();
+            if (!mask) { if (opts.onNoMask) opts.onNoMask(); return; }
+            ed.altErase = e.altKey;
+            ed.wandAdd = e.shiftKey;
+            const p = pos(e);
+            switch (ed.tool) {
+                case 'brush': case 'stamp':
+                    ed.snapshot();
+                    painting = true;
+                    try { opts.canvas.setPointerCapture(e.pointerId); } catch { /* noop */ }
+                    lastX = p.x; lastY = p.y;
+                    if (ed.tool === 'stamp') stamp(mask, p.x, p.y, radiusPx());
+                    else dab(mask, p.x, p.y, radiusPx());
+                    opts.onChange();
+                    break;
+                case 'lasso':
+                    lassoDown = { x: p.x, y: p.y, moved: false };
+                    ed.lassoPts.push(p);
+                    ed.cursor = p;
+                    try { opts.canvas.setPointerCapture(e.pointerId); } catch { /* noop */ }
+                    opts.onChange();
+                    break;
+                case 'rect': case 'ellipse':
+                    ed.drag.active = true;
+                    ed.drag.x0 = ed.drag.x1 = p.x; ed.drag.y0 = ed.drag.y1 = p.y;
+                    try { opts.canvas.setPointerCapture(e.pointerId); } catch { /* noop */ }
+                    break;
+                case 'wand':
+                    ed.snapshot(); wand(p.x, p.y); after();
+                    ed.altErase = false; ed.wandAdd = false;
+                    break;
+            }
             e.preventDefault();
         });
-        displayCanvas.addEventListener('pointermove', e => {
-            if (!drawing || !opts.active()) return;
-            const [x, y] = pos(e);
-            strokeTo(x, y);
-            opts.onPaint();
-            e.preventDefault();
+        opts.canvas.addEventListener('pointermove', e => {
+            if (opts.active && !opts.active()) return;
+            ed.overCanvas = true;
+            syncCursorRing(e);
+            if (painting) {
+                const mask = opts.getMask(); if (!mask) return;
+                const p = pos(e); stroke(mask, p.x, p.y); opts.onChange(); e.preventDefault();
+            } else if (ed.drag.active) {
+                const p = pos(e); ed.drag.x1 = p.x; ed.drag.y1 = p.y; opts.onChange(); e.preventDefault();
+            } else if (ed.tool === 'lasso' && lassoDown) {
+                const p = pos(e);
+                ed.cursor = p;
+                if (!lassoDown.moved && dist(p, lassoDown) < LASSO_DRAG_MIN) return;
+                lassoDown.moved = true;
+                const last = ed.lassoPts[ed.lassoPts.length - 1];
+                if (!last || dist(p, last) >= LASSO_STEP) ed.lassoPts.push(p);
+                scheduleOverlay();
+                e.preventDefault();
+            } else if (ed.tool === 'lasso' && ed.lassoPts.length) {
+                ed.cursor = pos(e);            // rubber band follows the pointer
+                scheduleOverlay();
+            }
         });
-        const end = e => {
-            if (!drawing) return;
-            drawing = false;
-            try { displayCanvas.releasePointerCapture(e.pointerId); } catch { /* noop */ }
-            // Stroke-level hook. Anything expensive (Heal's live fill) belongs here
-            // rather than in onPaint, which fires on every pointermove.
-            if (opts.onStrokeEnd) opts.onStrokeEnd();
+        const endStroke = e => {
+            if (painting) {
+                painting = false;
+                try { opts.canvas.releasePointerCapture(e.pointerId); } catch { /* noop */ }
+                if (opts.onStrokeEnd) opts.onStrokeEnd();
+            }
+            if (ed.drag.active) {
+                ed.drag.active = false;
+                const mask = opts.getMask();
+                const d = ed.drag;
+                const x = Math.min(d.x0, d.x1), y = Math.min(d.y0, d.y1);
+                const w = Math.abs(d.x1 - d.x0), h = Math.abs(d.y1 - d.y0);
+                if (mask && w >= 1 && h >= 1) {
+                    ed.snapshot();
+                    fillPath(mask, ctx => {
+                        if (ed.tool === 'ellipse') ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
+                        else ctx.rect(x, y, w, h);
+                    });
+                }
+                after();
+            }
+            /* A pointerleave must not finish a lasso -- the outline is meant to
+               survive the pointer wandering off the canvas between corners. */
+            if (lassoDown && e.type !== 'pointerleave') {
+                const p = pos(e);
+                if (lassoDown.moved) ed.lassoPts.push(p);
+                lassoDown = null;
+                try { opts.canvas.releasePointerCapture(e.pointerId); } catch { /* noop */ }
+                const p0 = ed.lassoPts[0];
+                if (ed.lassoPts.length >= 3 && p0 && dist(p, p0) <= snapDist()) ed.closeLasso();
+                else opts.onChange();
+            }
+            ed.altErase = false;
+            ed.wandAdd = false;
         };
-        displayCanvas.addEventListener('pointerup', end);
-        displayCanvas.addEventListener('pointercancel', end);
+        opts.canvas.addEventListener('pointerup', endStroke);
+        opts.canvas.addEventListener('pointercancel', endStroke);
+        opts.canvas.addEventListener('pointerleave', e => {
+            ed.cursor = null;
+            endStroke(e);
+            if (ed.tool === 'lasso') scheduleOverlay();
+        });
+
+        ed.closeLasso = () => {
+            if (ed.tool !== 'lasso' || ed.lassoPts.length < 3) return false;
+            /* Drop the vertices the CLOSING GESTURE itself left behind: a
+               double-click delivers two pointerdowns -- each taken as a vertex --
+               before `dblclick` fires, and a click on the start dot lands one more
+               on top of it. Never strip below 3, or a valid triangle disappears. */
+            const pts = ed.lassoPts.slice();
+            while (pts.length > 3 && dist(pts[pts.length - 1], pts[pts.length - 2]) < LASSO_STEP) pts.pop();
+            while (pts.length > 3 && dist(pts[pts.length - 1], pts[0]) <= snapDist()) pts.pop();
+            const mask = opts.getMask();
+            if (mask) {
+                ed.snapshot();
+                fillPath(mask, ctx => { pts.forEach((p, k) => k ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.closePath(); });
+            }
+            ed.lassoPts = [];
+            ed.cursor = null;
+            lassoDown = null;
+            after();
+            return true;
+        };
+        opts.canvas.addEventListener('dblclick', () => { ed.closeLasso(); });
+
+        /* ---- controls ---- */
+        MASK_TOOLS.forEach(([t]) => { const b = id('tool-' + t); if (b) b.addEventListener('click', () => ed.setTool(t)); });
+        /* Every generated slider gets its readout wired here rather than at the
+           seven call sites -- the same reason the markup is generated at all. */
+        ['brush', 'hardness', 'value', 'tol', 'rough', 'scatter'].forEach(k => {
+            const inp = id(k), out = id(k + '-val');
+            if (inp && out) inp.addEventListener('input', () => {
+                out.textContent = inp.value;
+                if (k === 'brush') syncCursorRing();
+            });
+        });
+        const pBtn = id('paint'); if (pBtn) pBtn.addEventListener('click', () => ed.setErase(false));
+        const eBtn = id('erase'); if (eBtn) eBtn.addEventListener('click', () => ed.setErase(true));
+        ['fill', 'invert', 'clear'].forEach(a => {
+            const b = id(a);
+            if (b) b.addEventListener('click', () => ({ fill: ed.fillAll, invert: ed.invert, clear: ed.clear })[a]());
+        });
+        const uBtn = id('undo'); if (uBtn) uBtn.addEventListener('click', () => ed.doUndo());
+        const rBtn = id('redo'); if (rBtn) rBtn.addEventListener('click', () => ed.doRedo());
+
+        /* Capture-phase, because Escape has to cancel an in-progress lasso before
+           the modal's own Escape handler closes the modal out from under it. */
+        document.addEventListener('keydown', e => {
+            if (opts.active && !opts.active()) return;
+            /* Don't hijack Ctrl+Z from TEXT entry. Several of these modals have a
+               text field (the Material modal's preset name), and silently reverting
+               a brush stroke instead of the letters someone just typed is the worst
+               version of this. Narrower than the app's global undo guard, which
+               bails on any INPUT|SELECT|TEXTAREA: here a slider or a dropdown is a
+               perfectly ordinary thing to have focused mid-paint, and Ctrl+Z means
+               nothing to either of them. */
+            const ae = document.activeElement;
+            const typing = ae && (ae.isContentEditable || ae.tagName === 'TEXTAREA'
+                || (ae.tagName === 'INPUT'
+                    && !/^(range|checkbox|radio|button|submit|reset|color|file)$/.test(ae.type)));
+            if (typing) return;
+            const z = e.key === 'z' || e.key === 'Z';
+            if ((e.ctrlKey || e.metaKey) && z) {
+                const did = e.shiftKey ? ed.doRedo() : ed.doUndo();
+                if (did) { e.preventDefault(); e.stopPropagation(); }
+            } else if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || e.key === 'Y')) {
+                if (ed.doRedo()) { e.preventDefault(); e.stopPropagation(); }
+            } else if (e.key === 'Enter' && ed.tool === 'lasso') {
+                if (ed.closeLasso()) { e.preventDefault(); e.stopPropagation(); }
+            } else if (e.key === 'Escape' && ed.lassoPts.length) {
+                ed.lassoPts = []; ed.cursor = null; lassoDown = null;
+                opts.onChange(); e.stopPropagation();
+            }
+        }, true);
+
+        ed.setTool(ed.tool);
+        ed.setErase(false);
+        ed.syncButtons();
+        return ed;
     }
 
     function downloadBlob(blob, filename) {
@@ -2226,6 +3067,9 @@ window.TRLE = window.TRLE || {};
             // looks identical with and without one — which is how "Reset to Original
             // didn't remove my glow" gets reported for a reset that worked.
             if (el.emissive) badges.innerHTML += '<span class="at-badge at-badge-e" title="Has an authored glow (Make Emissive)">E</span>';
+            // Same reasoning as the glow badge: an authored height map never touches
+            // el.canvas, so without this the cell looks identical to one without.
+            if (el.hgParams) badges.innerHTML += '<span class="at-badge at-badge-h" title="Has an authored height map (Make Height Map)">H</span>';
             cell.appendChild(badges);
 
             const lbl = document.createElement('span');
@@ -3474,6 +4318,8 @@ window.TRLE = window.TRLE || {};
         // the menu is the first place someone looks to check whether a glow stuck.
         const emBtn = menu.querySelector('[data-action="emissive"]');
         if (emBtn) emBtn.textContent = el.emissive ? '✨ Edit Glow…' : '✨ Make Emissive…';
+        const hgBtn = menu.querySelector('[data-action="heightmap"]');
+        if (hgBtn) hgBtn.textContent = el.hgParams ? '🏔️ Edit Height Map…' : '🏔️ Make Height Map…';
 
         // Edit Height Transition — only on tiles that carry a stored height-transition recipe.
         menu.querySelectorAll('[data-httonly]').forEach(b => {
@@ -3566,6 +4412,10 @@ window.TRLE = window.TRLE || {};
             case 'emissive':
                 if (el.kind !== 'tile') { showToast('Emissive works on source tiles only', 'info'); return; }
                 openEmissiveModal(id);
+                break;
+            case 'heightmap':
+                if (el.kind !== 'tile') { showToast('Height maps work on source tiles only', 'info'); return; }
+                openHeightMapModal(id);
                 break;
             case 'rotate': applyTileTransform(ctxTargets(id), c => rotateTile90(c), 'Rotated 90°'); break;
             case 'fliph':  applyTileTransform(ctxTargets(id), c => flipTile(c, true), 'Flipped horizontally'); break;
@@ -3739,7 +4589,7 @@ window.TRLE = window.TRLE || {};
     }
 
     /* ============ MODAL INFRASTRUCTURE ============ */
-    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'bset', 'fade', 'emissive', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'delight', 'import', 'origami', 'stainedglass', 'noise', 'atlaspreview', 'confirm'];
+    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'bset', 'fade', 'emissive', 'heightmap', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'delight', 'import', 'origami', 'stainedglass', 'noise', 'atlaspreview', 'confirm'];
 
     function visibleModal() {
         return MODAL_NAMES
@@ -3833,6 +4683,7 @@ window.TRLE = window.TRLE || {};
         healCleanup();
         fadeCleanup();
         emissiveCleanup();
+        hgCleanup();
         anchorCleanup();
         bsetCleanup();
         htCleanup();
@@ -5122,7 +5973,7 @@ window.TRLE = window.TRLE || {};
 
     /* ============ TRANSITION MODAL ============ */
     const tr = { baseId: null, overlayId: null, activeMode: 'Top',
-                 maskMode: 'dir', customMask: null, brushErase: false, tab: 'single',
+                 maskMode: 'dir', customMask: null, tab: 'single',
                  overlayGeom: { rot: 0, flipH: false, flipV: false } };
 
     /* Solid mask for the Full Set's plain cells — kept as customMask transitions
@@ -5420,7 +6271,7 @@ window.TRLE = window.TRLE || {};
         const P = 192;
         const method   = $('at-tr-method').value;
         const pivot    = parseInt($('at-tr-pivot').value) / 100;
-        const hardness = parseInt($('at-tr-hardness').value) / 100;
+        const hardness = parseInt($('at-tr-edgehard').value) / 100;
         const L = trSetLayout();
         const org0 = trOrgParams();
         const alts = trAltCount();
@@ -5487,7 +6338,7 @@ window.TRLE = window.TRLE || {};
     function trCurrentMask(P) {
         if (tr.maskMode === 'custom') return softenMask(tr.customMask, P);
         const pivot    = parseInt($('at-tr-pivot').value) / 100;
-        const hardness = parseInt($('at-tr-hardness').value) / 100;
+        const hardness = parseInt($('at-tr-edgehard').value) / 100;
         return buildTopologyMask(P, tr.activeMode, pivot, hardness, trSingleOrgParams());
     }
 
@@ -5520,6 +6371,8 @@ window.TRLE = window.TRLE || {};
         ctx.drawImage(trOverlayCanvas(), 0, 0, 96, 96);
     }
 
+    let trEditor = null;
+
     function trPreview() {
         if (tr.baseId === null) return;
         if (tr.tab === 'set') { trSetPreview(); return; }   // all refresh paths route here
@@ -5533,7 +6386,9 @@ window.TRLE = window.TRLE || {};
         const sorg    = trSingleOrgParams();
         if (sorg && sorg.shadow > 0 && shadowHitsDiffuse(sorg))
             comp = applyContactShadow(comp, mask, P, sorg.shadow, shadowOpts(sorg));
-        $('at-tr-preview').getContext('2d').drawImage(comp, 0, 0);
+        const pctx = $('at-tr-preview').getContext('2d');
+        pctx.drawImage(comp, 0, 0);
+        if (trEditor && tr.maskMode === 'custom') trEditor.drawOverlay(pctx);
     }
 
     function setupTransModal() {
@@ -5644,7 +6499,7 @@ window.TRLE = window.TRLE || {};
         $('at-tr-ov-fliph').addEventListener('click', () => { tr.overlayGeom.flipH = !tr.overlayGeom.flipH; trOverlayChanged(); });
         $('at-tr-ov-flipv').addEventListener('click', () => { tr.overlayGeom.flipV = !tr.overlayGeom.flipV; trOverlayChanged(); });
 
-        ['at-tr-pivot', 'at-tr-hardness'].forEach(id => {
+        ['at-tr-pivot', 'at-tr-edgehard'].forEach(id => {
             $(id).addEventListener('input', function () {
                 $(id + '-val').textContent = this.value;
                 trPreview();
@@ -5660,31 +6515,18 @@ window.TRLE = window.TRLE || {};
         tr.customMask = document.createElement('canvas');
         tr.customMask.width = 256; tr.customMask.height = 256;
         $('at-tr-mask-source').addEventListener('change', e => trSetMaskSource(e.target.value));
-        $('at-tr-brush').addEventListener('input', function () { $('at-tr-brush-val').textContent = this.value; });
-        $('at-tr-brush-mode').addEventListener('click', function () {
-            tr.brushErase = !tr.brushErase;
-            this.textContent = tr.brushErase ? '🧽 Erase' : '🖌️ Paint';
-            this.setAttribute('aria-pressed', String(tr.brushErase));
+        /* No Wand here: this canvas shows the COMPOSITE of two textures, so a
+           colour pick would sample something the mask does not correspond to.
+           Every other surface paints over the texture the wand would read. */
+        buildMaskToolbar($('at-tr-tools'), 'at-tr', {
+            tools: ['brush', 'lasso', 'rect', 'ellipse'], brushMax: 96
         });
-        $('at-tr-mask-clear').addEventListener('click', () => {
-            const c = tr.customMask.getContext('2d');
-            c.fillStyle = '#000'; c.fillRect(0, 0, tr.customMask.width, tr.customMask.height);
-            trPreview();
-        });
-        $('at-tr-mask-invert').addEventListener('click', () => {
-            const c = tr.customMask.getContext('2d');
-            const d = c.getImageData(0, 0, tr.customMask.width, tr.customMask.height);
-            for (let i = 0; i < d.data.length; i += 4) {
-                d.data[i] = 255 - d.data[i]; d.data[i+1] = 255 - d.data[i+1]; d.data[i+2] = 255 - d.data[i+2];
-            }
-            c.putImageData(d, 0, 0);
-            trPreview();
-        });
-        attachMaskBrush($('at-tr-preview'), tr.customMask, {
-            active: () => tr.maskMode === 'custom',
-            brushSize: () => parseInt($('at-tr-brush').value),
-            erase: () => tr.brushErase,
-            onPaint: trPreview
+        trEditor = createMaskEditor('at-tr', {
+            canvas: $('at-tr-preview'),
+            mode: 'luma',
+            getMask: () => tr.customMask,
+            active: () => tr.maskMode === 'custom' && $('at-modal-trans').style.display !== 'none',
+            onChange: trPreview
         });
 
         $('at-tr-add').addEventListener('click', () => {
@@ -5695,7 +6537,7 @@ window.TRLE = window.TRLE || {};
             if (tr.tab === 'set') {
                 const L = trSetLayout();
                 const pivot    = parseInt($('at-tr-pivot').value) / 100;
-                const hardness = parseInt($('at-tr-hardness').value) / 100;
+                const hardness = parseInt($('at-tr-edgehard').value) / 100;
                 const geom = geomIsIdentity(tr.overlayGeom) ? null : { ...tr.overlayGeom };
                 const org0 = trOrgParams();
                 const alts = trAltCount();
@@ -5752,7 +6594,7 @@ window.TRLE = window.TRLE || {};
             const modes = trActiveDirs();
             if (!modes.length) { showToast('Select at least one direction!', 'error'); return; }
             const pivot    = parseInt($('at-tr-pivot').value) / 100;
-            const hardness = parseInt($('at-tr-hardness').value) / 100;
+            const hardness = parseInt($('at-tr-edgehard').value) / 100;
             const sorg     = trSingleOrgParams();
 
             modes.forEach(mode => {
@@ -7375,11 +8217,63 @@ window.TRLE = window.TRLE || {};
         r.readAsText(file);
     }
 
-    /* Whether to feather the height map's borders so a tiling texture's parallax
-       doesn't cliff at the repeat seam. Shared by preview + export so they match. */
-    function heightSeamlessOn() {
-        const cb = document.getElementById('at-export-height-seamless');
-        return !!(cb && cb.checked);
+    /* The white-edge settings a tile's height map is generated with. Shared by
+       preview + export so they cannot disagree.
+
+       Tomb Engine's parallax marches the UV in ATLAS-PAGE space, up to ~35.8px past
+       a texture's own border on a 4096 page, against Tomb Editor's 8px of edge
+       bleed -- so anything short of a white border samples the neighbouring texture
+       and shows as a black bar. `null` means the engine's defaults, whose band is
+       derived from the tile size (see Engine.heightEdgeBandFor); `{amount: 0}` is
+       off. A per-tile recipe wins over the export-card default. */
+    function heightEdgeOpts(el) {
+        if (el && el.hgParams && el.hgParams.edge) return el.hgParams.edge;
+        const cb = document.getElementById('at-export-height-white');
+        return (!cb || cb.checked) ? null : { amount: 0 };
+    }
+
+    /* Advisory under the white-edge checkbox. The band is not a taste setting: TEN's
+       parallax reach is an absolute distance in atlas-page pixels, so the fraction of
+       a tile it covers grows as the tile shrinks -- 3.5% at 1024, 14% at 256, and more
+       than half a 64px tile, which is why parallax does not survive on small textures.
+       Say the number rather than leaving people to discover it in-engine. */
+    function syncHeightWhiteNote() {
+        const note = $('at-height-white-note'), row = $('at-height-white-row');
+        const cb = document.getElementById('at-export-height-white');
+        if (!note || !row) return;
+        const on = row.style.display !== 'none' && cb && cb.checked;
+        note.style.display = on ? '' : 'none';
+        if (!on) return;
+        const S = state.tileSize;
+        const band = TRLE.Engine.heightEdgeBandFor(S);
+        const px = Math.round(band * S);
+        const pct = Math.round(band * 100);
+        note.innerHTML = S <= 64
+            ? `⚠️ At <strong>${S}px</strong> the fade would take <strong>${pct}%</strong> of the tile — `
+              + `parallax reaches ~${Math.round(TRLE.Engine.POM_REACH_PX)}px whatever the texture's size, so there is `
+              + `almost no interior left to carve. Author parallax textures at <strong>256px or larger</strong>.`
+            : `Fades the outer <strong>${px}px</strong> (${pct}%) of each edge. Tomb Engine's parallax can march `
+              + `~${Math.round(TRLE.Engine.POM_REACH_PX)}px past a texture's border in the atlas page, so that is the `
+              + `width it has to cover. Bigger textures spend proportionally less.`;
+    }
+
+    /* Per-tile height overrides (P2's Make Height Map recipe), merged into the
+       preset that generateMaps receives. */
+    function heightPresetOverrides(el) {
+        const o = { heightEdge: heightEdgeOpts(el) };
+        const p = el && el.hgParams;
+        if (p) {
+            if (typeof p.strength === 'number') o.heightStrength = p.strength;
+            if (typeof p.blur === 'number') o.heightBlur = p.blur;
+            if (typeof p.top === 'number') o.heightTop = p.top;
+            if (p.invert) o.heightInvert = true;
+            /* The source picker has to reach EXPORT, not just the modal preview --
+               hgBuildMap is only what the Height modal draws for itself. */
+            const src = hgSourceOpts(p.source);
+            if (src) o.heightSource = src;
+            if (p.mask && typeof p.lift === 'number') o.heightPaint = { mask: p.mask, lift: p.lift };
+        }
+        return o;
     }
 
     function matSchedulePreview() {
@@ -7437,7 +8331,7 @@ window.TRLE = window.TRLE || {};
                 wrap.innerHTML = '<p class="sm-hint" style="margin:6px 0;">Pick or save a preset to preview its maps.</p>';
                 return;
             }
-            const preset = Object.assign({}, matCurrentPresetObj(), { flipNormalY: state.flipNormalY, heightSeamless: heightSeamlessOn(), alphaFlatten: canvasHasAlpha(el.canvas) });
+            const preset = Object.assign({}, matCurrentPresetObj(), Object.assign({ flipNormalY: state.flipNormalY, alphaFlatten: canvasHasAlpha(el.canvas) }, heightPresetOverrides(el)));
             const tex = TRLE.Engine.createTextureFromImage(el.canvas);
             const maps = TRLE.Engine.generateMaps(tex, S, S, preset, enabled);
             mat.gl = { tex, maps };
@@ -7533,7 +8427,7 @@ window.TRLE = window.TRLE || {};
             const c = composeLayerMaps(el.canvas, matMulti.layers, enabled, S);
             canv = { diffuse: el.canvas, normal: c.normal, ao: c.ao, roughness: c.roughness, emissive: c.emissive, height: c.height };
         } else {
-            const preset = Object.assign({}, matCurrentPresetObj(), { flipNormalY: state.flipNormalY, heightSeamless: heightSeamlessOn(), alphaFlatten: canvasHasAlpha(el.canvas) });
+            const preset = Object.assign({}, matCurrentPresetObj(), Object.assign({ flipNormalY: state.flipNormalY, alphaFlatten: canvasHasAlpha(el.canvas) }, heightPresetOverrides(el)));
             const tex  = TRLE.Engine.createTextureFromImage(el.canvas);
             const maps = TRLE.Engine.generateMaps(tex, S, S, preset, enabled);
             const toCanvas = k => maps[k] ? TRLE.Engine.fboToCanvas(maps[k]) : null;
@@ -7638,7 +8532,7 @@ window.TRLE = window.TRLE || {};
 
     /* ============ MULTI-MATERIAL (per-region layers) ============ */
     const MM_COLORS = ['#e8852a', '#4ec9b0', '#c586c0', '#dcdcaa', '#569cd6', '#f44747', '#6a9955', '#d7ba7d'];
-    const matMulti = { enabled: false, layers: [], active: 0, tool: 'brush', erase: false, loading: false };
+    const matMulti = { enabled: false, layers: [], active: 0, tool: 'brush', loading: false };   // paint state (tool mode, erase, undo) lives on mmEditor
 
     function mmHexToRgb(hex) {
         const h = hex.replace('#', '');
@@ -7661,7 +8555,7 @@ window.TRLE = window.TRLE || {};
         }
         matMulti.active = 0;
         matMulti.tool = 'brush';
-        matMulti.erase = false;
+        if (mmEditor) { mmEditor.setErase(false); mmEditor.resetHistory(); }
         $('at-mm-enable').checked = matMulti.enabled;
         mmApplyEnabledUI();
         if (matMulti.enabled) mmSelect(0); else mmRenderList();
@@ -7741,6 +8635,9 @@ window.TRLE = window.TRLE || {};
         matMulti.active = i;
         const L = matMulti.layers[i];
         if (!L) return;
+        // Each layer owns its own mask, so an undo stack taken on one of them would
+        // restore the wrong pixels onto the next. Switching layers starts fresh.
+        if (mmEditor) mmEditor.resetHistory();
         matMulti.loading = true;
         mat.dirty = false;
         matLoadMaterialDescriptor(L.material);
@@ -7820,219 +8717,63 @@ window.TRLE = window.TRLE || {};
             ctx.drawImage(mmTintMask(L.mask, L.color, S), 0, 0, S, S);
         });
         ctx.globalAlpha = 1;
-        ctx.strokeStyle = '#fff'; ctx.lineWidth = Math.max(1, S / 200);
-        // lasso in-progress outline
-        if (matMulti.tool === 'lasso' && mmLasso.pts.length) {
-            ctx.beginPath();
-            mmLasso.pts.forEach((p, k) => k ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
-            ctx.stroke();
-        }
-        // rectangle / ellipse rubber-band outline
-        if (mmDrag.active && (matMulti.tool === 'rect' || matMulti.tool === 'ellipse')) {
-            const x = Math.min(mmDrag.x0, mmDrag.x1), y = Math.min(mmDrag.y0, mmDrag.y1);
-            const w = Math.abs(mmDrag.x1 - mmDrag.x0), h = Math.abs(mmDrag.y1 - mmDrag.y0);
-            ctx.beginPath();
-            if (matMulti.tool === 'ellipse') ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
-            else ctx.rect(x, y, w, h);
-            ctx.stroke();
-        }
+        // The lasso outline and the rect/ellipse rubber band belong to the editor,
+        // which knows the in-progress interaction; this canvas is ours to composite.
+        if (mmEditor) mmEditor.drawOverlay(ctx);
     }
 
-    /* ---- Selection painting on the canvas (brush · lasso · rect · ellipse · wand) ---- */
-    const mmLasso = { pts: [] };
-    const mmDrag = { active: false, x0: 0, y0: 0, x1: 0, y1: 0 };
-    function mmCanvasPos(ev) {
-        const cv = $('at-mat-select'); const r = cv.getBoundingClientRect();
-        return { x: (ev.clientX - r.left) / r.width * cv.width, y: (ev.clientY - r.top) / r.height * cv.height };
-    }
+    /* ---- Selection editing ----
+       The brush/lasso/rect/ellipse/wand implementation that used to live here is now
+       createMaskEditor, shared with every other paint surface. What stays is the
+       multi-material-specific part: which mask the editor edits (the ACTIVE layer's,
+       and the Base layer has none), and what to redraw afterwards. */
+    let mmEditor = null;
+
     function mmActiveMask() {
         const L = matMulti.layers[matMulti.active];
         if (!L || matMulti.active === 0) return null;     // base has no paintable mask
         if (!L.mask) L.mask = mmBlankMask(state.tileSize);
         return L.mask;
     }
-    function mmBrushDab(mask, x, y) {
-        const ctx = mask.getContext('2d');
-        ctx.globalCompositeOperation = matMulti.erase ? 'destination-out' : 'source-over';
-        ctx.fillStyle = '#fff';
-        ctx.beginPath();
-        ctx.arc(x, y, parseInt($('at-mm-brush').value, 10) / 2, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.globalCompositeOperation = 'source-over';
-    }
-    function mmFillPolygon(mask, pts) {
-        if (pts.length < 3) return;
-        const ctx = mask.getContext('2d');
-        ctx.globalCompositeOperation = matMulti.erase ? 'destination-out' : 'source-over';
-        ctx.fillStyle = '#fff';
-        ctx.beginPath();
-        pts.forEach((p, k) => k ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
-        ctx.closePath(); ctx.fill();
-        ctx.globalCompositeOperation = 'source-over';
-    }
-    /* Fill a dragged rectangle / ellipse into the mask. */
-    function mmFillShape(mask, shape, x0, y0, x1, y1) {
-        const x = Math.min(x0, x1), y = Math.min(y0, y1), w = Math.abs(x1 - x0), h = Math.abs(y1 - y0);
-        if (w < 1 || h < 1) return;
-        const ctx = mask.getContext('2d');
-        ctx.globalCompositeOperation = matMulti.erase ? 'destination-out' : 'source-over';
-        ctx.fillStyle = '#fff';
-        ctx.beginPath();
-        if (shape === 'ellipse') ctx.ellipse(x + w / 2, y + h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
-        else ctx.rect(x, y, w, h);
-        ctx.fill();
-        ctx.globalCompositeOperation = 'source-over';
-    }
-    /* Magic wand: select pixels whose diffuse colour is within Tolerance of the
-       clicked pixel — contiguous (flood fill) or every matching pixel in the tile. */
-    function mmWandSelect(px, py) {
-        const mask = mmActiveMask(), el = byId(mat.id);
-        if (!mask || !el) return;
-        const S = state.tileSize;
-        const ix = Math.max(0, Math.min(S - 1, Math.floor(px)));
-        const iy = Math.max(0, Math.min(S - 1, Math.floor(py)));
-        const src = el.canvas.getContext('2d').getImageData(0, 0, S, S).data;
-        const o = (iy * S + ix) * 4, tr = src[o], tg = src[o + 1], tb = src[o + 2];
-        const thr = (parseInt($('at-mm-tol').value, 10) / 100) * 441.673;   // max RGB euclidean distance
-        const contiguous = $('at-mm-wand-contig').checked;
-        const ctx = mask.getContext('2d');
-        const md = ctx.getImageData(0, 0, S, S);
-        const add = !matMulti.erase;
-        const match = p => { const i = p * 4, dr = src[i] - tr, dg = src[i + 1] - tg, db = src[i + 2] - tb; return Math.sqrt(dr * dr + dg * dg + db * db) <= thr; };
-        const set = p => { const i = p * 4; const v = add ? 255 : 0; md.data[i] = v; md.data[i + 1] = v; md.data[i + 2] = v; md.data[i + 3] = v; };
-        if (contiguous) {
-            const seen = new Uint8Array(S * S), stack = [iy * S + ix];
-            while (stack.length) {
-                const p = stack.pop();
-                if (seen[p]) continue;
-                seen[p] = 1;
-                if (!match(p)) continue;
-                set(p);
-                const x = p % S, y = (p / S) | 0;
-                if (x > 0) stack.push(p - 1); if (x < S - 1) stack.push(p + 1);
-                if (y > 0) stack.push(p - S); if (y < S - 1) stack.push(p + S);
-            }
-        } else {
-            for (let p = 0; p < S * S; p++) if (match(p)) set(p);
-        }
-        ctx.putImageData(md, 0, 0);
-    }
 
+    /* Called BY the editor (opts.onTool) whenever the tool changes, and also used to
+       set the tool programmatically. The per-tool hint it used to write into
+       `#at-mm-selhint` now lives in the editor's own hint line -- this only ever
+       wrote the first one, because the tool buttons never called it, so the panel
+       spent its life telling you how to use whatever tool was active at open.
+       `#at-mm-selhint` goes back to being the layer message and nothing else. */
     function mmSetTool(tool) {
+        if (mmEditor && mmEditor.tool !== tool) mmEditor.setTool(tool);
         matMulti.tool = tool;
-        mmLasso.pts = [];
-        mmDrag.active = false;
-        document.querySelectorAll('#at-mat-multi .at-seg[data-tool]').forEach(b => b.classList.toggle('active', b.dataset.tool === tool));
-        $('at-mat-select').classList.toggle('at-mm-brushmode', tool === 'brush');
-        $('at-mm-brushwrap').style.display = tool === 'brush' ? '' : 'none';
-        $('at-mm-wandwrap').style.display = tool === 'wand' ? '' : 'none';
-        $('at-mm-contigwrap').style.display = tool === 'wand' ? '' : 'none';
-        const hint = {
-            brush: 'Drag to paint the region; toggle Paint/Erase.',
-            lasso: 'Click points around the region; double-click or Enter to close.',
-            rect: 'Drag a rectangle over the region.',
-            ellipse: 'Drag an ellipse over the region.',
-            wand: 'Click a colour to select similar pixels (raise Tol to grab more).'
-        }[tool];
-        if (matMulti.active > 0) $('at-mm-selhint').textContent = hint;
         mmRenderCanvas();
     }
 
     function setupMultiMaterial() {
+        // Feather is not a brush setting -- it softens the FINISHED layer mask when the
+        // maps are composited -- so it rides in as extraHTML rather than becoming part
+        // of the shared editor, where every other surface would inherit a control that
+        // means nothing to it.
+        buildMaskToolbar($('at-mm-tools'), 'at-mm', {
+            extraHTML: '<label class="at-mm-feather" title="Soften this layer\'s selection edge (px)">Feather<input type="range" id="at-mm-feather" min="0" max="24" value="2"></label>'
+        });
+        mmEditor = createMaskEditor('at-mm', {
+            canvas: $('at-mat-select'),
+            mode: 'alpha',
+            getMask: mmActiveMask,
+            getSource: () => { const el = byId(mat.id); return el ? el.canvas : null; },
+            active: () => matMulti.enabled && $('at-modal-mat').style.display !== 'none',
+            onTool: mmSetTool,
+            onChange: mmRenderCanvas,
+            onStrokeEnd: matSchedulePreview,
+            onNoMask: () => showToast('Select a layer above the Base to paint its region', 'info')
+        });
+
         $('at-mm-enable').addEventListener('change', e => mmEnable(e.target.checked));
         $('at-mm-add').addEventListener('click', mmAddLayer);
-        document.querySelectorAll('#at-mat-multi .at-seg[data-tool]').forEach(b =>
-            b.addEventListener('click', () => mmSetTool(b.dataset.tool)));
-        $('at-mm-erase').addEventListener('click', function () {
-            matMulti.erase = !matMulti.erase;
-            this.textContent = matMulti.erase ? '🧽 Erase' : '🖌 Paint';
-            this.setAttribute('aria-pressed', String(matMulti.erase));
-        });
         $('at-mm-feather').addEventListener('input', function () {
             const L = matMulti.layers[matMulti.active];
             if (L) { L.feather = parseInt(this.value, 10) || 0; matSchedulePreview(); }
         });
-        $('at-mm-fill').addEventListener('click', () => {
-            const mask = mmActiveMask(); if (!mask) return;
-            const S = state.tileSize, ctx = mask.getContext('2d');
-            ctx.globalCompositeOperation = matMulti.erase ? 'destination-out' : 'source-over';
-            ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, S, S);
-            ctx.globalCompositeOperation = 'source-over';
-            mmRenderCanvas(); matSchedulePreview();
-        });
-        $('at-mm-invert').addEventListener('click', () => {
-            const mask = mmActiveMask(); if (!mask) return;
-            const S = state.tileSize, ctx = mask.getContext('2d');
-            const inv = document.createElement('canvas'); inv.width = S; inv.height = S;
-            const ix = inv.getContext('2d');
-            ix.fillStyle = '#fff'; ix.fillRect(0, 0, S, S);
-            ix.globalCompositeOperation = 'destination-out'; ix.drawImage(mask, 0, 0);
-            ctx.clearRect(0, 0, S, S); ctx.drawImage(inv, 0, 0);
-            mmRenderCanvas(); matSchedulePreview();
-        });
-        $('at-mm-clear').addEventListener('click', () => {
-            const mask = mmActiveMask(); if (!mask) return;
-            mask.getContext('2d').clearRect(0, 0, mask.width, mask.height);
-            mmLasso.pts = [];
-            mmRenderCanvas(); matSchedulePreview();
-        });
-
-        const cv = $('at-mat-select');
-        let painting = false;
-        cv.addEventListener('pointerdown', e => {
-            const mask = mmActiveMask();
-            if (!mask) { showToast('Select a layer above the Base to paint its region', 'info'); return; }
-            const p = mmCanvasPos(e);
-            switch (matMulti.tool) {
-                case 'brush':
-                    painting = true; try { cv.setPointerCapture(e.pointerId); } catch {}
-                    mmBrushDab(mask, p.x, p.y); mmRenderCanvas(); break;
-                case 'lasso':
-                    mmLasso.pts.push(p); mmRenderCanvas(); break;
-                case 'rect': case 'ellipse':
-                    mmDrag.active = true; mmDrag.x0 = mmDrag.x1 = p.x; mmDrag.y0 = mmDrag.y1 = p.y;
-                    try { cv.setPointerCapture(e.pointerId); } catch {} break;
-                case 'wand':
-                    mmWandSelect(p.x, p.y); mmRenderCanvas(); matSchedulePreview(); break;
-            }
-            e.preventDefault();
-        });
-        cv.addEventListener('pointermove', e => {
-            if (painting && matMulti.tool === 'brush') {
-                const mask = mmActiveMask(); if (!mask) return;
-                const p = mmCanvasPos(e); mmBrushDab(mask, p.x, p.y); mmRenderCanvas(); e.preventDefault();
-            } else if (mmDrag.active && (matMulti.tool === 'rect' || matMulti.tool === 'ellipse')) {
-                const p = mmCanvasPos(e); mmDrag.x1 = p.x; mmDrag.y1 = p.y; mmRenderCanvas(); e.preventDefault();
-            }
-        });
-        const endStroke = () => {
-            if (painting) { painting = false; matSchedulePreview(); }
-            if (mmDrag.active) {
-                mmDrag.active = false;
-                const mask = mmActiveMask();
-                if (mask) mmFillShape(mask, matMulti.tool, mmDrag.x0, mmDrag.y0, mmDrag.x1, mmDrag.y1);
-                mmRenderCanvas(); matSchedulePreview();
-            }
-        };
-        cv.addEventListener('pointerup', endStroke);
-        cv.addEventListener('pointerleave', endStroke);
-        cv.addEventListener('dblclick', () => {   // close the lasso
-            if (matMulti.tool === 'lasso' && mmLasso.pts.length >= 3) {
-                const mask = mmActiveMask();
-                if (mask) { mmFillPolygon(mask, mmLasso.pts); }
-                mmLasso.pts = []; mmRenderCanvas(); matSchedulePreview();
-            }
-        });
-        document.addEventListener('keydown', e => {
-            if (!matMulti.enabled || $('at-overlay').style.display === 'none') return;
-            if (matMulti.tool === 'lasso' && e.key === 'Enter' && mmLasso.pts.length >= 3) {
-                const mask = mmActiveMask();
-                if (mask) mmFillPolygon(mask, mmLasso.pts);
-                mmLasso.pts = []; mmRenderCanvas(); matSchedulePreview();
-            } else if (matMulti.tool === 'lasso' && e.key === 'Escape' && mmLasso.pts.length) {
-                e.stopPropagation(); mmLasso.pts = []; mmRenderCanvas();   // cancel the in-progress lasso, keep modal open
-            }
-        }, true);
     }
 
     function setupMatModal() {
@@ -8189,8 +8930,8 @@ window.TRLE = window.TRLE || {};
        capped (HEAL_PREVIEW_MAX) so painting stays responsive on big tiles, so Save
        must not blindly reuse it -- it recomputes unless the cache is already
        full-resolution. */
-    const heal = { id: null, maskCanvas: null, resultCanvas: null, resultRes: 0,
-                   brushErase: false, timer: null };
+    const heal = { id: null, maskCanvas: null, resultCanvas: null, resultRes: 0, timer: null };
+    let healEditor = null;
     const HEAL_PREVIEW_MAX = 256;
 
     function healCleanup() {
@@ -8224,16 +8965,8 @@ window.TRLE = window.TRLE || {};
             }
         }
         ctx.putImageData(od, 0, 0);
+        if (healEditor) healEditor.drawOverlay(ctx);
         $('at-heal-canvas-label').textContent = 'Paint the area to heal (red = selected)';
-    }
-
-    function healSetTool(tool) {
-        heal.brushErase = (tool === 'erase');
-        document.querySelectorAll('#at-modal-heal [data-heal-tool]').forEach(b => {
-            const on = b.dataset.healTool === tool;
-            b.classList.toggle('active', on);
-            b.setAttribute('aria-pressed', on ? 'true' : 'false');
-        });
     }
 
     /* Live fill preview.
@@ -8398,11 +9131,10 @@ window.TRLE = window.TRLE || {};
     function openHealModal(id) {
         heal.id = id;
         heal.resultCanvas = null;
-        heal.brushErase = false;
         $('at-heal-tileno').textContent = indexOf(id) + 1;
         const mc = heal.maskCanvas.getContext('2d');
         mc.fillStyle = '#000'; mc.fillRect(0, 0, 256, 256);
-        healSetTool('paint');
+        if (healEditor) { healEditor.setErase(false); healEditor.resetHistory(); }
         updateHealHint();
         heal.resultCanvas = null;
         heal.resultRes = 0;
@@ -8414,42 +9146,86 @@ window.TRLE = window.TRLE || {};
         healRenderResult();   // clears the After pane from any previous tile
     }
 
+    /* Wire a `.at-cmp-frame` wipe + hold-to-flick pair. Generic on purpose: the
+       Heal panes are the first use, and any other two-canvas comparison in the
+       tool should reuse this rather than grow a second one. */
+    function setupCompare(frameId, rangeId, holdId) {
+        const frame = $(frameId), range = $(rangeId), hold = $(holdId);
+        if (!frame) return;
+        let held = false, restore = 50;
+        const set = v => {
+            frame.style.setProperty('--pos', v + '%');
+            if (range) range.value = v;
+        };
+        const drag = e => {
+            if (held) return;
+            const r = frame.getBoundingClientRect();
+            set(Math.max(0, Math.min(100, ((e.clientX - r.left) / r.width) * 100)));
+        };
+        if (range) range.addEventListener('input', () => set(range.value));
+        let down = false;
+        frame.addEventListener('pointerdown', e => {
+            down = true;
+            try { frame.setPointerCapture(e.pointerId); } catch { /* noop */ }
+            drag(e); e.preventDefault();
+        });
+        frame.addEventListener('pointermove', e => { if (down) drag(e); });
+        const up = () => { down = false; };
+        frame.addEventListener('pointerup', up);
+        frame.addEventListener('pointercancel', up);
+        if (hold) {
+            /* Hold shows the ORIGINAL over the whole frame. Flicking the two in the
+               same position is what catches a smear; the wipe is for studying one
+               boundary. They answer different questions, hence both. */
+            const start = () => {
+                if (held) return;
+                held = true;
+                restore = range ? +range.value : 50;
+                frame.classList.add('at-cmp-held');
+                frame.style.setProperty('--pos', '100%');
+            };
+            const end = () => {
+                if (!held) return;
+                held = false;
+                frame.classList.remove('at-cmp-held');
+                frame.style.setProperty('--pos', restore + '%');
+            };
+            hold.addEventListener('pointerdown', e => { start(); e.preventDefault(); });
+            ['pointerup', 'pointerleave', 'pointercancel', 'blur'].forEach(t => hold.addEventListener(t, end));
+            // Keyboard: Space/Enter hold for as long as the key is down.
+            hold.addEventListener('keydown', e => { if (e.key === ' ' || e.key === 'Enter') { start(); e.preventDefault(); } });
+            hold.addEventListener('keyup', e => { if (e.key === ' ' || e.key === 'Enter') end(); });
+        }
+        set(50);
+    }
+
     function setupHealModal() {
-        // Create the mask canvas up-front so attachMaskBrush binds a real object.
+        setupCompare('at-heal-cmp', 'at-heal-cmp-range', 'at-heal-hold');
+        // Create the mask canvas up-front so the editor binds a real object.
         heal.maskCanvas = document.createElement('canvas');
         heal.maskCanvas.width = 256; heal.maskCanvas.height = 256;
+        buildMaskToolbar($('at-heal-tools'), 'at-heal', {
+            brushMax: 96,
+            extraHTML: '<span id="at-heal-busy" class="sm-hint" style="margin:0;display:none;">Filling…</span>'
+        });
+        /* The fill is expensive (94ms at 256, 233ms at 512), so onChange stays cheap
+           -- paint view only -- and the refill is hung off onStrokeEnd. That split is
+           what keeps painting responsive, and it is the reason Heal was converted to
+           the shared editor last. */
+        healEditor = createMaskEditor('at-heal', {
+            canvas: $('at-heal-canvas'),
+            mode: 'luma',
+            getMask: () => heal.maskCanvas,
+            getSource: () => { const el = byId(heal.id); return el ? el.canvas : null; },
+            active: () => heal.id !== null && $('at-modal-heal').style.display !== 'none',
+            onChange: () => { heal.resultCanvas = null; heal.resultRes = 0; healRenderPaint(); },
+            onStrokeEnd: healSchedulePreview
+        });
         // Method and hardness both change what the fill produces, so both re-run it.
         $('at-heal-method').addEventListener('change', () => {
             updateHealHint();
             healRenderPaint();
             healSchedulePreview();
-        });
-        $('at-heal-brush').addEventListener('input', function () {
-            $('at-heal-brush-val').textContent = this.value;
-        });
-        $('at-heal-hardness').addEventListener('input', function () {
-            $('at-heal-hardness-val').textContent = this.value;
-        });
-        // Paint and Erase are two buttons, not one that relabels itself: which mode
-        // you are in should be readable without remembering what the label means.
-        document.querySelectorAll('#at-modal-heal [data-heal-tool]').forEach(b =>
-            b.addEventListener('click', () => healSetTool(b.dataset.healTool)));
-        $('at-heal-clear').addEventListener('click', () => {
-            const mc = heal.maskCanvas.getContext('2d');
-            mc.fillStyle = '#000'; mc.fillRect(0, 0, heal.maskCanvas.width, heal.maskCanvas.height);
-            healRenderPaint();
-            healSchedulePreview();
-        });
-
-        attachMaskBrush($('at-heal-canvas'), heal.maskCanvas, {
-            active: () => heal.id !== null && $('at-modal-heal').style.display !== 'none',
-            brushSize: () => parseInt($('at-heal-brush').value),
-            erase: () => heal.brushErase,
-            // onPaint runs per dab: paint view only, nothing expensive.
-            onPaint: () => { heal.resultCanvas = null; heal.resultRes = 0; healRenderPaint(); },
-            // The fill is recomputed once the stroke ends.
-            onStrokeEnd: healSchedulePreview,
-            hardness: () => parseInt($('at-heal-hardness').value) / 100
         });
         $('at-heal-save').addEventListener('click', () => {
             if (heal.id === null) return;
@@ -8469,13 +9245,14 @@ window.TRLE = window.TRLE || {};
     }
 
     /* ============ FADE TO TRANSPARENT MODAL (Phase T3) ============ */
-    const fade = { id: null, maskCanvas: null, brushErase: false };
+    const fade = { id: null, maskCanvas: null };
+    let fadeEditor = null;
 
     function fadeCleanup() { fade.id = null; }
 
     function fadeBuildMask(P) {
         const amount = parseInt($('at-fade-amount').value) / 100;
-        const hardness = parseInt($('at-fade-hardness').value) / 100;
+        const hardness = parseInt($('at-fade-edgehard').value) / 100;
         const shape = $('at-fade-shape').value;
         if (shape === 'custom') return softenMask(fade.maskCanvas, P);
         if (shape === 'dir') return buildTopologyMask(P, $('at-fade-dir').value, 1 - amount, hardness);
@@ -8492,23 +9269,23 @@ window.TRLE = window.TRLE || {};
         const ctx = cv.getContext('2d');
         ctx.clearRect(0, 0, P, P);
         ctx.drawImage(faded, 0, 0);
+        if (fadeEditor && $('at-fade-shape').value === 'custom') fadeEditor.drawOverlay(ctx);
     }
 
     function fadeSetShape() {
         const shape = $('at-fade-shape').value;
         $('at-fade-dir-wrap').style.display = shape === 'dir' ? '' : 'none';
         $('at-fade-custom').style.display = shape === 'custom' ? '' : 'none';
+        $('at-fade-shapeopts').style.display = shape === 'custom' ? 'none' : '';
         fadePreview();
     }
 
     function openFadeModal(id) {
         fade.id = id;
-        fade.brushErase = false;
         $('at-fade-tileno').textContent = indexOf(id) + 1;
         const mc = fade.maskCanvas.getContext('2d');
         mc.fillStyle = '#000'; mc.fillRect(0, 0, fade.maskCanvas.width, fade.maskCanvas.height);
-        const bm = $('at-fade-brush-mode');
-        bm.textContent = '🖌️ Paint'; bm.setAttribute('aria-pressed', 'false');
+        if (fadeEditor) { fadeEditor.setErase(false); fadeEditor.resetHistory(); }
         fadeSetShape();
         openModal('fade');
         fadePreview();
@@ -8525,23 +9302,16 @@ window.TRLE = window.TRLE || {};
         $('at-fade-shape').addEventListener('change', fadeSetShape);
         $('at-fade-dir').addEventListener('change', fadePreview);
         $('at-fade-amount').addEventListener('input', function () { $('at-fade-amount-val').textContent = this.value; fadePreview(); });
-        $('at-fade-hardness').addEventListener('input', function () { $('at-fade-hardness-val').textContent = this.value; fadePreview(); });
-        $('at-fade-brush').addEventListener('input', function () { $('at-fade-brush-val').textContent = this.value; });
-        $('at-fade-brush-mode').addEventListener('click', function () {
-            fade.brushErase = !fade.brushErase;
-            this.textContent = fade.brushErase ? '🧽 Erase' : '🖌️ Paint';
-            this.setAttribute('aria-pressed', String(fade.brushErase));
-        });
-        $('at-fade-clear').addEventListener('click', () => {
-            const mc = fade.maskCanvas.getContext('2d');
-            mc.fillStyle = '#000'; mc.fillRect(0, 0, fade.maskCanvas.width, fade.maskCanvas.height);
-            fadePreview();
-        });
-        attachMaskBrush($('at-fade-preview'), fade.maskCanvas, {
-            active: () => fade.id !== null && $('at-fade-shape').value === 'custom' && $('at-modal-fade').style.display !== 'none',
-            brushSize: () => parseInt($('at-fade-brush').value),
-            erase: () => fade.brushErase,
-            onPaint: fadePreview
+        $('at-fade-edgehard').addEventListener('input', function () { $('at-fade-edgehard-val').textContent = this.value; fadePreview(); });
+        buildMaskToolbar($('at-fade-tools'), 'at-fade', { brushMax: 96 });
+        fadeEditor = createMaskEditor('at-fade', {
+            canvas: $('at-fade-preview'),
+            mode: 'luma',
+            getMask: () => fade.maskCanvas,
+            getSource: () => { const el = byId(fade.id); return el ? el.canvas : null; },
+            active: () => fade.id !== null && $('at-fade-shape').value === 'custom'
+                          && $('at-modal-fade').style.display !== 'none',
+            onChange: fadePreview
         });
         $('at-fade-apply').addEventListener('click', () => {
             if (fade.id === null) return;
@@ -8565,7 +9335,8 @@ window.TRLE = window.TRLE || {};
        pick-colour, hue-range, brightness, paint. Glow source: texture colours
        or a flat tint. Shared strength + feather/bloom. Preview shows the
        emissive on black (how it reads in the dark). */
-    const emissive = { id: null, maskCanvas: null, brushErase: false };
+    const emissive = { id: null, maskCanvas: null };
+    let emEditor = null;   // shared mask editor; owns the tool, erase flag and undo stack
 
     function emissiveCleanup() { emissive.id = null; }
 
@@ -8631,6 +9402,15 @@ window.TRLE = window.TRLE || {};
         const src = $('at-em-source-canvas').getContext('2d');
         src.clearRect(0, 0, P, P);
         src.drawImage(tile, 0, 0);
+        // Paint mode used to give no feedback at all on this canvas -- you painted
+        // blind and read the result off the emissive preview next to it. Tint the
+        // mask over the tile, then let the editor add its lasso / rubber band.
+        if ($('at-em-mode').value === 'paint') {
+            src.globalAlpha = 0.5;
+            src.drawImage(mmTintMask(emissive.maskCanvas, '#ffcc66', P), 0, 0, P, P);
+            src.globalAlpha = 1;
+            if (emEditor) emEditor.drawOverlay(src);
+        }
         const out = emissiveCompute(tile);
         const ctx = $('at-em-preview').getContext('2d');
         ctx.fillStyle = '#000'; ctx.fillRect(0, 0, P, P);
@@ -8644,6 +9424,7 @@ window.TRLE = window.TRLE || {};
         $('at-em-grp-brightness').style.display = m === 'brightness' ? '' : 'none';
         $('at-em-grp-paint').style.display = m === 'paint' ? '' : 'none';
         $('at-em-grp-softness').style.display = m === 'paint' ? 'none' : '';
+        $('at-em-master-note').style.display = m === 'paint' ? '' : 'none';
         $('at-em-source-canvas').style.cursor = m === 'paint' ? 'crosshair' : (m === 'brightness' ? 'default' : 'crosshair');
         emissivePreview();
     }
@@ -8690,13 +9471,11 @@ window.TRLE = window.TRLE || {};
 
     function openEmissiveModal(id) {
         emissive.id = id;
-        emissive.brushErase = false;
         $('at-em-tileno').textContent = indexOf(id) + 1;
         emSyncState();
         const mc = emissive.maskCanvas.getContext('2d');
         mc.fillStyle = '#000'; mc.fillRect(0, 0, emissive.maskCanvas.width, emissive.maskCanvas.height);
-        const bm = $('at-em-brush-mode');
-        bm.textContent = '🖌️ Paint'; bm.setAttribute('aria-pressed', 'false');
+        if (emEditor) { emEditor.setErase(false); emEditor.resetHistory(); }
         emSetSourceType();
         emSetMode();
         openModal('emissive');
@@ -8721,23 +9500,16 @@ window.TRLE = window.TRLE || {};
         sliders.forEach(([s, v]) => $(s).addEventListener('input', function () {
             $(v).textContent = this.value; emissivePreview();
         }));
-        $('at-em-brush').addEventListener('input', function () { $('at-em-brush-val').textContent = this.value; });
-        $('at-em-brush-mode').addEventListener('click', function () {
-            emissive.brushErase = !emissive.brushErase;
-            this.textContent = emissive.brushErase ? '🧽 Erase' : '🖌️ Paint';
-            this.setAttribute('aria-pressed', String(emissive.brushErase));
-        });
-        $('at-em-clear').addEventListener('click', () => {
-            const mc = emissive.maskCanvas.getContext('2d');
-            mc.fillStyle = '#000'; mc.fillRect(0, 0, emissive.maskCanvas.width, emissive.maskCanvas.height);
-            emissivePreview();
-        });
         $('at-em-source-canvas').addEventListener('pointerdown', emSampleSource);
-        attachMaskBrush($('at-em-source-canvas'), emissive.maskCanvas, {
-            active: () => emissive.id !== null && $('at-em-mode').value === 'paint' && $('at-modal-emissive').style.display !== 'none',
-            brushSize: () => parseInt($('at-em-brush').value),
-            erase: () => emissive.brushErase,
-            onPaint: emissivePreview
+        buildMaskToolbar($('at-em-tools'), 'at-em', { brushMax: 96, value: 'Brightness' });
+        emEditor = createMaskEditor('at-em', {
+            canvas: $('at-em-source-canvas'),
+            mode: 'luma',
+            getMask: () => emissive.maskCanvas,
+            getSource: () => { const el = byId(emissive.id); return el ? el.canvas : null; },
+            active: () => emissive.id !== null && $('at-em-mode').value === 'paint'
+                          && $('at-modal-emissive').style.display !== 'none',
+            onChange: emissivePreview
         });
         $('at-em-remove').addEventListener('click', () => {
             if (emissive.id === null) return;
@@ -8760,6 +9532,494 @@ window.TRLE = window.TRLE || {};
             pushHistory('Emissive map');
             showToast('Emissive map applied (Emissive export map enabled)', 'success');
         });
+    }
+
+
+    /* ============ HEIGHT MAP MODAL ============
+       The dedicated parallax editor, alongside the Height sliders in Set Material
+       for the same reason Make Emissive exists alongside the emissive ones: height
+       belongs on a handful of hero textures, not on a preset every tile shares.
+
+       Stored as a RE-EDITABLE RECIPE on `el.hgParams`, the sgParams/htParams
+       pattern, not as baked pixels like `el.emissive`. Height is derived from the
+       diffuse, so a recipe keeps working when the tile is recoloured or healed --
+       and the settings are the thing worth coming back to. The paint mask is the
+       only pixels, and only when someone painted one.
+
+       The preview is TombEngine's OWN parallax shader (Engine.pomPreview), not a
+       displaced mesh: the point of this modal is to show the artifact it exists to
+       prevent, and only the real march produces that. */
+    const hg = { id: null, mask: null, timer: null, editor: null,
+                 map: null, viewRaf: 0, yaw: 35, pitch: 18 };
+
+    function hgCleanup() { hg.id = null; clearTimeout(hg.timer); }
+
+    const HG_PROFILE_HINTS = [
+        'A soft ramp to white. What the Tomb Engine devs’ own reference images use — start here.',
+        'A straight ramp. Slightly more interior detail kept than Smooth, slightly harder to miss.',
+        'Narrow and steep. For large textures, where the band it has to cover is only a few percent.',
+        'The band wanders in and out along the edge. Rubble, broken stone, anything that should not end on a ruled line.',
+        'Ends the fade on a mortar line instead of slicing a stone in half. Needs a texture with real joints — on anything else it falls back to Smooth.'
+    ];
+
+    /* The recipe the controls currently describe. */
+    function hgReadParams() {
+        let edges = 0;
+        document.querySelectorAll('#at-hg-edges [data-edge]').forEach(b => {
+            if (b.classList.contains('active')) edges |= parseInt(b.dataset.edge, 10);
+        });
+        const p = {
+            strength: parseInt($('at-hg-strength').value, 10),
+            blur: parseInt($('at-hg-blur').value, 10),
+            /* `invert` keeps its original meaning -- "the thing the relief is read
+               from is HIGH, not low" -- so recipes saved before the source picker
+               existed still load and still mean what they meant. */
+            invert: $('at-hg-raise').classList.contains('active'),
+            source: hgReadSource(),
+            edge: {
+                profile: parseInt($('at-hg-profile').value, 10),
+                band: parseInt($('at-hg-band').value, 10) / 100,
+                amount: parseInt($('at-hg-amount').value, 10) / 100,
+                edges, seed: 0
+            }
+        };
+        if (hgMaskHasPaint()) p.lift = parseInt($('at-hg-lift').value, 10) / 100;
+        return p;
+    }
+
+    /* ---- the height source, and saying out loud which side sinks ----
+       Height was always read from luminance, with a bare "Invert (dark is high)"
+       checkbox as the only say in it -- which cannot express "the mortar carves in
+       and the stones stay flat" on a texture whose stones are darker than its
+       joints. The picker reuses the emissiveMask shader, so no new GLSL: it hands
+       back a 0..1 selection and simpleHeight's existing u_invert decides which end
+       of it is the surface. */
+    function hgReadSource() {
+        const mode = $('at-hg-source').value;
+        if (mode === 'lum') return { mode: 'lum' };
+        return {
+            mode,
+            target: $('at-hg-target').value,
+            tol: parseInt($('at-hg-srctol').value, 10),
+            hue: parseInt($('at-hg-hue').value, 10),
+            hueWidth: parseInt($('at-hg-huewidth').value, 10)
+        };
+    }
+
+    /* The engine opts for a non-luminance source, or null for plain luminance. */
+    function hgSourceOpts(src) {
+        if (!src || !src.mode || src.mode === 'lum') return null;
+        if (src.mode === 'color') {
+            return { mode: 1, target: emHexToRgb01(src.target || '#8a8175'),
+                     tolerance: (src.tol != null ? src.tol : 25) / 100, softness: 0.3 };
+        }
+        return { mode: 2, hueCenter: (src.hue != null ? src.hue : 30) / 360,
+                 hueWidth: (src.hueWidth != null ? src.hueWidth : 30) / 360,
+                 satMin: 0.15, valMin: 0.1, softness: 0.3 };
+    }
+
+    function hgSetSide(raised) {
+        [['at-hg-sink', !raised], ['at-hg-raise', raised]].forEach(([id, on]) => {
+            const b = $(id);
+            if (b) { b.classList.toggle('active', on); b.setAttribute('aria-pressed', String(on)); }
+        });
+        hgSideNote();
+    }
+
+    function hgSyncSource() {
+        const m = $('at-hg-source').value;
+        $('at-hg-grp-color').style.display = m === 'color' ? '' : 'none';
+        $('at-hg-grp-hue').style.display = m === 'hue' ? '' : 'none';
+        ['at-hg-srctol', 'at-hg-hue', 'at-hg-huewidth'].forEach(k => {
+            const v = $(k + '-val'); if (v) v.textContent = $(k).value;
+        });
+        hgSideNote();
+    }
+
+    /* The line the report actually asked for: name what ends up deep and what ends
+       up on the surface, in the tile's own terms. It also has to be honest that
+       "on top" is the POLYGON PLANE, not proud of the wall -- Tomb Engine reads
+       depth = 1.0 - ORSH.w and only ever carves in (HEIGHT-MAP-AUDIT.md), so a user
+       expecting geometry to pop out is about to be disappointed by the engine, not
+       by this tool. */
+    function hgSideNote() {
+        const el = $('at-hg-side-note');
+        if (!el) return;
+        const m = $('at-hg-source').value;
+        const raised = $('at-hg-raise').classList.contains('active');
+        let picked;
+        if (m === 'color') picked = `pixels close to <strong>${$('at-hg-target').value}</strong>`;
+        else if (m === 'hue') picked = `pixels around hue <strong>${$('at-hg-hue').value}°</strong>`;
+        else picked = 'the <strong>darker</strong> pixels';
+        const plural = m === 'lum';                       // "everything else" takes a singular verb
+        const other = plural ? 'the lighter pixels' : 'everything else';
+        const v = (pl, sg) => plural ? pl : sg;
+        const Picked = picked.charAt(0).toUpperCase() + picked.slice(1);
+        el.innerHTML = raised
+            ? `${Picked} sit on the wall surface; ${other} ${v('carve', 'carves')} in behind them.`
+            : `${Picked} carve in (deep); ${other} ${v('sit', 'sits')} on the wall surface.`;
+        el.innerHTML += ' <em>Nothing is ever pushed out in front of the wall.</em>';
+    }
+
+    /* Eyedrop the tile for the colour / hue source. Capture phase and only in a
+       picker mode, so the mask editor keeps the canvas the rest of the time. */
+    function hgSampleSource(ev) {
+        const m = $('at-hg-source').value;
+        if (m !== 'color' && m !== 'hue') return;
+        if (!ev.shiftKey && !ev.altKey && ev.button !== 0) return;
+        const el = byId(hg.id); if (!el) return;
+        const cv = $('at-hg-canvas');
+        const r = cv.getBoundingClientRect();
+        const S = el.canvas.width;
+        const x = Math.max(0, Math.min(S - 1, Math.floor((ev.clientX - r.left) / r.width * S)));
+        const y = Math.max(0, Math.min(S - 1, Math.floor((ev.clientY - r.top) / r.height * S)));
+        const d = el.canvas.getContext('2d').getImageData(x, y, 1, 1).data;
+        if (m === 'color') {
+            $('at-hg-target').value = emRgb01ToHex([d[0] / 255, d[1] / 255, d[2] / 255]);
+        } else {
+            const hue = Math.round(emRgbHue(d[0], d[1], d[2]) * 360);
+            $('at-hg-hue').value = hue; $('at-hg-hue-val').textContent = hue;
+        }
+        ev.stopPropagation(); ev.preventDefault();
+        hgSideNote();
+        hgSchedulePreview();
+    }
+
+    function hgMaskHasPaint() {
+        if (!hg.mask) return false;
+        const d = hg.mask.getContext('2d').getImageData(0, 0, hg.mask.width, hg.mask.height).data;
+        for (let i = 0; i < d.length; i += 4) if (d[i] > 8) return true;
+        return false;
+    }
+
+    function hgWriteParams(p) {
+        $('at-hg-strength').value = p.strength ?? 20;
+        $('at-hg-blur').value = p.blur ?? 2;
+        hgSetSide(!!p.invert);
+        const src = p.source || { mode: 'lum' };
+        $('at-hg-source').value = src.mode || 'lum';
+        $('at-hg-target').value = src.target || '#8a8175';
+        $('at-hg-srctol').value = src.tol != null ? src.tol : 25;
+        $('at-hg-hue').value = src.hue != null ? src.hue : 30;
+        $('at-hg-huewidth').value = src.hueWidth != null ? src.hueWidth : 30;
+        hgSyncSource();
+        const e = p.edge || {};
+        $('at-hg-profile').value = String(e.profile ?? 0);
+        $('at-hg-band').value = Math.round((e.band ?? TRLE.Engine.heightEdgeBandFor(state.tileSize)) * 100);
+        $('at-hg-amount').value = Math.round((e.amount ?? 1) * 100);
+        $('at-hg-lift').value = Math.round((p.lift ?? -0.4) * 100);
+        const edges = e.edges ?? 15;
+        document.querySelectorAll('#at-hg-edges [data-edge]').forEach(b => {
+            const on = (edges & parseInt(b.dataset.edge, 10)) !== 0;
+            b.classList.toggle('active', on);
+            b.setAttribute('aria-pressed', String(on));
+        });
+        hgSyncLabels();
+    }
+
+    function hgSyncLabels() {
+        const S = state.tileSize;
+        const bandPct = parseInt($('at-hg-band').value, 10);
+        $('at-hg-strength-val').textContent = $('at-hg-strength').value;
+        $('at-hg-blur-val').textContent = $('at-hg-blur').value;
+        $('at-hg-band-val').textContent = bandPct;
+        $('at-hg-band-px').textContent = Math.round(bandPct / 100 * S);
+        $('at-hg-amount-val').textContent = $('at-hg-amount').value;
+        $('at-hg-lift-val').textContent = $('at-hg-lift').value;
+        $('at-hg-profile-hint').textContent = HG_PROFILE_HINTS[parseInt($('at-hg-profile').value, 10)] || '';
+
+        /* The band is not a taste setting. TEN's parallax reach is an absolute
+           distance in atlas-page pixels, so the share of a tile it covers grows as
+           the tile shrinks -- and below the safe band the black bars come back. */
+        const safe = TRLE.Engine.heightEdgeBandFor(S);
+        const reach = Math.round(TRLE.Engine.POM_REACH_PX);
+        const adv = $('at-hg-band-advice');
+        const amount = parseInt($('at-hg-amount').value, 10);
+        if (amount < 100) {
+            adv.style.display = 'block';
+            adv.innerHTML = '⚠️ Below <strong>100%</strong> the border is not the surface plane, so the parallax march is '
+                + 'only slowed, not stopped. Expect edge artifacts unless this texture’s borders are never visible.';
+        /* The "author parallax at 256px or larger" warning used to fire here too, on
+           every small tile. It still fires on the export card, and the band advice
+           below already says what the band costs -- three copies of one fact read as
+           nagging, so this modal no longer repeats it. */
+        } else if (bandPct / 100 < safe - 0.005) {
+            adv.style.display = 'block';
+            adv.innerHTML = `⚠️ Below the safe band for a <strong>${S}px</strong> tile (<strong>${Math.round(safe * 100)}%</strong>, `
+                + `${Math.round(safe * S)}px). Tomb Engine’s parallax can march ~${reach}px past this texture’s border in the atlas page, `
+                + `so a shorter fade lets the black bars back.`;
+        } else {
+            adv.style.display = 'none';
+        }
+    }
+
+    /* Tile + the painted mask, so strokes are visible while you make them. */
+    function hgRenderPaint() {
+        const el = byId(hg.id); if (!el) return;
+        const cv = $('at-hg-canvas'), S = state.tileSize;
+        cv.width = S; cv.height = S;
+        const ctx = cv.getContext('2d');
+        ctx.clearRect(0, 0, S, S);
+        ctx.drawImage(el.canvas, 0, 0, S, S);
+        const lift = parseInt($('at-hg-lift').value, 10);
+        ctx.globalAlpha = 0.55;
+        ctx.drawImage(mmTintMask(hg.mask, lift < 0 ? '#569cd6' : '#e8852a', S), 0, 0, S, S);
+        ctx.globalAlpha = 1;
+        if (hg.editor) hg.editor.drawOverlay(ctx);
+    }
+
+    /* Generate the height map this recipe produces, as a canvas. */
+    function hgBuildMap() {
+        const el = byId(hg.id); if (!el) return null;
+        const S = state.tileSize;
+        const p = hgReadParams();
+        const preset = Object.assign({}, resolvePreset(el), {
+            heightStrength: p.strength, heightBlur: p.blur, heightInvert: p.invert,
+            heightSource: hgSourceOpts(p.source),
+            heightEdge: p.edge, alphaFlatten: canvasHasAlpha(el.canvas),
+            heightPaint: p.lift != null ? { mask: hg.mask, lift: p.lift } : null
+        });
+        const tex = TRLE.Engine.createTextureFromImage(el.canvas);
+        const maps = TRLE.Engine.generateMaps(tex, S, S, preset, { height: true });
+        const out = maps.height ? TRLE.Engine.fboToCanvas(maps.height) : null;
+        Object.values(maps).forEach(f => f && TRLE.Engine.deleteFBO(f));
+        TRLE.Engine.deleteTexture(tex);
+        return out;
+    }
+
+    /* Turning the view does NOT change the height map, so the two are split.
+
+       They used to be one function behind a 120ms debounce, which meant every
+       degree of drag re-ran the whole of generateMaps -- gray, blur, a GPU
+       percentile READBACK, the edge fade -- to draw the same map from a different
+       angle. Measured: rebuilding the map is 8.5ms at 256 and 16ms at 1024, while
+       the view render alone is 1.8ms at every size. That is the difference between
+       "it updates when I let go" and 60fps. */
+    function hgMap() {
+        if (!hg.map) hg.map = hgBuildMap();
+        return hg.map;
+    }
+
+    /* Camera moved only. Cheap enough to run every frame. */
+    function hgRenderView() {
+        const el = byId(hg.id); if (!el) return;
+        const map = hgMap(); if (!map) return;
+        const S = state.tileSize;
+        const pom = TRLE.Engine.pomPreview3D(el.canvas, map, S,
+            { yaw: hg.yaw, pitch: hg.pitch, dist: 3.1, size: 420 });
+        const pc = $('at-hg-pom');
+        pc.width = pom.width; pc.height = pom.height;
+        pc.getContext('2d').drawImage(pom, 0, 0);
+
+        /* The reach depends on the angle off the surface NORMAL, which with two
+           axes is not just the yaw: cos(theta) = cos(yaw)*cos(pitch). Derived, so
+           it stays true however the view is turned -- and it is the reason the
+           angle needs no slider: it is a readout, not a control. */
+        const cosT = Math.abs(Math.cos(hg.yaw * Math.PI / 180) * Math.cos(hg.pitch * Math.PI / 180));
+        const deg = Math.round(Math.acos(Math.max(-1, Math.min(1, cosT))) * 180 / Math.PI);
+        const reach = (Math.sin(deg * Math.PI / 180) / Math.max(0.4, cosT)) * 0.0035 * 4096;
+        $('at-hg-pom-note').innerHTML = `You are <strong>${deg}°</strong> off square to the surface, where the parallax march reaches `
+            + `<strong>${Math.round(reach)}px</strong> (${Math.round(reach / S * 100)}% of this tile). A <strong>smeared or black strip</strong> `
+            + `along an edge is the march leaving the texture: first Tomb Editor's 8px of edge bleed (the stretched pixels), then whatever `
+            + `the packer put next in the atlas.`;
+    }
+
+    /* A height PARAMETER changed: the cached map is stale. */
+    function hgPreview() {
+        const el = byId(hg.id); if (!el) return;
+        hg.map = null;
+        hgSyncLabels();
+        hgRenderPaint();
+        const S = state.tileSize;
+        const map = hgMap();
+        if (!map) return;
+        const mc = $('at-hg-map');
+        mc.width = S; mc.height = S;
+        mc.getContext('2d').drawImage(map, 0, 0);
+        hgRenderView();
+    }
+
+    /* Orbit the parallax preview the way any 3D view works: drag turns it on both
+       axes, the two sliders mirror the same state so it stays keyboard-reachable,
+       and both axes are signed so the surface can be faced dead-on (0°) and turned
+       either way. The old single 15..85 slider could do none of that -- it could
+       not face the wall, could not turn left, and saturated after ~175px of drag,
+       which is exactly what made it feel stuck. 85 is the limit because a plane at
+       90° is edge-on and has no pixels. */
+    const HG_VIEW_DEFAULT = { yaw: 35, pitch: 18 };
+    /* 85, not 90: a plane seen exactly edge-on has no pixels. */
+    function hgSetView(yaw, pitch) {
+        const clamp = v => Math.max(-85, Math.min(85, v));
+        hg.yaw = clamp(yaw);
+        hg.pitch = clamp(pitch);
+        hgScheduleView();
+    }
+    /* One render per frame however many pointermoves arrive. */
+    function hgScheduleView() {
+        if (hg.viewRaf) return;
+        hg.viewRaf = requestAnimationFrame(() => { hg.viewRaf = 0; hgRenderView(); });
+    }
+    function hgSetupOrbit() {
+        const cv = $('at-hg-pom');
+        if (!cv) return;
+        let down = false, lastX = 0, lastY = 0;
+        cv.addEventListener('pointerdown', e => {
+            down = true; lastX = e.clientX; lastY = e.clientY;
+            cv.style.cursor = 'grabbing';
+            try { cv.setPointerCapture(e.pointerId); } catch { /* noop */ }
+            e.preventDefault();
+        });
+        cv.addEventListener('pointermove', e => {
+            if (!down) return;
+            /* Drag RIGHT turns the surface's right edge away, which is what a
+               grab-and-turn gesture reads as. 0.35°/px over a 420px canvas covers
+               the whole range in about two thirds of its width. hgSetView renders
+               on the next frame -- NOT hgSchedulePreview, which would rebuild the
+               height map the rotation cannot have changed. */
+            hgSetView(hg.yaw + (e.clientX - lastX) * 0.35,
+                      hg.pitch - (e.clientY - lastY) * 0.35);
+            lastX = e.clientX; lastY = e.clientY;
+        });
+        const up = e => {
+            down = false; cv.style.cursor = 'grab';
+            try { cv.releasePointerCapture(e.pointerId); } catch { /* noop */ }
+        };
+        cv.addEventListener('pointerup', up);
+        cv.addEventListener('pointercancel', up);
+        cv.addEventListener('dblclick', () => hgSetView(HG_VIEW_DEFAULT.yaw, HG_VIEW_DEFAULT.pitch));
+        $('at-hg-view-reset').addEventListener('click', () => hgSetView(HG_VIEW_DEFAULT.yaw, HG_VIEW_DEFAULT.pitch));
+        /* Keyboard, because removing the sliders removed the only non-pointer way
+           to turn it. Shift for a coarse step, Home to recentre. */
+        cv.addEventListener('keydown', e => {
+            const step = e.shiftKey ? 15 : 5;
+            const move = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, step], ArrowDown: [0, -step] }[e.key];
+            if (move) { hgSetView(hg.yaw + move[0], hg.pitch + move[1]); e.preventDefault(); return; }
+            if (e.key === 'Home') { hgSetView(HG_VIEW_DEFAULT.yaw, HG_VIEW_DEFAULT.pitch); e.preventDefault(); }
+        });
+    }
+
+    function hgSchedulePreview() {
+        clearTimeout(hg.timer);
+        hg.timer = setTimeout(hgPreview, 120);
+    }
+
+    function hgSyncState() {
+        const el = byId(hg.id);
+        const has = !!(el && el.hgParams);
+        $('at-hg-title').textContent = has ? 'Edit Height Map' : 'Make Height Map';
+        $('at-hg-state').innerHTML = has
+            ? 'This tile already has a height map — the controls below are its settings.'
+            : 'This tile has no height map yet. The previews show what Apply would give you.';
+        const rm = $('at-hg-remove');
+        if (rm) { rm.disabled = !has; rm.title = has ? '' : 'This tile has no height map'; }
+    }
+
+    function openHeightMapModal(id) {
+        hg.id = id;
+        const el = byId(id);
+        const S = state.tileSize;
+        if (!hg.mask || hg.mask.width !== S) {
+            hg.mask = document.createElement('canvas'); hg.mask.width = hg.mask.height = S;
+        }
+        const mc = hg.mask.getContext('2d');
+        mc.clearRect(0, 0, S, S);
+        if (el.hgParams && el.hgParams.mask) mc.drawImage(el.hgParams.mask, 0, 0, S, S);
+        $('at-hg-tileno').textContent = indexOf(id) + 1;
+        hgSyncState();
+        // An existing recipe reloads as it was; a fresh one starts from the tile's
+        // own material, so the modal opens showing the height it would already export.
+        hgWriteParams(el.hgParams || {
+            strength: resolvePreset(el).heightStrength,
+            blur: resolvePreset(el).heightBlur,
+            source: { mode: 'lum' },
+            edge: { band: TRLE.Engine.heightEdgeBandFor(S) }
+        });
+        if (hg.editor) { hg.editor.setErase(false); hg.editor.resetHistory(); }
+        openModal('heightmap');
+        hgPreview();
+    }
+
+    function setupHeightMapModal() {
+        hgSetupOrbit();
+        buildMaskToolbar($('at-hg-tools'), 'at-hg', { brushMax: 96, value: 'Depth' });
+        hg.editor = createMaskEditor('at-hg', {
+            canvas: $('at-hg-canvas'),
+            mode: 'luma',
+            getMask: () => hg.mask,
+            getSource: () => { const el = byId(hg.id); return el ? el.canvas : null; },
+            active: () => hg.id !== null && $('at-modal-heightmap').style.display !== 'none',
+            onChange: hgRenderPaint,
+            onStrokeEnd: hgSchedulePreview
+        });
+
+        ['at-hg-strength', 'at-hg-blur', 'at-hg-band', 'at-hg-amount', 'at-hg-lift']
+            .forEach(k => $(k).addEventListener('input', hgSchedulePreview));
+        $('at-hg-profile').addEventListener('change', hgSchedulePreview);
+        $('at-hg-source').addEventListener('change', () => { hgSyncSource(); hgSchedulePreview(); });
+        $('at-hg-target').addEventListener('input', () => { hgSideNote(); hgSchedulePreview(); });
+        ['at-hg-srctol', 'at-hg-hue', 'at-hg-huewidth'].forEach(k =>
+            $(k).addEventListener('input', function () {
+                $(k + '-val').textContent = this.value; hgSideNote(); hgSchedulePreview();
+            }));
+        [['at-hg-sink', false], ['at-hg-raise', true]].forEach(([id, raised]) =>
+            $(id).addEventListener('click', () => { hgSetSide(raised); hgSchedulePreview(); }));
+        /* Eyedrop the tile for the colour / hue source, the way Make Emissive does.
+           Only when a picker mode is active -- in Light & dark there is nothing to
+           sample, and the canvas belongs to the brush. */
+        $('at-hg-canvas').addEventListener('pointerdown', hgSampleSource, true);
+        document.querySelectorAll('#at-hg-edges [data-edge]').forEach(b =>
+            b.addEventListener('click', () => {
+                const on = !b.classList.contains('active');
+                b.classList.toggle('active', on);
+                b.setAttribute('aria-pressed', String(on));
+                hgSchedulePreview();
+            }));
+
+        $('at-hg-remove').addEventListener('click', () => {
+            if (hg.id === null) return;
+            const el = byId(hg.id);
+            if (!el.hgParams) { showToast('This tile has no height map to remove', 'info'); return; }
+            el.hgParams = null;
+            closeModal();
+            renderGrid();
+            const unticked = syncHeightExport();
+            pushHistory('Remove height map');
+            showToast('Height map removed' + (unticked ? ' (Height export map off)' : ''), 'success');
+        });
+
+        $('at-hg-apply').addEventListener('click', () => {
+            if (hg.id === null) return;
+            const el = byId(hg.id);
+            const p = hgReadParams();
+            if (p.lift != null) p.mask = cloneCanvas(hg.mask);
+            el.hgParams = p;
+            enableHeightExport();   // so the map actually ships
+            closeModal();
+            renderGrid();
+            pushHistory('Height map');
+            showToast('Height map applied (Height export map enabled)', 'success');
+        });
+    }
+
+    /* Height export tick/untick, mirroring the emissive pair. An authored height map
+       that never reaches the export is the "invisible state reads as broken" shape. */
+    function heightExportCheckbox() { return document.querySelector('#at-map-checks input[data-map="height"]'); }
+    function enableHeightExport() {
+        const cb = heightExportCheckbox();
+        if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change')); }
+    }
+    /* Height is expensive in TEN and switches SSAO and decals off for the material,
+       so leaving the box ticked after the last authored map is removed is not a
+       harmless black PNG the way a stray emissive was -- it is a real cost. Only
+       untick when NOTHING wants height: no recipe, no PSD-imported height layer. */
+    function syncHeightExport() {
+        const cb = heightExportCheckbox();
+        if (!cb || !cb.checked) return false;
+        const wanted = state.elements.some(el => el.hgParams || (el.importedMaps && el.importedMaps.height));
+        if (wanted) return false;
+        cb.checked = false;
+        cb.dispatchEvent(new Event('change'));
+        return true;
     }
 
     /* ============ ANCHORED TRANSITION MODAL ============
@@ -10114,7 +11374,8 @@ window.TRLE = window.TRLE || {};
     /* ============ DE-LIGHT MODAL ============
        Whole-texture flatten (divide by blur) OR paint a baked shadow and
        inpaint it away (neighbour-aware fill, reusing healPatchFill). */
-    const dl = { id: null, maskCanvas: null, brushErase: false, resultCanvas: null, batchIds: [] };
+    const dl = { id: null, maskCanvas: null, resultCanvas: null, batchIds: [] };
+    let dlEditor = null;
     function dlCleanup() { dl.id = null; dl.resultCanvas = null; dl.batchIds = []; }
     function dlMode() { return document.querySelector('input[name="at-dl-mode"]:checked').value; }
     function dlRender() {
@@ -10147,6 +11408,7 @@ window.TRLE = window.TRLE || {};
             }
         }
         ctx.putImageData(od, 0, 0);
+        if (dlEditor) dlEditor.drawOverlay(ctx);
         $('at-dl-canvas-label').textContent = 'Paint the shadow to remove (red = selected)';
     }
     /* Whole-texture mode is a per-pixel op with no per-tile input, so it batches;
@@ -10168,13 +11430,12 @@ window.TRLE = window.TRLE || {};
         dl.id = id;
         dl.batchIds = list.slice();
         dl.resultCanvas = null;
-        dl.brushErase = false;
         $('at-dl-tileno').textContent = indexOf(id) + 1;
         const mc = dl.maskCanvas.getContext('2d');
         mc.fillStyle = '#000'; mc.fillRect(0, 0, dl.maskCanvas.width, dl.maskCanvas.height);
         document.querySelector('input[name="at-dl-mode"][value="whole"]').checked = true;
         $('at-dl-strength').value = 85; $('at-dl-strength-val').textContent = '85';
-        const bm = $('at-dl-brush-mode'); bm.textContent = '🖌️ Paint';
+        if (dlEditor) { dlEditor.setErase(false); dlEditor.resetHistory(); }
         openModal('delight');
         dlSyncModeUI();
     }
@@ -10187,25 +11448,20 @@ window.TRLE = window.TRLE || {};
             $('at-dl-strength-val').textContent = this.value;
             if (dlMode() === 'whole') dlRender();
         });
-        $('at-dl-brush').addEventListener('input', function () { $('at-dl-brush-val').textContent = this.value; });
-        $('at-dl-brush-mode').addEventListener('click', function () {
-            dl.brushErase = !dl.brushErase;
-            this.textContent = dl.brushErase ? '🧽 Erase' : '🖌️ Paint';
-        });
-        $('at-dl-clear').addEventListener('click', () => {
-            const mc = dl.maskCanvas.getContext('2d');
-            mc.fillStyle = '#000'; mc.fillRect(0, 0, dl.maskCanvas.width, dl.maskCanvas.height);
-            dl.resultCanvas = null; dlRender();
+        buildMaskToolbar($('at-dl-tools'), 'at-dl', { brushMax: 96 });
+        dlEditor = createMaskEditor('at-dl', {
+            canvas: $('at-dl-canvas'),
+            mode: 'luma',
+            getMask: () => dl.maskCanvas,
+            getSource: () => { const el = byId(dl.id); return el ? el.canvas : null; },
+            active: () => dl.id !== null && dlMode() === 'inpaint'
+                          && $('at-modal-delight').style.display !== 'none',
+            // Any mask change invalidates the inpaint result that was rendered from it.
+            onChange: () => { dl.resultCanvas = null; dlRender(); }
         });
         $('at-dl-preview-btn').addEventListener('click', () => {
             dl.resultCanvas = healPatchFill(byId(dl.id).canvas, dl.maskCanvas, state.tileSize);
             dlRender();
-        });
-        attachMaskBrush($('at-dl-canvas'), dl.maskCanvas, {
-            active: () => dl.id !== null && dlMode() === 'inpaint' && $('at-modal-delight').style.display !== 'none',
-            brushSize: () => parseInt($('at-dl-brush').value),
-            erase: () => dl.brushErase,
-            onPaint: () => { dl.resultCanvas = null; dlRender(); }
         });
         $('at-dl-apply').addEventListener('click', () => {
             if (dl.id === null) return;
@@ -12173,7 +13429,7 @@ window.TRLE = window.TRLE || {};
             if (enabledMaps.emissive && el.emissive) result.emissive = cloneCanvas(el.emissive);
         } else {
             const tex  = TRLE.Engine.createTextureFromImage(el.canvas);
-            const preset = Object.assign({}, resolvePreset(el), { flipNormalY: state.flipNormalY, heightSeamless: heightSeamlessOn(), alphaFlatten: canvasHasAlpha(el.canvas) });
+            const preset = Object.assign({}, resolvePreset(el), Object.assign({ flipNormalY: state.flipNormalY, alphaFlatten: canvasHasAlpha(el.canvas) }, heightPresetOverrides(el)));
             const maps = TRLE.Engine.generateMaps(tex, S, S, preset, enabledMaps);
             for (const mt of TRLE.MapOrder) {
                 if (maps[mt]) {
@@ -12750,6 +14006,12 @@ window.TRLE = window.TRLE || {};
             }
             // Animations store only params — frames are regenerated on load.
             if (el.anim) e.anim = el.anim;
+            if (el.hgParams) {
+                // Height-map recipe (re-editable). The paint mask is the only pixels,
+                // and only when a region was actually painted.
+                e.hgParams = Object.assign({}, el.hgParams);
+                e.hgParams.mask = el.hgParams.mask ? await png(el.hgParams.mask) : null;
+            }
             if (el.htParams) e.htParams = el.htParams;   // height-transition recipe (re-editable)
             if (el.sgParams) e.sgParams = el.sgParams;   // stained-glass recipe (re-editable)
             elements.push(e);
@@ -12871,9 +14133,14 @@ window.TRLE = window.TRLE || {};
                 anim: e.anim || null,
                 htParams: e.htParams || null,
                 sgParams: e.sgParams || null,
+                hgParams: e.hgParams ? Object.assign({}, e.hgParams, { mask: null }) : null,
                 original: null, canvas: null
             };
             if (e.customMask) { const im = await loadImageURL(e.customMask); if (im) el.customMask = imgToCanvas(im); }
+            if (e.hgParams && e.hgParams.mask) {
+                const im = await loadImageURL(e.hgParams.mask);
+                if (im) el.hgParams.mask = imgToCanvas(im);
+            }
             if (e.emissive) { const im = await loadImageURL(e.emissive); if (im) el.emissive = imgToCanvas(im); }
             if (e.importedMaps) {
                 const bag = {};
@@ -13540,6 +14807,8 @@ window.TRLE = window.TRLE || {};
         });
         $('at-export-btn').addEventListener('click', exportAtlas);
         $('at-export-tiles').addEventListener('click', exportTilesIndividually);
+        const whiteCb = document.getElementById('at-export-height-white');
+        if (whiteCb) whiteCb.addEventListener('change', () => { syncHeightWhiteNote(); renderGrid(); });
         $('at-export-flipy').addEventListener('change', e => {
             state.flipNormalY = e.target.checked;
             showToast(e.target.checked
@@ -13550,11 +14819,12 @@ window.TRLE = window.TRLE || {};
         const heightCb = document.querySelector('#at-map-checks input[data-map="height"]');
         const heightWarn = $('at-height-warning');
         if (heightCb && heightWarn) {
-            const seamlessRow = $('at-height-seamless-row');
+            const whiteRow = $('at-height-white-row');
             const alphaWarn = $('at-height-alpha-warning');
             const syncHeightWarn = toast => {
                 heightWarn.style.display = heightCb.checked ? 'block' : 'none';
-                if (seamlessRow) seamlessRow.style.display = heightCb.checked ? 'flex' : 'none';
+                if (whiteRow) whiteRow.style.display = heightCb.checked ? 'flex' : 'none';
+                syncHeightWhiteNote();
                 // Cutout tiles get their holes flattened in the height map, but
                 // parallax over an alpha edge is still dicey in-engine — say so.
                 // Only scanned while Height is actually ticked, so the per-tile
@@ -13626,6 +14896,7 @@ window.TRLE = window.TRLE || {};
         setupBsetModal();
         setupFadeModal();
         setupEmissiveModal();
+        setupHeightMapModal();
         setupAnchorModal();
         setupHeightModal();
         setupTransGridModal();
@@ -13678,7 +14949,12 @@ window.TRLE = window.TRLE || {};
                     emissive: !!el.emissive,
                     importedMaps: el.importedMaps ? Object.keys(el.importedMaps) : null,
                     sgParams: el.sgParams ? JSON.parse(JSON.stringify(el.sgParams)) : null,
-                    htParams: !!el.htParams
+                    htParams: !!el.htParams,
+                    // The mask is a canvas, so report whether there IS one rather
+                    // than trying to send it over CDP.
+                    hgParams: el.hgParams
+                        ? Object.assign({}, el.hgParams, { mask: !!el.hgParams.mask })
+                        : null
                 };
             },
             count() { return state.elements.length; },
@@ -13757,6 +15033,58 @@ window.TRLE = window.TRLE || {};
                 const maps = deriveMaps(el, enabled, {});
                 if (!maps[mt]) return null;
                 return [...maps[mt].getContext('2d').getImageData(0, 0, 1, 1).data].slice(0, 3);
+            },
+            /* test-only: the ACTIVE multi-material layer mask, as an alpha
+               histogram. The display canvas cannot answer this -- it composites
+               the tint over an opaque tile, so every pixel reads alpha 255 and a
+               feathered brush is indistinguishable from a hard one. */
+            /* test-only: the paint mask of any of the seven surfaces, by name.
+               Every new assertion in validate-mask-editor (Value levels, lasso
+               fill, wand replace, stamp variety) needs the RAW mask -- reading
+               them through a surface's GPU preview measures the texture's own
+               colour as much as the mask, which cost a probe run. */
+            // test-only: the Stamp contour generator, so shape variety and
+            // seeded determinism are measurable without a UI in the way.
+            stampAlpha: buildStampAlpha,
+            maskCanvasFor(which) {
+                return ({ em: emissive.maskCanvas, hg: hg.mask, heal: heal.maskCanvas,
+                          fade: fade.maskCanvas, dl: dl.maskCanvas, tr: tr.customMask,
+                          mm: mmActiveMask() })[which] || null;
+            },
+            maskProbe(which) {
+                const m = this.maskCanvasFor(which);
+                if (!m) return null;
+                const d = m.getContext('2d').getImageData(0, 0, m.width, m.height).data;
+                let h = 2166136261, nonzero = 0, max = 0, sum = 0;
+                const levels = {};
+                for (let i = 0; i < d.length; i += 4) {
+                    const v = d[i];
+                    h ^= v; h = Math.imul(h, 16777619);
+                    if (v > 8) { nonzero++; sum += v; if (v > max) max = v; levels[v] = (levels[v] || 0) + 1; }
+                }
+                // the handful of most common non-zero levels, commonest first
+                const top = Object.keys(levels).map(Number).sort((a, b) => levels[b] - levels[a]).slice(0, 6);
+                return { w: m.width, h: m.height, sig: (h >>> 0).toString(16), nonzero, max,
+                         mean: nonzero ? +(sum / nonzero).toFixed(2) : 0,
+                         topLevels: top.map(v => [v, levels[v]]) };
+            },
+            maskStats() {
+                const m = mmActiveMask();
+                if (!m) return null;
+                const d = m.getContext('2d').getImageData(0, 0, m.width, m.height).data;
+                let empty = 0, partial = 0, solid = 0;
+                for (let i = 3; i < d.length; i += 4) {
+                    if (d[i] <= 8) empty++; else if (d[i] >= 247) solid++; else partial++;
+                }
+                return { empty, partial, solid, total: d.length / 4 };
+            },
+            /* test-only: does anything matching `pattern` appear anywhere in the
+               serialised project? Used to prove the mask editor's undo stack stays
+               modal-local -- it is a closure variable, and this is what would catch
+               someone hanging it off the element to "make undo survive a reopen". */
+            async projectScan(pattern) {
+                const txt = JSON.stringify(await buildProjectJSON());
+                return new RegExp(pattern, 'i').test(txt);
             },
             // test-only: did ag-psd stay off the main thread? window.agPsd is only
             // ever set by the file:// fallback path.

@@ -141,43 +141,301 @@ TRLE.Shaders = {
     /* ---------- Simple Height (for preset-based generation) ----------
        Desaturate + contrast + bias — simpler than multi-frequency.
        ---------------------------------------------------------------- */
+    /* ---------- Height (parallax) ----------
+       TombEngine reads this as `depth = 1.0 - ORSH.w` (Materials.hlsli:159): WHITE
+       is the polygon plane and everything darker is carved BELOW it. POM never pops
+       a texel out in front of the surface.
+
+       This used to be `h = (h - 0.5) * strength + 0.5` -- centred on mid-gray, which
+       put the whole tile half a depth-range under the plane whatever the slider said.
+       Measured consequence: at Height Strength 1, on an almost-flat map, TEN still
+       marched the UV ~12.5px with no relief to show for it, and dragged every border
+       that far into the neighbouring atlas texture. See HEIGHT-MAP-AUDIT.md.
+
+       So the contrast scale stays, and then the whole map slides so its u_ref
+       (the 98th percentile, measured on the CPU -- not the MAX, or one white speck
+       would flatten the tile) lands on u_top. The relief is unchanged to three
+       decimal places; the wasted constant offset drops ~7.8x.
+       -------------------------------------------------------------------------- */
     simpleHeight: `#version 300 es
         precision highp float;
         uniform sampler2D u_texture;  // blurred grayscale
-        uniform float u_strength;     // 0-1
-        uniform float u_bias;         // -0.5 to 0.5
+        uniform float u_strength;     // contrast about mid-gray
+        uniform float u_ref;          // the contrast-scaled map's 98th percentile
+        uniform float u_top;          // where that percentile should land (1.0 = TEN's plane)
         uniform float u_invert;       // 0 or 1
         in vec2 v_uv;
         out vec4 fragColor;
         void main() {
             float h = texture(u_texture, v_uv).r;
-            h = (h - 0.5) * u_strength + 0.5 + u_bias;
+            h = (h - 0.5) * u_strength + 0.5;
             if (u_invert > 0.5) h = 1.0 - h;
+            h += u_top - u_ref;
             h = clamp(h, 0.0, 1.0);
             fragColor = vec4(vec3(h), 1.0);
         }`,
 
-    /* ---------- Seamless Height Edges ----------
-       A height map turns a tile's natural left↔right / top↔bottom brightness
-       mismatch into a parallax "cliff" at the repeat seam (far more visible than
-       the diffuse seam). This blends the sharp interior toward a wrap-blurred
-       copy inside a border band: a REPEAT-wrap blur is continuous across the
-       seam, so the border becomes continuous while the interior keeps its detail.
-       u_band = border width as a fraction of the tile (0..0.5).
+    /* ---------- Height: fade the border to white ----------
+       The TEN devs' rule: "Parallax textures cannot be seamlessly tiled, so to avoid
+       artifacts on edges, you must make sure that the height map fades to white on
+       texture edges." White is depth 0, so the POM march terminates immediately
+       there and cannot carry the UV out of the texture's own box.
+
+       It has to, because the march is long. POM_HEIGHT_SCALE 0.0035 over a 4096 page
+       is 14.3px at a 45 degree view and 35.8px at the grazing limit, against Tomb
+       Editor's 8px of edge bleed -- so past the padding it samples an unrelated
+       texture, or black. That is the reported "black bars at the edges", measured at
+       6.45% of the tile before this and 0% after.
+
+       NOTE, because it contradicts the rule everywhere else in this codebase: the
+       noise here is NOT periodic and must not be made so. Every other procedural
+       field (makePeriodicNoise, bsetOrgFields, the Build Pattern warp) samples a
+       lattice whose period divides the tile because the result has to wrap. A white
+       border deliberately destroys the height map's tiling -- that is the entire
+       point -- so there is nothing to preserve and a lattice would only constrain
+       the shape.
+
+       u_profile: 0 smooth (smoothstep) - what the devs' own example images show
+                  1 linear            - predictable, keeps marginally more interior
+                  2 tight             - narrow and steep, for large tiles
+                  3 rough             - the distance field perturbed, for rubble
+                  4 joint-aware       - handled on the CPU, arrives here as profile 0
+       u_edges:   per-side enables, N/E/S/W packed as 1/2/4/8.
        -------------------------------------------------------------------------- */
-    edgeFeather: `#version 300 es
+    heightEdgeWhite: `#version 300 es
         precision highp float;
-        uniform sampler2D u_sharp;     // original height
-        uniform sampler2D u_blurred;   // wrap-blurred height (continuous across seam)
-        uniform float u_band;          // 0..0.5
+        uniform sampler2D u_texture;
+        uniform sampler2D u_bandMap;  // 4 rows N,E,S,W — local band width in .r, as a fraction of u_bandMax
+        uniform float u_band;         // nominal border width, fraction of the tile (0..0.5)
+        uniform float u_bandMax;      // what a bandMap value of 1.0 means
+        uniform float u_useBandMap;   // 1 = joint-aware
+        uniform float u_amount;       // 0..1, how far toward white the border goes
+        uniform float u_profile;
+        uniform float u_edges;        // bitmask N=1 E=2 S=4 W=8
+        uniform float u_seed;
+        uniform float u_texel;        // 1/size
+        in vec2 v_uv;
+        out vec4 fragColor;
+
+        float hash(vec2 p) {
+            return fract(sin(dot(p, vec2(127.1, 311.7)) + u_seed) * 43758.5453123);
+        }
+        float vnoise(vec2 p) {
+            vec2 i = floor(p), f = fract(p);
+            f = f * f * (3.0 - 2.0 * f);
+            return mix(mix(hash(i), hash(i + vec2(1, 0)), f.x),
+                       mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), f.x), f.y);
+        }
+        bool on(float bit) { return mod(floor(u_edges / bit), 2.0) >= 0.5; }
+
+        /* Local band width for one edge. Joint-aware reads it from the lookup the
+           CPU built by finding the first mortar line inward of each border position;
+           everything else is the nominal band, with Rough varying it spatially.
+
+           Rough varies the WIDTH rather than displacing the contour, so the border
+           stays white by construction: d is 0 there whatever the band is, and no
+           amount of noise can reopen the parallax march. */
+        float bandFor(float row, float t) {
+            if (u_useBandMap > 0.5)
+                return max(texture(u_bandMap, vec2(t, (row + 0.5) / 4.0)).r * u_bandMax, 1e-4);
+            if (u_profile > 2.5 && u_profile < 3.5)
+                return max(u_band * (1.0 + 0.55 * (vnoise(v_uv * 9.0) * 2.0 - 1.0)), 1e-4);
+            return max(u_band, 1e-4);
+        }
+
+        /* How white this edge wants the pixel, 1 at the border falling to 0 inside.
+           The outermost texel's CENTRE sits half a texel in, so without that shift
+           the linear and tight profiles stop a shade short of 255 at the border --
+           and a shade short of white is still a live parallax march. */
+        float edgeW(float dist, float row, float along) {
+            if (dist > 0.5) return 0.0;
+            float t = clamp(max(0.0, dist - 0.5 * u_texel) / bandFor(row, along), 0.0, 1.0);
+            if (u_profile < 0.5)      return 1.0 - smoothstep(0.0, 1.0, t);        // smooth
+            else if (u_profile < 1.5) return 1.0 - t;                              // linear
+            else if (u_profile < 2.5) return 1.0 - smoothstep(0.0, 1.0, sqrt(t));  // tight
+            return 1.0 - smoothstep(0.0, 1.0, t);                                  // rough, joint-aware
+        }
+
+        void main() {
+            float h = texture(u_texture, v_uv).r;
+            /* Per-edge, then MAX -- not a single distance-to-nearest-border. The
+               joint-aware band differs per edge and per position along it, so the
+               four have to be evaluated separately. A disabled edge contributes
+               nothing, which is what lets a texture that only ever meets a floor on
+               one side keep the detail on its other three. */
+            float w = 0.0;
+            if (on(1.0)) w = max(w, edgeW(v_uv.y,       0.0, v_uv.x));
+            if (on(2.0)) w = max(w, edgeW(1.0 - v_uv.x, 1.0, v_uv.y));
+            if (on(4.0)) w = max(w, edgeW(1.0 - v_uv.y, 2.0, v_uv.x));
+            if (on(8.0)) w = max(w, edgeW(v_uv.x,       3.0, v_uv.y));
+
+            h = mix(h, 1.0, clamp(w * u_amount, 0.0, 1.0));
+            fragColor = vec4(vec3(h), 1.0);
+        }`,
+
+    /* ---------- Height: painted lift ----------
+       Raise or lower a painted region of the height map. Runs BETWEEN the plane
+       shift and the white border, never after: a stroke near the edge would
+       otherwise punch a hole in the border and hand the parallax march its way out
+       of the texture again, which is the whole thing the border exists to stop.
+       -------------------------------------------------------------------------- */
+    heightPaint: `#version 300 es
+        precision highp float;
+        uniform sampler2D u_texture;
+        uniform sampler2D u_mask;
+        uniform float u_lift;      // -1..1
         in vec2 v_uv;
         out vec4 fragColor;
         void main() {
-            float d = min(min(v_uv.x, 1.0 - v_uv.x), min(v_uv.y, 1.0 - v_uv.y));
-            float t = smoothstep(0.0, max(u_band, 1e-4), d);   // 0 at edge → blurred, 1 inside → sharp
-            float h = mix(texture(u_blurred, v_uv).r, texture(u_sharp, v_uv).r, t);
-            fragColor = vec4(vec3(h), 1.0);
+            float h = texture(u_texture, v_uv).r;
+            float m = texture(u_mask, v_uv).r;
+            fragColor = vec4(vec3(clamp(h + u_lift * m, 0.0, 1.0)), 1.0);
         }`,
+
+    /* ---------- Parallax preview (what TombEngine will actually draw) ----------
+       A port of TEN's ParallaxOcclusionMapping (Materials.hlsli:114-180) so the
+       Height modal can show the real thing instead of a displaced-mesh
+       approximation -- including the failure it exists to prevent.
+
+       The march is in ATLAS-PAGE space, so this needs the tile's size to convert:
+       a fixed page-pixel reach is a bigger slice of a small tile. Past the
+       texture's own border it shows what the packed page really holds -- Tomb
+       Editor's edge bleed for u_padPx pixels, then black for the unrelated
+       neighbour beyond it. That black IS the reported bar.
+       -------------------------------------------------------------------------- */
+    pomPreview: `#version 300 es
+        precision highp float;
+        uniform sampler2D u_diffuse;
+        uniform sampler2D u_height;
+        uniform float u_reach;     // full-depth march, in TILE units (reachPx / tileSize)
+        uniform float u_steps;
+        uniform float u_padPx;     // Tomb Editor's edge bleed, in tile units
+        uniform float u_dir;       // march direction in x: +1 or -1
+        in vec2 v_uv;
+        out vec4 fragColor;
+
+        // Outside the tile the page holds the bled edge pixel, so the march reads
+        // a clamped sample -- exactly what the shipped atlas would give it.
+        float hAt(vec2 uv) { return texture(u_height, clamp(uv, 0.0, 1.0)).r; }
+
+        void main() {
+            float n = max(1.0, floor(u_steps));
+            float layer = 1.0 / n;
+            vec2 step = vec2(u_dir * u_reach / n, 0.0);
+
+            float depth = 0.0;
+            vec2 uv = v_uv;
+            float mapDepth = 1.0 - hAt(uv);
+            for (int i = 0; i < 16; i++) {
+                if (float(i) >= n || depth >= mapDepth) break;
+                uv += step; depth += layer;
+                mapDepth = 1.0 - hAt(uv);
+            }
+            vec2 prev = uv - step;
+            float mapPrev = 1.0 - hAt(prev);
+            float after = mapDepth - depth;
+            float before = mapPrev - (depth - layer);
+            float w = clamp(after / (after - before + 1e-6), 0.0, 1.0);
+            vec2 finalUV = mix(uv, prev, w);
+
+            float over = max(max(finalUV.x - 1.0, -finalUV.x),
+                             max(finalUV.y - 1.0, -finalUV.y));
+            if (over > u_padPx) { fragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+            fragColor = vec4(texture(u_diffuse, clamp(finalUV, 0.0, 1.0)).rgb, 1.0);
+        }`,
+
+    /* ---------- TombEngine parallax, ON A 3D SURFACE ----------
+       The flat `pomPreview` above marches with ONE reach value for the whole
+       image, taken from a "viewing angle" slider -- which is a fair picture of a
+       wall seen face-on at that angle and tells you very little about how the
+       relief will read as you move past it.
+
+       This is the same march with a REAL view vector: the quad is drawn in
+       perspective and each fragment computes its own tangent-space view direction,
+       which is exactly what TombEngine does (Materials.hlsli:114-180). So the
+       parallax gets stronger toward grazing parts of the surface and weaker
+       head-on, all in one image, the way it does in game.
+
+       It is deliberately NOT a displaced mesh. TombEngine does not move geometry:
+       it fakes depth per-pixel, so the silhouette of a parallax-mapped wall stays
+       perfectly flat and the relief flattens out as you rotate away. A displaced
+       mesh would show bumpy edges and real occlusion the engine never produces --
+       i.e. it would be wrong in precisely the way that matters here.
+
+       Needs its own VERTEX shader, hence the {vert, frag} form. */
+    pomPreview3D: {
+        vert: `#version 300 es
+        in vec2 a_position;
+        uniform mat4 u_mvp;
+        uniform vec3 u_camPos;       // camera in the quad's local space
+        out vec2 v_uv;
+        out vec3 v_viewTS;           // view direction, tangent space
+        void main() {
+            vec3 local = vec3(a_position, 0.0);          // the quad lies in z = 0
+            v_uv = a_position * 0.5 + 0.5;
+            /* Tangent space for this quad is trivial: tangent = +x, bitangent = +y,
+               normal = +z, so the local-space view vector already IS the
+               tangent-space one. Keeping it explicit because the moment this stops
+               being a flat quad that stops being true. */
+            v_viewTS = u_camPos - local;
+            gl_Position = u_mvp * vec4(local, 1.0);
+        }`,
+        frag: `#version 300 es
+        precision highp float;
+        uniform sampler2D u_diffuse;
+        uniform sampler2D u_height;
+        uniform float u_scale;       // POM_HEIGHT_SCALE * page/tile, in UV units
+        uniform float u_minAngle;    // POM_MIN_ANGLE clamp (TEN uses 0.4)
+        uniform float u_steps;
+        uniform float u_padPx;       // Tomb Editor's edge bleed, in tile units
+        uniform float u_light;       // simple lambert so the relief reads at all
+        in vec2 v_uv;
+        in vec3 v_viewTS;
+        out vec4 fragColor;
+
+        float hAt(vec2 uv) { return texture(u_height, clamp(uv, 0.0, 1.0)).r; }
+
+        void main() {
+            vec3 v = normalize(v_viewTS);
+            // TEN clamps the tangent-space Z so a grazing view cannot march forever.
+            float vz = max(abs(v.z), u_minAngle);
+            vec2 dir = -v.xy / vz * u_scale;
+
+            float n = max(1.0, floor(u_steps));
+            float layer = 1.0 / n;
+            vec2 stepUV = dir / n;
+
+            float depth = 0.0;
+            vec2 uv = v_uv;
+            float mapDepth = 1.0 - hAt(uv);
+            for (int i = 0; i < 32; i++) {
+                if (float(i) >= n || depth >= mapDepth) break;
+                uv += stepUV; depth += layer;
+                mapDepth = 1.0 - hAt(uv);
+            }
+            vec2 prev = uv - stepUV;
+            float mapPrev = 1.0 - hAt(prev);
+            float after = mapDepth - depth;
+            float before = mapPrev - (depth - layer);
+            float w = clamp(after / (after - before + 1e-6), 0.0, 1.0);
+            vec2 finalUV = mix(uv, prev, w);
+
+            float over = max(max(finalUV.x - 1.0, -finalUV.x),
+                             max(finalUV.y - 1.0, -finalUV.y));
+            if (over > u_padPx) { fragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+
+            vec3 c = texture(u_diffuse, clamp(finalUV, 0.0, 1.0)).rgb;
+            /* A cheap lambert off the height gradient. Not TEN's lighting -- this
+               preview is honest about the GEOMETRY, not the shading -- but without
+               any shading at all a parallax surface is very hard to read. */
+            float t = 1.0 / 256.0;
+            float hx = hAt(finalUV + vec2(t, 0.0)) - hAt(finalUV - vec2(t, 0.0));
+            float hy = hAt(finalUV + vec2(0.0, t)) - hAt(finalUV - vec2(0.0, t));
+            vec3 nrm = normalize(vec3(-hx * 4.0, -hy * 4.0, 1.0));
+            float lam = clamp(dot(nrm, normalize(vec3(-0.4, 0.5, 0.75))), 0.0, 1.0);
+            fragColor = vec4(c * mix(1.0, 0.45 + 0.75 * lam, u_light), 1.0);
+        }`
+    },
 
     /* ---------- Normal Map from Height ----------
        Central-difference height gradient packed as a tangent-space normal.

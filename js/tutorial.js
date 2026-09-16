@@ -204,7 +204,7 @@
         {
             id: 'heal', icon: '🩹', title: 'Heal / Fill',
             what: 'Paints out blemishes, logos or scratches by filling the area with surrounding colour or re-synthesised texture.',
-            how: ['<strong>Right-click</strong> a tile → <strong>Heal / Fill</strong>.', 'Paint over the <em>whole</em> blemish so the selection touches clean texture on every side.', 'Pick <strong>Neighbour-aware</strong> (default), <strong>Texture</strong> (whole-tile synthesis) or <strong>Smooth</strong> (diffusion), then <strong>Save to Tile</strong>.', 'The <strong>Before</strong> and <strong>After</strong> panes on the right update as you paint, so you can judge the fill without saving. Lower <strong>Hardness</strong> to feather the selection edge; <strong>Paint</strong> and <strong>Erase</strong> are separate buttons.'],
+            how: ['<strong>Right-click</strong> a tile → <strong>Heal / Fill</strong>.', 'Paint over the <em>whole</em> blemish so the selection touches clean texture on every side.', 'Pick <strong>Neighbour-aware</strong> (default), <strong>Texture</strong> (whole-tile synthesis) or <strong>Smooth</strong> (diffusion), then <strong>Save to Tile</strong>.', 'The result on the right updates as you paint. <strong>Drag the divider</strong> across it to wipe between before and after, or press and hold <strong>👁 Hold to see the original</strong> to flick the whole tile back — both land on the same pixels, which is how you spot a smear or a seam. Raise <strong>Edge softness</strong> to feather the selection edge; <strong>Paint</strong> and <strong>Erase</strong> are separate buttons.'],
             before: 'heal', tip: '<strong>Neighbour-aware</strong> matches the local tone, so a dark mark on a light surface heals light (and vice-versa) instead of going grey — just be sure to paint over the entire mark.'
         },
         {
@@ -303,6 +303,25 @@
             tip: 'Watch out for double-counting. If the tile also exports material maps, the preset reads this same grain back out of the diffuse and amplifies it through Normal and Roughness, so it lands twice and a value that looked fine in the diffuse can come out as a violently pitted normal map. The tool detects this and the line under <strong>Strength</strong> tells you which case you are in: with maps on, keep it low; on a diffuse-only texture nothing downstream amplifies it, so judge it by eye. It is off by default in Build Pattern on purpose, since most people build bricks from a texture that is already bricky.'
         },
         {
+            id: 'heightmap', icon: '🏔️', title: 'Height maps (parallax)',
+            what: 'A <strong>height map</strong> drives real <strong>parallax</strong> in Tomb Engine: high points shift in front of low ones as the camera moves, so mortar joints, ladder rungs and carved reliefs genuinely recede instead of being faked by shading. White is the polygon surface, darker is deeper — parallax only ever carves <em>in</em>, it never pushes a texel out in front of the wall.',
+            how: [
+                '<strong>Right-click</strong> a tile → <strong>🏔️ Make Height Map</strong>, under <strong>Set Material</strong>. The Height sliders in <strong>Set Material</strong> still work; this is the per-texture editor, and it is where the edge controls live.',
+                '<strong>What the relief is read from</strong> decides which part of the texture becomes deep. <strong>Light &amp; dark</strong> uses the whole texture. <strong>A colour I pick</strong> and <strong>A hue range</strong> select one thing — click the tile to eyedrop the mortar, say — so the joints carve in while the stones stay flat, which light-and-dark cannot do on a wall whose stones are darker than its joints. <strong>Which side sinks</strong> flips it, and the line underneath spells out what ends up deep and what ends up on the surface.',
+                '<strong>Relief depth</strong> is how far the recesses sit below the surface. <strong>Smoothing</strong> blurs the texture before reading it as elevation — raise it if the relief looks noisy, because parallax on fine grain reads as the surface swimming.',
+                '<strong>Edges — fade to white</strong> is the part you cannot skip, and it is on by default. Tomb Engine marches the UV <em>out of the texture\'s own box</em> in the atlas page, so without a white border it samples whatever the packer put next door: the black and smeared bars along texture edges. White is the surface plane, so a white border stops the march dead.',
+                'The <strong>Band</strong> defaults to what your tile size actually needs and warns if you go under it. This is not a preference: the march is a fixed distance in <em>atlas-page</em> pixels (~36px), so it eats 3.5% of a 1024px texture and 14% of a 256px one. Below 128px there is barely any interior left, which is why parallax wants big textures.',
+                '<strong>Profile</strong> shapes the fade. <strong>Smooth</strong> is the default and matches the Tomb Engine team\'s own reference images. <strong>Tight</strong> keeps more interior on large textures, <strong>Rough</strong> wanders in and out for rubble, and <strong>Joint-aware</strong> ends the fade on a mortar line instead of slicing a stone in half — it needs a texture with real coursed joints and quietly falls back to Smooth on anything else.',
+                'Untick an edge under <strong>Fade these edges</strong> if the texture never shows it — a floor tile that always meets a wall on one side keeps its detail there.',
+                'Paint a region under the tile and <strong>Raise or lower the painted area</strong> pushes it proud or sinks it: an alcove, a deeper joint, a panel. The full paint toolbar is there, and its <strong>Value</strong> slider sets how deep <em>that</em> region goes — so a shallow dent and a deep alcove can live on one tile. The slider itself is the master for all of them.',
+                'The <strong>In Tomb Engine</strong> pane is the real parallax shader, not an approximation — and you <strong>grab it and turn it</strong>, live, like any 3D view (arrow keys work too; double-click or <strong>⟳ Reset view</strong> to recentre). Watch the relief flatten as you rotate away: that is what parallax does in game, not a fault in your map. It is deliberately not a 3D model, because Tomb Engine never moves geometry — a parallax wall keeps a flat silhouette, and a displaced mesh would look better and be wrong. Drop <strong>Amount</strong> to 0 to watch the edge artifact appear.'
+            ],
+            before: 'heightmap',
+            beforeLabel: 'White edge off — the texture\'s right border smears',
+            afterLabel: 'The shipped default — same parallax, clean border',
+            tip: 'Use it sparingly. Parallax is expensive, and it also switches <strong>SSAO off</strong> for that material and disables <strong>bullet holes, explosion marks and other decals</strong> on it. It cannot be combined with animated, double-sided or mirror textures either. A handful of hero surfaces per level — a brick wall you walk past, a ladder, a carved door — not the whole atlas.'
+        },
+        {
             id: 'animated', icon: '🎞️', title: 'Animated textures',
             what: 'Generates a procedural, seamlessly-<em>looping</em> animation — water, lava, clouds, smoke, energy, plus directional effects like <strong>fire, waterfalls and rivers</strong> — as a group of frames you drop straight into the atlas. There’s a wide preset library (caustic/deep/boiling water, lava &amp; molten metal, blood, ice, mercury, honey, poison gas, steam, electric plasma, aurora sky…). Every frame also tiles on its own, so you can emit a <strong>single seamless tile</strong> for UV-rotate instead of a sequence.',
             how: [
@@ -342,11 +361,26 @@
             tip: 'Saved presets are <em>baked into</em> the tile when you assign them, so a tile keeps its look even if you later edit or delete the preset. Presets are stored in your browser — <strong>Export</strong> them if you want a backup.'
         },
         {
+            id: 'paint-tools', icon: '🖌', title: 'The paint tools (shared by every brush)',
+            what: 'Seven places in the tool let you paint a region: <strong>Set Material</strong>\u2019s multi-material layers, <strong>Make Emissive</strong>, <strong>Heal</strong>, <strong>Fade to Transparent</strong>, <strong>De-light</strong>, <strong>Make Height Map</strong> and a transition\u2019s custom mask. They all run the same toolbar, so what you learn once works everywhere: the same tools, the same modifier keys and the same undo.',
+            how: [
+'<strong>🖌 Brush</strong> paints freehand; <strong>Edge softness</strong> feathers the stroke, and 0% is a crisp edge. <strong>🪨 Stamp</strong> lays an irregular blob instead of a disc, for things that should not look drawn: moss, rust, rubble, pitting. Click for one, drag for a scattered run. <strong>Roughness</strong> takes it from a clean pebble to a ragged clump, and no two are the same shape.',
+                '<strong>🪢 Lasso</strong> takes either gesture and you can mix them in one outline: click to drop straight corners, or press and drag to trace freehand. It closes and fills when you land on the <em>start dot</em>, or press <strong>Enter</strong>. <strong>Escape</strong> throws the outline away. <strong>▭ Rect</strong> and <strong>⬭ Ellipse</strong> just drag.',
+                '<strong>🪄 Wand</strong> grabs a colour region. A plain click <em>replaces</em> what was selected, <strong>Shift</strong>+click adds another region and <strong>Alt</strong>+click removes one. Raise <strong>Tolerance</strong> to take in more of the texture; untick <strong>Only the patch I click</strong> to take that colour everywhere in the tile.',
+                '<strong>Alt</strong> erases with any tool while you hold it, so you do not have to keep switching <strong>🖌️ Paint</strong> / <strong>🧽 Erase</strong>. <strong>Ctrl+Z</strong> and <strong>Ctrl+Shift+Z</strong> undo and redo inside the modal, per stroke rather than per dab.',
+                'Two surfaces add a slider for <em>how much</em> the stroke lays down, named after what it paints: <strong>Brightness</strong> in Make Emissive, <strong>Depth</strong> in Make Height Map. Paint one area at 100 and another at 30 and you get a bright glow and a dim one, or a deep alcove and a shallow dent, on the same tile. Overlapping strokes stay at the level you set instead of building toward full.'
+            ],
+            before: 'painttools',
+            beforeLabel: 'One intensity for the whole map',
+            afterLabel: 'Three stamps painted at Brightness 100, 55 and 25',
+            tip: 'The slider marked <strong>Master strength</strong> (Emissive) or <strong>Raise or lower</strong> (Height) scales <em>everything</em> at once, painted areas included. Use <strong>Brightness</strong> / <strong>Depth</strong> for the difference between regions and the master for the overall level. Note you cannot paint a lower level over a higher one — erase that area first.'
+        },
+        {
             id: 'multi-material', icon: '🎭', title: 'Multiple materials on one tile',
             what: 'A single texture often mixes surfaces — a wall that is <strong>brick + a wooden door + a metal knob</strong>. Multi-material lets you paint a different material onto each region, so the brick reads as stone, the door as wood and the knob as metal in one tile.',
             how: [
                 'In <strong>Set Material</strong>, tick <strong>🎭 Multiple materials</strong>. The <strong>Base</strong> layer covers the whole tile — set its material (e.g. Brick) with the normal controls.',
-                '<strong>＋ Add layer</strong> for each extra surface, then <strong>select where it applies</strong> on the texture: <strong>🖌 Brush</strong>, <strong>🪢 Lasso</strong> (click points, double-click/Enter to close), <strong>▭ Rect</strong> / <strong>⬭ Ellipse</strong> (drag a shape), or <strong>🪄 Wand</strong> (click a colour to grab similar pixels — raise <em>Tol</em> to select more, untick <em>Contiguous</em> to grab them tile-wide). With a layer selected, the material controls below edit <em>that</em> layer.',
+                '<strong>＋ Add layer</strong> for each extra surface, then <strong>select where it applies</strong> using the shared paint tools above — brush, stamp, lasso, rectangle, ellipse or wand. With a layer selected, the material controls below edit <em>that</em> layer.',
                 '<strong>Order matters</strong> — layers stack bottom→top, each painting over the ones beneath. For a wall it’s <em>Base = Brick → Wooden door → Metal knob</em>. Reorder with ▲▼, soften a boundary with <strong>Feather</strong>, then <strong>Assign</strong>.'
             ],
             tip: 'The lit preview and 🧊 3D preview show the <em>composited</em> result as you paint, so you can see brick meet wood meet metal. Transition/Wang tiles inherit materials and so don’t take layers. Each tile’s layers are saved in your project file.'
@@ -371,7 +405,8 @@
             how: [
                 '<strong>Right-click</strong> a tile → <strong>Make Emissive</strong>.',
                 'Choose what glows: <strong>Pick a colour</strong> (eyedrop the preview), a <strong>Hue range</strong>, <strong>Bright areas</strong>, or <strong>Paint</strong> it by hand.',
-                'Colour it with the <strong>Texture’s own colours</strong> or a flat <strong>Tint</strong>, set <strong>Strength</strong> and <strong>Feather / bloom</strong>, then click <strong>Apply</strong> — the <strong>Emissive</strong> export map switches on automatically.'
+                'Colour it with the <strong>Texture’s own colours</strong> or a flat <strong>Tint</strong>, set <strong>Master strength</strong> and <strong>Feather / bloom</strong>, then click <strong>Apply</strong> — the <strong>Emissive</strong> export map switches on automatically.',
+                'In <strong>Paint</strong> mode the toolbar carries a <strong>Value</strong> slider. That is what makes one rune brighter than the next: <strong>Master strength</strong> scales the whole map together, <strong>Value</strong> is per region. See <em>The paint tools</em> above.'
             ],
             before: 'emissive',
             tip: 'The preview sits on black because emissive is what you still see in the dark. Most materials glow nowhere — use it only for light sources and effects.'
@@ -469,8 +504,13 @@
         return e;
     }
 
-    /* Drag-to-wipe before/after comparison (clip-path based). */
-    function buildCompare(name) {
+    /* Drag-to-wipe before/after comparison (clip-path based).
+       `labels` is optional: most pairs are self-evident, but some show a subtle
+       difference where naming what you are looking at is the whole point. */
+    function buildCompare(name, labels) {
+        const esc = t => String(t).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+        const capBefore = labels && labels[0] ? esc(labels[0]) : 'Before';
+        const capAfter = labels && labels[1] ? esc(labels[1]) : 'After';
         const wrap = el('div', 'tut-compare');
         wrap.innerHTML = `
             <div class="tut-badge">🖐 Test for yourself</div>
@@ -480,7 +520,7 @@
                 <div class="cmp-divider"></div>
             </div>
             <input type="range" class="cmp-range" min="0" max="100" value="50" aria-label="Reveal amount — drag to compare before and after">
-            <div class="cmp-foot"><span>Before</span><span>After</span></div>`;
+            <div class="cmp-foot"><span>${capBefore}</span><span>${capAfter}</span></div>`;
         const frame = wrap.querySelector('.cmp-frame');
         const range = wrap.querySelector('.cmp-range');
         const set = v => frame.style.setProperty('--pos', v + '%');
@@ -766,7 +806,7 @@
             if (s.before) {
                 const demo = el('div', 'tut-demo');
                 demo.appendChild(buildExample(s.before));
-                demo.appendChild(buildCompare(s.before));
+                demo.appendChild(buildCompare(s.before, [s.beforeLabel, s.afterLabel]));
                 sec.appendChild(demo);
             }
             if (s.gallery) sec.appendChild(buildGallery(s.gallery));
