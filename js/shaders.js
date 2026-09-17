@@ -1301,6 +1301,11 @@ TRLE.Shaders = {
        flattening large-scale brightness variation (baked sun/shadow) while
        keeping local colour + detail. Re-centred to mid-grey and mixed back by
        u_strength so it stays controllable.
+
+       Alpha is PASSED THROUGH, as in colorAdjust and colorTransfer. It used to be
+       written as a hard 1.0, which quietly turned every cutout opaque: the RGB
+       under alpha 0 is 0 in a canvas, so a fence's holes came back as solid black
+       bars. Measured on a half-transparent tile, mean alpha 191.5 -> 255.
        --------------------------------------------------------------- */
     delight: `#version 300 es
         precision highp float;
@@ -1310,11 +1315,12 @@ TRLE.Shaders = {
         in vec2 v_uv;
         out vec4 fragColor;
         void main() {
-            vec3 d = texture(u_texture, v_uv).rgb;
+            vec4 src = texture(u_texture, v_uv);
+            vec3 d = src.rgb;
             vec3 b = texture(u_blurred, v_uv).rgb;
             float bl = dot(b, vec3(0.299, 0.587, 0.114));
             vec3 evened = d / max(bl, 0.04) * 0.5;        // normalise by local luminance
-            fragColor = vec4(clamp(mix(d, evened, u_strength), 0.0, 1.0), 1.0);
+            fragColor = vec4(clamp(mix(d, evened, u_strength), 0.0, 1.0), src.a);
         }`,
 
     /* ---------- Colour Adjust (HSL / contrast / gamma / temp) ----------

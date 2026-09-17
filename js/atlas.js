@@ -841,6 +841,182 @@ window.TRLE = window.TRLE || {};
         return out;
     }
 
+    /* ============ OVERLAY COMPOSITING (🖼 Overlay Texture) ============
+       Lays one texture ON TOP of another instead of blending between them. The
+       tile is a transition element carrying an `ovParams` recipe, so it inherits
+       refreshTransitions, deriveMaps, "Go to Base / Overlay Texture", undo and
+       the customMask persistence that was already there.
+
+       What it deliberately does NOT reuse is `compositeTransition`. That lerps
+       straight RGB, and a canvas stores 0 in the RGB of a fully transparent
+       pixel — so blending toward a cutout darkens instead of leaving the base
+       alone. An overlay needs real source-over, which canvas 2D gives for free,
+       along with multiply / screen / overlay via globalCompositeOperation. No
+       new GLSL for any of it. */
+    const OV_BLENDS = ['normal', 'multiply', 'screen', 'overlay'];
+    const OV_MODES  = ['all', 'color', 'hue', 'bright', 'paint'];
+
+    /* The selection modes read a texture and decide where the overlay shows.
+       WHICH texture is a real choice, not a detail: sampling the OVERLAY cuts a
+       decal out of its own background (the opaque-on-opaque case), sampling the
+       BASE puts grime only on the wall's mortar. Default is the overlay. */
+    function ovSampleCanvas(p, baseCanvas, placedOverlay) {
+        return p.sample === 'base' ? baseCanvas : placedOverlay;
+    }
+
+    /* Coverage: a greyscale canvas, white where the overlay shows through.
+       `paintMask` is the element's customMask (paint mode only). Opacity is
+       folded in here so every consumer — diffuse and every PBR map — sees one
+       number. Returns null for the 'all' mode, which means "no mask at all":
+       the overlay's own alpha is the whole answer and multiplying by a solid
+       white canvas would only cost a readback. */
+    function ovCoverage(p, baseCanvas, placedOverlay, S, paintMask) {
+        const op = p.opacity == null ? 1 : p.opacity;
+        let sel = null;
+        if (p.mode === 'paint') {
+            sel = paintMask ? softenMask(paintMask, S) : null;
+            if (!sel) return null;
+            // Feather is honoured here too. Edge softness is NOT — the brush owns
+            // that in paint mode, and a second slider of the same name that fed
+            // nothing is exactly what the mask-editor naming rules exist to stop.
+            if (p.feather > 0) sel = featherMask(sel, S, p.feather * (S / 256));
+            if (p.invert) sel = ovInvertMask(sel);
+        } else if (p.mode !== 'all') {
+            sel = TRLE.Engine.selectionMask(
+                resizeCanvas(ovSampleCanvas(p, baseCanvas, placedOverlay), S, S),
+                ovSelectionOpts(p, S));
+        }
+        if (!sel) return op >= 1 ? null : ovFlatMask(S, op);
+        if (op >= 1) return sel;
+        // Scale the whole selection by opacity. 'multiply' against a grey field
+        // is exact on a greyscale mask and needs no per-pixel loop.
+        const out = cloneCanvas(sel);
+        const ctx = out.getContext('2d');
+        ctx.globalCompositeOperation = 'multiply';
+        ctx.fillStyle = `rgb(${Math.round(op * 255)},${Math.round(op * 255)},${Math.round(op * 255)})`;
+        ctx.fillRect(0, 0, S, S);
+        ctx.globalCompositeOperation = 'source-over';
+        return out;
+    }
+    function ovFlatMask(S, v) {
+        const c = document.createElement('canvas');
+        c.width = c.height = S;
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = `rgb(${Math.round(v * 255)},${Math.round(v * 255)},${Math.round(v * 255)})`;
+        ctx.fillRect(0, 0, S, S);
+        return c;
+    }
+    function ovInvertMask(src) {
+        const out = cloneCanvas(src);
+        const ctx = out.getContext('2d');
+        const im = ctx.getImageData(0, 0, out.width, out.height), d = im.data;
+        for (let i = 0; i < d.length; i += 4) {
+            d[i] = 255 - d[i]; d[i + 1] = 255 - d[i + 1]; d[i + 2] = 255 - d[i + 2];
+        }
+        ctx.putImageData(im, 0, 0);
+        return out;
+    }
+    /* Recipe → Engine.selectionMask opts. `feather` is in pixels, so it scales
+       with the tile the way Make Emissive's does. */
+    function ovSelectionOpts(p, S) {
+        const o = {
+            softness: (p.softness == null ? 30 : p.softness) / 100,
+            feather:  (p.feather || 0) * (S / 256),
+            invert:   !!p.invert
+        };
+        if (p.mode === 'bright') { o.mode = 0; o.threshold = (p.threshold == null ? 80 : p.threshold) / 100; }
+        else if (p.mode === 'hue') {
+            o.mode = 2;
+            o.hueCenter = (p.hue == null ? 30 : p.hue) / 360;
+            o.hueWidth  = (p.hueWidth == null ? 30 : p.hueWidth) / 360;
+            o.satMin    = (p.satMin == null ? 30 : p.satMin) / 100;
+            o.valMin    = (p.valMin == null ? 20 : p.valMin) / 100;
+        } else {   // 'color'
+            o.mode = 1;
+            o.target = emHexToRgb01(p.target || '#ffffff');
+            o.tolerance = (p.tolerance == null ? 25 : p.tolerance) / 100;
+        }
+        return o;
+    }
+
+    /* Lay `placedOverlay` over `baseCanvas` through `cov` (nullable).
+
+       The overlay's own alpha and the coverage mask multiply, which is what
+       makes "Whole overlay" the right default for a transparent decal and still
+       lets a painted mask cut into it. destination-in against a mask whose ALPHA
+       carries the coverage does that multiplication in one composite op. */
+    function composeOverlayDiffuse(baseCanvas, placedOverlay, cov, S, blend) {
+        let src = resizeCanvas(placedOverlay, S, S);
+        if (cov) {
+            // Coverage is greyscale; turn it into an alpha stencil first, because
+            // destination-in reads the source's ALPHA, not its luminance.
+            const stencil = document.createElement('canvas');
+            stencil.width = stencil.height = S;
+            const sc = stencil.getContext('2d');
+            const cd = resizeCanvas(cov, S, S).getContext('2d').getImageData(0, 0, S, S);
+            const im = sc.createImageData(S, S);
+            for (let i = 0; i < cd.data.length; i += 4) {
+                im.data[i] = im.data[i + 1] = im.data[i + 2] = 255;
+                im.data[i + 3] = cd.data[i];
+            }
+            sc.putImageData(im, 0, 0);
+            const ctx = src.getContext('2d');
+            ctx.globalCompositeOperation = 'destination-in';
+            ctx.drawImage(stencil, 0, 0);
+            ctx.globalCompositeOperation = 'source-over';
+        }
+        const out = resizeCanvas(baseCanvas, S, S);
+        const octx = out.getContext('2d');
+        octx.globalCompositeOperation = OV_BLENDS.includes(blend) && blend !== 'normal'
+            ? blend : 'source-over';
+        octx.drawImage(src, 0, 0);
+        octx.globalCompositeOperation = 'source-over';
+        return out;
+    }
+
+    /* The effective coverage as a mask the MAP compositor can use: the overlay's
+       own alpha times `cov`. compositeTransition lerps by mask luminance, and a
+       PBR map is opaque, so a plain lerp is right there — what it must not do is
+       ignore the overlay's transparency, or a decal's material would be painted
+       across the whole tile. The blend mode is deliberately NOT applied: a
+       multiply pass changes how the surface LOOKS, not what it IS, so roughness
+       and normal should describe whatever physically sits on top. */
+    function ovMapMask(placedOverlay, cov, S) {
+        const src = resizeCanvas(placedOverlay, S, S)
+            .getContext('2d').getImageData(0, 0, S, S).data;
+        const cd = cov ? resizeCanvas(cov, S, S).getContext('2d').getImageData(0, 0, S, S).data : null;
+        const out = document.createElement('canvas');
+        out.width = out.height = S;
+        const im = out.getContext('2d').createImageData(S, S);
+        for (let i = 0; i < im.data.length; i += 4) {
+            const v = cd ? (src[i + 3] * cd[i]) / 255 : src[i + 3];
+            im.data[i] = im.data[i + 1] = im.data[i + 2] = v;
+            im.data[i + 3] = 255;
+        }
+        out.getContext('2d').putImageData(im, 0, 0);
+        return out;
+    }
+
+    /* Everything an overlay tile needs, from its recipe and its two parents.
+       Shared by refreshTransitions (diffuse), deriveMaps (map mask) and the
+       modal's preview, so the three can never disagree. Returns null when a
+       parent has been deleted. */
+    function overlayParts(el, S) {
+        const base = byId(el.base), overlay = byId(el.overlay);
+        if (!base || !overlay) return null;
+        const p = el.ovParams;
+        const baseCanvas = resizeCanvas(base.canvas, S, S);
+        const placed = resizeCanvas(
+            el.overlayGeom ? geomTransform(overlay.canvas, el.overlayGeom) : overlay.canvas, S, S);
+        const cov = ovCoverage(p, baseCanvas, placed, S, el.customMask);
+        return { base: baseCanvas, placed, cov, params: p };
+    }
+    function buildOverlayTile(el, S) {
+        const parts = overlayParts(el, S);
+        if (!parts) return null;
+        return composeOverlayDiffuse(parts.base, parts.placed, parts.cov, S, parts.params.blend);
+    }
+
     /* Flatten transparent pixels to opaque magenta (#FF00FF) — Tomb Editor treats
        pure magenta as invisible. Returns a new canvas; input is untouched. */
     function magentaKey(canvas) {
@@ -1740,6 +1916,33 @@ window.TRLE = window.TRLE || {};
 
     function cloneCanvas(src) {
         return resizeCanvas(src, src.width, src.height);
+    }
+
+    /* Draw `src` into `dst`, REPLACING whatever was there — the only correct way
+       to put a new image on a canvas that is reused.
+
+       A bare drawImage composites source-over, so everything the destination
+       already held survives underneath a transparent pixel. That is invisible on
+       opaque textures and wrong in two distinct ways on transparent ones:
+
+         - on a MODAL PREVIEW canvas it is the last tile you looked at showing
+           through the new one. Reported as "the transparent texture gets overlaid
+           on the previous texture"; measured on three tiles (red / blue / cutout)
+           the cutout's preview corner read the blue tile's pixels, then the red
+           tile's after that one was previewed.
+         - on a TILE's own canvas it is the pre-edit pixels compositing with the
+           edited ones, which corrupts alpha rather than merely looking wrong. A
+           half-transparent tile put through Adjust Colours at Brightness −50
+           came out alpha 128 → 192, and its RGB only fell 199→114 where the
+           opaque half fell 200→73.
+
+       `applyTileTransform` always did this correctly (clearRect then drawImage);
+       everything else grew its own copy of the line without the clear. */
+    function drawReplace(dst, src, w, h) {
+        const W = w || dst.width, H = h || dst.height;
+        const ctx = dst.getContext('2d');
+        ctx.clearRect(0, 0, dst.width, dst.height);
+        ctx.drawImage(src, 0, 0, W, H);
     }
 
     /* Does this diffuse have cutouts? Drives `alphaFlatten` in generateMaps so a
@@ -2998,7 +3201,9 @@ window.TRLE = window.TRLE || {};
     function cellById(id) { return $('at-grid').querySelector(`.at-cell[data-id="${id}"]`); }
 
     function cellAriaLabel(el, i) {
-        const parts = [`Element ${i + 1}`, el.kind === 'transition' ? 'transition tile' : 'tile'];
+        const kindWord = el.kind !== 'transition' ? 'tile'
+            : el.ovParams ? 'overlay tile' : 'transition tile';
+        const parts = [`Element ${i + 1}`, kindWord];
         parts.push(el.kind === 'transition' ? 'material inherited' : materialLabel(el));
         if (el.seamless) parts.push('seamless');
         if (el.emissive) parts.push('has glow');
@@ -3058,7 +3263,9 @@ window.TRLE = window.TRLE || {};
             const badges = document.createElement('span');
             badges.className = 'at-badges';
             if (el.seamless && el.kind !== 'anim') badges.innerHTML += '<span class="at-badge at-badge-s" title="Seamless applied">S</span>';
-            if (el.kind === 'transition') badges.innerHTML += '<span class="at-badge at-badge-t" title="Transition tile">T</span>';
+            if (el.kind === 'transition') badges.innerHTML += el.ovParams
+                ? '<span class="at-badge at-badge-t" title="Overlay tile — one texture laid on top of another">T</span>'
+                : '<span class="at-badge at-badge-t" title="Transition tile">T</span>';
             if (el.kind === 'anim') {
                 const a = el.anim || {};
                 badges.innerHTML += `<span class="at-badge at-badge-a" title="Animated frame ${(a.index || 0) + 1} of ${a.total || 1}">A${a.total > 1 ? (a.index || 0) + 1 : ''}</span>`;
@@ -3390,6 +3597,7 @@ window.TRLE = window.TRLE || {};
             else if (mode === 'transgrid') openTransGridModal(base, id);
             else if (mode === 'organic') openOrganicModal(base, id);
             else if (mode === 'heighttrans') openHeightModal(base, id);
+            else if (mode === 'overlay') openOverlayModal(base, id);
             else if (mode === 'recolor') openRecolorModal(base, id);
             else openTransModal(base, id);
             return;
@@ -3845,6 +4053,7 @@ window.TRLE = window.TRLE || {};
             : mode === 'borderset' ? 'be the border / trim texture'
             : mode === 'organic' ? 'build the organic transition'
             : mode === 'heighttrans' ? 'settle into its crevices'
+            : mode === 'overlay' ? 'be laid over the top'
             : mode === 'recolor' ? 'sample its colours'
             : 'build the transition';
         const same = $('at-pick-same');
@@ -3913,6 +4122,7 @@ window.TRLE = window.TRLE || {};
                 // restore (like transitions), so no pixels are snapshotted.
                 anim: el.anim ? JSON.parse(JSON.stringify(el.anim)) : null,
                 htParams: el.htParams ? JSON.parse(JSON.stringify(el.htParams)) : null, // height-transition recipe (re-editable)
+                ovParams: el.ovParams ? JSON.parse(JSON.stringify(el.ovParams)) : null, // overlay recipe (re-editable)
                 sgParams: el.sgParams ? JSON.parse(JSON.stringify(el.sgParams)) : null, // stained-glass recipe (re-editable)
                 original: el.original || null,                          // immutable ref (tiles)
                 // Snapshot the canvas whenever it diverges from `original`
@@ -3962,6 +4172,7 @@ window.TRLE = window.TRLE || {};
                 importedMaps: cloneImportedMaps(s.importedMaps),
                 anim: s.anim ? JSON.parse(JSON.stringify(s.anim)) : null,
                 htParams: s.htParams ? JSON.parse(JSON.stringify(s.htParams)) : null,
+                ovParams: s.ovParams ? JSON.parse(JSON.stringify(s.ovParams)) : null,
                 sgParams: s.sgParams ? JSON.parse(JSON.stringify(s.sgParams)) : null,
                 edited: s.edited
             };
@@ -4325,6 +4536,10 @@ window.TRLE = window.TRLE || {};
         menu.querySelectorAll('[data-httonly]').forEach(b => {
             b.style.display = el.htParams ? '' : 'none';
         });
+        // Edit Overlay — only on tiles that carry a stored overlay recipe.
+        menu.querySelectorAll('[data-ovonly]').forEach(b => {
+            b.style.display = el.ovParams ? '' : 'none';
+        });
         // Edit Stained Glass — only on tiles that carry a stored stained-glass recipe.
         menu.querySelectorAll('[data-sgonly]').forEach(b => {
             b.style.display = el.sgParams ? '' : 'none';
@@ -4386,6 +4601,8 @@ window.TRLE = window.TRLE || {};
             case 'transgrid': enterPickMode(id, 'transgrid'); showToast('Now click the second texture for the transition grid', 'info'); break;
             case 'organic': enterPickMode(id, 'organic'); showToast('Now click the second texture for the organic transition', 'info'); break;
             case 'heighttrans': enterPickMode(id, 'heighttrans'); showToast('Now click the texture to settle into the crevices (overlay)', 'info'); break;
+            case 'overlay': enterPickMode(id, 'overlay'); showToast('Now click the texture to lay on top', 'info'); break;
+            case 'editoverlay': if (el.ovParams) editOverlayModal(el); break;
             case 'edithtrans': if (el.htParams) editHeightModal(el); break;
             case 'editanim':
                 if (el.kind !== 'anim' || !el.anim) { showToast('Not an animated tile', 'info'); return; }
@@ -4486,7 +4703,7 @@ window.TRLE = window.TRLE || {};
                 // "restored to original" leaves no way to tell it was cleared.
                 const hadGlow = targets.some(t => !!t.emissive);
                 targets.forEach(t => {
-                    t.canvas.getContext('2d').drawImage(t.original, 0, 0);
+                    drawReplace(t.canvas, t.original);
                     t.seamless = false;
                     t.edited = false;
                     t.emissive = null;
@@ -4569,6 +4786,14 @@ window.TRLE = window.TRLE || {};
                 }
                 return;
             }
+            // An overlay tile is checked BEFORE customMask: paint mode stores its
+            // mask there too, and a lerp is the wrong composite for a texture laid
+            // on top (see composeOverlayDiffuse).
+            if (el.ovParams) {
+                const c = buildOverlayTile(el, S);
+                if (c) drawReplace(el.canvas, c);
+                return;
+            }
             const base = byId(el.base), overlay = byId(el.overlay);
             if (!base || !overlay) return;
             const mask = el.customMask
@@ -4589,7 +4814,7 @@ window.TRLE = window.TRLE || {};
     }
 
     /* ============ MODAL INFRASTRUCTURE ============ */
-    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'bset', 'fade', 'emissive', 'heightmap', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'delight', 'import', 'origami', 'stainedglass', 'noise', 'atlaspreview', 'confirm'];
+    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'bset', 'fade', 'emissive', 'heightmap', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'delight', 'overlay', 'import', 'origami', 'stainedglass', 'noise', 'atlaspreview', 'confirm'];
 
     function visibleModal() {
         return MODAL_NAMES
@@ -4687,6 +4912,7 @@ window.TRLE = window.TRLE || {};
         anchorCleanup();
         bsetCleanup();
         htCleanup();
+        ovCleanup();
         tgCleanup();
         orgCleanup();
         anCleanup();
@@ -5059,7 +5285,7 @@ window.TRLE = window.TRLE || {};
         sm.previewFBO = previewFBO;
 
         const previewCanvas = $('at-sm-preview');
-        previewCanvas.getContext('2d').drawImage(TRLE.Engine.fboToCanvas(previewFBO), 0, 0);
+        drawReplace(previewCanvas, TRLE.Engine.fboToCanvas(previewFBO));
     }
 
     function setupSeamlessModal() {
@@ -5112,7 +5338,7 @@ window.TRLE = window.TRLE || {};
                     TRLE.Engine.deleteFBO(fbo);
                     TRLE.Engine.deleteTexture(tex);
                 }
-                el.canvas.getContext('2d').drawImage(out, 0, 0);
+                drawReplace(el.canvas, out);
                 el.seamless = true;
             });
             const n = targets.length;
@@ -9234,7 +9460,7 @@ window.TRLE = window.TRLE || {};
             // when it happens to already be full size.
             const result = (heal.resultCanvas && heal.resultRes === state.tileSize)
                 ? heal.resultCanvas : healComputeFill(state.tileSize);
-            el.canvas.getContext('2d').drawImage(result, 0, 0);
+            drawReplace(el.canvas, result);
             el.edited = true;   // canvas now diverges from original → must be snapshotted
             closeModal();
             refreshTransitions();
@@ -10737,6 +10963,269 @@ window.TRLE = window.TRLE || {};
         });
     }
 
+    /* ============ OVERLAY TEXTURE MODAL ============
+       Lays one texture on top of another. The compositing lives up beside the
+       transition compositor (see composeOverlayDiffuse); this is the UI.
+
+       Stored as a RE-EDITABLE RECIPE on `el.ovParams`, like htParams/sgParams —
+       the overlay is derived from its two parents every refresh, so recolouring
+       or healing either parent flows straight through. The only pixels it owns
+       are the paint mask, and those go in `el.customMask`, which already
+       persisted. `refreshTransitions` checks ovParams BEFORE customMask.
+
+       The selection picker is deliberately Make Emissive's, not a new one: the
+       job has the same shape (decide a region on a texture, show the result),
+       so colour / hue / bright / paint mean exactly what they mean there. */
+    const ov = { baseId: null, overlayId: null, editId: null, maskCanvas: null,
+                 geom: { rot: 0, flipH: false, flipV: false } };
+    let ovEditor = null;
+
+    function ovCleanup() { ov.baseId = null; ov.overlayId = null; ov.editId = null; }
+
+    /* The controls → a recipe. The same object shape is what gets stored on the
+       element, so there is one definition of an overlay and no translation step. */
+    function ovReadParams() {
+        const n = id => parseInt($('at-ov-' + id).value, 10);
+        return {
+            mode:      $('at-ov-mode').value,
+            sample:    $('at-ov-sample').value,
+            target:    $('at-ov-target').value,
+            tolerance: n('tolerance'),
+            hue:       n('hue'),
+            hueWidth:  n('huewidth'),
+            satMin:    n('satmin'),
+            valMin:    n('valmin'),
+            threshold: n('threshold'),
+            softness:  n('softness'),
+            feather:   n('feather'),
+            invert:    $('at-ov-selinvert').checked,
+            opacity:   n('opacity') / 100,
+            blend:     $('at-ov-blend').value
+        };
+    }
+    /* Recipe → controls (Edit Overlay, and nothing else). */
+    function ovLoadParams(p) {
+        if (!p) return;
+        const set = (id, v) => { const e = $('at-ov-' + id); if (e != null && v != null) e.value = v; };
+        set('mode', p.mode); set('sample', p.sample || 'overlay');
+        set('target', p.target || '#ffffff');
+        set('tolerance', p.tolerance); set('hue', p.hue); set('huewidth', p.hueWidth);
+        set('satmin', p.satMin); set('valmin', p.valMin); set('threshold', p.threshold);
+        set('softness', p.softness); set('feather', p.feather);
+        set('opacity', Math.round((p.opacity == null ? 1 : p.opacity) * 100));
+        set('blend', p.blend || 'normal');
+        $('at-ov-selinvert').checked = !!p.invert;
+        ovSyncLabels();
+    }
+    function ovSyncLabels() {
+        [['tolerance'], ['hue'], ['huewidth'], ['satmin'], ['valmin'], ['threshold'],
+         ['softness'], ['feather'], ['opacity']].forEach(([k]) => {
+            const v = $('at-ov-' + k + '-val');
+            if (v) v.textContent = $('at-ov-' + k).value;
+        });
+    }
+
+    /* A throwaway element, so the preview runs the exact code path the placed
+       tile will (overlayParts / buildOverlayTile), not a parallel copy of it. */
+    function ovPreviewEl() {
+        return {
+            base: ov.baseId, overlay: ov.overlayId,
+            overlayGeom: geomIsIdentity(ov.geom) ? null : Object.assign({}, ov.geom),
+            ovParams: ovReadParams(),
+            customMask: ov.maskCanvas
+        };
+    }
+
+    /* What the left-hand canvas shows, which is also what the eyedropper and the
+       wand read. In the colour / hue / bright modes it is the texture being
+       SAMPLED, or clicking it would pick a colour the selection never sees. In
+       the other two it is the overlay at full coverage — "everything", so paint
+       reads as revealing part of it. */
+    function ovSourceFor(S) {
+        const p = ovReadParams();
+        const base = byId(ov.baseId), over = byId(ov.overlayId);
+        if (!base || !over) return null;
+        const b = resizeCanvas(base.canvas, S, S);
+        const placed = resizeCanvas(geomTransform(over.canvas, ov.geom), S, S);
+        if (p.mode === 'color' || p.mode === 'hue' || p.mode === 'bright') {
+            return p.sample === 'base' ? b : placed;
+        }
+        return composeOverlayDiffuse(b, placed, null, S, p.blend);
+    }
+
+    function ovPreview() {
+        if (ov.baseId === null) return;
+        const P = 256;
+        const src = ovSourceFor(P);
+        if (!src) return;
+        const sctx = $('at-ov-source-canvas').getContext('2d');
+        sctx.clearRect(0, 0, P, P);
+        sctx.drawImage(src, 0, 0, P, P);
+        if ($('at-ov-mode').value === 'paint') {
+            sctx.globalAlpha = 0.5;
+            sctx.drawImage(mmTintMask(ov.maskCanvas, '#e8852a', P), 0, 0, P, P);
+            sctx.globalAlpha = 1;
+            if (ovEditor) ovEditor.drawOverlay(sctx);
+        }
+        const out = buildOverlayTile(ovPreviewEl(), P);
+        if (out) drawReplace($('at-ov-preview'), out, P, P);
+    }
+
+    function ovSetMode() {
+        const m = $('at-ov-mode').value;
+        const sel = m !== 'all';
+        $('at-ov-grp-color').style.display  = m === 'color'  ? '' : 'none';
+        $('at-ov-grp-hue').style.display    = m === 'hue'    ? '' : 'none';
+        $('at-ov-grp-bright').style.display = m === 'bright' ? '' : 'none';
+        $('at-ov-grp-paint').style.display  = m === 'paint'  ? '' : 'none';
+        $('at-ov-grp-sel').style.display    = sel ? '' : 'none';
+        $('at-ov-grp-softness').style.display = m === 'paint' ? 'none' : '';
+        // "Read colours from" only means something for the three sampling modes.
+        const samples = m === 'color' || m === 'hue' || m === 'bright';
+        $('at-ov-grp-sample').style.display = samples ? '' : 'none';
+        const hint = $('at-ov-sample-hint');
+        hint.style.display = samples ? '' : 'none';
+        hint.innerHTML = $('at-ov-sample').value === 'base'
+            ? 'Reading the <strong>base</strong>: the overlay lands only where the base matches — grime in the mortar, moss on the dark stones.'
+            : 'Reading the <strong>overlay</strong>: cuts the overlay out of its own background — a decal or mural on a flat colour.';
+        $('at-ov-source-canvas').style.cursor = (m === 'bright' || m === 'all') ? 'default' : 'crosshair';
+        ovPreview();
+    }
+
+    /* Eyedrop the source canvas for the colour / hue target. Same gesture as
+       Make Emissive's, on the same kind of canvas. */
+    function ovSampleSource(e) {
+        const mode = $('at-ov-mode').value;
+        if (mode !== 'color' && mode !== 'hue') return;
+        const cv = $('at-ov-source-canvas'), r = cv.getBoundingClientRect();
+        const x = Math.max(0, Math.min(cv.width - 1, Math.floor((e.clientX - r.left) / r.width * cv.width)));
+        const y = Math.max(0, Math.min(cv.height - 1, Math.floor((e.clientY - r.top) / r.height * cv.height)));
+        const d = cv.getContext('2d').getImageData(x, y, 1, 1).data;
+        if (mode === 'color') {
+            $('at-ov-target').value = emRgb01ToHex([d[0] / 255, d[1] / 255, d[2] / 255]);
+        } else {
+            const hue = Math.round(emRgbHue(d[0], d[1], d[2]) * 360);
+            $('at-ov-hue').value = hue;
+            $('at-ov-hue-val').textContent = hue;
+        }
+        ovPreview();
+    }
+
+    function ovOpenCommon(baseId, overlayId) {
+        ov.baseId = baseId;
+        ov.overlayId = overlayId;
+        $('at-ov-base-no').textContent    = indexOf(baseId) + 1;
+        $('at-ov-overlay-no').textContent = indexOf(overlayId) + 1;
+        if (ovEditor) { ovEditor.setErase(false); ovEditor.resetHistory(); }
+        ovSetMode();
+        openModal('overlay');
+        ovPreview();
+    }
+
+    /* A NEW overlay starts from the defaults, the way Adjust Colours does.
+       Without this the modal reopens on whatever the last one left behind —
+       including whatever recipe Edit Overlay loaded into it — so the second
+       decal you place silently inherits the first one's colour key and Invert.
+       Caught by validate-overlay: a paint-mode test came out inverted. */
+    function ovResetControls() {
+        const d = $('at-ov-mode');
+        d.value = 'all';
+        $('at-ov-sample').value = 'overlay';
+        $('at-ov-blend').value = 'normal';
+        $('at-ov-target').value = '#ffffff';
+        $('at-ov-selinvert').checked = false;
+        [['tolerance', 25], ['hue', 30], ['huewidth', 30], ['satmin', 30], ['valmin', 20],
+         ['threshold', 80], ['softness', 30], ['feather', 0], ['opacity', 100]]
+            .forEach(([k, v]) => { $('at-ov-' + k).value = v; });
+        ovSyncLabels();
+    }
+
+    function openOverlayModal(baseId, overlayId) {
+        ov.editId = null;
+        ov.geom = { rot: 0, flipH: false, flipV: false };
+        ovResetControls();
+        const mc = ov.maskCanvas.getContext('2d');
+        mc.fillStyle = '#000';
+        mc.fillRect(0, 0, ov.maskCanvas.width, ov.maskCanvas.height);
+        $('at-ov-add').textContent = '💾 Add Overlay Tile';
+        ovOpenCommon(baseId, overlayId);
+    }
+
+    /* Reopen a placed overlay on its own recipe. The paint mask comes back off
+       el.customMask, which is where it was saved. */
+    function editOverlayModal(el) {
+        ov.editId = el.id;
+        ov.geom = Object.assign({ rot: 0, flipH: false, flipV: false }, el.overlayGeom || {});
+        const mc = ov.maskCanvas.getContext('2d');
+        mc.fillStyle = '#000';
+        mc.fillRect(0, 0, ov.maskCanvas.width, ov.maskCanvas.height);
+        if (el.customMask) mc.drawImage(el.customMask, 0, 0, ov.maskCanvas.width, ov.maskCanvas.height);
+        ovLoadParams(el.ovParams);
+        $('at-ov-add').textContent = '💾 Update Overlay';
+        ovOpenCommon(el.base, el.overlay);
+    }
+
+    function setupOverlayModal() {
+        ov.maskCanvas = document.createElement('canvas');
+        ov.maskCanvas.width = 256; ov.maskCanvas.height = 256;
+
+        $('at-ov-mode').addEventListener('change', ovSetMode);
+        $('at-ov-sample').addEventListener('change', ovSetMode);
+        $('at-ov-blend').addEventListener('change', ovPreview);
+        $('at-ov-target').addEventListener('input', ovPreview);
+        $('at-ov-selinvert').addEventListener('change', ovPreview);
+        ['tolerance', 'hue', 'huewidth', 'satmin', 'valmin', 'threshold',
+         'softness', 'feather', 'opacity'].forEach(k => {
+            $('at-ov-' + k).addEventListener('input', function () {
+                $('at-ov-' + k + '-val').textContent = this.value;
+                ovPreview();
+            });
+        });
+        $('at-ov-rot').addEventListener('click', () => { ov.geom.rot = (ov.geom.rot + 90) % 360; ovPreview(); });
+        $('at-ov-fliph').addEventListener('click', () => { ov.geom.flipH = !ov.geom.flipH; ovPreview(); });
+        $('at-ov-flipv').addEventListener('click', () => { ov.geom.flipV = !ov.geom.flipV; ovPreview(); });
+        $('at-ov-source-canvas').addEventListener('pointerdown', ovSampleSource);
+
+        buildMaskToolbar($('at-ov-tools'), 'at-ov', { brushMax: 96 });
+        ovEditor = createMaskEditor('at-ov', {
+            canvas: $('at-ov-source-canvas'),
+            mode: 'luma',
+            getMask: () => ov.maskCanvas,
+            getSource: () => ovSourceFor(ov.maskCanvas.width),
+            active: () => ov.baseId !== null && $('at-ov-mode').value === 'paint'
+                          && $('at-modal-overlay').style.display !== 'none',
+            onChange: ovPreview
+        });
+
+        $('at-ov-add').addEventListener('click', () => {
+            if (ov.baseId === null) return;
+            const S = state.tileSize, p = ovReadParams();
+            const geom = geomIsIdentity(ov.geom) ? null : Object.assign({}, ov.geom);
+            // Only paint mode owns pixels; the other modes recompute their mask
+            // from the recipe, so storing one would just bloat the project file.
+            const mask = p.mode === 'paint' ? cloneCanvas(ov.maskCanvas) : null;
+            if (ov.editId != null) {
+                const el = byId(ov.editId);
+                if (el) { el.ovParams = p; el.overlayGeom = geom; el.customMask = mask; }
+                closeModal(); renderGrid(); refreshTransitions();
+                pushHistory('Edit overlay'); showToast('Overlay updated', 'success');
+                return;
+            }
+            state.elements.push({
+                id: state.nextId++, kind: 'transition', canvas: blankCanvas(S),
+                original: null, seamless: false, material: null,
+                base: ov.baseId, overlay: ov.overlayId,
+                mode: 'custom', pivot: 0, hardness: 0, blendMethod: 'alpha',
+                customMask: mask, overlayGeom: geom, ovParams: p
+            });
+            closeModal();
+            renderGrid();
+            refreshTransitions();
+            pushHistory('Overlay texture');
+            showToast('Added overlay tile', 'success');
+        });
+    }
+
     /* ============ TRANSITION GRID MODAL ============
        Designs ONE continuous A→B border across a Cols×Rows wall, then slices it
        into per-cell custom-mask transition tiles that connect seamlessly. Anchors
@@ -11199,7 +11688,7 @@ window.TRLE = window.TRLE || {};
         const fbo = E.createFBO(P, P);
         E.blit('colorAdjust', Object.assign({ u_texture: ca.tex }, caUniforms()), fbo);
         const out = E.fboToCanvas(fbo);
-        $('at-ca-preview').getContext('2d').drawImage(out, 0, 0, P, P);
+        drawReplace($('at-ca-preview'), out, P, P);
         E.deleteFBO(fbo);
     }
     /* `ids` is the whole selection when the right-click landed inside one. The
@@ -11229,7 +11718,7 @@ window.TRLE = window.TRLE || {};
             if (!targets.length) return;
             targets.forEach(el => {
                 const out = caApplyTo(el.canvas, state.tileSize);
-                el.canvas.getContext('2d').drawImage(out, 0, 0);
+                drawReplace(el.canvas, out);
                 el.edited = true;
             });
             const n = targets.length;
@@ -11312,7 +11801,7 @@ window.TRLE = window.TRLE || {};
         if (rc.baseId === null) return;
         const P = $('at-rc-preview').width;
         const out = rcApplyTo(byId(rc.baseId).canvas, P);
-        $('at-rc-preview').getContext('2d').drawImage(out, 0, 0, P, P);
+        drawReplace($('at-rc-preview'), out, P, P);
     }
     /* The selection is read HERE, not when the menu entry was clicked, and that
        is safe: pick mode swallows cell clicks without touching the selection,
@@ -11359,7 +11848,7 @@ window.TRLE = window.TRLE || {};
             const stats = targets.map(rcStatsFor);
             targets.forEach((el, i) => {
                 const out = rcApplyTo(el.canvas, state.tileSize, stats[i]);
-                el.canvas.getContext('2d').drawImage(out, 0, 0);
+                drawReplace(el.canvas, out);
                 el.edited = true;
             });
             const n = targets.length;
@@ -11390,6 +11879,7 @@ window.TRLE = window.TRLE || {};
             return;
         }
         if (dl.resultCanvas) {
+            ctx.clearRect(0, 0, P, P);
             ctx.drawImage(dl.resultCanvas, 0, 0, P, P);
             $('at-dl-canvas-label').textContent = 'Preview (shadow inpainted)';
             return;
@@ -11473,7 +11963,7 @@ window.TRLE = window.TRLE || {};
                 const out = whole
                     ? delightWhole(el.canvas, state.tileSize, strength)
                     : (dl.resultCanvas || healPatchFill(el.canvas, dl.maskCanvas, state.tileSize));
-                el.canvas.getContext('2d').drawImage(out, 0, 0);
+                drawReplace(el.canvas, out);
                 el.edited = true;
             });
             const n = targets.length;
@@ -13401,6 +13891,25 @@ window.TRLE = window.TRLE || {};
                         applyContactShadowAO(result[mt], mask, S, b.org.shadow, shadowOpts(b.org));
                 }
             }
+        } else if (el.kind === 'transition' && el.ovParams) {
+            // Overlay tile: the parents' maps composite through the same coverage
+            // the diffuse used, times the overlay's own alpha. A lerp is correct
+            // here (maps are opaque), unlike for the diffuse.
+            const base    = deriveMaps(byId(el.base), enabledMaps, cache);
+            const overlay = deriveMaps(byId(el.overlay), enabledMaps, cache);
+            const parts   = overlayParts(el, S);
+            if (parts) {
+                const mask = ovMapMask(parts.placed, parts.cov, S);
+                for (const mt of TRLE.MapOrder) {
+                    if (!enabledMaps[mt] || !base[mt] || !overlay[mt]) continue;
+                    let om = overlay[mt];
+                    if (el.overlayGeom) {
+                        om = geomTransform(om, el.overlayGeom);
+                        if (mt === 'normal') normalFixGeom(om, el.overlayGeom);
+                    }
+                    result[mt] = compositeTransition(base[mt], om, mask, S);
+                }
+            }
         } else if (el.kind === 'transition') {
             const base    = deriveMaps(byId(el.base), enabledMaps, cache);
             const overlay = deriveMaps(byId(el.overlay), enabledMaps, cache);
@@ -14013,6 +14522,7 @@ window.TRLE = window.TRLE || {};
                 e.hgParams.mask = el.hgParams.mask ? await png(el.hgParams.mask) : null;
             }
             if (el.htParams) e.htParams = el.htParams;   // height-transition recipe (re-editable)
+            if (el.ovParams) e.ovParams = el.ovParams;   // overlay recipe (re-editable)
             if (el.sgParams) e.sgParams = el.sgParams;   // stained-glass recipe (re-editable)
             elements.push(e);
         }
@@ -14132,6 +14642,7 @@ window.TRLE = window.TRLE || {};
                 overlayGeom: e.overlayGeom || null,
                 anim: e.anim || null,
                 htParams: e.htParams || null,
+                ovParams: e.ovParams || null,
                 sgParams: e.sgParams || null,
                 hgParams: e.hgParams ? Object.assign({}, e.hgParams, { mask: null }) : null,
                 original: null, canvas: null
@@ -14899,6 +15410,7 @@ window.TRLE = window.TRLE || {};
         setupHeightMapModal();
         setupAnchorModal();
         setupHeightModal();
+        setupOverlayModal();
         setupTransGridModal();
         setupOrganicModal();
         setupAnimModal();
@@ -14950,6 +15462,7 @@ window.TRLE = window.TRLE || {};
                     importedMaps: el.importedMaps ? Object.keys(el.importedMaps) : null,
                     sgParams: el.sgParams ? JSON.parse(JSON.stringify(el.sgParams)) : null,
                     htParams: !!el.htParams,
+                    ovParams: el.ovParams ? JSON.parse(JSON.stringify(el.ovParams)) : null,
                     // The mask is a canvas, so report whether there IS one rather
                     // than trying to send it over CDP.
                     hgParams: el.hgParams
@@ -14976,6 +15489,34 @@ window.TRLE = window.TRLE || {};
             // leave the other intact (which is what keeps Reset to Original honest).
             tileSig(i) { return capSig(state.elements[i] && state.elements[i].canvas); },
             originalSig(i) { return capSig(state.elements[i] && state.elements[i].original); },
+            /* test-only: the ALPHA channel alone. `tileSig` samples every 17th
+               byte, which steps over most of it -- and alpha is the channel the
+               source-over bug moved (a half-transparent tile came out of Adjust
+               Colours at 192 instead of 128 while its RGB looked plausible). */
+            alphaProbe(i) {
+                const el = state.elements[i];
+                if (!el || !el.canvas) return null;
+                const d = el.canvas.getContext('2d').getImageData(0, 0, el.canvas.width, el.canvas.height).data;
+                let h = 2166136261, min = 255, max = 0, sum = 0, n = 0, zero = 0;
+                for (let k = 3; k < d.length; k += 4) {
+                    const a = d[k];
+                    h ^= a; h = Math.imul(h, 16777619);
+                    if (a < min) min = a; if (a > max) max = a;
+                    if (a === 0) zero++;
+                    sum += a; n++;
+                }
+                return { sig: (h >>> 0).toString(16), min, max, zero, mean: +(sum / n).toFixed(2) };
+            },
+            /* test-only: adopt a tile's current pixels as its immutable
+               `original`. Lets a validator paint a cutout fixture onto the live
+               cell canvas and still have "Reset to Original" mean something. */
+            adoptOriginal(i) {
+                const el = state.elements[i];
+                if (!el || !el.canvas) return false;
+                el.original = cloneCanvas(el.canvas);
+                el.edited = false; el.seamless = false;
+                return true;
+            },
             // test-only: a tile's mean RGB. A signature says *whether* pixels
             // moved; the batch-edit checks need to know *where to* — that a
             // recoloured tile landed on the reference's tone rather than merely
@@ -15026,13 +15567,16 @@ window.TRLE = window.TRLE || {};
                 if (!c) return null;
                 return [...c.getContext('2d').getImageData(0, 0, 1, 1).data].slice(0, 3);
             },
-            derivedMapPixel(i, mt) {
+            /* (x, y) default to the top-left corner, which is where every
+               caller before the overlay work read. An overlay tile needs a point
+               inside the decal and one outside it, so they are arguments now. */
+            derivedMapPixel(i, mt, x, y) {
                 const el = state.elements[i];
                 if (!el) return null;
                 const enabled = {}; TRLE.MapOrder.forEach(m => { enabled[m] = true; });
                 const maps = deriveMaps(el, enabled, {});
                 if (!maps[mt]) return null;
-                return [...maps[mt].getContext('2d').getImageData(0, 0, 1, 1).data].slice(0, 3);
+                return [...maps[mt].getContext('2d').getImageData(x || 0, y || 0, 1, 1).data].slice(0, 3);
             },
             /* test-only: the ACTIVE multi-material layer mask, as an alpha
                histogram. The display canvas cannot answer this -- it composites
@@ -15049,7 +15593,7 @@ window.TRLE = window.TRLE || {};
             maskCanvasFor(which) {
                 return ({ em: emissive.maskCanvas, hg: hg.mask, heal: heal.maskCanvas,
                           fade: fade.maskCanvas, dl: dl.maskCanvas, tr: tr.customMask,
-                          mm: mmActiveMask() })[which] || null;
+                          ov: ov.maskCanvas, mm: mmActiveMask() })[which] || null;
             },
             maskProbe(which) {
                 const m = this.maskCanvasFor(which);

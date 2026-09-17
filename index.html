@@ -333,6 +333,7 @@
         <div class="at-ctx-title">Edit</div>
         <button data-action="editanim" role="menuitem" data-animonly>🎞️ Edit Animation…</button>
         <button data-action="edithtrans" role="menuitem" data-httonly>🏔️ Edit Height Transition…</button>
+        <button data-action="editoverlay" role="menuitem" data-ovonly>🖼 Edit Overlay…</button>
         <button data-action="editstainedglass" role="menuitem" data-sgonly>🪟 Edit Stained Glass…</button>
     </div>
     <div class="at-ctx-col" data-col="transitions">
@@ -343,6 +344,12 @@
         <button data-action="transgrid" role="menuitem" data-animhide>🗺️ Make Transition Grid…</button>
         <button data-action="organic" role="menuitem" data-animhide>🌿 Make Organic Transition…</button>
         <button data-action="heighttrans" role="menuitem" data-animhide>🏔️ Make Height Transition…</button>
+        <!-- Not a blend between two terrains: it lays one texture ON TOP of
+             another (source-over, not a cross-fade), which is why it sits at the
+             bottom of the group rather than among the mask builders. Offered on
+             transition tiles too — a finished transition is a perfectly good
+             backdrop to put a decal on. -->
+        <button data-action="overlay" role="menuitem" data-animhide>🖼 Overlay Texture…</button>
     </div>
     <div class="at-ctx-col" data-col="generate">
         <div class="at-ctx-title">Generate</div>
@@ -1165,6 +1172,173 @@
             <button class="btn btn-secondary" data-close>Cancel</button>
             <button class="btn btn-secondary" id="at-em-remove">🗑️ Remove glow</button>
             <button class="btn btn-primary" id="at-em-apply">💾 Apply Emissive</button>
+        </div>
+    </div>
+
+    <!-- ── Overlay Texture modal ─────────────────────
+         Lays one texture on top of another. Mirrors Make Emissive's shape on
+         purpose: the same "what gets selected" picker (colour / hue / bright /
+         paint), the same tuning-flexes + pinned-preview-rail layout, and the
+         same two 256px canvases, because the job is the same shape — decide a
+         region on one texture, then show the result. -->
+    <div class="at-modal at-modal-xl" id="at-modal-overlay" role="dialog" aria-modal="true" aria-label="Overlay Texture" style="display:none;">
+        <div class="at-modal-title">🖼 Overlay — Tile <span id="at-ov-base-no"></span> under Tile <span id="at-ov-overlay-no"></span></div>
+        <div class="sm-hint">Lays the overlay texture <em>on top of</em> the base instead of blending between them. A texture that already has transparency needs nothing here; for an opaque one, pick out what should show through by colour, by hue, or by painting it.</div>
+        <div class="at-modal-cols" style="--at-side-w:600px;">
+            <div class="at-modal-tune">
+                <div class="form-row" style="align-items:flex-end;">
+                    <div class="form-group" style="min-width:190px;">
+                        <label for="at-ov-mode">What shows through</label>
+                        <select id="at-ov-mode">
+                            <option value="all" selected>Whole overlay (use its own transparency)</option>
+                            <option value="color">Pick a colour</option>
+                            <option value="hue">Hue range</option>
+                            <option value="bright">Bright areas</option>
+                            <option value="paint">Paint it</option>
+                        </select>
+                    </div>
+                    <!-- Hidden for "Whole overlay" and "Paint it": neither reads a
+                         texture's colours, so the question doesn't arise. -->
+                    <div class="form-group" id="at-ov-grp-sample" style="display:none;min-width:150px;">
+                        <label for="at-ov-sample">Read colours from</label>
+                        <select id="at-ov-sample">
+                            <option value="overlay" selected>The overlay</option>
+                            <option value="base">The base</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="sm-hint" id="at-ov-sample-hint" style="display:none;"></div>
+
+                <!-- Pick-a-colour controls -->
+                <div id="at-ov-grp-color" style="display:none;">
+                    <div class="form-row" style="align-items:flex-end;">
+                        <div class="form-group" style="min-width:90px;">
+                            <label for="at-ov-target">Target</label>
+                            <input type="color" id="at-ov-target" value="#ffffff" style="width:100%;height:30px;padding:0;">
+                        </div>
+                        <div class="form-group" style="flex:1;">
+                            <label for="at-ov-tolerance">Tolerance — <span id="at-ov-tolerance-val">25</span>%</label>
+                            <input type="range" id="at-ov-tolerance" min="1" max="100" value="25" style="width:100%;">
+                        </div>
+                    </div>
+                    <div class="sm-hint">Click the source preview to eyedrop the target colour.</div>
+                </div>
+
+                <!-- Hue-range controls -->
+                <div id="at-ov-grp-hue" style="display:none;">
+                    <div class="form-row">
+                        <div class="form-group" style="flex:1;">
+                            <label for="at-ov-hue">Hue — <span id="at-ov-hue-val">30</span>°</label>
+                            <input type="range" id="at-ov-hue" min="0" max="360" value="30" style="width:100%;">
+                        </div>
+                        <div class="form-group" style="flex:1;">
+                            <label for="at-ov-huewidth">Hue width — <span id="at-ov-huewidth-val">30</span>°</label>
+                            <input type="range" id="at-ov-huewidth" min="2" max="180" value="30" style="width:100%;">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group" style="flex:1;">
+                            <label for="at-ov-satmin">Min saturation — <span id="at-ov-satmin-val">30</span>%</label>
+                            <input type="range" id="at-ov-satmin" min="0" max="100" value="30" style="width:100%;">
+                        </div>
+                        <div class="form-group" style="flex:1;">
+                            <label for="at-ov-valmin">Min brightness — <span id="at-ov-valmin-val">20</span>%</label>
+                            <input type="range" id="at-ov-valmin" min="0" max="100" value="20" style="width:100%;">
+                        </div>
+                    </div>
+                    <div class="sm-hint">Click the source preview to set the hue from a pixel.</div>
+                </div>
+
+                <!-- Brightness controls -->
+                <div id="at-ov-grp-bright" style="display:none;">
+                    <div class="form-group">
+                        <label for="at-ov-threshold">Brightness cutoff — <span id="at-ov-threshold-val">80</span>%</label>
+                        <input type="range" id="at-ov-threshold" min="0" max="100" value="80" style="width:100%;">
+                    </div>
+                </div>
+
+                <!-- Paint controls -->
+                <div id="at-ov-grp-paint" style="display:none;">
+                    <div class="sm-hint" style="margin-top:0;">Paint on the source preview, on the right, where the overlay should show.</div>
+                    <div class="at-mask-tools" id="at-ov-tools"></div>
+                </div>
+
+                <!-- Shared across every mode except "Whole overlay", which has no
+                     selection to soften or flip. -->
+                <div id="at-ov-grp-sel">
+                    <div class="form-row">
+                        <!-- Hidden in Paint mode. The brush toolbar has its own
+                             Edge softness there and this one is not read at all
+                             (ovCoverage's paint branch never calls selectionMask),
+                             so leaving it visible puts two identically-named
+                             sliders side by side with one of them inert — the
+                             at-fade-hardness collision in a different costume. -->
+                        <div class="form-group" id="at-ov-grp-softness" style="flex:1;">
+                            <label for="at-ov-softness">Edge softness — <span id="at-ov-softness-val">30</span>%</label>
+                            <input type="range" id="at-ov-softness" min="0" max="100" value="30" style="width:100%;">
+                        </div>
+                        <div class="form-group" style="flex:1;">
+                            <label for="at-ov-feather">Feather — <span id="at-ov-feather-val">0</span>px</label>
+                            <input type="range" id="at-ov-feather" min="0" max="24" value="0" style="width:100%;">
+                        </div>
+                    </div>
+                    <!-- NOT `at-ov-invert`: buildMaskToolbar generates that id for
+                         its own "⇄ Invert" button, and getElementById returns the
+                         first match — the exact collision that made the Height
+                         recipe's invert checkbox drive the paint mask and left the
+                         toolbar's button dead. Rename the surface's element. -->
+                    <div class="form-group">
+                        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                            <input type="checkbox" id="at-ov-selinvert"> Invert the selection
+                        </label>
+                        <div class="sm-hint">Select the part you want to <em>remove</em>, then tick this — usually easier for keying a decal off a flat background.</div>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group" style="flex:1;">
+                        <label for="at-ov-opacity">Opacity — <span id="at-ov-opacity-val">100</span>%</label>
+                        <input type="range" id="at-ov-opacity" min="0" max="100" value="100" style="width:100%;">
+                    </div>
+                    <div class="form-group" style="flex:1;">
+                        <label for="at-ov-blend">Blend</label>
+                        <select id="at-ov-blend">
+                            <option value="normal" selected>Normal</option>
+                            <option value="multiply">Multiply (dirt, stains, shadow)</option>
+                            <option value="screen">Screen (light leaks, dust, glow)</option>
+                            <option value="overlay">Overlay (contrast, weathering)</option>
+                        </select>
+                    </div>
+                </div>
+                <!-- Stated because it is a real limit and not a guessable one: the
+                     PBR maps describe what physically sits on top, so they follow
+                     the coverage and ignore the blend mode. -->
+                <div class="sm-hint">Blend affects the colour only. The generated normal / AO / roughness maps follow the <em>coverage</em>, so they describe whatever is actually on top.</div>
+
+                <div class="form-group">
+                    <label>Overlay orientation</label>
+                    <div class="form-row" style="gap:6px;">
+                        <button class="btn btn-secondary btn-sm" id="at-ov-rot" type="button">↻ Rotate 90°</button>
+                        <button class="btn btn-secondary btn-sm" id="at-ov-fliph" type="button">↔ Flip H</button>
+                        <button class="btn btn-secondary btn-sm" id="at-ov-flipv" type="button">↕ Flip V</button>
+                    </div>
+                </div>
+            </div>
+            <div class="at-modal-side"><div class="form-row">
+                <div class="form-group" style="flex:1;">
+                    <label>Source <span style="color:var(--text-secondary);font-size:0.75rem;">(click to pick / paint)</span></label>
+                    <canvas id="at-ov-source-canvas" width="256" height="256" style="width:100%;border:1px solid var(--border);border-radius:var(--radius-sm);cursor:crosshair;image-rendering:pixelated;"></canvas>
+                </div>
+                <div class="form-group" style="flex:1;">
+                    <label>Result</label>
+                    <canvas id="at-ov-preview" width="256" height="256" class="at-fade-canvas" style="width:100%;cursor:default;"></canvas>
+                </div>
+            </div>
+            </div>
+        </div>
+        <div class="at-modal-actions">
+            <button class="btn btn-secondary" data-close>Cancel</button>
+            <button class="btn btn-primary" id="at-ov-add">💾 Add Overlay Tile</button>
         </div>
     </div>
 

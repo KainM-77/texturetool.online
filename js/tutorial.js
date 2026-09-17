@@ -202,6 +202,19 @@
             tip: 'Works best on textures with real relief (cobble/brick flooring). The whole recipe is stored on the tile, so it survives undo and project save and stays fully re-editable.'
         },
         {
+            id: 'overlay', icon: '\u{1F5BC}', title: 'Overlay textures',
+            what: 'Lays one texture <em>on top of</em> another instead of blending between them. A decal on a wall, a mural on stone, grime over brick. The other transition tools cross-fade two terrains; this one stacks them, so the overlay\u2019s own transparency is respected and nothing underneath is tinted where the overlay isn\u2019t.',
+            how: [
+                '<strong>Right-click</strong> the background texture \u2192 <strong>Overlay Texture</strong>, then click the texture to lay on top.',
+                'If the top texture already has transparency, leave <strong>What shows through</strong> on <strong>Whole overlay</strong>. Everything else is for cutting a shape out of an opaque texture.',
+                '<strong>Pick a colour</strong> or <strong>Hue range</strong> keys it by colour: click the source preview to eyedrop, set the <strong>Tolerance</strong>, and tick <strong>Invert the selection</strong> if you sampled the background rather than the subject. <strong>Bright areas</strong> keys by luminance. <strong>Paint it</strong> gives you the brush, lasso and wand.',
+                '<strong>Read colours from</strong> decides which texture gets sampled. Reading <em>the overlay</em> cuts a decal off its own background; reading <em>the base</em> puts the overlay only where the background matches, which is how you get grime in mortar joints and moss on the dark stones.',
+                'Set <strong>Opacity</strong>, and a <strong>Blend</strong> if you want one: <strong>Multiply</strong> for dirt and stains, <strong>Screen</strong> for dust and light, <strong>Overlay</strong> for weathering. Then <strong>Add Overlay Tile</strong>.'
+            ],
+            before: 'overlay',
+            tip: 'The result is a live recipe, not baked pixels: recolour or heal either source and the overlay tile follows. <strong>Right-click \u2192 Edit Overlay</strong> reopens it. Blend affects colour only, so the generated normal / AO / roughness maps describe whatever is actually on top.'
+        },
+        {
             id: 'heal', icon: '🩹', title: 'Heal / Fill',
             what: 'Paints out blemishes, logos or scratches by filling the area with surrounding colour or re-synthesised texture.',
             how: ['<strong>Right-click</strong> a tile → <strong>Heal / Fill</strong>.', 'Paint over the <em>whole</em> blemish so the selection touches clean texture on every side.', 'Pick <strong>Neighbour-aware</strong> (default), <strong>Texture</strong> (whole-tile synthesis) or <strong>Smooth</strong> (diffusion), then <strong>Save to Tile</strong>.', 'The result on the right updates as you paint. <strong>Drag the divider</strong> across it to wipe between before and after, or press and hold <strong>👁 Hold to see the original</strong> to flick the whole tile back — both land on the same pixels, which is how you spot a smear or a seam. Raise <strong>Edge softness</strong> to feather the selection edge; <strong>Paint</strong> and <strong>Erase</strong> are separate buttons.'],

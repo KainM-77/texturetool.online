@@ -1191,6 +1191,55 @@ TRLE.Engine = (function() {
         return canvas;
     }
 
+    /* ---- Selection mask from a diffuse ----
+       The brightness / colour-distance / hue-range selection that Make Emissive
+       and the height-source picker both build inline, handed back as a plain
+       greyscale canvas (white = selected). No new GLSL: it is the same
+       `emissiveMask` shader, which is why the opts names match
+       emissiveFromDiffuse's.
+
+       opts: mode 0|1|2, threshold, softness, target[r,g,b 0-1], tolerance,
+             hueCenter, hueWidth, satMin, valMin, feather (px), invert (bool) */
+    function selectionMask(diffuseCanvas, opts = {}) {
+        const w = diffuseCanvas.width, h = diffuseCanvas.height;
+        const tex = createTextureFromImage(diffuseCanvas);
+        const maskFBO = createFBO(w, h);
+        blit('emissiveMask', {
+            u_texture:   tex,
+            u_mode:      opts.mode || 0,
+            u_threshold: opts.threshold != null ? opts.threshold : 0.8,
+            u_softness:  opts.softness != null ? opts.softness : 0.3,
+            u_target:    opts.target || [1, 1, 1],
+            u_tolerance: opts.tolerance != null ? opts.tolerance : 0.25,
+            u_hueCenter: opts.hueCenter != null ? opts.hueCenter : 0.08,
+            u_hueWidth:  opts.hueWidth != null ? opts.hueWidth : 0.08,
+            u_satMin:    opts.satMin != null ? opts.satMin : 0.3,
+            u_valMin:    opts.valMin != null ? opts.valMin : 0.2
+        }, maskFBO);
+
+        let blurred = null, src = maskFBO;
+        if (opts.feather && opts.feather > 0) {
+            blurred = gaussianBlur(maskFBO.texture, w, h, opts.feather);
+            src = blurred;
+        }
+        const canvas = fboToCanvas(src);
+        deleteFBO(maskFBO);
+        if (blurred) deleteFBO(blurred);
+        deleteTexture(tex);
+
+        // Inverting on the CPU keeps the shader free of a uniform that only one
+        // caller wants; the mask is already back as pixels by this point.
+        if (opts.invert) {
+            const ctx = canvas.getContext('2d');
+            const im = ctx.getImageData(0, 0, w, h), d = im.data;
+            for (let i = 0; i < d.length; i += 4) {
+                d[i] = 255 - d[i]; d[i + 1] = 255 - d[i + 1]; d[i + 2] = 255 - d[i + 2];
+            }
+            ctx.putImageData(im, 0, 0);
+        }
+        return canvas;
+    }
+
     /* ---- GPU-only FBO → screen blit (zero CPU readback) ----
        Uses gl.blitFramebuffer() to copy an FBO's colour
        attachment directly to the default framebuffer (canvas).
@@ -1233,6 +1282,7 @@ TRLE.Engine = (function() {
         pomPreview,
         pomPreview3D,
         emissiveFromDiffuse,
+        selectionMask,
         loadImageAsTexture,
         canvasToBlob,
         encodeTGA,
