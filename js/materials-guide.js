@@ -151,7 +151,7 @@
         },
         {
             id: 'tiers', icon: '🗂️', title: 'Preset tiers (Realistic, Dramatic, Fantasy)',
-            what: `The material picker has a second dropdown next to the preset list. It re-cuts the same 53 solid materials three ways. <strong>Stone</strong> is still stone in all three; what changes is how hard the generated maps push.`,
+            what: `The material picker has a second dropdown next to the preset list. It re-cuts the same solid materials three ways. <strong>Stone</strong> is still stone in all three; what changes is how hard the generated maps push.`,
             derive: `<strong>📷 Realistic</strong> is the default and the safe choice for TR-style texture packs. <strong>🗿 Dramatic</strong> deepens the crevice shadows and strengthens the relief for a weathered, Elder-Scrolls-ish read. <strong>✨ Fantasy</strong> goes the other way: soft relief, flat shading, a brighter sheen, and a little glow on the precious materials, for a stylised pastel look.<br><br>Each tier scales off how much relief a material actually has, so <em>Stone</em> and <em>Bark</em> shift a lot between tiers while <em>Glass</em> and <em>Chrome</em> barely move. Every material appears in every tier even when the difference is tiny, so you can switch tier without losing your material.`,
             slidersTitle: 'The tiers',
             tuningTitle: 'Good to know',
@@ -166,7 +166,7 @@
                 ['Mixing tiers', 'fine. Tier is per tile, so a Dramatic stone wall can sit next to a Realistic metal door.'],
                 ['Going further', 'every tier is just a starting point for the advanced sliders. Tweak one and it becomes a custom material you can save.']
             ],
-            tip: `Fantasy only changes the <em>maps</em>. Presets never touch your diffuse, so the colours stay exactly as you painted them — if you want a pastel look, stylise the texture itself and let the Fantasy tier handle how it catches light.`
+            tip: `Fantasy only changes the <em>maps</em>. Presets never touch your diffuse, so the colours stay exactly as you painted them, if you want a pastel look, stylise the texture itself and let the Fantasy tier handle how it catches light.`
         },
         {
             id: 'specular', icon: '✨', title: 'Specular (how shiny)',
@@ -182,7 +182,7 @@
                 ['Brick / stone / concrete / wood', 'low Base (40 to 80), mostly matte.'],
                 ['Fabric / sand / dirt / paper', 'lowest Base (20 to 50), barely any highlight at all.']
             ],
-            tip: `Specular and roughness work together in TEN. High specular with high roughness gives a broad soft sheen like satin. High specular with low roughness gives a tight mirror hotspot. Push Base above about 200 and you are asking for a near-white map: in-engine that lays white over your texture and drains the colour out of it, which is why even the metals top out at 180.`
+            tip: `Specular and roughness work together in TEN. High specular with high roughness gives a broad soft sheen like satin. High specular with low roughness gives a tight mirror hotspot. Push Base above about 200 and you are asking for a near-white map: in-engine that lays white over your texture and drains the colour out of it, which is why even the metals top out at 180.<br><br>On a <em>reflective</em> material (Tomb Editor's texture panel, <strong>Materials</strong>, <strong>Material type</strong> set to <strong>Reflective</strong> or <strong>Skybox Reflective</strong>) this map does a second job: it is the blend between your texture and the reflection, so 255 means pure environment and no texture at all. Tomb Editor fills in a flat 128 when a reflective material has no specular map, which makes 128 a fair middle. The liquid presets sit above it on purpose (<strong>Still Water</strong> is 169). Roughness does not blur that reflection, it only shapes the highlight.`
         },
         {
             id: 'roughness', icon: '🔲', title: 'Roughness (sharp vs blurry reflection)',
@@ -204,7 +204,7 @@
         {
             id: 'height', icon: '⬆️', title: 'Height / Parallax (real depth)',
             what: `Where a normal map <em>fakes</em> bumps, a <strong>height</strong> map drives real <strong>parallax</strong>. High points actually shift in front of low ones as the camera moves, so mortar joints genuinely look recessed. It’s the most convincing depth you can get, and also the most expensive.`,
-            derive: `Same brightness-as-elevation reading as the normal map, written out as grayscale. <strong>White is the polygon surface</strong> and darker is deeper, because Tomb Engine's parallax only carves <em>in</em> — nothing is ever pushed out in front of the wall. The tool puts the texture's high points on white for you, so the whole depth range goes on relief instead of sinking the surface. <strong>Height Blur</strong> smooths the source first so you get clean relief instead of pixel jitter.`,
+            derive: `Same brightness-as-elevation reading as the normal map, written out as grayscale. <strong>White is the polygon surface</strong> and darker is deeper, because Tomb Engine's parallax only carves <em>in</em>, nothing is ever pushed out in front of the wall. The tool puts the texture's high points on white for you, so the whole depth range goes on relief instead of sinking the surface. <strong>Height Blur</strong> smooths the source first so you get clean relief instead of pixel jitter.`,
             sliders: [
                 ['Height Strength', 'how far the recesses sit below the surface.'],
                 ['Height Blur', 'smooths the source first so the relief isn’t noisy.']
@@ -214,11 +214,11 @@
                 ['Wood planks / tile', 'moderate, just enough to sink the joints.'],
                 ['Sand / fabric / smooth surfaces', 'low. There’s barely any real relief, and parallax on fine noise makes the surface look like it’s swimming.']
             ],
-            tip: `Height costs more than framerate. It is GPU-heavy, and it also switches <strong>SSAO off</strong> for that material and disables <strong>decals</strong> — bullet holes, explosion marks — on it. Use it on a handful of hero textures per level rather than the whole atlas. Leave <strong>Fade height edges to white</strong> ticked: parallax marches the UV out of the texture's own box in the atlas page, and a white border is what stops the black bars along texture edges. For per-texture control of the fade — and a preview of the real in-engine shader — use <strong>🏔️ Make Height Map</strong> from the right-click menu.`
+            tip: `Height costs more than framerate. It is GPU-heavy, and it also switches <strong>SSAO off</strong> for that material and disables <strong>decals</strong>, bullet holes, explosion marks, on it. Use it on a handful of hero textures per level rather than the whole atlas. Leave <strong>Fade height edges to white</strong> ticked: parallax marches the UV out of the texture's own box in the atlas page, and a white border is what stops the black bars along texture edges. For per-texture control of the fade, and a preview of the real in-engine shader, use <strong>🏔️ Make Height Map</strong> from the right-click menu.`
         },
         {
-            id: 'transparency', icon: '🕳️', title: 'Transparency (fences, grates, foliage)',
-            what: `Maps are always fully opaque, even when the texture they came from isn’t. That’s on purpose: a height or normal map is data, not a picture, and a hole in it means nothing. Your <em>diffuse</em> keeps its alpha exactly as you made it.`,
+            id: 'transparency', icon: '🕳️', title: 'Cutouts: what the maps do inside a hole',
+            what: `<strong>Transparency is not a map.</strong> It lives in your diffuse's alpha, exactly as you made it, and there is nothing extra to author or export for it. This section is here because a cutout changes what the <em>other</em> maps do, and that part does need explaining.<br><br>Maps are always fully opaque, even when the texture they came from isn't. That's on purpose: a height or normal map is data, not a picture, and a hole in it would mean nothing to the engine.`,
             derive: `The catch is what the tool reads <em>inside</em> a cutout. Transparent pixels arrive as pure black, which is the darkest value there is, so left alone every hole would become the deepest part of the height map and every cutout edge a cliff. The tool checks each tile for transparency and flattens those areas to neutral instead, so the holes carry no relief. Nothing to switch on: if the tile has alpha, it happens.`,
             tuning: [
                 ['Fences / grates / railings', 'the classic case. Bars get relief, gaps stay flat.'],
@@ -286,9 +286,9 @@
         const wrap = el('div', 'mat-table-wrap');
         const t = el('table', 'mat-table');
         t.innerHTML = `<thead><tr>
-            <th>Material</th><th title="Normal Strength">N</th><th title="AO Intensity">AO</th>
-            <th title="Roughness Base">R</th><th title="Specular Base">S</th><th title="Height Strength">H</th>
-            <th>Notes</th></tr></thead>`;
+ <th>Material</th><th title="Normal Strength">N</th><th title="AO Intensity">AO</th>
+ <th title="Roughness Base">R</th><th title="Specular Base">S</th><th title="Height Strength">H</th>
+ <th>Notes</th></tr></thead>`;
         const tb = el('tbody');
         RECIPES.forEach(row => {
             if (row.head) {
@@ -317,24 +317,24 @@
     function buildTuner() {
         const wrap = el('div', 'mat-tuner');
         wrap.innerHTML = `
-            <div class="tut-badge">🧪 Live — the real engine</div>
-            <div class="mt-row">
-                <label>Texture:</label>
-                <div class="mt-tex-btns" id="mt-tex"></div>
-            </div>
-            <div class="mt-row">
-                <label for="mt-preset">Material preset:</label>
-                <select id="mt-preset"></select>
-                <button class="mt-tex-btn" id="mt-reset" title="Reset the sliders to this preset's values">↺ Reset to preset</button>
-            </div>
-            <div class="mt-desc" id="mt-desc"></div>
-            <div class="mt-sliders" id="mt-sliders"></div>
-            <div class="tut-maps-grid" id="mt-maps"></div>
-            <div class="tut-prev2x">
-                <figure><canvas class="tut-prev-2d" id="mt-2d" width="256" height="256"></canvas><figcaption>2D lit preview (flat)</figcaption></figure>
-                <figure><canvas class="tut-prev-3d" id="mt-3d" width="256" height="256"></canvas><figcaption>🧊 3D displaced preview<span class="tut-3d-status" id="mt-3d-status"></span></figcaption></figure>
-            </div>
-            <p class="tut-maps-note">Left is the flat shaded preview. Right is a real <strong>3D engine</strong> (Babylon.js) that displaces a mesh using the height map, so you can drag to orbit and scroll to zoom. It loads once this widget scrolls into view.</p>`;
+ <div class="tut-badge">🧪 Live, the real engine</div>
+ <div class="mt-row">
+ <label>Texture:</label>
+ <div class="mt-tex-btns" id="mt-tex"></div>
+ </div>
+ <div class="mt-row">
+ <label for="mt-preset">Material preset:</label>
+ <select id="mt-preset"></select>
+ <button class="mt-tex-btn" id="mt-reset" title="Reset the sliders to this preset's values">↺ Reset to preset</button>
+ </div>
+ <div class="mt-desc" id="mt-desc"></div>
+ <div class="mt-sliders" id="mt-sliders"></div>
+ <div class="tut-maps-grid" id="mt-maps"></div>
+ <div class="tut-prev2x">
+ <figure><canvas class="tut-prev-2d" id="mt-2d" width="256" height="256"></canvas><figcaption>2D lit preview (flat)</figcaption></figure>
+ <figure><canvas class="tut-prev-3d" id="mt-3d" width="256" height="256"></canvas><figcaption>🧊 3D displaced preview<span class="tut-3d-status" id="mt-3d-status"></span></figcaption></figure>
+ </div>
+ <p class="tut-maps-note">Left is the flat shaded preview. Right is a real <strong>3D engine</strong> (Babylon.js) that displaces a mesh using the height map, so you can drag to orbit and scroll to zoom. It loads once this widget scrolls into view.</p>`;
         setTimeout(() => initTuner(wrap), 0);
         return wrap;
     }
@@ -344,7 +344,7 @@
         const mapsGrid = wrap.querySelector('#mt-maps');
         const E = window.TRLE && window.TRLE.Engine;
         if (!E || !E.init(document.getElementById('mat-gl'))) {
-            mapsGrid.innerHTML = '<p class="tut-maps-note">This live tuner needs WebGL 2.0 — open the tool itself to try it.</p>';
+            mapsGrid.innerHTML = '<p class="tut-maps-note">This live tuner needs WebGL 2.0, open the tool itself to try it.</p>';
             return;
         }
 
@@ -374,7 +374,7 @@
         TUNER_SLIDERS.forEach(([key, label, min, max, step]) => {
             const row = el('div', 'mt-slider');
             row.innerHTML = `<span>${label}</span><span class="mt-val" id="mt-val-${key}">–</span>
-                <input type="range" id="mt-s-${key}" min="${min}" max="${max}" step="${step}">`;
+ <input type="range" id="mt-s-${key}" min="${min}" max="${max}" step="${step}">`;
             slidersWrap.appendChild(row);
             sliderEls[key] = row.querySelector('input');
         });
@@ -383,7 +383,7 @@
         const c2d = wrap.querySelector('#mt-2d');
         const c3d = wrap.querySelector('#mt-3d');
         const status = wrap.querySelector('#mt-3d-status');
-        const setStatus = m => { if (status) status.textContent = m ? ' — ' + m : ''; };
+        const setStatus = m => { if (status) status.textContent = m ? ', ' + m : ''; };
 
         // ---- state ----
         let curKind = 'solid';
@@ -455,7 +455,7 @@
             const enabled = { normal: true, ao: true, specular: true, roughness: true, height: true, emissive: emis };
             let maps;
             try { maps = E.generateMaps(diffTex, S, S, preset, enabled); }
-            catch (err) { console.error('[materials tuner]', err); mapsGrid.innerHTML = '<p class="tut-maps-note">Map generation failed — see console.</p>'; return; }
+            catch (err) { console.error('[materials tuner]', err); mapsGrid.innerHTML = '<p class="tut-maps-note">Map generation failed, see console.</p>'; return; }
 
             // 2D lit preview from the freshly-generated map textures.
             try {
@@ -520,7 +520,7 @@
             try {
                 p3d = TRLE.Preview3D.create(c3d, { relief: 0.5, onStatus: setStatus });
                 if (latestMaps) p3d.setMaps(latestMaps).then(ok => { if (ok) setTimeout(() => p3d.resize(), 60); });
-            } catch (err) { console.error('[materials 3D]', err); setStatus('error — see console'); }
+            } catch (err) { console.error('[materials 3D]', err); setStatus('error, see console'); }
         };
         if ('IntersectionObserver' in window) {
             const io = new IntersectionObserver(ents => ents.forEach(e => { if (e.isIntersecting) { start3D(); io.disconnect(); } }), { threshold: 0.15 });

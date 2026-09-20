@@ -1801,6 +1801,57 @@ input[type="range"]::-moz-range-thumb {
     position: relative;
 }
 
+/* ---- Restore-last-session strip -----------------------------------------
+   Above the three ways in, because it is a fourth one. It replaced a boot-time
+   openConfirm: users reported that refreshing and being met by a dialog "feels
+   like an ad", and they are right, a refresh is the most ordinary thing anyone
+   does here. Quiet, skippable, and it never blocks the page.
+
+   Styled like a card rather than like a warning: nothing is wrong, there is
+   just something here if you want it. */
+.at-restore {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px 20px;
+    /* It replaced a modal, and a modal is a big thing. A 44px strip read as a
+       notification bar people skim past; this is a route into the tool, the
+       same weight as the three cards under it. */
+    min-height: 88px;
+    margin: 0 0 14px;
+    padding: 14px 16px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius-sm);
+}
+/* An author `display: flex` beats the UA's `[hidden] { display: none }`. Fourth
+   occurrence in this file; see `.demo-frame-veil` and `.demo-resume`. */
+.at-restore[hidden] { display: none; }
+.at-restore-body { display: flex; flex-direction: column; gap: 3px; min-width: 0; flex: 1 1 240px; }
+.at-restore-title { font-size: 0.95rem; color: var(--text-primary); font-weight: 600; }
+.at-restore-detail { font-size: 0.82rem; line-height: 1.45; color: var(--text-secondary); }
+.at-restore-actions { display: flex; gap: 8px; flex-shrink: 0; }
+
+/* The stored atlas's first row. `image-rendering: pixelated` for the same
+   reason every other preview in the tool has it: these are small textures and a
+   smoothed 48px thumbnail of a 256px tile is mush. */
+.at-restore-thumbs { display: flex; align-items: center; gap: 3px; flex-shrink: 0; }
+.at-restore-thumbs[hidden] { display: none; }
+.at-restore-thumb {
+    width: 48px; height: 48px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: var(--bg-primary);
+    image-rendering: pixelated;
+}
+/* A transition or an animation stores a recipe, not pixels, so there is
+   genuinely nothing to draw until it is loaded and re-rendered. Say that with
+   an empty cell rather than a broken one. */
+.at-restore-thumb-empty { opacity: 0.35; }
+.at-restore-more { font-size: 0.78rem; color: var(--text-muted); padding-left: 4px; }
+
 /* ---- Start screen: three ways in ----------------------------------------
    Upload / generate / load-a-project as equal, self-contained choices. Load
    Project used to be reachable only from the export card, which is hidden
@@ -2349,10 +2400,29 @@ body.at-modal-open { overflow: hidden; }
 .at-modal-cols .at-modal-main > details,
 .at-modal-cols .at-modal-side > details { min-width: 0; }
 
-/* 3-zone folds to 2 before the 1360 tier starts being squeezed by its 96vw cap
-   (1360 / 0.96 = 1417), so it folds with margin in hand rather than mid-squeeze.
-   The paint surface and the previews share the second column, previews below. */
-@media (max-width: 1239px) {
+/* 3-zone folds to 2 before the 1360 tier starts being squeezed by its vw cap, so
+   it folds with margin in hand rather than mid-squeeze. The paint surface and the
+   previews share the second column, previews below.
+
+   THE NUMBER USED TO BE 1239, which contradicted the sentence above it and left a
+   ~160px band where the middle zone was squeezed below its content and
+   `.at-modal-work`'s `overflow: hidden` silently cut the text off mid-word.
+   Measured on Build Pattern: at 1300 the work track is 403px against 470px of
+   content (67 clipped), at 1280 it is 384 (86), at 1240 it is 345 (125). Reported
+   from a 1920 screen at 150% browser zoom, which is a 1280px viewport, so this is
+   an ordinary setup rather than an exotic one.
+
+   The arithmetic the fold has to clear: an `at-modal-xxl` is min(1360, 97vw), the
+   three tracks take 340 + 440 plus 36 of gap and 40 of padding, so the middle zone
+   gets modal - 856. It needs 470, so the modal needs 1326, so the viewport needs
+   1367. Hence 1366, which is also the laptop width the modal budget table is
+   written around. Measured after the change: 3 zones and zero clipping at 1400 and
+   up, folded and zero clipping at 1366 and down.
+
+   Do NOT round this up for margin. The demo course frames the tool at exactly
+   1400px, so a breakpoint of 1401 folds every 3-zone modal inside the course at
+   every window size, and 1400 measures clean with three zones. */
+@media (max-width: 1366px) {
     .at-modal-cols.at-3zone:not(.at-work-collapsed) { grid-template-columns: minmax(0, 340px) minmax(0, 1fr); }
     .at-modal-cols.at-3zone:not(.at-work-collapsed) .at-modal-side { grid-column: 2; }
     .at-modal-cols.at-3zone.at-work-collapsed { grid-template-columns: minmax(0, 1fr) minmax(0, 0px) minmax(0, 430px); }
@@ -2781,6 +2851,28 @@ body.at-modal-open { overflow: hidden; }
 #at-org-previews canvas.at-org-sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 
 /* Organic per-side seamless box model */
+/* The hint canvas is `width: 100%` inline, so it took the whole 500px work zone:
+   a 256px backing store blown up 1.95x, which is both blocky and the tallest
+   thing in the modal. Measured at a 1400px viewport, varying only this cap:
+
+     cap   hint  ratio  modal height  body scroll
+     none   500  1.95x     801            5
+     460    460  1.80x     766            0
+     420    420  1.64x     726            0
+     380    380  1.48x     686            0
+     340    340  1.33x     646            0
+     300    300  1.17x     627            0
+
+   Scrolling stops at 460 and below ~340 the canvas is no longer what drives the
+   height, so 380 clears the scroll with real margin at an upscale between Fade's
+   (1.68x) and De-light's (1.17x).
+
+   The emphasis was also backwards: this canvas is an OPTIONAL rough hint, and it
+   was four times the area of each of the six variations underneath it, which are
+   the actual output. Capping it is the cheap half of that; giving the variations
+   more room is a layout change and has not been done. */
+#at-org-hint { max-width: 380px; }
+
 .at-org-seam-row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
 #at-org-seambox { border: 1px solid var(--border); border-radius: var(--radius-sm); background: #111; flex: 0 0 auto; }
 .at-org-seam-ctrls { flex: 1; min-width: 160px; display: flex; flex-direction: column; gap: 8px; }
@@ -3270,3 +3362,309 @@ body.at-modal-open { overflow: hidden; }
 /* While held, the whole frame shows the original -- the divider would only be
    noise at that point. */
 .at-cmp-frame.at-cmp-held .at-cmp-divider { display: none; }
+
+/* ============================================================
+   DEMO COURSE (demo.html)
+
+   Layout is frame-left / rail-right, and the rail takes its width OUT OF THE
+   FRAME rather than out of the modals. That works because every modal width
+   tier is `min(px, vw)`: shrink the frame and the modal shrinks with it, with
+   no override and no restyling. Measured — at-modal-xxl in a 1400px frame
+   renders at 1358px (docs/demo/plan.md §1.2).
+
+   THE RAIL IS NEVER HORIZONTAL. `.at-modal` is capped at calc(100dvh - 56px),
+   and inside a frame `dvh` is the FRAME's height, so a top or bottom bar would
+   cost all 26 modals their 881px design budget and re-break the eight that
+   MODAL-LAYOUT-AUDIT.md found clamped at exactly that. Horizontal space is
+   free here; vertical space is not.
+   ============================================================ */
+.demo-body { overflow: hidden; }
+
+/* Inside the course frame the tool's own header is redundant chrome — the
+   course has its own, and the tool's carries a "Watch a demo" link back to the
+   page you are already on. Hiding it also gives every modal back ~49px of the
+   `calc(100dvh - 56px)` budget, which is the one resource a framed tool is
+   short of (see the rail-is-never-horizontal note below). */
+html.at-demo-frame .app-header { display: none; }
+
+/* The tool's own side rails are hidden in the course and a step asks for the one
+   it is teaching (`rails` in demo-lessons.js, applied through TRLE.Demo.showRails).
+   Session + Messages on the left and History on the right cost 500px of a 1400px
+   frame, and until lesson 1's last step no lesson is talking about either of them.
+   Hidden, not removed: showToast writes into the left rail's log unconditionally. */
+html.at-demo-frame .at-shell { grid-template-columns: minmax(0, 1fr); }
+html.at-demo-frame .at-rail { display: none; }
+html.at-demo-frame.at-demo-rail-l .at-rail-left  { display: block; }
+html.at-demo-frame.at-demo-rail-r .at-rail-right { display: block; }
+html.at-demo-frame.at-demo-rail-l .at-shell { grid-template-columns: 230px minmax(0, 1fr); }
+html.at-demo-frame.at-demo-rail-r .at-shell { grid-template-columns: minmax(0, 1fr) 270px; }
+html.at-demo-frame.at-demo-rail-l.at-demo-rail-r .at-shell {
+    grid-template-columns: 230px minmax(0, 1fr) 270px;
+}
+
+.demo-shell {
+    display: flex;
+    align-items: stretch;
+    height: calc(100dvh - 56px);
+    min-height: 0;
+}
+
+.demo-stage {
+    position: relative;
+    flex: 0 0 1400px;
+    width: 1400px;
+    min-width: 0;
+    background: var(--bg-primary);
+    /* A box-shadow, NOT `border-right: 1px`. The border sits inside the
+       border box, so the stage's clientWidth was 1399 at the side-by-side
+       tier and `fitFrame` scaled the entire tool by 0.999 at 1920, resampling
+       every glyph in it to save one pixel. A shadow draws the same line and
+       costs no layout. */
+    box-shadow: 1px 0 0 var(--border);
+    /* Belt and braces for the scaled frame below: `fitFrame` sizes the iframe so
+       it lands exactly on the stage, and if its JS never runs the 100%/100%
+       fallback here is what keeps a 1400px iframe from spilling over the rail. */
+    overflow: hidden;
+}
+/* The frame's LAYOUT width is 1400 at every window size, and `fitFrame` in
+   demo.js scales it down to whatever the stage can give it. That is what makes
+   the course's layout deterministic: the tool inside always sees the same
+   viewport, so the 1366 three-zone fold can never fire because of the WINDOW.
+   The alternatives were both measured and both lose. Shrinking the frame folds
+   every 3-zone modal and drops its preview below the fold (the 1300px tier that
+   shipped, see the note below). Overlaying the rail hides the right ~420px of
+   the tool, which is what a user screenshotted at a 1725px window: the start
+   card's third panel and the right-hand side of every modal sat underneath the
+   lesson text. Scaling loses nothing except size, which is what browser zoom
+   does anyway, and the tool is already used at 150% zoom in the wild. */
+.demo-frame {
+    width: 100%; height: 100%;
+    border: 0; display: block;
+    transform-origin: 0 0;
+}
+
+.demo-frame-veil {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--bg-primary);
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    z-index: 5;
+}
+/* An author `display: flex` BEATS the UA stylesheet's `[hidden] { display: none }`,
+   so `el.hidden = true` silently does nothing and the veil sits over the tool
+   forever. Same shape as the openModal display:block bug this repo has hit three
+   times: a display rule quietly winning over the thing meant to control it. */
+.demo-frame-veil[hidden] { display: none; }
+
+.demo-rail {
+    flex: 1 1 auto;
+    min-width: 320px;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-secondary);
+    min-height: 0;
+}
+
+/* Below 1720 the rail cannot take its width out of the frame without pushing
+   modals under their tier, so the frame keeps its 1400px of LAYOUT and is scaled
+   down to whatever is left (see `fitFrame`). Nothing folds and nothing hides.
+   ---------------------------------------------------------------------------
+   Two earlier answers here were both wrong. There used to be an intermediate tier that shrank the stage to 1300px
+   between 1601 and 1750, which is 66px UNDER the 1366 three-zone breakpoint, so
+   every 3-zone modal in the course folded to two columns and dropped its preview
+   below the fold. Measured on Make Height Map at a 1700px window: grid
+   `340px 860px`, the parallax preview 898px down the page behind 1180px of
+   scroll. At 1550, where the rail already overlaid, the same modal was
+   `340px 502px 440px` with the preview at 166px and 72px of scroll. The layout
+   was broken in a band and correct on both sides of it, which is why it read as
+   random. Reported with a screenshot. The tier was deleted and the rail overlaid
+   instead, which traded that for hiding the right-hand 420px of the tool: at a
+   1725px window the start card's third panel and the right edge of every modal
+   sat underneath the lesson text. Also reported with a screenshot.
+
+   The arithmetic that sets the threshold: side-by-side needs the 1400px stage
+   plus `.demo-rail`'s 320px min-width, so 1720. It used to be 1750, and that
+   50px of "margin" was itself a bug: at a 1725px window the two DO fit, and the
+   course overlaid the rail anyway. Do not round it up again.
+
+   The rail no longer goes `position: fixed` below the threshold either. It stays
+   in flow and the frame scales to the space that is left, so the rail never
+   covers the tool it is describing.
+
+   THIS BLOCK MUST SIT AFTER `.demo-rail`'s own declaration. It overrides the
+   rail's `flex: 1 1 auto; min-width: 320px` at the same specificity, so above
+   it the base rule wins on source order and the stage collapses to 1px, which
+   is what happened the first time. */
+@media (max-width: 1719px) {
+    /* `flex: 1 1 0`, not `1 1 auto`: with a content-based basis the stage would
+       size itself off the 1400px iframe it contains, `fitFrame` would then resize
+       that iframe, and the ResizeObserver watching the stage would run it again.
+       A zero basis makes the stage purely a share of the free space, so the
+       measurement only ever flows one way. */
+    .demo-stage { flex: 1 1 0; width: auto; }
+    .demo-rail  { flex: 0 0 clamp(300px, 26%, 400px); min-width: 0; }
+}
+.demo-rail-head {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+.demo-lesson-pick { display: flex; align-items: center; gap: 8px; font-size: 0.8rem; color: var(--text-secondary); }
+.demo-lesson-pick select { flex: 1; min-width: 0; }
+
+.demo-dots { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.demo-dot {
+    width: 13px; height: 13px; padding: 0;
+    border-radius: 50%;
+    border: 1px solid var(--border-light);
+    background: transparent;
+    cursor: pointer;
+    transition: background var(--transition), border-color var(--transition), transform var(--transition);
+}
+.demo-dot:hover { transform: scale(1.18); border-color: var(--accent); }
+.demo-dot.done { background: var(--text-secondary); border-color: var(--text-secondary); }
+.demo-dot.current { background: var(--accent); border-color: var(--accent); }
+
+/* The resume card covers the rail body rather than sitting above it: the step
+   underneath is already rendered (the rail is drawn before the frame is even
+   reachable) and showing both at once would ask a question the page has
+   visibly already answered. */
+.demo-resume {
+    position: absolute;
+    inset: 0;
+    z-index: 3;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 10px;
+    padding: 16px;
+    background: var(--bg-secondary);
+}
+/* An author `display: flex` beats the UA's `[hidden] { display: none }`. Same
+   trap as `.demo-frame-veil` right above, and as openModal's display:block. */
+.demo-resume[hidden] { display: none; }
+.demo-resume h2 { margin: 0; font-size: 1rem; color: var(--text-primary); }
+.demo-resume p { margin: 0; font-size: 0.85rem; line-height: 1.5; color: var(--text-secondary); }
+.demo-resume-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+.demo-resume-note { font-size: 0.75rem !important; opacity: 0.8; }
+
+.demo-rail-body {
+    position: relative;
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 16px;
+    min-height: 0;
+}
+.demo-step-title { margin: 0 0 10px; font-size: 1.02rem; color: var(--text-primary); }
+.demo-step-say { font-size: 0.875rem; line-height: 1.55; color: var(--text-secondary); }
+.demo-step-say strong { color: var(--accent); font-weight: 600; }
+.demo-step-say em { color: var(--text-primary); font-style: italic; }
+.demo-step-say code {
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 0.92em;
+    background: var(--bg-tertiary);
+    border-radius: var(--radius-sm);
+    padding: 1px 4px;
+}
+
+.demo-handoff {
+    margin-top: 14px; padding: 11px 13px;
+    border: 1px solid var(--accent);
+    border-left-width: 3px;
+    border-radius: var(--radius);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    font-size: 0.85rem; line-height: 1.5;
+    color: var(--text-primary);
+}
+.demo-handoff-label {
+    font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--accent); font-weight: 700; margin-bottom: 4px;
+}
+
+.demo-status { margin-top: 12px; font-size: 0.78rem; color: var(--text-secondary); min-height: 1.2em; }
+.demo-status-live { color: var(--accent); }
+.demo-status-warn { color: var(--danger, #e06c6c); }
+
+.demo-rail-foot {
+    flex-shrink: 0;
+    padding: 12px 16px 14px;
+    border-top: 1px solid var(--border);
+}
+.demo-nav { display: flex; gap: 8px; }
+.demo-nav .btn { flex: 1; }
+.demo-nav-minor { margin-top: 8px; }
+.demo-nav-minor .btn { font-size: 0.72rem; }
+.demo-foot-note { margin: 10px 0 0; font-size: 0.72rem; line-height: 1.45; color: var(--text-secondary); }
+.demo-foot-note a { color: var(--accent); }
+
+/* Shown instead of the frame when the parent cannot reach into it (file://). */
+.demo-blocked {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--bg-primary);
+    padding: 24px;
+    overflow-y: auto;
+    z-index: 10;
+}
+.demo-blocked[hidden] { display: none; }
+.demo-blocked-card {
+    max-width: 560px;
+    border: 1px solid var(--border-light);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius);
+    background: var(--bg-secondary);
+    padding: 22px 24px;
+}
+.demo-blocked-card h2 { margin: 0 0 12px; font-size: 1.05rem; color: var(--text-primary); }
+.demo-blocked-card p { margin: 0 0 12px; font-size: 0.875rem; line-height: 1.55; color: var(--text-secondary); }
+.demo-blocked-card strong { color: var(--accent); }
+.demo-blocked-card pre {
+    margin: 0 0 12px; padding: 10px 12px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 0.82rem; color: var(--text-primary);
+    overflow-x: auto;
+}
+/* NOT `.demo-blocked-card a` — that repaints the primary button's label in the
+   accent colour it is already filled with, and the button comes out blank. */
+.demo-blocked-card p a { color: var(--accent); }
+.demo-blocked-note { font-size: 0.8rem !important; opacity: 0.85; }
+.demo-blocked-actions { display: flex; gap: 8px; margin-top: 16px; flex-wrap: wrap; }
+.demo-blocked-actions .btn { text-decoration: none; }
+
+/* ---- Spotlight ----
+   Four divs framing a real hole, NOT one raised element: a z-index promotion
+   cannot lift something across a frame boundary, and a real hole leaves the
+   spotlit control fully interactive and un-restyled. The rect comes out of the
+   frame's coordinate space with the frame's own offset added — measured at
+   0.00px error against the modal's own getBoundingClientRect. */
+.demo-scrim {
+    position: fixed;
+    background: rgba(0, 0, 0, 0.66);
+    pointer-events: none;
+    z-index: 9000;
+    display: none;
+    transition: opacity var(--transition-lg, 220ms cubic-bezier(0.4, 0, 0.2, 1));
+}
+.demo-ring {
+    position: fixed;
+    display: none;
+    pointer-events: none;
+    z-index: 9001;
+    border: 2px solid var(--accent);
+    border-radius: 6px;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 0 18px color-mix(in srgb, var(--accent) 55%, transparent);
+    transition: left var(--transition-lg, 220ms cubic-bezier(0.4, 0, 0.2, 1)),
+                top var(--transition-lg, 220ms cubic-bezier(0.4, 0, 0.2, 1)),
+                width var(--transition-lg, 220ms cubic-bezier(0.4, 0, 0.2, 1)),
+                height var(--transition-lg, 220ms cubic-bezier(0.4, 0, 0.2, 1));
+}
+/* Once the user takes over, dim much less: they are using the tool now, not
+   watching it. The ring stays as a reminder of what the step was about. */
+.demo-handed-over .demo-scrim { background: rgba(0, 0, 0, 0.18); }
+
+/* The global prefers-reduced-motion block above already zeroes these
+   transitions; the runner separately checks the query, because a JS tween is
+   not a CSS transition and inherits nothing from it. */

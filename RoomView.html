@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TRLE Atlas Tool, Room View</title>
+<link rel="icon" href="favicon.svg">
+<style>
+    :root { --bg-primary:#1e1e1e; --bg-panel:#252526; --border:#3c3c3c; --accent:#e8852a;
+            --text:#d4d4d4; --text-dim:#9a9a9a; --rail-l:220px; --rail-r:280px; }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body { background: var(--bg-primary); color: var(--text);
+           font: 13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+           display: flex; flex-direction: column; overflow: hidden; }
+    header { display: flex; align-items: center; gap: 14px; padding: 8px 14px;
+             background: var(--bg-panel); border-bottom: 1px solid var(--border); flex: none; }
+    header h1 { font-size: 14px; margin: 0; font-weight: 600; }
+    header a { color: var(--accent); text-decoration: none; font-weight: 600; }
+    header a:hover { text-decoration: underline; }
+    .spacer { flex: 1; }
+
+    /* Tomb Editor's arrangement: build on the left, textures on the right, the
+       Lighting panel as a strip along the bottom with the flame emitters beside
+       it. 2.8 shipped this as one tall side rail and that was wrong twice over.
+       It moved the one panel the audience already knows, and it did not fit:
+       the rail's content measured 1460px inside a 1037px rail at 1920x1080, so
+       Materials sat below the fold at the resolution we design for.
+
+       Grid areas rather than nested flex rows, because the whole point is that
+       the arrangement changes at a breakpoint, and areas can move a panel
+       between rows while flex cannot. */
+    .body { flex: 1; min-height: 0; display: grid;
+            grid-template-columns: var(--rail-l) minmax(0, 1fr) var(--rail-r);
+            grid-template-rows: minmax(0, 1fr) auto;
+            grid-template-areas: "left stage right" "dock dock dock"; }
+    .rail { background: var(--bg-panel); overflow-y: auto; padding: 9px; min-width: 0; }
+    .rail-left  { grid-area: left;  border-right: 1px solid var(--border); }
+    .rail-right { grid-area: right; border-left:  1px solid var(--border); }
+    .stage { grid-area: stage; position: relative; min-width: 0; min-height: 0; }
+    canvas { display: block; width: 100%; height: 100%; }
+    .hint { position: absolute; left: 12px; bottom: 10px; color: var(--text-dim);
+            background: rgba(0,0,0,.45); padding: 6px 10px; border-radius: 4px; pointer-events: none; }
+    .band { position: absolute; border: 1px solid var(--accent); pointer-events: none;
+            background: rgba(232,133,42,.14); display: none; }
+    .band.on { display: block; }
+    .readout { position: absolute; right: 12px; top: 10px; color: var(--text-dim);
+               background: rgba(0,0,0,.45); padding: 6px 10px; border-radius: 4px;
+               font-variant-numeric: tabular-nums; pointer-events: none; }
+
+    /* The dock. Collapsing it is the only way to get the height back, and a room
+       view wants height more than it wants any of these controls. */
+    .dock { grid-area: dock; background: var(--bg-panel); border-top: 1px solid var(--border); }
+    .dock-head { display: flex; align-items: center; gap: 10px; padding: 2px 10px;
+                 background: #2d2d2e; border-bottom: 1px solid var(--border);
+                 font-size: 12px; font-weight: 600; }
+    .dock-head .cap { color: var(--text-dim); font-weight: 400; }
+    /* Wraps rather than scrolls. A hidden horizontal scroll in a control strip
+       is the failure mode where a control exists, is reachable, and is never
+       found, so below the width it needs the dock gets taller instead. */
+    .dock-body { display: flex; flex-wrap: wrap; gap: 8px 14px; padding: 8px 10px;
+                 align-items: flex-start; }
+    .dock.closed .dock-body { display: none; }
+    .dockcol { display: flex; flex-direction: column; gap: 5px; flex: none; }
+    .dc-lights { width: 196px; } .dc-colour { width: 210px; } .dc-range { width: 252px; }
+    .dc-flags  { width: 168px; } .dc-day { width: 196px; } .dc-flame  { width: 200px; }
+    .dc-flame  { flex: 1; }
+    #rv-daytime { width: 100%; margin: 2px 0 0; accent-color: var(--accent); }
+    .dockcol > h3 { margin: 0 0 1px; font-size: 11px; font-weight: 600; color: var(--text-dim);
+                    text-transform: uppercase; letter-spacing: .04em; }
+    .sep { align-self: stretch; width: 1px; background: var(--border); flex: none; }
+
+    section { border: 1px solid var(--border); border-radius: 5px; margin-bottom: 10px; }
+    section > h2 { font-size: 12px; margin: 0; padding: 7px 10px; background: #2d2d2e;
+                   border-bottom: 1px solid var(--border); border-radius: 4px 4px 0 0; font-weight: 600; }
+    .pad { padding: 9px 10px; }
+    /* Reference prose, not a control. Folded away by default because the left
+       rail is 190px wide at 1366 and four paragraphs in a 190px column is
+       648px of height against 568 available. The per-control explanation lives
+       on the controls themselves, as a title. */
+    details.acc { border: 1px solid var(--border); border-radius: 5px; margin-bottom: 10px; }
+    details.acc > summary { font-size: 12px; padding: 7px 10px; background: #2d2d2e;
+                            border-radius: 4px; font-weight: 600; cursor: pointer; }
+    details.acc[open] > summary { border-bottom: 1px solid var(--border);
+                                  border-radius: 4px 4px 0 0; }
+    button, select, input[type=number], input[type=text] {
+        background: #333; color: var(--text); border: 1px solid var(--border);
+        border-radius: 4px; padding: 3px 8px; font: inherit; }
+    button { cursor: pointer; }
+    button:hover:not(:disabled) { border-color: var(--accent); }
+    button:disabled, select:disabled, input:disabled { opacity: .45; cursor: not-allowed; }
+    button.primary { background: var(--accent); color: #1a1a1a; border-color: var(--accent); font-weight: 600; }
+    .row { display: flex; gap: 6px; align-items: center; }
+    .grid2 { display: grid; grid-template-columns: auto 1fr auto 1fr; gap: 4px 7px; align-items: center; }
+    .grid2 label { color: var(--text-dim); font-size: 12px; white-space: nowrap; }
+    .grid2 input[type=number] { width: 100%; min-width: 62px; }
+    .checks { display: grid; grid-template-columns: 1fr 1fr; gap: 1px 10px; }
+    .checks label { font-size: 12px; display: flex; gap: 5px; align-items: center; }
+    .note { color: var(--text-dim); font-size: 11.5px; margin: 0; }
+    .rail .note { margin-top: 7px; }
+    #rv-lights { list-style: none; margin: 0; padding: 0; height: 56px; overflow-y: auto;
+                 border: 1px solid var(--border); border-radius: 4px; background: #1f1f20; }
+    #rv-lights li { padding: 2px 7px; cursor: pointer; display: flex; align-items: center; gap: 6px; }
+    #rv-lights li.sel { background: #3a3a3b; outline: 1px solid var(--accent); outline-offset: -1px; }
+    .swatch { width: 12px; height: 12px; border-radius: 2px; border: 1px solid #555; flex: none; }
+    #rv-palette { display: grid; grid-template-columns: repeat(4, 1fr); gap: 3px; }
+    #rv-palette button { padding: 0; aspect-ratio: 1; background-size: 400% 400%;
+                         border: 1px solid var(--border); border-radius: 3px; }
+    #rv-palette button.sel { outline: 2px solid var(--accent); border-color: var(--accent); }
+    .bar { height: 5px; background: #1a1a1a; border-radius: 3px; overflow: hidden; margin-top: 8px; display: none; }
+    .bar.on { display: block; }
+    .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .18s ease; }
+
+    /* The dock has to stay on ONE row down to 1366, because wrapping it costs
+       more height than the columns save: measured, it went 175px to 314px and
+       took the stage from 862 to 411. So the columns narrow first and only wrap
+       when there is genuinely no width left. */
+    @media (max-width: 1500px) {
+        .dc-lights { width: 176px; } .dc-colour { width: 190px; } .dc-range { width: 236px; }
+        .dc-flags  { width: 160px; } .dc-day { width: 178px; } .dc-flame  { width: 182px; }
+    }
+    @media (max-width: 1200px) { :root { --rail-l: 190px; --rail-r: 236px; } }
+    /* Below 900 there is not enough width for three columns plus a usable
+       viewport, so everything stacks and the page scrolls. The stage keeps a
+       floor so it never collapses to nothing. */
+    @media (max-width: 900px) {
+        body { overflow: auto; }
+        .body { grid-template-columns: minmax(0, 1fr);
+                grid-template-rows: auto auto auto auto;
+                grid-template-areas: "stage" "left" "right" "dock"; }
+        .rail { overflow: visible; }
+        .rail-left, .rail-right { border: none; border-top: 1px solid var(--border); }
+        .stage { min-height: 320px; height: 46vh; }
+    }
+</style>
+</head>
+<body>
+<header>
+    <h1>🏛 Room View</h1>
+    <span id="rv-status" style="color:var(--text-dim)">Loading the room…</span>
+    <span class="spacer"></span>
+    <label>Field of view
+        <select id="rv-fov">
+            <option value="50" selected>50, editor</option>
+            <option value="90">90, in game</option>
+        </select>
+    </label>
+    <a href="index.html">Back to the tool</a>
+</header>
+
+<div class="body">
+
+<div class="rail rail-left">
+    <section>
+        <h2>✨ Materials</h2>
+        <div class="pad">
+            <label style="display:flex;gap:6px;align-items:center;">
+                <input type="checkbox" id="rv-usemaps" checked> Use the material maps
+            </label>
+            <div class="checks" id="rv-maps" style="margin-top:6px;">
+                <label><input type="checkbox" id="rv-map-normal" checked> Normal</label>
+                <label><input type="checkbox" id="rv-map-ao" checked> AO</label>
+                <label><input type="checkbox" id="rv-map-specular" checked> Specular</label>
+                <label><input type="checkbox" id="rv-map-roughness" checked> Roughness</label>
+                <label><input type="checkbox" id="rv-map-emissive" checked> Emissive</label>
+            </div>
+            <p class="note" id="rv-mapadvice"></p>
+            <button id="rv-apply" class="primary" style="margin-top:8px;width:100%;">Apply materials</button>
+            <div class="bar" id="rv-bar"><i></i></div>
+            <p class="note">Painting is live. Re-lighting the room is the slow half, so it runs
+            here rather than on every change.</p>
+        </div>
+    </section>
+    <details class="acc">
+        <summary>💡 About the lights</summary>
+        <div class="pad">
+            <p class="note"><strong>Static</strong>, <strong>Dynamic</strong> and
+            <strong>Imported</strong> choose which objects a bulb lights, so they do nothing to
+            room geometry. They are here to match Tomb Editor. <strong>Shadow</strong> is a point
+            light with a negative intensity, so set Intensity below zero.</p>
+            <p class="note">Drag a coloured handle to move the selected light. A
+            <strong>Sun</strong> lights by direction, so moving one only changes where its
+            shadows fall: aim it with the yellow handle instead.</p>
+            <p class="note">A <strong>Spot</strong> uses In &#945; and Out &#945; for its cone,
+            and shades the surface by the way it points rather than by the direction back to the
+            bulb. That is measured against Tomb Editor, not assumed.</p>
+            <p class="note"><strong>Time of day</strong> swings the first <strong>Sun</strong>
+            along an arc and re-lights as it goes. The angle is measured; <strong>Warm at the
+            horizon</strong> is ours, not Tomb Editor's, so untick it to see the sun you actually
+            built at the angle the slider picked.</p>
+            <p class="note">A flame is the only light that reaches room geometry after the bake,
+            so it is the only one that moves without re-lighting. Carrying one around the room is
+            the quickest way to see what the material maps are doing.</p>
+            <p class="note">A flame lights through walls, and so does the game: TombEngine casts
+            no shadows from a room's dynamic lights.</p>
+        </div>
+    </details>
+</div>
+
+<div class="stage">
+    <canvas id="rv-canvas"></canvas>
+    <div class="band" id="rv-band"></div>
+    <div class="hint">Right-drag to turn · middle-drag to move · wheel to zoom · left-drag to paint · shift-drag to select</div>
+    <div class="readout" id="rv-readout"></div>
+</div>
+
+<div class="rail rail-right">
+    <section>
+        <h2>🧱 Texturing</h2>
+        <div class="pad">
+            <div id="rv-palette"></div>
+            <div class="row" style="margin-top:8px;">
+                <select id="rv-role">
+                    <option value="all">everything</option>
+                    <option value="wall" selected>walls</option>
+                    <option value="floors">floors and slopes</option>
+                    <option value="ceilings">ceilings</option>
+                </select>
+                <button id="rv-paint">Apply to all</button>
+            </div>
+            <div class="row" style="margin-top:6px;">
+                <button id="rv-applysel" disabled style="flex:1;">Apply to selection</button>
+                <button id="rv-clearsel" disabled>Clear</button>
+            </div>
+            <p class="note" id="rv-selnote">Nothing selected.</p>
+            <div class="row" style="margin-top:6px;">
+                <button id="rv-rot">&#8635; Rotate face</button>
+                <button id="rv-flip">&#8646; Flip face</button>
+                <button id="rv-undo" disabled>&#8630; Undo</button>
+            </div>
+            <p class="note">Drag to paint faces with the selected tile. Hold <strong>Shift</strong>
+            and drag a box to select, <strong>Alt</strong> to deselect. One tile covers one
+            sector, and a short face shows the part of the tile it covers.</p>
+        </div>
+    </section>
+</div>
+
+<div class="dock" id="rv-dock">
+    <div class="dock-head">
+        <button id="rv-dock-toggle" aria-expanded="true" style="padding:1px 7px;">▾</button>
+        <span>💡 Lighting</span>
+        <span class="cap" id="rv-dock-cap"></span>
+    </div>
+    <div class="dock-body">
+
+        <div class="dockcol dc-lights">
+            <h3>Lights</h3>
+            <ul id="rv-lights"></ul>
+            <div class="row">
+                <select id="rv-ltype" style="flex:1;min-width:0;">
+                    <option value="point">Point</option>
+                    <option value="spot">Spot</option>
+                    <option value="sun">Sun</option>
+                    <option value="shadow">Shadow</option>
+                </select>
+                <button id="rv-ladd">+</button>
+                <button id="rv-ldel">&minus;</button>
+            </div>
+        </div>
+
+        <div class="dockcol dc-colour">
+            <h3>Colour and intensity</h3>
+            <input type="color" id="rv-lcolour" style="width:100%;height:24px;padding:1px;">
+            <div class="grid2" style="grid-template-columns:auto 1fr;">
+                <label>Intensity</label><input type="number" id="rv-lint" step="0.01" min="-2" max="2" value="0.5">
+                <label>Quality</label>
+                <select id="rv-lquality" style="min-width:0;">
+                    <option value="low" selected>Default (1 sample)</option>
+                    <option value="medium">Medium (9)</option>
+                    <option value="high">High (25)</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="dockcol dc-range">
+            <h3>Range and direction</h3>
+            <div class="grid2">
+                <label>In d</label><input type="number" id="rv-lin" step="0.1" min="0" value="1">
+                <label>Out d</label><input type="number" id="rv-lout" step="0.1" min="0" value="5">
+                <label>In &#945;</label><input type="number" id="rv-lina" step="1" min="0" max="180" value="20" disabled>
+                <label>Out &#945;</label><input type="number" id="rv-louta" step="1" min="0" max="180" value="25" disabled>
+                <label>Dir Y</label><input type="number" id="rv-ldiry" step="1" value="0">
+                <label>Dir X</label><input type="number" id="rv-ldirx" step="1" min="-90" max="90" value="-90">
+            </div>
+        </div>
+
+        <div class="dockcol dc-flags">
+            <h3>Flags</h3>
+            <div class="checks">
+                <label><input type="checkbox" id="rv-lenabled" checked> Enabled</label>
+                <label><input type="checkbox" id="rv-lstatic" title="Chooses whether this bulb lights STATIC objects. Room geometry is not an object, so it does nothing here." checked disabled> Static</label>
+                <label><input type="checkbox" id="rv-lobstruct" checked> Obstruct</label>
+                <label><input type="checkbox" id="rv-ldynamic" title="Chooses whether this bulb lights DYNAMIC objects. Room geometry is not an object, so it does nothing here." checked disabled> Dynamic</label>
+                <label><input type="checkbox" id="rv-lshadow" title="A shadow bulb is a point light with a negative Intensity. Set Intensity below zero instead." disabled> Shadow</label>
+                <label><input type="checkbox" id="rv-limported" title="Chooses whether this bulb lights IMPORTED geometry. Does nothing to the room itself." checked disabled> Imported</label>
+            </div>
+        </div>
+
+        <div class="sep"></div>
+
+        <div class="dockcol dc-day">
+            <h3>&#127749; Time of day</h3>
+            <input type="range" id="rv-daytime" min="0" max="240" step="1" value="120"
+                   title="Swings the first Sun along an arc: on the horizon at both ends, overhead in the middle. The numbers beside the clock are the Dir X and Dir Y Tomb Editor would show.">
+            <div class="row">
+                <button id="rv-dayplay" style="flex:none;">&#9654; Play</button>
+                <span class="note" id="rv-dayread" style="flex:1;min-width:0;"></span>
+            </div>
+            <label style="display:flex;gap:5px;align-items:center;font-size:12px;"
+                   title="Warms the sun's colour toward the horizon. The ANGLE is measured off Tomb Editor's own exports; the COLOUR is our convenience and corresponds to nothing in the editor. Untick it and the sun keeps the colour you gave it, at exactly the same angle.">
+                <input type="checkbox" id="rv-dayramp" checked> Warm at the horizon
+            </label>
+        </div>
+
+        <div class="dockcol dc-flame">
+            <h3>🔥 Flame emitters</h3>
+            <div class="row">
+                <label style="display:flex;gap:5px;align-items:center;font-size:12px;flex:1;">
+                    <input type="checkbox" id="rv-flame" checked> In the alcove
+                </label>
+                <button id="rv-flameplace">Place</button>
+            </div>
+            <label style="display:flex;gap:5px;align-items:center;font-size:12px;">
+                <input type="checkbox" id="rv-flametravel"> Carry it in a circle
+            </label>
+            <div class="grid2">
+                <label>Radius</label><input type="number" id="rv-flameradius" step="0.25" min="0.25" max="8" value="3" disabled>
+                <label>Seconds</label><input type="number" id="rv-flamesecs" step="0.5" min="1" max="60" value="8" disabled>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+</div>
+
+<script src="js/store.js"></script>
+<script src="js/roomlight.js"></script>
+<script src="js/roomuv.js"></script>
+<!-- TombEngine-derived, non-commercial: see ten/LICENSE. Loaded before the
+     renderer, which interpolates its GLSL into the room shader. -->
+<script src="ten/room-shading.js"></script>
+<script src="js/roomview.js"></script>
+<script src="js/roomview-page.js"></script>
+</body>
+</html>

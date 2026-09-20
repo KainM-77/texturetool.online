@@ -22,8 +22,36 @@ TRLE.Store = (() => {
     const DB_NAME = 'trle-atlastool';
     const DB_VERSION = 1;
     const STORE = 'sessions';
-    const KEY_SESSION = 'session';     // the full project (tiles as Blobs)
-    const KEY_META = 'session-meta';   // tiny header, read on boot
+    /* The slot the tool writes to. ONE slot is the whole storage policy (see the
+       header), so this is not a step toward a project library — it exists so the
+       demo course can run the real tool against a throwaway record instead of
+       overwriting the user's crash net.
+
+       It has to be a RECORD key rather than a separate database: demo.html frames
+       index.html, and a frame shares its parent's origin, so IndexedDB is the same
+       database either way. Measured, not assumed — the frame's autosave shows up in
+       the parent's indexedDB.databases(). Keying the record is the smallest change
+       that actually separates them. */
+    let KEY_SESSION = 'session';       // the full project (tiles as Blobs)
+    let KEY_META = 'session-meta';     // tiny header, read on boot
+    /* The Room View handoff: the six stitched atlas pages as Blobs, plus a small
+       manifest. A SEPARATE record from the session, deliberately -- the session
+       is the crash net and must not be disturbed by opening a preview, and the
+       handoff is disposable and can be rewritten on every open. It is namespaced
+       by useSlot for the same reason the session is: demo.html frames the tool
+       and a frame shares its parent's origin. */
+    let KEY_ROOMVIEW = 'roomview';
+
+    /* Point every read and write at a different record. Call before anything else
+       touches storage; `null`/'session' restores the real slot. */
+    function useSlot(name) {
+        const slot = name && name !== 'session' ? String(name) : null;
+        KEY_SESSION = slot ? `${slot}-session` : 'session';
+        KEY_META = slot ? `${slot}-session-meta` : 'session-meta';
+        KEY_ROOMVIEW = slot ? `${slot}-roomview` : 'roomview';
+        return { session: KEY_SESSION, meta: KEY_META, roomview: KEY_ROOMVIEW };
+    }
+    function currentSlot() { return { session: KEY_SESSION, meta: KEY_META, roomview: KEY_ROOMVIEW }; }
 
     let dbPromise = null;
     let broken = false;   // a failed open stays failed; don't retry every save
@@ -130,5 +158,24 @@ TRLE.Store = (() => {
         set(true);
     }, false);
 
-    return { available, isPersisted, requestPersistence, estimate, saveSession, loadSession, sessionMeta, clearSession };
+    /* ---- Room View handoff ----
+       Fails soft like everything else here: if storage refuses, the Room View
+       falls back to its placeholder atlas rather than to a broken page. */
+    async function saveRoomView(payload) {
+        return await tx('readwrite', (store, set) => {
+            store.put(payload, KEY_ROOMVIEW);
+            set(true);
+        }) === true;
+    }
+
+    async function loadRoomView() {
+        return await tx('readonly', (store, set) => {
+            const r = store.get(KEY_ROOMVIEW);
+            r.onsuccess = () => set(r.result || null);
+        });
+    }
+
+    return { available, isPersisted, requestPersistence, estimate, saveSession, loadSession, sessionMeta, clearSession,
+             saveRoomView, loadRoomView,
+             useSlot, currentSlot };
 })();

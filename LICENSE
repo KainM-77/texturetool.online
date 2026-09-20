@@ -2,9 +2,26 @@ MIT License
 
 TRLE Tools / Atlas Tool — Copyright (c) 2026 KainM-77
 
-THE WHOLE REPOSITORY IS MIT. Every file is available under the terms below, with
-no copyleft strings, no per-file exceptions, and nothing to check before reusing
-any part of it.
+THE REPOSITORY IS MIT WITH ONE EXCEPTION, AND THE EXCEPTION IS A DIRECTORY.
+
+Every file is available under the terms below, with no copyleft strings, except
+for `AtlasTool/ten/`. That one directory is derived from TombEngine and carries
+TombEngine's own licence: Modified MIT, FOR NON-COMMERCIAL USE ONLY. Its terms
+are in `AtlasTool/ten/LICENSE` and what is in it is described in
+`AtlasTool/ten/README.md`.
+
+The boundary is physical so that it can be checked by looking at a path. Nothing
+outside that directory depends on it, and the Room View preview it serves is the
+only feature that loads it. `AtlasTool/js/engine.js`, `js/shaders.js` and
+`js/presets.js` — the shared export pipeline — do not import from it, which is
+asserted by `AtlasTool/tools/validate-licensing.mjs`.
+
+The directory is SEPARABLE, and that is asserted rather than claimed: delete it and
+the tool still slices atlases and generates and exports every material map, losing
+only two previews. Nothing in it generates a map or touches the export path.
+
+What is left outside it is one scalar, one prose citation and some development
+tooling that is never distributed. All of it is listed in THIRD-PARTY-NOTICES.md.
 
 Until 2026-09-13 the project shipped under GPL-3.0, because two seamless-tiling
 shaders (`seamlessMaker` and `seamlessSplat`) had been ported from Materialize

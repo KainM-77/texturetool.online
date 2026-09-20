@@ -14,6 +14,15 @@ import os
 PORT = 8080
 
 class Handler(http.server.SimpleHTTPRequestHandler):
+    def end_headers(self):
+        # Same reason the repo-root server.py does this: with no build step the
+        # tool is eleven separate <script> files, so a browser that caches one of
+        # them ends up running a MIXED version of the tool -- which presents as a
+        # function missing from a sibling module rather than as anything obviously
+        # cache-shaped.
+        self.send_header("Cache-Control", "no-store, must-revalidate")
+        super().end_headers()
+
     """Plain static file handler."""
 
     def log_message(self, format, *args):  # noqa: A002

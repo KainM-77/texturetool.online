@@ -229,10 +229,11 @@ TRLE.Engine = (function() {
         return pixels;
     }
 
-    /* ---- Height-map geometry, from TombEngine's own parallax shader ----
-       POM marches the UV by POM_HEIGHT_SCALE (0.0035) over the ATLAS PAGE, divided
-       by the view's tangent-space Z which is clamped at POM_MIN_ANGLE (0.4)
-       -- Materials.hlsli:17-23, 143-150. Over a 4096 page (the minimum; Tomb Editor
+    /* ---- Height-map geometry, sized by TombEngine's own parallax march ----
+       POM marches the UV by the engine's height scale over the ATLAS PAGE, divided
+       by the view's tangent-space Z which is clamped at its grazing minimum. Both
+       numbers are TombEngine's and are held in `ten/preview-shaders.js`, not here.
+       Over a 4096 page (the minimum; Tomb Editor
        takes the level's larger setting when set) that is 14.3px at a 45 degree view
        and 35.8px at the grazing limit, against 8px of edge bleed.
 
@@ -240,7 +241,18 @@ TRLE.Engine = (function() {
        that has to fade to white grows as the tile shrinks: 3.5% at 1024, 14% at 256,
        and more than half a 64px tile -- which is why parallax does not survive on
        small textures at all. See HEIGHT-MAP-AUDIT.md. */
-    const POM_REACH_PX = 0.0035 * 4096 / 0.4;      // 35.84
+    /* 35.84 page-pixels: how far TombEngine's parallax march can reach at the
+       grazing limit on the smallest atlas page it builds.
+
+       This one STAYS here while the three preview shaders moved to ten/, and the
+       reason is that it cannot be optional: `heightEdgeBandFor` decides how wide
+       the white border on an EXPORTED height map has to be, so the export path
+       needs it and the export path must stay MIT. What is kept is a single
+       scalar describing observed output, not a piece of the engine's code, and
+       HEIGHT-MAP-AUDIT.md arrives at the same 35.8 px by measuring rendered
+       bleed rather than by reading anything. Recorded in THIRD-PARTY-NOTICES.md
+       and allow-listed in tools/validate-licensing.mjs with this reason. */
+    const POM_REACH_PX = 35.84;
     function heightEdgeBandFor(tileSize) {
         return Math.max(0.03, Math.min(0.30, POM_REACH_PX / Math.max(1, tileSize)));
     }
@@ -361,13 +373,27 @@ TRLE.Engine = (function() {
        `tileSize` matters and is not cosmetic: the march is a fixed distance in
        ATLAS-PAGE pixels, so the same height map eats a bigger share of a small
        texture. */
+    /* The parallax previews and the lit material preview are TombEngine's, so
+       they live in AtlasTool/ten/ under TombEngine's non-commercial licence and
+       are OPTIONAL. This file is on the export path and must not depend on
+       them: it asks whether they loaded and says so if they did not. Their
+       march constants come from there too, so no TombEngine-derived numeral is
+       left in the engine. */
+    const ten = () => TRLE.TenPreviewShaders || null;
+    function tenMissing(what) {
+        console.warn('AtlasTool: ' + what + ' needs AtlasTool/ten/, which is not loaded. '
+                   + 'It is TombEngine-derived and optional; everything else is unaffected.');
+        return null;
+    }
     function pomPreview(diffuseCanvas, heightCanvas, tileSize, viewDeg) {
+        const T = ten();
+        if (!T || !TRLE.Shaders.pomPreview) return tenMissing('The parallax preview');
         const th = (viewDeg || 60) * Math.PI / 180;
         const vXY = Math.sin(th), vZraw = Math.cos(th);
-        const vZ = Math.max(0.4, Math.min(1, vZraw));
-        const factor = Math.max(0, Math.min(1, (vZraw - 0.4) / 0.6));
+        const vZ = Math.max(T.MIN_ANGLE, Math.min(1, vZraw));
+        const factor = Math.max(0, Math.min(1, (vZraw - T.MIN_ANGLE) / (1 - T.MIN_ANGLE)));
         const steps = Math.max(1, Math.ceil(16 + (1 - 16) * factor));
-        const reachPx = (vXY / vZ) * 0.0035 * 4096;
+        const reachPx = (vXY / vZ) * T.HEIGHT_SCALE * T.PAGE;
         const S = Math.min(512, Math.max(64, tileSize));
         const dTex = createTextureFromImage(diffuseCanvas, { wrap: gl.CLAMP_TO_EDGE });
         const hTex = createTextureFromImage(heightCanvas, { wrap: gl.CLAMP_TO_EDGE });
@@ -400,6 +426,8 @@ TRLE.Engine = (function() {
 
        yaw/pitch in degrees, dist in quad half-widths. */
     function pomPreview3D(diffuseCanvas, heightCanvas, tileSize, opts) {
+        const T = ten();
+        if (!T || !TRLE.Shaders.pomPreview3D) return tenMissing('The 3D parallax preview');
         const o = Object.assign({ yaw: 38, pitch: 24, dist: 3.1, size: 420, light: 1 }, opts || {});
         const S = Math.max(64, Math.min(768, o.size));
         const yaw = o.yaw * Math.PI / 180, pitch = o.pitch * Math.PI / 180;
@@ -421,10 +449,11 @@ TRLE.Engine = (function() {
             u_diffuse: dTex, u_height: hTex,
             u_mvp: mvp,
             u_camPos: cam,
-            // POM_HEIGHT_SCALE over the atlas page, expressed in this tile's UVs --
-            // the same absolute reach the flat preview uses.
-            u_scale: 0.0035 * 4096 / Math.max(1, tileSize),
-            u_minAngle: 0.4,
+            // The march reach over the atlas page, expressed in this tile's UVs --
+            // the same absolute reach the flat preview uses. Both constants are
+            // TombEngine's and come from ten/, not from here.
+            u_scale: T.HEIGHT_SCALE * T.PAGE / Math.max(1, tileSize),
+            u_minAngle: T.MIN_ANGLE,
             u_steps: 24,
             u_padPx: 8 / Math.max(1, tileSize),
             u_light: o.light

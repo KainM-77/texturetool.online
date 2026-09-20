@@ -226,7 +226,7 @@ window.TRLE = window.TRLE || {};
        would mean changing a control outside the panel behind the user's back. */
     const ORG_STYLES = {
         blobs: {
-            label: 'Blobs', hint: 'Soft rounded lobes. The general-purpose one — sand, moss, worn paint.',
+            label: 'Blobs', hint: 'Soft rounded lobes. The general-purpose one, sand, moss, worn paint.',
             defaults: { wobble: 55, scale: 3, feather: 0 }, crisp: 0, warp: 0.20, add: null
         },
         spikes: {
@@ -547,17 +547,17 @@ window.TRLE = window.TRLE || {};
         const relief = noiseExportsRelief();
         if (target === 'ao') {
             return relief
-                ? 'AO only — the engine applies this as occlusion and the diffuse stays clean. The right choice for a PBR/TEN export.'
-                : '<strong>AO only, but no relief maps are ticked for export.</strong> Nothing will carry this shadow — tick AO in Export, or switch to Diffuse.';
+                ? 'AO only, the engine applies this as occlusion and the diffuse stays clean. The right choice for a PBR/TEN export.'
+                : '<strong>AO only, but no relief maps are ticked for export.</strong> Nothing will carry this shadow, tick AO in Export, or switch to Diffuse.';
         }
         if (target === 'both') {
             return relief
-                ? '<strong>Both — this lands twice.</strong> The map generator reads the darkening back out of the diffuse and turns it into relief, on top of the AO you just baked. Keep the amount low, or pick one.'
+                ? '<strong>Both, this lands twice.</strong> The map generator reads the darkening back out of the diffuse and turns it into relief, on top of the AO you just baked. Keep the amount low, or pick one.'
                 : 'Both, but no relief maps are ticked, so only the diffuse copy will ship.';
         }
         return relief
             ? '<strong>Relief maps are on.</strong> They read this darkening back out of the diffuse and turn it into geometry, so a strong band becomes a trench in the normals. Go easy, or move it to AO.'
-            : 'Diffuse-only, which is what classic TRLE wants — the shadow is painted into the texture and nothing downstream amplifies it.';
+            : 'Diffuse-only, which is what classic TRLE wants, the shadow is painted into the texture and nothing downstream amplifies it.';
     }
 
     function buildTopologyMask(S, mode, pivot, hardness, org) {
@@ -746,11 +746,37 @@ window.TRLE = window.TRLE || {};
        White at the borders → black in the centre, used to fade a decal's edges
        to transparent. `amt` (0..1) = how far the fade reaches inward; `hardness`
        sharpens the ramp. Same blur tail as the other masks. */
-    function buildEdgeVignetteMask(S, amt, hardness) {
+    /* `org` displaces the vignette's contour with the SAME style machinery the
+       transition edges use, and deliberately WITHOUT the sin(pi*nx)*sin(pi*ny)
+       border window that `buildTopologyMask` applies.
+
+       That window exists to keep a tile seamless with its neighbours, and there
+       is no seam to keep here: a vignette takes all four borders to alpha 0, so
+       the tile already cannot repeat. Windowing would also aim the damping at
+       exactly the wrong place, because this contour SITS near the border (at
+       dist = amt, which is 17.5% in at the default 35% amount) where the window
+       is still small. Same argument the height map's white border makes for
+       using non-periodic noise in its `rough` profile: an effect whose whole job
+       is to destroy the edge must not be windowed at the edge.
+
+       `coords`' coordinate warp is skipped for the same reason (it is scaled by
+       that window); the style's character comes from `shape`, which is called
+       with win = 1. */
+    function buildEdgeVignetteMask(S, amt, hardness, org) {
         amt = Math.max(0.02, Math.min(1, amt)) * 0.5;     // up to half-tile
         hardness = Math.max(0, Math.min(1, hardness));
-        const lower = 0.5 * hardness, upper = 1.0 - 0.5 * hardness;
+        let lower = 0.5 * hardness, upper = 1.0 - 0.5 * hardness;
         const hardCut = upper <= lower + 1e-5;
+        const O = makeOrganic(org, S);
+        const aa = CORNER_AA_PX / Math.max(2, S);
+        // A hard cut has no band for the detail to displace, so floor one, but
+        // only with organic on: widening it otherwise moves every existing mask.
+        if (O && upper - lower < aa) { lower = 0.5 - aa * 0.5; upper = 0.5 + aa * 0.5; }
+        const vign = (px, py) => {
+            const dist = Math.min(px, 1 - px, py, 1 - py);   // 0 at edge … 0.5 centre
+            return 1 - Math.min(1, dist / amt);              // 1 at edge → 0 inside
+        };
+        const h = 1 / Math.max(2, S - 1);
         const canvas = document.createElement('canvas');
         canvas.width = S; canvas.height = S;
         const ctx = canvas.getContext('2d');
@@ -760,10 +786,20 @@ window.TRLE = window.TRLE || {};
             for (let x = 0; x < S; x++) {
                 const nx = S > 1 ? x / (S - 1) : 0.5;
                 const ny = S > 1 ? y / (S - 1) : 0.5;
-                const dist = Math.min(nx, 1 - nx, ny, 1 - ny);   // 0 at edge … 0.5 centre
-                let v = 1 - Math.min(1, dist / amt);             // 1 at edge → 0 inside
-                if (hardCut) v = v >= 0.5 ? 1 : 0;
-                else v = Math.max(0, Math.min(1, (v - lower) / (upper - lower)));
+                let v;
+                if (O) {
+                    let g = vign(nx, ny);
+                    const gx = (vign(nx + h, ny) - vign(nx - h, ny)) / (2 * h);
+                    const gy = (vign(nx, ny + h) - vign(nx, ny - h)) / (2 * h);
+                    g = O.shape(g, gx, gy, nx, ny, 1);
+                    const b = O.band(lower, upper, g, g, aa);
+                    const cc = Math.max(0, Math.min(1, (g - b.lo) / Math.max(1e-6, b.hi - b.lo)));
+                    v = cc * cc * (3 - 2 * cc);
+                } else {
+                    v = vign(nx, ny);
+                    if (hardCut) v = v >= 0.5 ? 1 : 0;
+                    else v = Math.max(0, Math.min(1, (v - lower) / (upper - lower)));
+                }
                 const byte = Math.round(v * 255);
                 const idx = (y * S + x) * 4;
                 d[idx] = byte; d[idx + 1] = byte; d[idx + 2] = byte; d[idx + 3] = 255;
@@ -1814,8 +1850,8 @@ window.TRLE = window.TRLE || {};
     function noiseAdvice(hasMaterial, presetKey) {
         const s = noiseDefaultStrength(presetKey, hasMaterial);
         return hasMaterial && noiseExportsRelief()
-            ? `Material maps are on. They read this same grain back out of the diffuse and amplify it, so it lands twice — around <strong>${s}%</strong> is usually plenty.`
-            : `Diffuse-only, so nothing downstream amplifies this and the grain is the whole detail budget — around <strong>${s}%</strong> is a normal starting point.`;
+            ? `Material maps are on. They read this same grain back out of the diffuse and amplify it, so it lands twice, around <strong>${s}%</strong> is usually plenty.`
+            : `Diffuse-only, so nothing downstream amplifies this and the grain is the whole detail budget, around <strong>${s}%</strong> is a normal starting point.`;
     }
 
     /* RGB (0-255) → {h,s,l} in HSL(0-360, 0-100, 0-100). */
@@ -1860,8 +1896,32 @@ window.TRLE = window.TRLE || {};
         }, duration);
     }
 
+    /* ============ DEMO MODE ============
+       `?demo` runs the tool inside the demo course's frame (demo.html). It changes
+       exactly three things and nothing else:
+
+         1. Storage is NAMESPACED, not suppressed. The course drives the real Apply
+            paths, so pushHistory -> markDirty -> scheduleAutosave still runs and
+            still writes -- it just writes somewhere the user does not keep anything.
+            A frame shares its parent's ORIGIN, so IndexedDB and localStorage are the
+            same stores whichever page opens them; namespacing the keys is the only
+            separation available. Suppressing the writes instead would mean every
+            future side effect had to remember a flag, which is the `data-batch`
+            failure mode.
+         2. `_cap` is installed and the session-restore prompt is skipped -- the same
+            two behaviours `?capture` needs, reused rather than re-implemented.
+         3. Theme and UI scale come from the PARENT (demoApplyChrome). Namespacing
+            PREFS_KEY is what stops the frame reading the user's own theme, so the
+            course has to hand it in or the frame renders dark inside a light page.
+
+       Everything else -- every modal, every shader, every validator hook -- is the
+       shipped tool, unmodified. That is the point: the course teaches the real UI. */
+    const DEMO_MODE = /[?&]demo\b/i.test(location.search);
+    const demoKey = base => DEMO_MODE ? base + '-demo' : base;
+    if (DEMO_MODE && window.TRLE && TRLE.Store && TRLE.Store.useSlot) TRLE.Store.useSlot('demo');
+
     /* ============ PREFS (localStorage) ============ */
-    const PREFS_KEY = 'trle-atlas-prefs';
+    const PREFS_KEY = demoKey('trle-atlas-prefs');
     const prefs = (() => {
         try { return JSON.parse(localStorage.getItem(PREFS_KEY)) || {}; }
         catch { return {}; }
@@ -1877,7 +1937,7 @@ window.TRLE = window.TRLE || {};
        Each is { id, name, preset } where `preset` is a full resolved preset
        object (base props + any slider tweaks), so it generates maps on its own
        and survives even if the original built-in preset changes. */
-    const USER_PRESETS_KEY = 'trle-atlas-matpresets';
+    const USER_PRESETS_KEY = demoKey('trle-atlas-matpresets');
     let userPresets = (() => {
         try { const a = JSON.parse(localStorage.getItem(USER_PRESETS_KEY)); return Array.isArray(a) ? a : []; }
         catch { return []; }
@@ -2127,8 +2187,8 @@ window.TRLE = window.TRLE || {};
        active, it still read "Paint where Layer 1 applies". Hence opts.onTool. */
     const MASK_TOOLS = [
         ['brush',   '🖌 Brush',   'Freehand; raise Edge softness to feather the stroke',
-                    'Drag to paint. <strong>Edge softness</strong> feathers the stroke — 0% is a crisp edge. Hold Alt to erase.'],
-        ['stamp',   '🪨 Stamp',   'Lays an irregular blob instead of a disc — moss, rubble, rust, pitting',
+                    'Drag to paint. <strong>Edge softness</strong> feathers the stroke, 0% is a crisp edge. Hold Alt to erase.'],
+        ['stamp',   '🪨 Stamp',   'Lays an irregular blob instead of a disc, moss, rubble, rust, pitting',
                     'Click to lay a blob, or drag to scatter a run of them. Every one is a different shape.'],
         ['lasso',   '🪢 Lasso',   'Click for straight corners, or drag to trace freehand; closes and fills',
                     'Click to place corners, or drag to trace freehand. Click the start dot, or press Enter, to close and fill.'],
@@ -2210,43 +2270,43 @@ window.TRLE = window.TRLE || {};
         /* One slider row. `wrapId` is what setTool shows/hides, and it keeps the
            id the inline `<label>` carried so nothing that looked it up breaks. */
         const slider = (wrapId, label, id, min, max, val, unit, title, hidden, cls) => `
-            <div class="form-group at-mask-slider${cls ? ' ' + cls : ''}" id="${prefix}-${wrapId}"${hidden ? ' style="display:none;"' : ''}${title ? ` title="${title}"` : ''}>
-                <label for="${prefix}-${id}">${label} — <span id="${prefix}-${id}-val">${val}</span>${unit}</label>
-                <input type="range" id="${prefix}-${id}" min="${min}" max="${max}" value="${val}">
-            </div>`;
+ <div class="form-group at-mask-slider${cls ? ' ' + cls : ''}" id="${prefix}-${wrapId}"${hidden ? ' style="display:none;"' : ''}${title ? ` title="${title}"` : ''}>
+ <label for="${prefix}-${id}">${label}: <span id="${prefix}-${id}-val">${val}</span>${unit}</label>
+ <input type="range" id="${prefix}-${id}" min="${min}" max="${max}" value="${val}">
+ </div>`;
         container.innerHTML = `
-            <div class="at-mask-btns">
-                <div class="at-seg-group at-mask-toolgroup">${seg}</div>
-                <div class="at-seg-group">
-                    <button type="button" class="at-seg active" id="${prefix}-paint" data-mask-mode="paint" aria-pressed="true" title="Add to the selection">🖌️ Paint</button>
-                    <button type="button" class="at-seg" id="${prefix}-erase" data-mask-mode="erase" aria-pressed="false" title="Take away from the selection (or hold Alt)">🧽 Erase</button>
-                </div>
-                <label class="at-mask-opt" id="${prefix}-contigwrap" style="display:none;" title="On: only the patch you click. Off: every pixel of that colour anywhere in the tile."><input type="checkbox" id="${prefix}-wand-contig" checked> Only the patch I click</label>
-                ${actionBtns}
-                <span class="at-mask-undo">
-                    <button type="button" class="btn btn-secondary at-btn-sm" id="${prefix}-undo" title="Undo (Ctrl+Z)" disabled>↶</button>
-                    <button type="button" class="btn btn-secondary at-btn-sm" id="${prefix}-redo" title="Redo (Ctrl+Shift+Z)" disabled>↷</button>
-                </span>
-                ${opts.extraHTML || ''}
-            </div>
-            <div class="at-mask-sliders">
-                ${/* FIRST and full width, whatever tool is active. It is the one
-                      control that means the same thing for every tool, so it must
-                      not shuffle position and change size as you switch between
-                      them -- with Brush it shared a row and with Lasso it became a
-                      full-width bar on its own, which read as two different
-                      controls. `at-mask-wide` spans the grid. */ ''}
-                ${opts.value ? slider('valuewrap', opts.value, 'value', 1, 100, 100, '%',
-                    `How much ${opts.value.toLowerCase()} this stroke lays down. Paint one area weaker than another.`,
-                    false, 'at-mask-wide') : ''}
-                ${slider('brushwrap', 'Brush size', 'brush', 2, opts.brushMax || 80, 18, ' px', 'How wide the brush is, in screen pixels')}
-                ${opts.hardness === false ? '' :
-                  slider('hardwrap', 'Edge softness', 'hardness', 0, 100, MASK_SOFT_DEFAULT, '%', '0% is a crisp edge; raise it to feather the stroke')}
-                ${slider('roughwrap', 'Roughness', 'rough', 0, 100, 55, '%', 'How ragged the blob is — 0 is a dented disc, 100 is a clump', true)}
-                ${slider('scatterwrap', 'Scatter', 'scatter', 0, 100, 35, '%', 'How far apart dragged stamps land', true)}
-                ${slider('wandwrap', 'Tolerance', 'tol', 2, 100, MASK_TOL_DEFAULT, '%', "How close a pixel's colour must be to the one you click", true)}
-            </div>
-            <div class="sm-hint at-mask-hint" id="${prefix}-toolhint"></div>`;
+ <div class="at-mask-btns">
+ <div class="at-seg-group at-mask-toolgroup">${seg}</div>
+ <div class="at-seg-group">
+ <button type="button" class="at-seg active" id="${prefix}-paint" data-mask-mode="paint" aria-pressed="true" title="Add to the selection">🖌️ Paint</button>
+ <button type="button" class="at-seg" id="${prefix}-erase" data-mask-mode="erase" aria-pressed="false" title="Take away from the selection (or hold Alt)">🧽 Erase</button>
+ </div>
+ <label class="at-mask-opt" id="${prefix}-contigwrap" style="display:none;" title="On: only the patch you click. Off: every pixel of that colour anywhere in the tile."><input type="checkbox" id="${prefix}-wand-contig" checked> Only the patch I click</label>
+ ${actionBtns}
+ <span class="at-mask-undo">
+ <button type="button" class="btn btn-secondary at-btn-sm" id="${prefix}-undo" title="Undo (Ctrl+Z)" disabled>↶</button>
+ <button type="button" class="btn btn-secondary at-btn-sm" id="${prefix}-redo" title="Redo (Ctrl+Shift+Z)" disabled>↷</button>
+ </span>
+ ${opts.extraHTML || ''}
+ </div>
+ <div class="at-mask-sliders">
+ ${/* FIRST and full width, whatever tool is active. It is the one
+ control that means the same thing for every tool, so it must
+ not shuffle position and change size as you switch between
+ them -- with Brush it shared a row and with Lasso it became a
+ full-width bar on its own, which read as two different
+ controls. `at-mask-wide` spans the grid. */ ''}
+ ${opts.value ? slider('valuewrap', opts.value, 'value', 1, 100, 100, '%',
+ `How much ${opts.value.toLowerCase()} this stroke lays down. Paint one area weaker than another.`,
+ false, 'at-mask-wide') : ''}
+ ${slider('brushwrap', 'Brush size', 'brush', 2, opts.brushMax || 80, 18, ' px', 'How wide the brush is, in screen pixels')}
+ ${opts.hardness === false ? '' :
+ slider('hardwrap', 'Edge softness', 'hardness', 0, 100, MASK_SOFT_DEFAULT, '%', '0% is a crisp edge; raise it to feather the stroke')}
+ ${slider('roughwrap', 'Roughness', 'rough', 0, 100, 55, '%', 'How ragged the blob is, 0 is a dented disc, 100 is a clump', true)}
+ ${slider('scatterwrap', 'Scatter', 'scatter', 0, 100, 35, '%', 'How far apart dragged stamps land', true)}
+ ${slider('wandwrap', 'Tolerance', 'tol', 2, 100, MASK_TOL_DEFAULT, '%', "How close a pixel's colour must be to the one you click", true)}
+ </div>
+ <div class="sm-hint at-mask-hint" id="${prefix}-toolhint"></div>`;
         maskToolbarIdGuard(container, prefix);
     }
 
@@ -2270,7 +2330,7 @@ window.TRLE = window.TRLE || {};
     function maskToolbarIdGuard(container, prefix) {
         container.querySelectorAll('[id]').forEach(el => {
             if (document.querySelectorAll(`[id="${el.id}"]`).length > 1) {
-                console.warn(`[mask editor] duplicate id "${el.id}" — the ${prefix} toolbar`
+                console.warn(`[mask editor] duplicate id "${el.id}", the ${prefix} toolbar`
                     + ' will resolve it to whichever element comes first. Rename the'
                     + " surface's own element, not the toolbar's.");
             }
@@ -3078,7 +3138,7 @@ window.TRLE = window.TRLE || {};
                 base = flat.canvas;
                 if (flat.approximated) {
                     showToast(`“${file.name}” has no flattened preview and uses ${flat.approximated} `
-                        + 'blend mode(s) the browser can\'t reproduce — flatten it in Photoshop for an exact match.', 'info', 6000);
+                        + 'blend mode(s) the browser can\'t reproduce, flatten it in Photoshop for an exact match.', 'info', 6000);
                 }
             }
             if (!base) throw new Error(`“${file.name}” has no visible layers.`);
@@ -3134,7 +3194,7 @@ window.TRLE = window.TRLE || {};
                 const img = new Image();
                 img.onload = () => resolve(img);
                 img.onerror = () => reject(new Error(
-                    `Couldn’t read “${file.name}”. Unsupported or corrupt image — try PNG, TGA or PSD.`));
+                    `Couldn’t read “${file.name}”. Unsupported or corrupt image, try PNG, TGA or PSD.`));
                 img.src = e.target.result;
             };
             reader.onerror = () => reject(new Error(`Couldn’t read “${file.name}”.`));
@@ -3247,7 +3307,7 @@ window.TRLE = window.TRLE || {};
             // the comment on validateBlocks.
             if (el.block) {
                 cell.classList.add('at-in-block');
-                cell.title = `Part of a ${el.block.label} — keeps its ${el.block.cols}-column shape when the atlas is resized`;
+                cell.title = `Part of a ${el.block.label}, keeps its ${el.block.cols}-column shape when the atlas is resized`;
             }
             if (el.id === state.selectedId) cell.classList.add('at-primary');
             if (el.id === state.pickBaseId) cell.classList.add('locked');
@@ -3264,7 +3324,7 @@ window.TRLE = window.TRLE || {};
             badges.className = 'at-badges';
             if (el.seamless && el.kind !== 'anim') badges.innerHTML += '<span class="at-badge at-badge-s" title="Seamless applied">S</span>';
             if (el.kind === 'transition') badges.innerHTML += el.ovParams
-                ? '<span class="at-badge at-badge-t" title="Overlay tile — one texture laid on top of another">T</span>'
+                ? '<span class="at-badge at-badge-t" title="Overlay tile, one texture laid on top of another">T</span>'
                 : '<span class="at-badge at-badge-t" title="Transition tile">T</span>';
             if (el.kind === 'anim') {
                 const a = el.anim || {};
@@ -3402,7 +3462,7 @@ window.TRLE = window.TRLE || {};
     function setupGrid() {
         const grid = $('at-grid');
         grid.setAttribute('role', 'grid');
-        grid.setAttribute('aria-label', 'Atlas elements — arrow keys to move, Enter to select, S/T/M for actions');
+        grid.setAttribute('aria-label', 'Atlas elements, arrow keys to move, Enter to select, S/T/M for actions');
         grid.addEventListener('keydown', onGridKeydown);
         $('at-cols-input').addEventListener('change', e => setColumns(parseInt(e.target.value)));
         $('at-rows-input').addEventListener('change', e => setRows(parseInt(e.target.value)));
@@ -3423,7 +3483,7 @@ window.TRLE = window.TRLE || {};
         renderGrid();
         pushHistory(`Columns: ${n}` + (r.added ? ` (+${r.added} spacer${r.added > 1 ? 's' : ''})` : ''));
         if (r.tooWide.length) {
-            showToast(`${r.tooWide.join(', ')} is wider than ${n} columns — it now flows with the loose tiles`, 'info');
+            showToast(`${r.tooWide.join(', ')} is wider than ${n} columns, it now flows with the loose tiles`, 'info');
         } else if (r.added) {
             showToast(`Kept ${r.kept} block${r.kept > 1 ? 's' : ''} in shape · ${r.added} spacer${r.added > 1 ? 's' : ''} added · Undo in History`, 'success');
         }
@@ -3572,7 +3632,7 @@ window.TRLE = window.TRLE || {};
             '🧩 Arrange as a grid?',
             `This set reads best as a ${width}-column block, but the atlas is ${state.cols} columns. ` +
             `Resize the atlas to ${width} columns so the tiles line up?` +
-            (blocks ? ' Blocks already in the atlas keep their own shape — their rows are padded with spacers.'
+            (blocks ? ' Blocks already in the atlas keep their own shape, their rows are padded with spacers.'
                     : ` Existing tiles reflow into ${width} columns.`) +
             (pads ? ` ${pads} blank spacer tile${pads > 1 ? 's' : ''} will pad the last row so the block starts on a fresh row.` : ''),
             `Resize to ${width} columns & add`,
@@ -3659,7 +3719,7 @@ window.TRLE = window.TRLE || {};
     /* Jump to a transition's source tile: select it, focus it, scroll to it. */
     function gotoSourceTile(srcId) {
         const src = byId(srcId);
-        if (!src) { showToast('Source tile not found — was it deleted?', 'error'); return; }
+        if (!src) { showToast('Source tile not found, was it deleted?', 'error'); return; }
         selectSingle(srcId);
         state.focusedId = srcId;
         renderGrid(); updateBulkBar();
@@ -3668,7 +3728,7 @@ window.TRLE = window.TRLE || {};
             cell.scrollIntoView({ behavior: 'smooth', block: 'center' });
             cell.focus({ preventScroll: true });
         }
-        showToast(`Jumped to tile ${indexOf(srcId) + 1} — set its material here`, 'info', 2500);
+        showToast(`Jumped to tile ${indexOf(srcId) + 1}, set its material here`, 'info', 2500);
     }
     /* Selected ids in atlas order (so bulk ops preserve relative order). */
     function selectedIdsInOrder() {
@@ -3734,7 +3794,7 @@ window.TRLE = window.TRLE || {};
     function bulkApplyMaterial() {
         const ids = selectedIdsInOrder().filter(id => { const el = byId(id); return el && el.kind !== 'transition'; });
         const skipped = state.selSet.size - ids.length;
-        if (!ids.length) { showToast('Transition tiles inherit materials — select some plain/animated tiles', 'info'); return; }
+        if (!ids.length) { showToast('Transition tiles inherit materials, select some plain/animated tiles', 'info'); return; }
         if (skipped > 0) showToast(`${skipped} transition tile${skipped !== 1 ? 's' : ''} will keep their inherited material`, 'info', 3500);
         openMatModalBatch(ids);
     }
@@ -3780,7 +3840,7 @@ window.TRLE = window.TRLE || {};
         if (!state.lastMaterial) { showToast('Assign a material once first, then this repeats it', 'info'); return; }
         const targets = ids.map(byId).filter(el => el && el.kind !== 'transition');
         const skipped = ids.length - targets.length;
-        if (!targets.length) { showToast('Transition tiles inherit materials — pick plain/animated tiles', 'info'); return; }
+        if (!targets.length) { showToast('Transition tiles inherit materials, pick plain/animated tiles', 'info'); return; }
         // A layer stack is masked per tile, so it only makes sense on a single target.
         const layers = (state.lastMatLayers && targets.length === 1) ? state.lastMatLayers : null;
         assignMaterialTo(targets, state.lastMaterial, layers);
@@ -3788,7 +3848,7 @@ window.TRLE = window.TRLE || {};
         const label = lastMaterialLabel();
         pushHistory(targets.length > 1 ? `Material → ${targets.length} tiles` : `Material: ${label}`);
         if (state.lastMatLayers && !layers) {
-            showToast(`Applied the base material of “${label}” to ${targets.length} tiles — layer masks are per-tile 🎨`, 'info', 4000);
+            showToast(`Applied the base material of “${label}” to ${targets.length} tiles, layer masks are per-tile 🎨`, 'info', 4000);
         } else {
             showToast(targets.length > 1
                 ? `Applied “${label}” to ${targets.length} tiles 🎨`
@@ -3919,7 +3979,7 @@ window.TRLE = window.TRLE || {};
     function blocksChanged(verb) {
         const dropped = validateBlocks();
         if (dropped.length) {
-            showToast(`${dropped.join(', ')} no longer lines up after ${verb} — it will reflow with the loose tiles now`, 'info');
+            showToast(`${dropped.join(', ')} no longer lines up after ${verb}, it will reflow with the loose tiles now`, 'info');
         }
         return dropped.length;
     }
@@ -4027,7 +4087,7 @@ window.TRLE = window.TRLE || {};
         if (ids.length === 1) {
             const el = byId(ids[0]);
             if (el.kind === 'anim' && el.anim && el.anim.total > 1)
-                msg = `Delete this animation — all ${el.anim.total} frames?`;
+                msg = `Delete this animation, all ${el.anim.total} frames?`;
             else
                 msg = `Delete ${el.kind === 'transition' ? 'this transition tile' : 'this tile'}?`;
         } else {
@@ -4277,8 +4337,8 @@ window.TRLE = window.TRLE || {};
             openConfirm(
                 '🔄 Start over?',
                 'This reloads the tool with an empty workbench. Your current session is '
-                + 'autosaved first, so you can restore it from the prompt on the way back in '
-                + '— or pick "Not now" there and start fresh.',
+                + 'autosaved first, so the start screen offers it straight back, or ignore '
+                + 'that offer and start fresh.',
                 '🔄 Start over',
                 reloadFresh
             );
@@ -4287,6 +4347,11 @@ window.TRLE = window.TRLE || {};
 
     function setupUnloadGuard() {
         window.addEventListener('beforeunload', e => {
+            // A lesson leaves the frame "dirty" by design, and the course resets the
+            // frame between lessons (iframe.src = iframe.src). Without this, every
+            // reset raises the browser's "leave site?" prompt, which reads as the
+            // demo having broken something.
+            if (DEMO_MODE) return;
             if (!state.dirty || !state.elements.length) return;
             e.preventDefault();
             e.returnValue = '';   // legacy browsers still want a truthy return value
@@ -4443,7 +4508,7 @@ window.TRLE = window.TRLE || {};
        count that doesn't match the selection isn't a silent mystery. */
     function noteSkipped(all, targets, why) {
         const n = all.length - targets.length;
-        if (n > 0) showToast(`${n} tile${n !== 1 ? 's' : ''} skipped — ${why}`, 'info', 3500);
+        if (n > 0) showToast(`${n} tile${n !== 1 ? 's' : ''} skipped: ${why}`, 'info', 3500);
     }
 
     /* "Applying to all N selected tiles" under a batchable modal's title.
@@ -4460,7 +4525,7 @@ window.TRLE = window.TRLE || {};
         }
         note.style.display = n > 1 ? '' : 'none';
         note.textContent = n > 1
-            ? `🎯 Applying to all ${n} selected tiles — the preview shows tile ${previewNo}.`
+            ? `🎯 Applying to all ${n} selected tiles, the preview shows tile ${previewNo}.`
             : '';
     }
 
@@ -4482,11 +4547,11 @@ window.TRLE = window.TRLE || {};
         const many = ctxActsOnSelection(id);
         const matBtn = menu.querySelector('[data-action="material"]');
         matBtn.disabled = !many && el.kind === 'transition';
-        matBtn.textContent = many ? `🎨 Set Material — ${state.selSet.size} tiles…` : '🎨 Set Material…';
+        matBtn.textContent = many ? `🎨 Set Material: ${state.selSet.size} tiles…` : '🎨 Set Material…';
         matBtn.title =
             (!many && el.kind === 'transition')
                 ? 'Transition tiles pick up their materials automatically from the two tiles they blend. '
-                  + 'Set the material on the base or overlay texture instead — this tile will follow along. '
+                  + 'Set the material on the base or overlay texture instead, this tile will follow along. '
                   + 'Use “Go to Base / Overlay Texture” below to jump straight to them.'
                 : '';
 
@@ -4496,7 +4561,7 @@ window.TRLE = window.TRLE || {};
         lastBtn.style.display = canLast ? '' : 'none';
         if (canLast) {
             lastBtn.textContent = `🎨 Apply Last Material (${lastMaterialLabel()})`
-                + (many ? ` — ${state.selSet.size} tiles` : '');
+                + (many ? ` · ${state.selSet.size} tiles` : '');
             lastBtn.title = 'Re-apply the last material you assigned, without opening the editor';
         }
         // Every other action that can run over the selection says so too. Only
@@ -4507,7 +4572,7 @@ window.TRLE = window.TRLE || {};
         menu.querySelectorAll('[data-batch]').forEach(b => {
             if (!b.dataset.baseLabel) b.dataset.baseLabel = b.textContent;
             const n = many ? ctxTargets(id, b.dataset.batch || 'tile').length : 1;
-            b.textContent = b.dataset.baseLabel + (n > 1 ? ` — ${n} tiles` : '');
+            b.textContent = b.dataset.baseLabel + (n > 1 ? ` · ${n} tiles` : '');
         });
 
         // Transition-only helpers: jump to the tiles this transition was built from.
@@ -4592,7 +4657,7 @@ window.TRLE = window.TRLE || {};
             case 'seamless':   openSeamlessModal(ctxTargets(id, 'noanim')); break;
             case 'transition': enterPickMode(id, 'transition'); showToast('Now click the second texture', 'info'); break;
             case 'wang': enterPickMode(id, 'wang'); showToast('Now click the second texture for the Wang set', 'info'); break;
-            case 'borderset': enterPickMode(id, 'borderset'); showToast('Click a second texture for the trim — or “Use same texture” for an origami fold', 'info'); break;
+            case 'borderset': enterPickMode(id, 'borderset'); showToast('Click a second texture for the trim, or “Use same texture” for an origami fold', 'info'); break;
             case 'origami':
                 if (el.kind !== 'tile') { showToast('Origami Frame works on source tiles only', 'info'); return; }
                 openOrigamiModal(id);
@@ -4612,7 +4677,7 @@ window.TRLE = window.TRLE || {};
                 // A right-click inside a multi-selection acts on the whole selection,
                 // so Ctrl+click → Set Material matches the bulk bar's Apply Material.
                 if (ctxActsOnSelection(id)) bulkApplyMaterial();
-                else if (el.kind === 'transition') showToast('Transitions inherit materials — set them on the base/overlay texture instead', 'info');
+                else if (el.kind === 'transition') showToast('Transitions inherit materials, set them on the base/overlay texture instead', 'info');
                 else openMatModal(id);
                 break;
             case 'lastmaterial': applyLastMaterial(ctxActsOnSelection(id) ? selectedIdsInOrder() : [id]); break;
@@ -4714,7 +4779,7 @@ window.TRLE = window.TRLE || {};
                 const n = targets.length;
                 pushHistory(n > 1 ? `Reset ${n} tiles` : 'Reset tile');
                 showToast((n > 1 ? `${n} tiles restored to original` : 'Tile restored to original')
-                    + (hadGlow ? ' — glow removed' : '')
+                    + (hadGlow ? ', glow removed' : '')
                     + (unticked ? ' (Emissive export map off)' : ''), 'success');
                 break;
             }
@@ -5173,9 +5238,9 @@ window.TRLE = window.TRLE || {};
     /* ============ SEAMLESS MODAL ============ */
     const SM_HINTS = {
         scattered:   'Best all-round (default). Great for sand, grass, gravel, foliage and rough stone.',
-        allsides:    'Preserves centre detail. Best for structured textures — brick, tile, panels.',
+        allsides:    'Preserves centre detail. Best for structured textures, brick, tile, panels.',
         collage:     'Simple half-offset blend. Cheapest; good for smooth, low-contrast surfaces (plaster).',
-        multiband:   'Blends each frequency band with its own width — keeps fine detail sharper than a single cross-fade. Good general-purpose choice for detailed surfaces.',
+        multiband:   'Blends each frequency band with its own width, keeps fine detail sharper than a single cross-fade. Good general-purpose choice for detailed surfaces.',
         splat:       'Rebuilds the tile from random rotated stamps, blended so overlaps keep the source\'s contrast. Hides repetition on busy organic textures; loses large-scale structure.'
     };
     const SM_PREVIEW = 512;
@@ -5345,10 +5410,10 @@ window.TRLE = window.TRLE || {};
             closeModal();
             refreshTransitions();
             renderGrid();
-            pushHistory(n > 1 ? `Make seamless — ${n} tiles` : 'Make seamless');
+            pushHistory(n > 1 ? `Make seamless: ${n} tiles` : 'Make seamless');
             showToast(n > 1
-                ? `${n} tiles updated in atlas — transitions refreshed`
-                : 'Tile updated in atlas — transitions refreshed', 'success');
+                ? `${n} tiles updated in atlas, transitions refreshed`
+                : 'Tile updated in atlas, transitions refreshed', 'success');
         });
     }
 
@@ -5432,10 +5497,10 @@ window.TRLE = window.TRLE || {};
         const el = $('at-anim-preview-note');
         if (pv === tile) { el.textContent = `Showing real ${tile}×${tile} pixels.`; el.style.color = 'var(--text-secondary)'; return; }
         if ($('at-anim-preview-size').value === 'auto') {
-            el.textContent = `Baked at ${pv}×${pv} — your ${tile}×${tile} tiles will have more detail than this.`;
+            el.textContent = `Baked at ${pv}×${pv}, your ${tile}×${tile} tiles will have more detail than this.`;
             el.style.color = 'var(--text-secondary)';
         } else {
-            el.textContent = `Previewing at ${pv}×${pv}, but the atlas is ${tile}×${tile} — tiles export at ${tile}.`;
+            el.textContent = `Previewing at ${pv}×${pv}, but the atlas is ${tile}×${tile}, tiles export at ${tile}.`;
             el.style.color = 'var(--warning)';
         }
     }
@@ -5459,7 +5524,7 @@ window.TRLE = window.TRLE || {};
         let warn = false;
         if (basePx < 6) {
             warn = true;
-            parts.push(`too fine for this tile size — drop Pattern scale to about ${Math.max(1, Math.floor(tile / 8))} or use a bigger tile`);
+            parts.push(`too fine for this tile size, drop Pattern scale to about ${Math.max(1, Math.floor(tile / 8))} or use a bigger tile`);
         } else if (finestPx < 2 && oct > usefulOct) {
             parts.push(`Detail above ${usefulOct} octaves only adds dither at this size`);
         }
@@ -5473,8 +5538,8 @@ window.TRLE = window.TRLE || {};
         const tile = state.tileSize || 256;
         const f = TRLE.AnimGen.ssFactor(tile, 4);
         $('at-anim-crisp-note').textContent = f > 1
-            ? `— render at ${f}× and average down (cleaner at small tile sizes)`
-            : '— no headroom at this tile size';
+            ? `, render at ${f}× and average down (cleaner at small tile sizes)`
+            : ', no headroom at this tile size';
         $('at-anim-crisp').disabled = f <= 1;
     }
 
@@ -5905,7 +5970,7 @@ window.TRLE = window.TRLE || {};
         try {
             an.frames = anGenerate(info);
         } catch (e) {
-            console.error(e); showToast('Generation failed — see console', 'error'); return;
+            console.error(e); showToast('Generation failed, see console', 'error'); return;
         }
         an.playIdx = 0;
         anRegenGlow();   // keep the preview glow strip in sync with the new frames
@@ -5977,7 +6042,7 @@ window.TRLE = window.TRLE || {};
     /* Human label for a preset's suggested material (for the modal note). */
     function anMaterialLabel(key) {
         const m = anDefaultMaterial(key);
-        if (!m) return 'None — assign one later with “Set Material…”';
+        if (!m) return 'None, assign one later with “Set Material…”';
         const p = getPreset(m.type, m.key, m.aesthetic);
         return p ? p.label : m.key;
     }
@@ -6010,7 +6075,7 @@ window.TRLE = window.TRLE || {};
         try {
             frames = anGenerate(info);
         } catch (e) {
-            console.error(e); showToast('Generation failed — see console', 'error'); return;
+            console.error(e); showToast('Generation failed, see console', 'error'); return;
         }
         const S = state.tileSize, total = frames.length;
         const seed = +$('at-anim-seed').value || 0, fps = +$('at-anim-fps').value || 12;
@@ -6540,7 +6605,9 @@ window.TRLE = window.TRLE || {};
         $('at-tr-base-no').textContent    = indexOf(baseId) + 1;
         $('at-tr-overlay-no').textContent = indexOf(overlayId) + 1;
 
-        $('at-tr-base-thumb').getContext('2d').drawImage(byId(baseId).canvas, 0, 0, 96, 96);
+        // Same reason as the lit preview: a reused 96px canvas, and a base tile
+        // may have alpha. trDrawOverlayThumb below already clears.
+        drawReplace($('at-tr-base-thumb'), byId(baseId).canvas, 96, 96);
         trDrawOverlayThumb();
 
         // Reset the custom-mask canvas (black = all base) for a fresh session.
@@ -6574,13 +6641,13 @@ window.TRLE = window.TRLE || {};
         trApplyVisibility();
         trOrgVisibility();   // Custom has no topology mask, so the panel parks
         $('at-tr-preview-label').textContent =
-            custom ? 'Paint mask — white = overlay (B) shows through' : 'Preview (last clicked direction)';
+            custom ? 'Paint mask, white = overlay (B) shows through' : 'Preview (last clicked direction)';
         $('at-tr-preview').style.cursor = custom ? 'crosshair' : 'default';
         trPreview();
     }
 
     const TR_CORNER_HINTS = {
-        seamless: 'Corner tiles meet the edge tiles exactly — the island reads as one shape.',
+        seamless: 'Corner tiles meet the edge tiles exactly, the island reads as one shape.',
         round:    'Legacy shape. The corner tiles run overlay along their whole inner edges, so the block shows a seam where a corner meets an edge cell.',
         sharp:    'Legacy 45° cut. Same seam as Rounded, half the amplitude.'
     };
@@ -6613,6 +6680,7 @@ window.TRLE = window.TRLE || {};
         if (sorg && sorg.shadow > 0 && shadowHitsDiffuse(sorg))
             comp = applyContactShadow(comp, mask, P, sorg.shadow, shadowOpts(sorg));
         const pctx = $('at-tr-preview').getContext('2d');
+        pctx.clearRect(0, 0, $('at-tr-preview').width, $('at-tr-preview').height);
         pctx.drawImage(comp, 0, 0);
         if (trEditor && tr.maskMode === 'custom') trEditor.drawOverlay(pctx);
     }
@@ -7629,7 +7697,7 @@ window.TRLE = window.TRLE || {};
         const origami = baseId === overlayId;
         const titleSrc = $('at-bset-title-src'), origamiHint = $('at-bset-origami-hint');
         if (origami) {
-            if (titleSrc) titleSrc.textContent = `Tile ${indexOf(baseId) + 1} (origami — one texture)`;
+            if (titleSrc) titleSrc.textContent = `Tile ${indexOf(baseId) + 1} (origami, one texture)`;
             if (origamiHint) origamiHint.style.display = '';
         } else {
             if (titleSrc) titleSrc.innerHTML =
@@ -7682,7 +7750,7 @@ window.TRLE = window.TRLE || {};
             c.style.cssText = 'width:100%;display:block;border:1px solid var(--border);border-radius:3px;image-rendering:pixelated;cursor:pointer;';
             c.getContext('2d').drawImage(bset.canvases[key], 0, 0);
             const meta = BSET_MODE_META[s.mode];
-            c.title = `${key} — ${meta.name}. Click to cycle how this slot is made.`;
+            c.title = `${key}: ${meta.name}. Click to cycle how this slot is made.`;
             const badge = document.createElement('span');
             badge.textContent = meta.badge;
             badge.style.cssText = 'position:absolute;top:2px;right:4px;font-size:0.7rem;color:#fff;background:rgba(0,0,0,.55);border-radius:3px;padding:0 3px;pointer-events:none;' + (s.mode === 'auto' ? 'opacity:.35;' : '');
@@ -8105,6 +8173,7 @@ window.TRLE = window.TRLE || {};
     }
 
     function matCleanup() {
+        matPreviewOnly = null;
         clearTimeout(mat.previewTimer);
         matCleanupGL();
         mat3dPause();
@@ -8152,7 +8221,7 @@ window.TRLE = window.TRLE || {};
         const keys = matPresetKeys(type, aesthetic);
         if (aesthetic === 'saved' && !keys.length) {
             // Empty "My presets" group — show a disabled hint so the picker isn't blank.
-            const o = new Option('No saved presets yet — tweak a material, then ⭐ Save', '');
+            const o = new Option('No saved presets yet, tweak a material, then ⭐ Save', '');
             o.disabled = true; sel.appendChild(o); sel.value = '';
         } else {
             keys.forEach(k => {
@@ -8313,7 +8382,7 @@ window.TRLE = window.TRLE || {};
             const lo = Math.min(...stds), hi = Math.max(...stds);
             return `🎚 These ${stds.length} textures <strong>vary a lot in contrast</strong> `
                  + `(luminance spread ${lo.toFixed(0)}–${hi.toFixed(0)}). Maps derive from diffuse `
-                 + `contrast, so one <strong>Normal Strength</strong> will land differently on each — `
+                 + `contrast, so one <strong>Normal Strength</strong> will land differently on each, `
                  + `the flatter ones come out softer than the punchy ones. Consider applying to them in `
                  + `groups, or set the material per tile.`;
         }
@@ -8335,13 +8404,13 @@ window.TRLE = window.TRLE || {};
            ceiling, and the user wonders why 50 still looks flat. */
         const clamped = Math.round(ideal) !== suggested;
         const advice = clamped
-            ? `even <strong>Normal Strength ${suggested}</strong> (the maximum) won't fully compensate — `
+            ? `even <strong>Normal Strength ${suggested}</strong> (the maximum) won't fully compensate, `
               + `consider raising the contrast of the texture itself first, with <strong>🎚 Adjust Colours</strong> or <strong>☀ De-light</strong>`
             : `try <strong>Normal Strength ${suggested}</strong> instead of ${p.normalStrength} in the advanced editor`;
         return `${low ? '🔅' : '🔆'} ${subject} <strong>${low ? 'low' : 'high'}-contrast</strong> `
              + `(luminance spread ${std.toFixed(0)} vs the ~${MAT_REF_STD} presets assume). `
              + `Maps derive from diffuse contrast, so <strong>${p.label || 'this preset'}</strong> will land `
-             + `${low ? 'flatter' : 'stronger'} than intended here — ${advice}.`;
+             + `${low ? 'flatter' : 'stronger'} than intended here: ${advice}.`;
     }
 
     function matRenderContrastAdvice() {
@@ -8475,7 +8544,7 @@ window.TRLE = window.TRLE || {};
         const px = Math.round(band * S);
         const pct = Math.round(band * 100);
         note.innerHTML = S <= 64
-            ? `⚠️ At <strong>${S}px</strong> the fade would take <strong>${pct}%</strong> of the tile — `
+            ? `⚠️ At <strong>${S}px</strong> the fade would take <strong>${pct}%</strong> of the tile, `
               + `parallax reaches ~${Math.round(TRLE.Engine.POM_REACH_PX)}px whatever the texture's size, so there is `
               + `almost no interior left to carve. Author parallax textures at <strong>256px or larger</strong>.`
             : `Fades the outer <strong>${px}px</strong> (${pct}%) of each edge. Tomb Engine's parallax can march `
@@ -8513,6 +8582,12 @@ window.TRLE = window.TRLE || {};
     function matMkPrev(wrap, canvas, label, S) {
         const d = document.createElement('div');
         d.className = 'at-mat-prev';
+        /* Addressable per map. The demo course points its spotlight at one
+           thumbnail (AO changes the lit preview by ~2 levels of 255 and its own
+           map by ~37, so the map IS the instrument), and a positional
+           :nth-child selector would silently point at the wrong map the day
+           MAT_PREVIEW_MAPS gains an entry. */
+        d.dataset.map = String(label).toLowerCase();
         const c = document.createElement('canvas');
         c.width = S; c.height = S;
         c.getContext('2d').drawImage(canvas, 0, 0, S, S);
@@ -8582,13 +8657,35 @@ window.TRLE = window.TRLE || {};
     }
 
     /* Lit preview using the materialPreview shader + cached maps (Phase 11). */
+    /* Test-only override for the 2D lit preview's per-map switches, driven by
+       TRLE._cap.matPreviewShow. The shader already takes a u_hasX flag per map,
+       so isolating one costs nothing; what it lacked was a way to ask. Null in
+       normal use, and matCleanup clears it so it cannot outlive the modal. */
+    let matPreviewOnly = null;
+
     function matRenderLit() {
         if (!mat.gl) return;
+        /* materialPreview reproduces TombEngine's Phong, so it lives in
+           AtlasTool/ten/ under TombEngine's non-commercial licence and is
+           optional. Without it the modal keeps every map thumbnail and the whole
+           generator; only this one lit composite is unavailable. */
+        if (!TRLE.Shaders.materialPreview) {
+            const el = $('at-mat-lit');
+            if (el) {
+                const g = el.getContext('2d');
+                g.clearRect(0, 0, el.width, el.height);
+                g.fillStyle = '#2a2a2b'; g.fillRect(0, 0, el.width, el.height);
+                g.fillStyle = '#9a9a9a'; g.font = '11px sans-serif'; g.textAlign = 'center';
+                g.fillText('Lit preview unavailable', el.width / 2, el.height / 2 - 6);
+                g.fillText('(AtlasTool/ten/ not loaded)', el.width / 2, el.height / 2 + 8);
+            }
+            return;
+        }
         const S = state.tileSize;
         const E = TRLE.Engine;
         const m = mat.gl.maps;
         const fallback = mat.gl.tex;
-        const has = k => (m[k] ? 1.0 : 0.0);
+        const has = k => (m[k] && (!matPreviewOnly || matPreviewOnly[k] !== false)) ? 1.0 : 0.0;
         const fbo = E.createFBO(S, S);
         E.blit('materialPreview', {
             u_diffuse:   mat.gl.tex,
@@ -8602,8 +8699,14 @@ window.TRLE = window.TRLE || {};
             u_hasEmissive: has('emissive'),
             u_lightDir: mat.lightDir
         }, fbo);
+        /* drawReplace, not drawImage: `materialPreview` ends
+           `fragColor = vec4(color, diffSample.a)`, so a cutout tile's preview has
+           real holes, and this canvas is ONE element reused by every tile. A bare
+           source-over draw left the previous tile showing through them, reported
+           as bricks visible under a metal grate. Eleventh site of the same defect;
+           the ten in b3ee5a9 did not include this one. */
         const lit = $('at-mat-lit');
-        lit.getContext('2d').drawImage(E.fboToCanvas(fbo), 0, 0, lit.width, lit.height);
+        drawReplace(lit, E.fboToCanvas(fbo), lit.width, lit.height);
         E.deleteFBO(fbo);
     }
 
@@ -8734,7 +8837,13 @@ window.TRLE = window.TRLE || {};
         mat.batchIds = null;
         mat.dirty = false;
         const el = byId(id);
-        $('at-mat-title').textContent = `🎨 Set Material — Tile ${indexOf(id) + 1}`;
+        $('at-mat-title').textContent = `🎨 Set Material, Tile ${indexOf(id) + 1}`;
+        /* Hide any banner a previous batch left behind; openMatModalBatch puts it
+           back. This modal used to signal a batch through its TITLE alone, which is
+           the only one of the six batchable modals that did not follow the
+           setBatchNote pattern, and the title cannot say which tile the preview is
+           showing -- the thing the banner exists to answer. */
+        setBatchNote('at-modal-mat', 1, 1);
 
         matLoadMaterialDescriptor(el.material);
         mmInit(el);           // set up the multi-material layer state from the tile
@@ -8752,7 +8861,8 @@ window.TRLE = window.TRLE || {};
     function openMatModalBatch(ids) {
         openMatModal(ids[0]);
         mat.batchIds = ids.slice();
-        $('at-mat-title').textContent = `🎨 Apply Material — ${ids.length} tiles`;
+        $('at-mat-title').textContent = `🎨 Apply Material: ${ids.length} tiles`;
+        setBatchNote('at-modal-mat', ids.length, indexOf(ids[0]) + 1);
         matRenderContrastAdvice();   // re-run now that it can see the whole batch
     }
 
@@ -8873,7 +8983,7 @@ window.TRLE = window.TRLE || {};
         mmRenderCanvas();
         const base = i === 0;
         $('at-mm-selhint').textContent = base
-            ? 'Base layer — its material fills the whole tile. Add a layer to paint a region on top.'
+            ? 'Base layer, its material fills the whole tile. Add a layer to paint a region on top.'
             : `Paint where “${L.name}” applies. It draws over the layers beneath it.`;
     }
 
@@ -9021,8 +9131,8 @@ window.TRLE = window.TRLE || {};
             const g = document.createElement('div');
             g.className = 'form-group';
             g.innerHTML = `
-                <label>${label} — <span id="at-mat-p-${key}-val">${min}</span></label>
-                <input type="range" id="at-mat-p-${key}" min="${min}" max="${max}" step="${step || 1}" value="${min}" style="width:100%;">`;
+ <label>${label}: <span id="at-mat-p-${key}-val">${min}</span></label>
+ <input type="range" id="at-mat-p-${key}" min="${min}" max="${max}" step="${step || 1}" value="${min}" style="width:100%;">`;
             wrap.appendChild(g);
             g.querySelector('input').addEventListener('input', function () {
                 $(`at-mat-p-${key}-val`).textContent = this.value;
@@ -9148,7 +9258,7 @@ window.TRLE = window.TRLE || {};
 
     /* ============ HEAL / FILL MODAL (Phase 6) ============ */
     const HEAL_HINTS = {
-        patch:     'Fills from the pixels immediately around the spot, matching local tone & texture. Best all-rounder — handles high-contrast areas where global sampling drags in the wrong shade.',
+        patch:     'Fills from the pixels immediately around the spot, matching local tone & texture. Best all-rounder, handles high-contrast areas where global sampling drags in the wrong shade.',
         diffusion: 'Smoothly interpolates surrounding colours into the painted area. Best for small blemishes, scratches or logos on smoothish surfaces.',
         texture:   'Replaces the painted area with texture re-synthesised from the whole tile. Best for uniformly busy / organic surfaces.'
     };
@@ -9473,6 +9583,8 @@ window.TRLE = window.TRLE || {};
     /* ============ FADE TO TRANSPARENT MODAL (Phase T3) ============ */
     const fade = { id: null, maskCanvas: null };
     let fadeEditor = null;
+    /* Owns the organic panel's reroll seed; readOrgPanel takes it back. */
+    let fadeOrg = null;
 
     function fadeCleanup() { fade.id = null; }
 
@@ -9481,8 +9593,13 @@ window.TRLE = window.TRLE || {};
         const hardness = parseInt($('at-fade-edgehard').value) / 100;
         const shape = $('at-fade-shape').value;
         if (shape === 'custom') return softenMask(fade.maskCanvas, P);
-        if (shape === 'dir') return buildTopologyMask(P, $('at-fade-dir').value, 1 - amount, hardness);
-        return buildEdgeVignetteMask(P, amount, hardness);   // 'edges'
+        /* Same recipe object both builders take, read through the shared panel.
+           `dir` goes through buildTopologyMask, which has honoured `org` on its
+           ratio branch since the single-tile organic fix, so that shape needed no
+           new maths at all. */
+        const org = readOrgPanel('at-fadeorg', fadeOrg ? fadeOrg.seed : 1);
+        if (shape === 'dir') return buildTopologyMask(P, $('at-fade-dir').value, 1 - amount, hardness, org);
+        return buildEdgeVignetteMask(P, amount, hardness, org);   // 'edges'
     }
 
     function fadePreview() {
@@ -9503,6 +9620,8 @@ window.TRLE = window.TRLE || {};
         $('at-fade-dir-wrap').style.display = shape === 'dir' ? '' : 'none';
         $('at-fade-custom').style.display = shape === 'custom' ? '' : 'none';
         $('at-fade-shapeopts').style.display = shape === 'custom' ? 'none' : '';
+        // A painted mask has no contour to displace, so the panel would be inert.
+        $('at-fade-orgwrap').style.display = shape === 'custom' ? 'none' : '';
         fadePreview();
     }
 
@@ -9520,6 +9639,7 @@ window.TRLE = window.TRLE || {};
     function setupFadeModal() {
         fade.maskCanvas = document.createElement('canvas');
         fade.maskCanvas.width = 256; fade.maskCanvas.height = 256;
+        fadeOrg = wireOrgPanel('at-fadeorg', fadePreview);
 
         const dirSel = $('at-fade-dir');
         TRANS_MODES.forEach(({ mode, label }) => dirSel.appendChild(new Option(label, mode)));
@@ -9689,7 +9809,7 @@ window.TRLE = window.TRLE || {};
         if (line) {
             line.textContent = has
                 ? '✨ This tile currently has a glow. Apply replaces it; Remove glow clears it.'
-                : 'This tile has no glow yet — the preview below shows what Apply would give you.';
+                : 'This tile has no glow yet, the preview below shows what Apply would give you.';
         }
         const rm = $('at-em-remove');
         if (rm) { rm.disabled = !has; rm.title = has ? '' : 'This tile has no glow'; }
@@ -9781,11 +9901,11 @@ window.TRLE = window.TRLE || {};
     function hgCleanup() { hg.id = null; clearTimeout(hg.timer); }
 
     const HG_PROFILE_HINTS = [
-        'A soft ramp to white. What the Tomb Engine devs’ own reference images use — start here.',
+        'A soft ramp to white. What the Tomb Engine devs’ own reference images use, start here.',
         'A straight ramp. Slightly more interior detail kept than Smooth, slightly harder to miss.',
         'Narrow and steep. For large textures, where the band it has to cover is only a few percent.',
         'The band wanders in and out along the edge. Rubble, broken stone, anything that should not end on a ruled line.',
-        'Ends the fade on a mortar line instead of slicing a stone in half. Needs a texture with real joints — on anything else it falls back to Smooth.'
+        'Ends the fade on a mortar line instead of slicing a stone in half. Needs a texture with real joints, on anything else it falls back to Smooth.'
     ];
 
     /* The recipe the controls currently describe. */
@@ -10134,7 +10254,7 @@ window.TRLE = window.TRLE || {};
         const has = !!(el && el.hgParams);
         $('at-hg-title').textContent = has ? 'Edit Height Map' : 'Make Height Map';
         $('at-hg-state').innerHTML = has
-            ? 'This tile already has a height map — the controls below are its settings.'
+            ? 'This tile already has a height map, the controls below are its settings.'
             : 'This tile has no height map yet. The previews show what Apply would give you.';
         const rm = $('at-hg-remove');
         if (rm) { rm.disabled = !has; rm.title = has ? '' : 'This tile has no height map'; }
@@ -11086,8 +11206,8 @@ window.TRLE = window.TRLE || {};
         const hint = $('at-ov-sample-hint');
         hint.style.display = samples ? '' : 'none';
         hint.innerHTML = $('at-ov-sample').value === 'base'
-            ? 'Reading the <strong>base</strong>: the overlay lands only where the base matches — grime in the mortar, moss on the dark stones.'
-            : 'Reading the <strong>overlay</strong>: cuts the overlay out of its own background — a decal or mural on a flat colour.';
+            ? 'Reading the <strong>base</strong>: the overlay lands only where the base matches, grime in the mortar, moss on the dark stones.'
+            : 'Reading the <strong>overlay</strong>: cuts the overlay out of its own background, a decal or mural on a flat colour.';
         $('at-ov-source-canvas').style.cursor = (m === 'bright' || m === 'all') ? 'default' : 'crosshair';
         ovPreview();
     }
@@ -11574,8 +11694,8 @@ window.TRLE = window.TRLE || {};
         refreshTransitions();
         renderGrid();
         const n = targets.length;
-        pushHistory(n > 1 ? `${label} — ${n} tiles` : label);
-        showToast(n > 1 ? `${label} — ${n} tiles` : label, 'success');
+        pushHistory(n > 1 ? `${label}: ${n} tiles` : label);
+        showToast(n > 1 ? `${label}: ${n} tiles` : label, 'success');
     }
 
     /* Replace a tile's source image (keeps its position, material + transitions). */
@@ -11617,8 +11737,8 @@ window.TRLE = window.TRLE || {};
         params.forEach(([key, label, min, max, def, suffix]) => {
             const g = document.createElement('div');
             g.className = 'form-group';
-            g.innerHTML = `<label>${label} — <span id="at-${prefix}-${key}-val">${def}</span>${suffix || ''}</label>
-                <input type="range" id="at-${prefix}-${key}" min="${min}" max="${max}" value="${def}" style="width:100%;">`;
+            g.innerHTML = `<label>${label}: <span id="at-${prefix}-${key}-val">${def}</span>${suffix || ''}</label>
+ <input type="range" id="at-${prefix}-${key}" min="${min}" max="${max}" value="${def}" style="width:100%;">`;
             wrap.appendChild(g);
             const input = g.querySelector('input');
             input.addEventListener('input', () => {
@@ -11725,7 +11845,7 @@ window.TRLE = window.TRLE || {};
             closeModal();
             refreshTransitions();
             renderGrid();
-            pushHistory(n > 1 ? `Adjust colours — ${n} tiles` : 'Adjust colours');
+            pushHistory(n > 1 ? `Adjust colours: ${n} tiles` : 'Adjust colours');
             showToast(n > 1 ? `Colours adjusted on ${n} tiles` : 'Colours adjusted', 'success');
         });
     }
@@ -11832,8 +11952,8 @@ window.TRLE = window.TRLE || {};
         if (!hint) return;
         const no = rc.baseId === null ? '' : indexOf(rc.baseId) + 1;
         hint.textContent = rcMatchMode() === 'each'
-            ? 'Each tile is measured on its own, so they all land on the reference’s tone — even if they started at different tones. Their differences from each other are evened out.'
-            : `The shift measured from tile ${no} is applied to every tile, so deliberate variants keep their spread — but tiles that started elsewhere won’t fully reach the reference.`;
+            ? 'Each tile is measured on its own, so they all land on the reference’s tone, even if they started at different tones. Their differences from each other are evened out.'
+            : `The shift measured from tile ${no} is applied to every tile, so deliberate variants keep their spread, but tiles that started elsewhere won’t fully reach the reference.`;
     }
     function setupRecolorModal() {
         buildSliderGrid('at-rc-sliders', RC_PARAMS, 'rc', rcRender);
@@ -11855,7 +11975,7 @@ window.TRLE = window.TRLE || {};
             closeModal();
             refreshTransitions();
             renderGrid();
-            pushHistory(n > 1 ? `Recolor — ${n} tiles` : 'Recolor');
+            pushHistory(n > 1 ? `Recolor: ${n} tiles` : 'Recolor');
             showToast(n > 1 ? `Recoloured ${n} tiles from reference` : 'Recoloured from reference', 'success');
         });
     }
@@ -11970,7 +12090,7 @@ window.TRLE = window.TRLE || {};
             closeModal();
             refreshTransitions();
             renderGrid();
-            pushHistory(n > 1 ? `De-light — ${n} tiles` : 'De-light');
+            pushHistory(n > 1 ? `De-light: ${n} tiles` : 'De-light');
             showToast(whole
                 ? (n > 1 ? `De-lit ${n} tiles (baked lighting flattened)` : 'De-lit (baked lighting flattened)')
                 : 'Shadow inpainted', 'success');
@@ -12957,8 +13077,8 @@ window.TRLE = window.TRLE || {};
         // usually collapsed and "is noise on?" is the question people will have.
         const p = NOISE_PRESETS[key];
         $('at-bp-sn-state').textContent = on
-            ? `— ${p ? p.label : key} ${$('at-bp-sn-strength').value}%`
-            : '— off';
+            ? `: ${p ? p.label : key} ${$('at-bp-sn-strength').value}%`
+            : ', off';
     }
 
     /* Reset the mortar sliders to the chosen style's defaults. */
@@ -13844,7 +13964,7 @@ window.TRLE = window.TRLE || {};
                 el.edited = true;          // `original` untouched → Reset still works
             });
             closeModal(); renderGrid();
-            pushHistory(n > 1 ? `Surface noise — ${n} tiles` : 'Surface noise');
+            pushHistory(n > 1 ? `Surface noise: ${n} tiles` : 'Surface noise');
             showToast(n > 1 ? `Surface noise applied to ${n} tiles` : 'Surface noise applied', 'success');
         });
     }
@@ -14057,7 +14177,133 @@ window.TRLE = window.TRLE || {};
         atlasPreviewRender();
     }
 
+    /* ============ ROOM VIEW HANDOFF ============
+       RoomView.html renders the atlas on real Tomb Raider room geometry. It is a
+       separate page rather than a modal: it wants a viewport and a persistent
+       camera, and a second window can sit BESIDE the editor, which beats a modal
+       for comparing while you edit.
+
+       What crosses the boundary is the EXPORTED PAGES, not the element graph.
+       That is the decision the whole feature rests on: the Room View consumes
+       exactly what Tomb Editor consumes, so it needs nothing from this file
+       beyond deriveMaps and stitchAtlas, and it previews the artifact that
+       actually ships rather than an approximation of it.
+
+       Everything here obeys two existing rules. The autosave is FLUSHED before
+       navigating, because it is debounced at 900ms and a bare window.open can
+       otherwise strand a second of work outside the crash net. And the pages are
+       encoded with canvasToBlob, never toDataURL, because six 4096-wide sheets
+       through a synchronous encoder is exactly the stall PERFORMANCE.md exists
+       to keep out. */
+    async function buildRoomViewPayload() {
+        const enabledMaps = {};
+        document.querySelectorAll('#at-map-checks input[data-map]').forEach(cb => {
+            enabledMaps[cb.dataset.map] = cb.checked;
+        });
+        const cache = {};
+        const pages = {};
+        const cols = Math.max(1, state.cols);
+        const rows = Math.ceil(state.elements.length / cols);
+
+        pages.diffuse = await TRLE.Engine.canvasToBlob(stitchAtlas(el => el.canvas));
+
+        if (TRLE.MapOrder.some(mt => enabledMaps[mt])) {
+            for (let i = 0; i < state.elements.length; i++) {
+                deriveMaps(state.elements[i], enabledMaps, cache);
+                // yield, so a large atlas does not block the frame -- the same
+                // shape as exportAtlas's own loop
+                if (i % 2 === 0) await new Promise(r => setTimeout(r, 0));
+            }
+            for (const mt of TRLE.MapOrder) {
+                if (!enabledMaps[mt]) continue;
+                pages[mt] = await TRLE.Engine.canvasToBlob(
+                    stitchAtlas(el => (cache[el.id] && cache[el.id][mt]) || null));
+            }
+        }
+
+        return {
+            pages,
+            manifest: {
+                name: exportBaseName(),
+                tileSize: state.tileSize,
+                cols, rows,
+                count: state.elements.length,
+                flipNormalY: !!state.flipNormalY,
+                /* The stamp is how the Room View knows its copy is stale. It
+                   re-reads on focus only when this changes, so alt-tabbing back
+                   does not trigger a re-bake. */
+                stamp: Date.now()
+            }
+        };
+    }
+
+    /* One level of indirection so a validator can drive the handoff without a
+       popup blocker in the way, the same trick `nav.reload` uses. */
+    const roomViewNav = { open: (url) => window.open(url, 'trle-roomview') };
+
+    /* The window is opened SYNCHRONOUSLY, on the click, before anything is
+       awaited -- and then pointed at the fresh handoff once it exists.
+
+       This is not a style preference. A browser only allows window.open inside
+       the user activation the click granted, and building the payload means
+       flushing the autosave and encoding up to six atlas sheets. Opening after
+       those awaits puts the call outside that window, the browser blocks it,
+       and window.open returns NULL rather than throwing -- so the failure
+       arrives as nothing happening, or as whatever generic message the caller
+       happens to have.
+
+       Opening first also makes the "refresh rather than open a second view"
+       behaviour reliable, because the named target is claimed before any of the
+       slow work starts. */
+    async function openRoomView() {
+        if (!state.elements.length) { showToast('Slice an atlas first!', 'error'); return; }
+        const btn = $('at-room-view');
+        const win = roomViewNav.open('RoomView.html');
+        if (win === null) {
+            showToast('Your browser blocked the Room View window. Allow pop-ups for this page, then try again.', 'error');
+            return;
+        }
+        /* The tool is eleven separate <script> files with no build step, so the
+           browser can end up holding one of them at an older version than the
+           rest. That presents as a function missing from a SIBLING module, which
+           is not an obviously cache-shaped error -- so say what it is. */
+        if (!TRLE.Store || typeof TRLE.Store.saveRoomView !== 'function') {
+            try { win.close(); } catch {}
+            showToast('Your browser is running a cached copy of the tool. Reload with Ctrl+Shift+R (Cmd+Shift+R on a Mac).', 'error');
+            console.error('Room View: js/store.js is stale — TRLE.Store.saveRoomView is missing.',
+                          'Loaded store keys:', TRLE.Store ? Object.keys(TRLE.Store) : TRLE.Store);
+            return;
+        }
+        setBusy(btn, true, 'Preparing…');
+        try {
+            try {
+                clearTimeout(autosave.timer);
+                await runAutosave();
+            } catch { /* storage refused; the handoff below still works */ }
+
+            const payload = await buildRoomViewPayload();
+            const stored = await TRLE.Store.saveRoomView(payload);
+            if (!stored) {
+                showToast('Could not store the atlas for the Room View, so it is showing the sample room', 'info');
+                return;
+            }
+            /* The window was opened before the payload existed, so it may have
+               already loaded without one. Point it at the fresh record. Same
+               origin, so this is allowed; and if it has not finished loading
+               yet it simply loads once with the record already in place. */
+            try { win.location.reload(); } catch { /* it may have been closed */ }
+            showToast('Room View opened with your atlas 🏛', 'success');
+        } catch (err) {
+            console.error('Room View handoff failed:', err);
+            showToast('Could not prepare the atlas for the Room View, see the console', 'error');
+        } finally {
+            setBusy(btn, false);
+        }
+    }
+
     function setupAtlasPreview() {
+        const rvBtn = $('at-room-view');
+        if (rvBtn) rvBtn.addEventListener('click', openRoomView);
         const btn = $('at-preview-atlas');
         if (btn) btn.addEventListener('click', openAtlasPreview);
         ['at-ap-grid', 'at-ap-numbers', 'at-ap-magenta'].forEach(id => {
@@ -14331,7 +14577,7 @@ window.TRLE = window.TRLE || {};
                     frames: g.single ? 1 : idx.length,
                     tiles: g.single ? `${idx[0]}` : `${idx[0]}-${idx[idx.length - 1]}`,
                     note: g.single
-                        ? 'Single seamless tile — set UV-Rotate on this texture in Tomb Editor.'
+                        ? 'Single seamless tile, set UV-Rotate on this texture in Tomb Editor.'
                         : 'Select these consecutive tiles as an animated texture range; frames loop seamlessly (last → first).'
                 };
             });
@@ -14350,7 +14596,7 @@ window.TRLE = window.TRLE || {};
             showToast('Atlas + material maps exported! 📦', 'success');
         } catch (err) {
             console.error(err);
-            showToast('Export failed — see console for details', 'error');
+            showToast('Export failed, see console for details', 'error');
         } finally {
             setBusy(btn, false);
             setTimeout(() => { progress.classList.remove('active'); stopExportAnim(); }, 600);
@@ -14424,7 +14670,7 @@ window.TRLE = window.TRLE || {};
             showToast(`Exported ${state.elements.length} tiles individually 🧩`, 'success');
         } catch (err) {
             console.error(err);
-            showToast('Export failed — see console for details', 'error');
+            showToast('Export failed, see console for details', 'error');
         } finally {
             setBusy(btn, false);
             setTimeout(() => progress.classList.remove('active'), 600);
@@ -14546,7 +14792,7 @@ window.TRLE = window.TRLE || {};
         openConfirm(
             '💾 Save Project',
             'Name this project. The same name is used for the save file and for everything you export '
-            + '— use the folder name you want under assets/textures.',
+            + ', use the folder name you want under assets/textures.',
             '💾 Save',
             (name) => {
                 $('at-export-name').value = name;          // one global name
@@ -14571,7 +14817,7 @@ window.TRLE = window.TRLE || {};
             showToast(`Project saved as “${base}.atlasproj.json” 💾`, 'success');
         } catch (err) {
             console.error(err);
-            showToast('Could not save the project — see console for details', 'error');
+            showToast('Could not save the project, see console for details', 'error');
         } finally {
             setBusy(btn, false);
         }
@@ -14596,7 +14842,7 @@ window.TRLE = window.TRLE || {};
         openConfirm(
             '📂 Load Project',
             'You have unsaved changes. Loading replaces everything in the workbench '
-            + '— save the current project first if you want to keep it.',
+            + ', save the current project first if you want to keep it.',
             '📂 Load anyway',
             () => loadProject(file),
             { danger: true }
@@ -14608,7 +14854,7 @@ window.TRLE = window.TRLE || {};
         try { proj = JSON.parse(await readProjectText(file)); }
         catch {
             showToast(/\.zip$/i.test(file.name)
-                ? 'No project file in that ZIP — re-export with “Include the project file” ticked'
+                ? 'No project file in that ZIP, re-export with “Include the project file” ticked'
                 : 'Could not read project file', 'error');
             return;
         }
@@ -14805,7 +15051,7 @@ window.TRLE = window.TRLE || {};
             // Worth saying once the user has work that isn't being covered.
             if (!state.elements.length) return hide();
             group.style.display = '';
-            info.textContent = 'Autosave unavailable in this browser — save your project to a file.';
+            info.textContent = 'Autosave unavailable in this browser, save your project to a file.';
             btn.style.display = 'none';
             if (keep) keep.style.display = 'none';
             return;
@@ -14827,7 +15073,7 @@ window.TRLE = window.TRLE || {};
             ? `This session: ${fmtBytes(meta.bytes || 0)}\n`
               + `All data this site holds in your browser: ${fmtBytes(est.usage)}`
               + (est.quota ? ` of ~${fmtBytes(est.quota)} available` : '')
-              + `\n(the browser's own figure — it is approximate, covers everything `
+              + `\n(the browser's own figure, it is approximate, covers everything `
               + `this site has stored, and takes a while to shrink after deletions)`
             : '';
         btn.style.display = '';
@@ -14848,29 +15094,127 @@ window.TRLE = window.TRLE || {};
 
     /* Offer the stored session back, once, on boot. Never restores silently:
        the tool may have been closed deliberately, and stomping a fresh start
-       with an old atlas is worse than one extra click. */
+       with an old atlas is worse than one extra click.
+
+       IT IS A STRIP ON THE START SCREEN, NOT A MODAL. It was an `openConfirm`
+       until 2026-09-20, and users reported that refreshing and being met by a
+       dialog "feels like an ad". They are right twice over: a refresh is the
+       most ordinary thing anyone does in this tool (it is also what the logo's
+       "start over" does), and a restore is an OFFER rather than a question that
+       has to be answered before the page can be used. A modal makes an offer
+       into a toll gate. The strip sits with the other three ways in, which is
+       where someone deciding how to begin is already looking.
+
+       `hideRestoreOffer` is called from `collapseUploadCard`, so every route
+       that ends with an atlas on the workbench takes the offer away: it is
+       about starting, and by then you have started. */
+    function hideRestoreOffer() {
+        const bar = $('at-restore');
+        if (bar) bar.hidden = true;
+        // Strand any thumbnail decode still in flight, and drop the bitmaps.
+        restoreThumbToken++;
+        const strip = $('at-restore-thumbs');
+        if (strip) { strip.hidden = true; strip.innerHTML = ''; }
+    }
+
+    /* Draw the stored atlas's FIRST ROW into the offer. A name and a count do
+       not tell you which session you are being offered; a picture of it does,
+       and this is the one screen where the user is deciding between their old
+       work and a fresh start.
+
+       Lazy on purpose. The header record exists precisely so the boot path can
+       answer "is there anything to restore?" without pulling the tile Blobs
+       back out, so this only runs once the strip is already on screen, and it
+       decodes one row, not the atlas. `createImageBitmap` keeps the decode off
+       the main thread (PERFORMANCE.md).
+
+       Token-guarded: `offerSessionRestore` can run twice (boot, then _cap), and
+       two interleaved paints would double the row. */
+    const RESTORE_ROW_MAX = 8;    // an 8-wide row is plenty to recognise it by
+    const RESTORE_THUMB   = 48;
+    let restoreThumbToken = 0;
+
+    async function paintRestoreThumbs() {
+        const strip = $('at-restore-thumbs');
+        if (!strip) return;
+        const token = ++restoreThumbToken;
+        strip.hidden = true;
+        strip.innerHTML = '';
+        let proj = null;
+        try { proj = await TRLE.Store.loadSession(); } catch { return; }
+        if (token !== restoreThumbToken) return;
+        if (!proj || !Array.isArray(proj.elements) || !proj.elements.length) return;
+
+        const cols = Math.max(1, proj.cols || proj.elements.length);
+        const row = proj.elements.slice(0, Math.min(cols, RESTORE_ROW_MAX));
+        for (const e of row) {
+            const c = document.createElement('canvas');
+            c.width = c.height = RESTORE_THUMB;
+            c.className = 'at-restore-thumb';
+            strip.appendChild(c);
+            // Only `kind: 'tile'` carries pixels. A transition or an anim frame
+            // stores its recipe and is re-rendered on load, so there is nothing
+            // here to draw yet.
+            const blob = e.canvas || e.original;
+            if (!(blob instanceof Blob)) { c.classList.add('at-restore-thumb-empty'); continue; }
+            try {
+                const bmp = await createImageBitmap(blob);
+                if (token !== restoreThumbToken) { bmp.close && bmp.close(); return; }
+                c.getContext('2d').drawImage(bmp, 0, 0, RESTORE_THUMB, RESTORE_THUMB);
+                if (bmp.close) bmp.close();
+            } catch { c.classList.add('at-restore-thumb-empty'); }
+        }
+        if (token !== restoreThumbToken) return;
+        const rest = cols - row.length;
+        if (rest > 0) {
+            const more = document.createElement('span');
+            more.className = 'at-restore-more';
+            more.textContent = `+${rest}`;
+            strip.appendChild(more);
+        }
+        strip.hidden = false;
+    }
+
+    async function restoreStoredSession() {
+        const proj = await TRLE.Store.loadSession();
+        if (!proj) { showToast('That session could not be read', 'error'); return false; }
+        if (!await applyProject(proj)) return false;
+        // Restored work isn't in a file yet, so it counts as unsaved.
+        markDirty();
+        hideRestoreOffer();
+        showToast(`Session restored (${state.elements.length} elements) ⏱️`, 'success');
+        return true;
+    }
+
     async function offerSessionRestore() {
         if (!TRLE.Store || !TRLE.Store.available()) return;
         const meta = await TRLE.Store.sessionMeta();
         renderStorageInfo();
-        if (!meta || !meta.count || state.elements.length) return;
-        openConfirm(
-            '⏱️ Restore last session?',
-            `An autosaved session from ${relativeTime(meta.savedAt)} is still here — `
-            + `“${meta.name}”, ${meta.count} element${meta.count === 1 ? '' : 's'}. `
-            + `Restore it, or pick "Not now" and it stays put until you clear it.`,
-            '⏱️ Restore',
-            async () => {
-                const proj = await TRLE.Store.loadSession();
-                if (!proj) { showToast('That session could not be read', 'error'); return; }
-                if (await applyProject(proj)) {
-                    // Restored work isn't in a file yet, so it counts as unsaved.
-                    markDirty();
-                    showToast(`Session restored (${state.elements.length} elements) ⏱️`, 'success');
-                }
-            },
-            { danger: false, cancelLabel: 'Not now' }
-        );
+        const bar = $('at-restore');
+        if (!bar) return;
+        if (!meta || !meta.count || state.elements.length) { hideRestoreOffer(); return; }
+        $('at-restore-detail').textContent =
+            `“${meta.name}”, ${meta.count} element${meta.count === 1 ? '' : 's'}, `
+            + `autosaved ${relativeTime(meta.savedAt)}. It stays here either way until you clear it.`;
+        bar.hidden = false;
+        // After the strip is up: it costs an IndexedDB read, and the offer
+        // should not wait on one to become clickable.
+        paintRestoreThumbs();
+    }
+
+    function setupRestoreOffer() {
+        const go = $('at-restore-go'), no = $('at-restore-no');
+        if (!go || !no) return;
+        go.addEventListener('click', async () => {
+            setBusy(go, true, 'Restoring…');
+            try { await restoreStoredSession(); }
+            finally { setBusy(go, false); }
+        });
+        /* "Not now" hides the strip for this page load and nothing else. It is
+           deliberately NOT remembered: the session is still in the browser, the
+           left rail still says so, and a remembered dismissal would leave
+           someone who changed their mind with no way back to it. */
+        no.addEventListener('click', hideRestoreOffer);
     }
 
     function setupStorageUI() {
@@ -14880,14 +15224,14 @@ window.TRLE = window.TRLE || {};
         if (keep) keep.addEventListener('click', async () => {
             const ok = await TRLE.Store.requestPersistence();
             showToast(ok ? 'Stored session protected from browser cleanup 🔒'
-                         : 'The browser declined — the session is still autosaved, just evictable if disk runs low',
+                         : 'The browser declined, the session is still autosaved, just evictable if disk runs low',
                       ok ? 'success' : 'warning', ok ? 3000 : 5000);
             renderStorageInfo();
         });
         btn.addEventListener('click', () => openConfirm(
             '🧹 Clear stored session',
             'This deletes the autosaved session from this browser. Your exported files and '
-            + 'saved project files are untouched — but anything not saved to a file is gone.',
+            + 'saved project files are untouched, but anything not saved to a file is gone.',
             '🧹 Clear',
             () => { discardAutosave(); showToast('Stored session cleared 🧹', 'success'); },
             { danger: true }
@@ -14995,9 +15339,9 @@ window.TRLE = window.TRLE || {};
         const cellW = iw / cols, cellH = ih / rows;
         const reasons = [];
         if (Math.abs(cellW / cellH - 1) > 0.02)
-            reasons.push(`each cell is <strong>${(cellW).toFixed(0)}×${(cellH).toFixed(0)}</strong> (not square) — tiles get stretched to ${imp.targetSize}²`);
+            reasons.push(`each cell is <strong>${(cellW).toFixed(0)}×${(cellH).toFixed(0)}</strong> (not square), tiles get stretched to ${imp.targetSize}²`);
         else if (Math.abs(iw % cols) > 0.5 || Math.abs(ih % rows) > 0.5)
-            reasons.push(`${iw}×${ih} doesn’t divide evenly into ${cols}×${rows} — cell edges are rounded`);
+            reasons.push(`${iw}×${ih} doesn’t divide evenly into ${cols}×${rows}, cell edges are rounded`);
         const warn = $('at-import-warn');
         if (reasons.length) { warn.innerHTML = '⚠️ ' + reasons.join('; ') + '. Adjust Columns/Rows to match the source for a clean 1:1 slice.'; warn.style.display = 'block'; }
         else warn.style.display = 'none';
@@ -15095,7 +15439,7 @@ window.TRLE = window.TRLE || {};
                 const size = state.tileSize || getTileSize() || 256;
                 const square = img.naturalWidth === img.naturalHeight;
                 openConfirm('📋 Paste image from clipboard',
-                    `Add the copied image (${img.naturalWidth}×${img.naturalHeight}px${square ? '' : ' — not square'}) to your atlas? You’ll choose how to slice it into tiles next.`,
+                    `Add the copied image (${img.naturalWidth}×${img.naturalHeight}px${square ? '' : ', not square'}) to your atlas? You’ll choose how to slice it into tiles next.`,
                     'Continue', () => openImportModal(img, size, isFirst),
                     { danger: false, cancelLabel: 'Cancel' });
             };
@@ -15119,7 +15463,7 @@ window.TRLE = window.TRLE || {};
         renderGrid();
         collapseUploadCard('blank atlas · click to start a different atlas');
         resetHistory('Blank atlas');
-        showToast('Blank atlas created — add tiles with “Add Image(s)”', 'info', 3500);
+        showToast('Blank atlas created, add tiles with “Add Image(s)”', 'info', 3500);
     }
 
     /* Load image files into tiles (preserves selection order). */
@@ -15138,7 +15482,7 @@ window.TRLE = window.TRLE || {};
        toward the atlas importer instead of squishing the sheet into one tile. */
     function atlasLikeReason(img) {
         const w = img.naturalWidth, h = img.naturalHeight, S = state.tileSize || getTileSize() || 256;
-        if (Math.abs(w / h - 1) > 0.12) return 'it isn’t square — atlas sheets usually aren’t';
+        if (Math.abs(w / h - 1) > 0.12) return 'it isn’t square, atlas sheets usually aren’t';
         if (Math.max(w, h) >= 3 * S) return 'it’s much larger than a single tile';
         return null;
     }
@@ -15165,7 +15509,7 @@ window.TRLE = window.TRLE || {};
                 if (why) {
                     const S = state.tileSize || getTileSize();
                     openConfirm('🗺️ Looks like an atlas',
-                        `This image is ${img.naturalWidth}×${img.naturalHeight} — ${why}. Adding it as one tile resizes the whole sheet down to ${S}². Pick tiles from it as an atlas instead?`,
+                        `This image is ${img.naturalWidth}×${img.naturalHeight}: ${why}. Adding it as one tile resizes the whole sheet down to ${S}². Pick tiles from it as an atlas instead?`,
                         '🗺️ Import from Atlas…',
                         () => openImportModal(img, S, !state.elements.length, assets[0].maps),
                         { cancelLabel: 'Add as one tile', danger: false, onNo: () => commitImageTiles(assets) });
@@ -15211,6 +15555,7 @@ window.TRLE = window.TRLE || {};
         const card = $('at-upload-card');
         if (card) card.open = false;
         if (hint) $('at-upload-summary-hint').textContent = hint;
+        hideRestoreOffer();
     }
 
     async function sliceAtlas() {
@@ -15273,7 +15618,7 @@ window.TRLE = window.TRLE || {};
         if (!ok) {
             const banner = $('webgl-compat-banner');
             banner.querySelector('.compat-message').textContent =
-                'WebGL 2.0 is not supported by this browser — the Atlas Tool cannot run.';
+                'WebGL 2.0 is not supported by this browser, the Atlas Tool cannot run.';
             banner.style.display = 'flex';
             return;
         }
@@ -15289,7 +15634,7 @@ window.TRLE = window.TRLE || {};
                 ? ` · ${Object.keys(state.imageLayers).length} material map(s) from PSD layers`
                 : '';
             $('at-upload-summary-hint').textContent =
-                `${img.naturalWidth}×${img.naturalHeight} loaded${layerNote} — choose a tile size, then Slice or Pick tiles`;
+                `${img.naturalWidth}×${img.naturalHeight} loaded${layerNote}, choose a tile size, then Slice or Pick tiles`;
         });
         $('at-slice-btn').addEventListener('click', sliceAtlas);
         $('at-pick-btn').addEventListener('click', () => {
@@ -15345,9 +15690,13 @@ window.TRLE = window.TRLE || {};
                     alphaWarn.style.display = n ? 'block' : 'none';
                     const label = $('at-height-alpha-count');
                     if (label) label.textContent = n === state.elements.length ? 'All' : String(n);
+                    // "1 of your tiles have transparency" was the read on a bench with
+                    // one cutout, which is most of them while you are learning.
+                    const verb = $('at-height-alpha-verb');
+                    if (verb) verb.textContent = n === 1 ? 'has' : 'have';
                 }
                 if (toast && heightCb.checked) {
-                    showToast('Height maps are GPU-expensive — prefer one texture at a time over a whole atlas', 'warning', 5000);
+                    showToast('Height maps are GPU-expensive, prefer one texture at a time over a whole atlas', 'warning', 5000);
                 }
             };
             heightCb.addEventListener('change', () => syncHeightWarn(true));
@@ -15388,6 +15737,7 @@ window.TRLE = window.TRLE || {};
         setupHistoryShortcuts();
         setupUnloadGuard();
         setupStorageUI();
+        setupRestoreOffer();
 
         setupGrid();
         setupCtxMenu();
@@ -15429,8 +15779,11 @@ window.TRLE = window.TRLE || {};
         // the REAL composition functions over CDP (single-sourced, no drift).
         // Capture runs skip the restore prompt (they build their own atlas and a
         // stray modal would break them) and trigger it via _cap instead.
-        if (/[?&]capture/i.test(location.search)) installCaptureHook();
+        // `?demo` deliberately reuses this rather than growing a second hook: two
+        // flags with overlapping behaviour is how the texturetool.html chimera began.
+        if (DEMO_MODE || /[?&]capture/i.test(location.search)) installCaptureHook();
         else offerSessionRestore();
+        if (DEMO_MODE) demoSetupFrame();
     }
 
     function installCaptureHook() {
@@ -16174,6 +16527,61 @@ window.TRLE = window.TRLE || {};
             // test-only: an atlas of DIFFERENT textures, one per url. setupManyTiles
             // clones one image n times, which can't show whether something read the
             // tile it was told to or just any tile.
+            /* Load an atlas image the way the upload card does, WITHOUT the file
+               picker -- which cannot be opened programmatically. The demo course
+               then clicks the real `#at-slice-btn`, so a lesson shows the genuine
+               slice (busy state, toast, collapsing upload card) rather than a
+               grid that appears by magic. */
+            /* Room View handoff (subphase 2.9). `stubRoomViewNav` replaces the
+               window.open so a validator can assert on the PAYLOAD without a
+               popup it cannot follow -- the same indirection `stubNav` uses for
+               location.reload, and for the same reason. */
+            stubRoomViewNav(fn) { roomViewNav.open = fn; },
+            openRoomView,
+            buildRoomViewPayload,
+
+            async loadAtlas(src) {
+                const img = await loadImg(src);
+                state.image = img;
+                state.imageLayers = null;
+                $('at-slice-btn').disabled = false;
+                $('at-pick-btn').disabled = false;
+                $('at-upload-summary-hint').textContent =
+                    `${img.naturalWidth}×${img.naturalHeight} loaded, choose a tile size, then Slice or Pick tiles`;
+                return { w: img.naturalWidth, h: img.naturalHeight };
+            },
+            /* Build an EXACT tile set for a demo lesson. Entries are either a
+               path (the whole image becomes one tile) or
+               `{ src, cell: [col, row], cellSize }` (one cell cut out of a
+               sheet), so a lesson can mix standalone example textures with
+               specific tiles of ExampleAtlas.png — "the darker sand and the
+               lighter sand" rather than whatever happened to be at index 4.
+               `setupTilesFrom` cannot do the second: it scales each whole image
+               down to one tile, which would squash a 4x4 sheet into a thumbnail. */
+            async setupFrom(entries, S) {
+                state.tileSize = S; state.cols = 4; state.elements = []; state.nextId = 1;
+                state.selectedId = null; state.selSet.clear(); state.selAnchor = null;
+                for (const e of entries) {
+                    const spec = typeof e === 'string' ? { src: e } : e;
+                    const img = await loadImg(spec.src);
+                    const c = document.createElement('canvas');
+                    c.width = c.height = S;
+                    const x = c.getContext('2d');
+                    if (spec.cell) {
+                        const cs = spec.cellSize || S;
+                        x.drawImage(img, spec.cell[0] * cs, spec.cell[1] * cs, cs, cs, 0, 0, S, S);
+                    } else {
+                        x.drawImage(img, 0, 0, S, S);
+                    }
+                    state.elements.push(tile(c, state.nextId++));
+                }
+                $('at-grid-card').style.display = 'block';
+                $('at-export-card').style.display = 'block';
+                collapseUploadCard(`${state.elements.length} elements · click to start a different atlas`);
+                resetHistory('Lesson set up');
+                renderGrid();
+                return state.elements.length;
+            },
             async setupTilesFrom(srcs, S) {
                 state.tileSize = S; state.cols = 4; state.elements = []; state.nextId = 1;
                 for (const u of srcs) {
@@ -16202,7 +16610,16 @@ window.TRLE = window.TRLE || {};
             storeMeta() { return TRLE.Store.sessionMeta(); },
             offerRestore() { return offerSessionRestore(); },
             clearStore() { discardAutosave(); return true; },
-            openAnchor() { openAnchorModal(1, 2); return true; },
+            /* The transition builders all arrive through the two-click pick flow
+               (right-click A, then click B). A lesson wants them open on a NAMED
+               pair so its copy can say "grass over sand" and mean it, and the
+               pick flow itself gets its own step rather than being re-enacted
+               before every builder. Ids default to 1/2 for the older validators
+               that call these with no arguments. */
+            openAnchor(a, b) { openAnchorModal(a || 1, b || 2); return true; },
+            openWang(a, b) { openWangModal(a || 1, b || 2); return true; },
+            openBset(a, b) { openBsetModal(a || 1, b || 2); return true; },
+            openHeightTrans(a, b) { openHeightModal(a || 1, b || 2); return true; },
             openTrans() { openTransModal(1, 2); return true; },
             openCtx(id) { openCtxMenuForCell(id); return true; },
             // test-only selection driver: select by index, read back the selection
@@ -16224,9 +16641,49 @@ window.TRLE = window.TRLE || {};
             // Project JSON header only — the full thing carries every tile as a
             // data-URL and would be far too big to hand back over CDP.
             async projectHead() { const p = await buildProjectJSON(); return { name: p.name, version: p.version, count: p.elements.length }; },
-            openGrid() { openTransGridModal(1, 2); return true; },
-            openOrganic() { openOrganicModal(1, 2); return true; },
+            openGrid(a, b) { openTransGridModal(a || 1, b || 2); return true; },
+            openOrganic(a, b) { openOrganicModal(a || 1, b || 2); return true; },
             openTrans(baseId, overlayId) { openTransModal(baseId || 1, overlayId || 2); return true; },
+            /* Recolor normally arrives through the two-click pick flow (right-click
+               a tile, then click the reference). A lesson wants the modal open on
+               a NAMED pair, so it can say "the darker sand onto the lighter one"
+               and mean it. */
+            openRecolor(baseId, refId) { openRecolorModal(baseId, refId); return true; },
+            /* Overlay arrives through the same two-click pick flow as Recolor
+               (right-click the base, then click the texture to lay on top), and a
+               lesson wants it open on a NAMED pair for the same reason. */
+            openOverlay(baseId, overlayId) { openOverlayModal(baseId, overlayId); return true; },
+            /* "Import from Atlas…" opens an OS file dialog before it opens the
+               modal, which a script cannot drive and a lesson should not try to:
+               a file dialog over a course is hostile. This is the same modal on a
+               named image. */
+            async openImport(src, size) {
+                openImportModal(await loadImg(src), size || state.tileSize || 256, !state.elements.length);
+                return true;
+            },
+            /* The parallax preview's view angle. It is deliberately not a control
+               (you turn a 3D view by grabbing it), so this is the only way a
+               script can move it, and parallax only declares itself when the view
+               moves: the whole point of the march is that near pixels slide over
+               far ones. Same role matLight plays for the normal map. */
+            hgView(yaw, pitch) { hgSetView(yaw, pitch); return { yaw: hg.yaw, pitch: hg.pitch }; },
+            /* Show only some of the maps in the 2D lit preview. `{ normal: false }`
+               relights the tile with a flat normal and everything else intact, so
+               a lesson can turn one map off and move the light to show what it was
+               doing. Pass null to restore. */
+            matPreviewShow(only) {
+                matPreviewOnly = only || null;
+                matRenderLit();
+                return true;
+            },
+            /* The 2D preview's light direction, which is otherwise only reachable
+               by dragging on the canvas. */
+            matLight(x, y, z) {
+                const len = Math.hypot(x, y, z) || 1;
+                mat.lightDir = [x / len, y / len, z / len];
+                matRenderLit();
+                return mat.lightDir;
+            },
             /* test-only: worst mismatch between the COMPOSED pixels either side of
                every shared edge inside a terrain block, read off the live grid
                canvases — what actually ships, not just the mask.
@@ -16288,6 +16745,49 @@ window.TRLE = window.TRLE || {};
             seamToggle(side, seg) { if (org.seam) org.seam[side][seg] = !org.seam[side][seg]; orgDrawSeamBox(); return org.seam ? org.seam[side][seg] : null; },
             modalRect(name) { const m = $(`at-modal-${name}`); const r = m.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height }; }
         };
+    }
+
+    /* ============ DEMO FRAME BRIDGE ============
+       The frame side of the demo course. Deliberately tiny: the parent already has
+       the whole of `_cap` and full same-origin DOM access, so the only thing it
+       cannot do from outside is reach the closure's applyTheme/applyScale. */
+    function demoSetupFrame() {
+        TRLE.Demo = {
+            /* The parent owns theme and UI scale, because namespacing PREFS_KEY is
+               exactly what stops this frame reading the user's own choice. */
+            applyChrome(opts) {
+                opts = opts || {};
+                if (opts.theme) applyTheme(opts.theme === 'light' ? 'light' : 'dark');
+                if (typeof opts.uiScale === 'number') applyScale(opts.uiScale);
+                return true;
+            },
+            /* The tool's own side rails (Session + Messages on the left, History
+               on the right) are HIDDEN in the course by default, and a step asks
+               for the one it teaches. Inside a 1400px frame those two rails cost
+               the grid 500px of the 1368 it could have, and neither is something
+               a lesson is talking about until lesson 1's last step. They are
+               styled out rather than removed: `showToast` writes into the left
+               rail's log unconditionally, so the element has to stay in the DOM
+               or every message in the course throws. */
+            showRails(which) {
+                const cl = document.documentElement.classList;
+                const w = String(which || '');
+                cl.toggle('at-demo-rail-l', w === 'left' || w === 'both');
+                cl.toggle('at-demo-rail-r', w === 'right' || w === 'both');
+                return w;
+            },
+            /* Which records this frame is writing to, so a validator can prove the
+               real slot was never touched. */
+            storageKeys() {
+                return {
+                    prefs: PREFS_KEY,
+                    presets: USER_PRESETS_KEY,
+                    session: TRLE.Store && TRLE.Store.currentSlot ? TRLE.Store.currentSlot() : null
+                };
+            },
+            ready: true
+        };
+        document.documentElement.classList.add('at-demo-frame');
     }
 
     /* ============ ACCESSIBILITY: theme + UI scale (persisted) ============ */

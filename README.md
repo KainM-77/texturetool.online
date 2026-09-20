@@ -23,7 +23,11 @@ emissive) — all on the GPU, entirely in your browser.
   texture (brush / lasso / rectangle / ellipse / magic-wand), as ordered layers.
 - **Animated textures** — procedural, seamlessly-looping animated texture sets.
 - **3D preview** — optional displaced-mesh PBR preview (Babylon.js, lazy-loaded).
+- **Room View** — open your atlas on real Tomb Raider room geometry, lit the way Tomb Editor
+  bakes a room and shaded the way Tomb Engine draws one. Paint faces, move the bulbs, carry a
+  flame around and sweep the sun through a day.
 - **Learn page** — an in-app tutorial with before/after examples for every tool.
+- **Demo course** — lesson-based walkthroughs that drive the real tool in a sandbox.
 
 ## Running locally
 
@@ -49,7 +53,16 @@ Then open <http://localhost:8080>.
 
 ## License
 
-**MIT — all of it.** See [LICENSE](LICENSE). No copyleft strings; reuse any part.
+**MIT, with one directory excepted.** See [LICENSE](LICENSE). No copyleft strings.
+
+`ten/` is derived from [TombEngine](https://github.com/TombEngine/TombEngine) and carries
+TombEngine's licence: Modified MIT, **non-commercial use only** (`ten/LICENSE`). It holds the
+shaders that reproduce the engine: the Room View's room lighting, the two parallax previews and
+the Material modal's lit composite. Everything outside it is plain MIT and free to reuse.
+
+Nothing in `ten/` generates a material map or touches the export, so **the directory is
+separable**: delete it and you keep a working MIT tool, losing only those previews. See
+`ten/README.md`.
 
 The project was GPL-3.0 until 2026-09-13, when the two seamless-tiling shaders
 adapted from [Materialize](https://github.com/BoundingBoxSoftware/Materialize)

@@ -39,11 +39,11 @@
                 'Coming back to earlier work? <strong>Load existing atlas project</strong> takes the export ZIP the tool gave you, or a saved <code>.atlasproj.json</code>, and restores every tile, material and transition. You do not need to re-slice anything.',
                 'Set the <strong>Tile Size</strong> first if you are starting fresh. Every map atlas in a set has to share it, and a saved project brings its own.',
                 'Drop an atlas image and click <strong>Slice Atlas</strong> to cut the whole sheet; or',
-                'Click <strong>Pick tiles…</strong> to set a grid and choose exactly which cells to import — rip one texture, grab several, or stitch from multiple atlases (each cell is resized to your tile size). Add more later with <strong>Import from Atlas…</strong>.',
+                'Click <strong>Pick tiles…</strong> to set a grid and choose exactly which cells to import, rip one texture, grab several, or stitch from multiple atlases (each cell is resized to your tile size). Add more later with <strong>Import from Atlas…</strong>.',
                 'Or click <strong>Create Blank Atlas</strong> under <strong>Generate a new atlas</strong> (set the columns), then add textures with <strong>Add Image(s)</strong>, <strong>Add Blank</strong>, or the <strong>＋</strong> cell.',
-                'You can also <strong>paste an image</strong> (Ctrl/Cmd+V) from your clipboard — confirm, then slice it like an imported atlas.',
+                'You can also <strong>paste an image</strong> (Ctrl/Cmd+V) from your clipboard, confirm, then slice it like an imported atlas.',
                 'Each tile is an element you can <strong>right-click</strong> to edit.',
-                'PNG, JPG, BMP, WebP, TGA and PSD all load. A layered PSD brings its material maps in with it — see <em>File types</em>.'
+                'PNG, JPG, BMP, WebP, TGA and PSD all load. A layered PSD brings its material maps in with it, see <em>File types</em>.'
             ],
             tip: 'Everything is non-destructive and fully undoable (<strong>Ctrl/Cmd+Z</strong>). <strong>Pick tiles…</strong> and <strong>Import from Atlas…</strong> append to the current atlas, so you can build one up from several sources.'
         },
@@ -51,26 +51,26 @@
             id: 'grid-basics', icon: '🖱️', title: 'Working with the grid',
             what: 'The grid is keyboard- and mouse-friendly. <strong>Right-click</strong> (or focus a tile and press the <strong>Menu</strong> key) for its actions.',
             how: [
-                'The right-click menu is grouped into columns — <strong>Transitions</strong>, <strong>Generate</strong>, <strong>Transform</strong>, <strong>Adjust</strong>, <strong>Material</strong>, <strong>File</strong> — laid out side by side so everything is visible without scrolling. Groups that do not apply are hidden: an animation frame or a transition tile shows fewer columns than a plain tile.',
+                'The right-click menu is grouped into columns, <strong>Transitions</strong>, <strong>Generate</strong>, <strong>Transform</strong>, <strong>Adjust</strong>, <strong>Material</strong>, <strong>File</strong>, laid out side by side so everything is visible without scrolling. Groups that do not apply are hidden: an animation frame or a transition tile shows fewer columns than a plain tile.',
                 'Arrow keys move focus, <strong>Enter</strong>/<strong>Space</strong> select; <strong>S</strong>/<strong>T</strong>/<strong>M</strong>/<strong>H</strong> trigger Seamless / Transition / Material / Heal.',
                 '<strong>Drag</strong> tiles to reorder, or <strong>Ctrl/Cmd+←/→</strong> to nudge; change <strong>Columns</strong> / <strong>Rows</strong> to reflow the whole atlas. Dragging a tile that is part of a selection moves the <em>whole</em> selection as one block, keeping its order.',
                 '<strong>Replace Image</strong> (right-click) swaps a tile’s texture; <strong>Reset to Original</strong> reverts it.',
                 'Remove a tile with right-click → <strong>Delete…</strong> (or press <strong>Delete</strong> on a focused tile); to clear several at once, select them (see below) and hit <strong>Delete</strong> on the bulk bar.',
                 'Tiles added by a set builder are outlined in orange: they form a <em>block</em> that only reads correctly at its own width. Change <strong>Columns</strong> and each block keeps its shape, its rows padded out with black spacer tiles. Delete a tile out of one and the block can no longer be whole rows, so it gives up the outline and reflows like any other tile.',
-                '<strong>👁️ Preview atlas</strong>, on the right of the Layout row, stitches everything into one image exactly as it exports — same order, same columns, same pixel size — with optional tile boundaries and numbers drawn over the top.',
-                '<strong>Undo</strong> / <strong>Redo</strong> sit in the grid header (<strong>Ctrl/Cmd+Z</strong>, <strong>Ctrl/Cmd+Shift+Z</strong>); the <strong>History</strong> panel on the right lists every step — click one to jump back.'
+                '<strong>👁️ Preview atlas</strong>, on the right of the Layout row, stitches everything into one image exactly as it exports, same order, same columns, same pixel size, with optional tile boundaries and numbers drawn over the top.',
+                '<strong>Undo</strong> / <strong>Redo</strong> sit in the grid header (<strong>Ctrl/Cmd+Z</strong>, <strong>Ctrl/Cmd+Shift+Z</strong>); the <strong>History</strong> panel on the right lists every step, click one to jump back.'
             ],
-            tip: 'Deleting a tile that other transitions are built on also removes those transitions (you’re warned first, and it’s fully undoable). Spacer tiles are black and they <em>do</em> ship in the exported atlas — that is the point of them, they hold your page alignment. Status messages appear in the log on the left, and transition tiles always stay after their source tiles automatically.'
+            tip: 'Deleting a tile that other transitions are built on also removes those transitions (you’re warned first, and it’s fully undoable). Spacer tiles are black and they <em>do</em> ship in the exported atlas, that is the point of them, they hold your page alignment. Status messages appear in the log on the left, and transition tiles always stay after their source tiles automatically.'
         },
         {
             id: 'batch-select', icon: '☑️', title: 'Select & batch-edit tiles',
-            what: 'Work on many tiles at once — like selecting icons on a desktop. Pick a group of tiles and a <strong>bulk-action bar</strong> appears so you can material, reorder, group or delete them together.',
+            what: 'Work on many tiles at once, like selecting icons on a desktop. Pick a group of tiles and a <strong>bulk-action bar</strong> appears so you can material, reorder, group or delete them together.',
             how: [
                 '<strong>Click</strong> a tile to select it; <strong>Ctrl/Cmd+click</strong> to add or remove individual tiles; <strong>Shift+click</strong> to select a whole range.',
                 '<strong>Drag a box</strong> across the grid background to rubber-band several tiles at once. <strong>Ctrl/Cmd+A</strong> selects everything; <strong>Esc</strong> clears.',
                 'With 2+ selected, use the bar: <strong>🎨 Apply Material</strong> (set one material on all of them, saved ⭐ presets included), <strong>🧲 Group together</strong> (gather them side-by-side), <strong>⏮ To front</strong> / <strong>To back ⏭</strong>, or <strong>🗑️ Delete</strong>. The bar sticks below the header, so it stays reachable while you scroll a tall atlas.',
-                '<strong>Right-clicking any selected tile</strong> works on the whole selection. Any menu entry that can run on several tiles says so — it reads <em>“— N tiles”</em> — and applies to all of them: <strong>Set Material</strong>, <strong>Adjust Colours</strong>, <strong>Recolor from Texture</strong>, <strong>De-light</strong>, <strong>Surface Noise</strong>, <strong>Make Seamless</strong>, the four <strong>Transform</strong> entries, <strong>Download PNG</strong> and <strong>Reset to Original</strong>. Right-clicking a tile <em>outside</em> the selection drops back to that one tile.',
-                'Entries with no count are per-tile by nature — <strong>Heal</strong>, <strong>Fade</strong>, <strong>Make Emissive</strong>, <strong>Build Pattern</strong>, <strong>Stained Glass</strong> and the transition builders all need something painted or picked on one specific texture.',
+                '<strong>Right-clicking any selected tile</strong> works on the whole selection. Any menu entry that can run on several tiles says so, it reads <em>“· N tiles”</em> and applies to all of them: <strong>Set Material</strong>, <strong>Adjust Colours</strong>, <strong>Recolor from Texture</strong>, <strong>De-light</strong>, <strong>Surface Noise</strong>, <strong>Make Seamless</strong>, the four <strong>Transform</strong> entries, <strong>Download PNG</strong> and <strong>Reset to Original</strong>. Right-clicking a tile <em>outside</em> the selection drops back to that one tile.',
+                'Entries with no count are per-tile by nature, <strong>Heal</strong>, <strong>Fade</strong>, <strong>Make Emissive</strong>, <strong>Build Pattern</strong>, <strong>Stained Glass</strong> and the transition builders all need something painted or picked on one specific texture.',
                 'Once you have assigned a material, <strong>🎨 Apply Last Material</strong> appears in the right-click menu and as <strong>↺ Repeat</strong> on the bar. It reapplies the last material with no modal, on one tile or a whole selection.'
             ],
             tip: 'A batch modal shows the settings on one tile and applies them to all of them, so tune against the preview then hit Apply once. <strong>Recolor</strong> adds a choice for this: <em>Match each tile to the reference</em> measures every tile separately so they all land on the reference’s tone (good for making mismatched textures sit together), while <em>Apply the same shift to every tile</em> keeps deliberate variants apart. <strong>Apply Material</strong> skips transition tiles (they inherit from their sources). Everything here is one undo step.'
@@ -78,25 +78,25 @@
         {
             id: 'seamless', icon: '🔄', title: 'Make Seamless',
             what: 'Removes the visible seam when a texture is tiled, so it repeats cleanly across a surface.',
-            how: ['<strong>Right-click</strong> a tile → <strong>Make Seamless</strong>.', 'Pick a method (<strong>Scattered edges</strong> is the all-rounder) and the blend radius.', 'Click <strong>Save to Atlas</strong> — the tile updates in place and any transitions using it refresh.'],
+            how: ['<strong>Right-click</strong> a tile → <strong>Make Seamless</strong>.', 'Pick a method (<strong>Scattered edges</strong> is the all-rounder) and the blend radius.', 'Click <strong>Save to Atlas</strong>, the tile updates in place and any transitions using it refresh.'],
             gallery: [
-                { src: 'seamless-orig.png', cap: 'Original (tiled — see the seam)' },
-                { src: 'seamless-pan.gif', cap: 'Scattered edges 20% — tiles seamlessly' },
+                { src: 'seamless-orig.png', cap: 'Original (tiled, see the seam)' },
+                { src: 'seamless-pan.gif', cap: 'Scattered edges 20%, tiles seamlessly' },
                 { src: 'seamless-blend.png', cap: 'Blend radius 100%' },
                 { src: 'seamless-final.png', cap: 'Finished tile' }
             ],
-            tip: 'The 2×2 tilings show the centre cross, where seams appear. The GIF pans across the tiled result — a seamless tile has no visible repeat line. A higher blend radius hides the seam harder but softens detail, so dial it back if the texture goes muddy.'
+            tip: 'The 2×2 tilings show the centre cross, where seams appear. The GIF pans across the tiled result, a seamless tile has no visible repeat line. A higher blend radius hides the seam harder but softens detail, so dial it back if the texture goes muddy.'
         },
         {
             id: 'transitions', icon: '🔀', title: 'Transitions',
             what: 'Blends two textures along an edge or corner so terrain types meet without a hard line.',
-            how: ['<strong>Right-click</strong> tile A → <strong>Make Transition with Texture</strong>, then click tile B.', 'Choose <strong>Directions</strong> (or paint a <strong>Custom</strong> mask) and a <strong>Blend method</strong>.', 'Re-orient the overlay (B) with <strong>Rotate</strong> / <strong>Flip</strong> if needed, then click <strong>Add</strong> — one tile per direction.'],
+            how: ['<strong>Right-click</strong> tile A → <strong>Make Transition with Texture</strong>, then click tile B.', 'Choose <strong>Directions</strong> (or paint a <strong>Custom</strong> mask) and a <strong>Blend method</strong>.', 'Re-orient the overlay (B) with <strong>Rotate</strong> / <strong>Flip</strong> if needed, then click <strong>Add</strong>, one tile per direction.'],
             before: 'transition',
             tip: 'Blend methods: <strong>Alpha</strong> (cross-fade), <strong>Height</strong> (organic interlock), <strong>Poisson</strong> (matches tone when the two differ in brightness). Or switch to the <strong>Full Set</strong> tab (below) to generate a whole patch at once.'
         },
         {
             id: 'transition-sets', icon: '🧱', title: 'Transition sets (full patch)',
-            what: 'The <strong>Full Set</strong> tab of Make Transition builds a whole terrain patch in one step and lays it into the atlas <em>spatially</em> — so the arrangement itself shows how the pieces fit, and you can see exactly which tile you’re picking in Tomb Editor. Reach for it when you want a ready-made island, hole or complete set rather than hand-picking single edges.',
+            what: 'The <strong>Full Set</strong> tab of Make Transition builds a whole terrain patch in one step and lays it into the atlas <em>spatially</em>, so the arrangement itself shows how the pieces fit, and you can see exactly which tile you’re picking in Tomb Editor. Reach for it when you want a ready-made island, hole or complete set rather than hand-picking single edges.',
             how: [
                 '<strong>Right-click</strong> tile A → <strong>Make Transition with Texture</strong>, click tile B, then switch to the <strong>🧩 Full Set</strong> tab.',
                 'Pick a <strong>Set layout</strong>: <strong>3×3 Island</strong> (a pocket of the overlay surrounded by the base), <strong>3×3 Hole</strong> (a window of the base inside the overlay), or <strong>5×3 Complete</strong> (island + hole + plain tiles together).',
@@ -112,64 +112,64 @@
             what: 'The boundary a transition draws is a clean curve, which reads as generated. The <strong>🌿 Organic edge</strong> panel breaks it up into a ragged, flecked, hand-painted one. It is in four places: the <strong>Single Tiles</strong> and <strong>Full Set</strong> tabs of Make Transition, in <strong>Make Wang Set</strong>, and in <strong>Add Borders &amp; Corners</strong>. It is a different thing from <strong>Make Organic Transition</strong> below: that scatters the overlay into loose patches across a single tile, this reshapes a boundary while keeping every tile joined to its neighbours.',
             how: [
                 'On <strong>Single Tiles</strong>, pick your <strong>Directions</strong> and open <strong>🌿 Organic edge</strong>. On <strong>Full Set</strong>, build the set with <strong>Corner style</strong> on <strong>Seamless</strong> first. Every slider starts at 0 and nothing changes until you move one.',
-                'The panel is hidden for a <strong>Custom</strong> painted mask — that mask is already whatever shape you drew.',
+                'The panel is hidden for a <strong>Custom</strong> painted mask, that mask is already whatever shape you drew.',
 'Pick an <strong>Edge style</strong>. <strong>Blobs</strong> gives soft rounded lobes, <strong>Spikes</strong> short tapered teeth, <strong>Drips</strong> long reaching fingers, <strong>Clumps</strong> chunky lobes with gaps, <strong>Fray</strong> a fine ragged fringe. Each one loads its own suggested settings and a line saying what it suits.',
-                'Teeth and fingers point <em>away</em> from the overlay, following the boundary wherever it runs — so an overlay coming up from the bottom spikes upward, and a corner spikes outward along its curve. Nothing is locked to a world direction, because a TRLE texture can be rotated freely.',
+                'Teeth and fingers point <em>away</em> from the overlay, following the boundary wherever it runs, so an overlay coming up from the bottom spikes upward, and a corner spikes outward along its curve. Nothing is locked to a world direction, because a TRLE texture can be rotated freely.',
                 '<strong>Amount</strong> sets how far the style pushes the boundary. <strong>Drift</strong> stops it crossing each tile edge at dead centre, which is the main tell that a set was generated. <strong>Scatter</strong> throws flecks of the overlay out past the edge.',
                 '<strong>Detail softness</strong> softens the parts the style moved, and only those. <strong>Hardness</strong> above widens the blend across the whole tile instead, which flattens the shape you just made.',
                 '<strong>Contact shadow</strong> darkens the base just outside the boundary so the overlay sits <em>on</em> it rather than inlaid into it. Turn it up and you get a <strong>Colour</strong>, a <strong>Blend</strong> and a <strong>Sits on</strong> control: <strong>Multiply</strong> darkens toward the colour and keeps the texture under it, <strong>Tint</strong> paints over and can lighten. A pale colour on Tint with <strong>Sits on</strong> near 100 gives a lit rim on the overlay instead of a shadow on the base.',
-                '<strong>Apply to</strong> decides where the shadow goes, and it matters more than it looks. In the <strong>Diffuse</strong> it is painted into the texture, which is what classic TRLE wants. But if you export relief maps, the map generator reads that darkening back out of the diffuse luminance and turns it into <em>geometry</em> — a band that looked right flat comes out as a trench in the normals. Send it to the <strong>AO map</strong> instead and the engine applies it as occlusion, leaving the diffuse clean. The panel tells you which case you are in.',
+                '<strong>Apply to</strong> decides where the shadow goes, and it matters more than it looks. In the <strong>Diffuse</strong> it is painted into the texture, which is what classic TRLE wants. But if you export relief maps, the map generator reads that darkening back out of the diffuse luminance and turns it into <em>geometry</em>, a band that looked right flat comes out as a trench in the normals. Send it to the <strong>AO map</strong> instead and the engine applies it as occlusion, leaving the diffuse clean. The panel tells you which case you are in.',
                 '<strong>Feature size</strong> sets how many blobs fit across a tile; <strong>🎲 Reroll</strong> draws a new pattern.',
                 '<strong>Alternates</strong> adds the whole set more than once, each copy drawn with different noise. Cycle them along a boundary instead of repeating one tile. They are still seamless with each other, and with the originals.'
             ],
             before: 'organic-edge',
             figureCaption: 'The same 3×3 island with the organic sliders off and on. Both are exactly seamless: the noise is faded out at each tile border, which is the one place a neighbouring tile’s pixels would be needed.',
-            tip: 'Only the <strong>Full Set</strong> tab gets <strong>Drift</strong> and <strong>Alternates</strong>. Drift is the one control that reaches the tile border, so it is safe only where the whole set is generated together — a Wang tile, a single directional tile or a border slot is laid next to tiles it was not drawn with. Alternates is a set idea for the same reason. An organic edge makes <em>repetition</em> more obvious, not less: a straight boundary tiles invisibly, a distinctive blob does not, so a long run of one organic tile reads as a repeating motif. Keep the sliders modest for edges you will lay in long runs, and save the strong settings for a boundary that appears once or twice.'
+            tip: 'Only the <strong>Full Set</strong> tab gets <strong>Drift</strong> and <strong>Alternates</strong>. Drift is the one control that reaches the tile border, so it is safe only where the whole set is generated together, a Wang tile, a single directional tile or a border slot is laid next to tiles it was not drawn with. Alternates is a set idea for the same reason. An organic edge makes <em>repetition</em> more obvious, not less: a straight boundary tiles invisibly, a distinctive blob does not, so a long run of one organic tile reads as a repeating motif. Keep the sliders modest for edges you will lay in long runs, and save the strong settings for a boundary that appears once or twice.'
         },
         {
             id: 'wang', icon: '🧩', title: 'Wang sets',
-            what: 'Generates the full 16-tile edge set so an overlay terrain connects in every up/down/left/right combination. <strong>Use a Wang set when an overlay needs to flow freely in any direction</strong> across a floor or wall — sand drifting over grass, water pooling on stone — so you can paint the boundary in unpredictable shapes and the tiles still join up. For a single straight or curved seam, a plain Transition or Anchored Transition is simpler; reach for Wang when you need every edge combination on hand.',
-            how: ['<strong>Right-click</strong> tile A → <strong>Make Wang Set with Texture</strong>, then click tile B.', 'Set the <strong>Blend method</strong>, <strong>Pivot</strong> and <strong>Hardness</strong> — corners blend smoothly (no diagonal crease) and <strong>Hardness</strong> sets the seam width (0 = wide soft blend, 100 = crisp cut).', 'Click <strong>Add 16 Tiles</strong> — drop the whole set into your level’s palette.'],
-            figure: 'wang-geo', figureCaption: 'A full grass→sand Wang set, laid out by where each edge sits: grass in the centre, sand creeping in from each side, and the corners blending two sides at once — so the 9 tiles form one coherent grass patch surrounded by sand.',
+            what: 'Generates the full 16-tile edge set so an overlay terrain connects in every up/down/left/right combination. <strong>Use a Wang set when an overlay needs to flow freely in any direction</strong> across a floor or wall, sand drifting over grass, water pooling on stone, so you can paint the boundary in unpredictable shapes and the tiles still join up. For a single straight or curved seam, a plain Transition or Anchored Transition is simpler; reach for Wang when you need every edge combination on hand.',
+            how: ['<strong>Right-click</strong> tile A → <strong>Make Wang Set with Texture</strong>, then click tile B.', 'Set the <strong>Blend method</strong>, <strong>Pivot</strong> and <strong>Hardness</strong>, corners blend smoothly (no diagonal crease) and <strong>Hardness</strong> sets the seam width (0 = wide soft blend, 100 = crisp cut).', 'Click <strong>Add 16 Tiles</strong>, drop the whole set into your level’s palette.'],
+            figure: 'wang-geo', figureCaption: 'A full grass→sand Wang set, laid out by where each edge sits: grass in the centre, sand creeping in from each side, and the corners blending two sides at once, so the 9 tiles form one coherent grass patch surrounded by sand.',
             tip: 'Wang tiles inherit materials from both sources, just like transitions.'
         },
         {
             id: 'borderset', icon: '🧱', title: 'Borders & corners (border sets)',
-            what: 'Builds a <em>reusable border tile set</em> from just two textures: a <strong>fill</strong> (grass, gravel, carpet) and a <strong>trim</strong> that runs along the boundary — stone edging, rope, a door frame. You get every edge, corner and fill piece needed to outline rooms and areas of any rectilinear shape, laid into the atlas as a readable block. Where a <strong>Wang set</strong> blends two terrains into each other, a border set keeps the trim as a crisp, decorative band <em>on top of</em> the fill.',
+            what: 'Builds a <em>reusable border tile set</em> from just two textures: a <strong>fill</strong> (grass, gravel, carpet) and a <strong>trim</strong> that runs along the boundary, stone edging, rope, a door frame. You get every edge, corner and fill piece needed to outline rooms and areas of any rectilinear shape, laid into the atlas as a readable block. Where a <strong>Wang set</strong> blends two terrains into each other, a border set keeps the trim as a crisp, decorative band <em>on top of</em> the fill.',
             how: [
                 '<strong>Right-click</strong> the fill tile → <strong>Generate</strong> → <strong>🧱 Add Borders &amp; Corners</strong>, then click the trim texture. (It sits under <strong>Make Seamless</strong>: it builds a set from two textures rather than blending one terrain into another.)',
-                'Pick a <strong>Set type</strong>: <strong>Frame</strong> (9 tiles — border around filled rectangles), <strong>Frame + inner corners</strong> (13 tiles — the border can also turn through concave corners, so <em>any</em> room shape works), or <strong>Lines</strong> (16 tiles — the trim runs <em>between</em> areas through tile centres, pipes/roads style, in every N/E/S/W combination).',
-                'Tune the <strong>Border width</strong> and <strong>Softness</strong>, and pick a <strong>Blend method</strong>. <strong>Trim follows direction</strong> rotates the trim texture along vertical runs and mitres the corners like a picture frame — untick it for isotropic trims (gravel, dirt).',
+                'Pick a <strong>Set type</strong>: <strong>Frame</strong> (9 tiles, border around filled rectangles), <strong>Frame + inner corners</strong> (13 tiles, the border can also turn through concave corners, so <em>any</em> room shape works), or <strong>Lines</strong> (16 tiles, the trim runs <em>between</em> areas through tile centres, pipes/roads style, in every N/E/S/W combination).',
+                'Tune the <strong>Border width</strong> and <strong>Softness</strong>, and pick a <strong>Blend method</strong>. <strong>Trim follows direction</strong> rotates the trim texture along vertical runs and mitres the corners like a picture frame, untick it for isotropic trims (gravel, dirt).',
                 'Open <strong>🌿 Organic edge</strong> to fray the trim where it meets the fill, with the same edge styles the transition tools use. Only the <em>inner</em> contour moves: the edge sitting on the tile border stays flush, so a border down the left of a tile goes ragged on its <em>right</em> and two bordered rooms still meet cleanly. Good for moss creeping off a stone edging or a worn carpet border; leave it at 0 for cut stone and tilework.',
-                'The <strong>Sample wall</strong> shows the whole set assembled into a room so you can check the joins before adding. If a slot looks wrong — usually baked lighting fighting a rotated edge — <strong>click it</strong> to cycle how it’s made: own mask → rotated ↻ → mirrored ↔/↕ → hand-picked atlas tile 🖼.',
-                'Click <strong>Add … Tiles</strong> — the set drops in as a spatial block (with a column-resize offer so it lines up), ready to place in Tomb Editor.'
+                'The <strong>Sample wall</strong> shows the whole set assembled into a room so you can check the joins before adding. If a slot looks wrong, usually baked lighting fighting a rotated edge, <strong>click it</strong> to cycle how it’s made: own mask → rotated ↻ → mirrored ↔/↕ → hand-picked atlas tile 🖼.',
+                'Click <strong>Add … Tiles</strong>, the set drops in as a spatial block (with a column-resize offer so it lines up), ready to place in Tomb Editor.'
             ],
             before: 'bset-organic',
-            figure: 'borderset-modal', figureCaption: 'A grass + sand border set (Frame + inner corners): the 13 slots on the left — edges, outer corners, fill and the four inner-corner patches — and the sample wall on the right showing the set assembled into an L-shaped room, the trim turning cleanly through the concave corner.',
-            tip: 'Border-set tiles are live transitions: they inherit materials from both sources and re-render when you edit either texture (make the fill seamless <em>first</em> for best results). The trim sits on the tile edges, so two bordered rooms placed side by side share a double-width band — exactly how classic TRLE border sets read.'
+            figure: 'borderset-modal', figureCaption: 'A grass + sand border set (Frame + inner corners): the 13 slots on the left, edges, outer corners, fill and the four inner-corner patches, and the sample wall on the right showing the set assembled into an L-shaped room, the trim turning cleanly through the concave corner.',
+            tip: 'Border-set tiles are live transitions: they inherit materials from both sources and re-render when you edit either texture (make the fill seamless <em>first</em> for best results). The trim sits on the tile edges, so two bordered rooms placed side by side share a double-width band, exactly how classic TRLE border sets read.'
         },
         {
             id: 'anchored', icon: '📐', title: 'Anchored transitions',
-            what: 'Like a transition, but the border between the two textures is a chain of <em>movable anchors</em> — so you can bend the seam into ridges, coastlines or any custom shape instead of a straight edge.',
+            what: 'Like a transition, but the border between the two textures is a chain of <em>movable anchors</em>, so you can bend the seam into ridges, coastlines or any custom shape instead of a straight edge.',
             how: [
                 '<strong>Right-click</strong> tile A → <strong>Make Anchored Transition</strong>, then click tile B.',
                 'Start from a preset, then <strong>drag</strong> an anchor, <strong>click</strong> empty space to add one, or <strong>right-click</strong> an anchor to remove it.',
                 '<strong>Drag the border line itself</strong> (between the anchors) to slide the whole border across the tile without changing its shape. The cursor turns into a move arrow when you are on it. A click on the line that does not move still adds an anchor there.',
                 'Pick the <strong>Border axis</strong>, <strong>Swap sides</strong>, set the <strong>Edge hardness</strong> and a <strong>Blend method</strong>, then click <strong>Add Transition Tile</strong>.',
                 'Re-orient the overlay (B) with <strong>Rotate</strong> / <strong>Flip</strong>, and tick <strong>Hide handles</strong> to preview without the anchor dots in the way.',
-                '<strong>Scroll the wheel</strong> over an anchor to cycle its curve (straight → bow out → bow in), or <strong>double-click</strong> it to toggle a curve and <strong>middle-drag</strong> the handle to fine-tune the bend — great for organic, flowing borders.',
-                'Raise <strong>🌊 Border warp</strong> to bend the whole seam into a slow, natural wave (<strong>🎲</strong> rerolls the pattern). It moves the <em>shape</em> of the border rather than roughening it — for a ragged, flecked edge use <strong>🌿 Organic edge</strong> on a plain Transition instead.'
+                '<strong>Scroll the wheel</strong> over an anchor to cycle its curve (straight → bow out → bow in), or <strong>double-click</strong> it to toggle a curve and <strong>middle-drag</strong> the handle to fine-tune the bend, great for organic, flowing borders.',
+                'Raise <strong>🌊 Border warp</strong> to bend the whole seam into a slow, natural wave (<strong>🎲</strong> rerolls the pattern). It moves the <em>shape</em> of the border rather than roughening it, for a ragged, flecked edge use <strong>🌿 Organic edge</strong> on a plain Transition instead.'
             ],
             figure: 'anchored-modal', figureCaption: 'The Anchored Transition editor: drag the white anchor dots along the A→B border, click empty space to add one, right-click to remove, and scroll over an anchor to curve it.',
             tip: 'It exports as a normal transition tile (a custom mask), so it composites, saves and undoes exactly like the others.'
         },
         {
             id: 'transgrid', icon: '🗺️', title: 'Transition grids',
-            what: 'Designs one continuous A→B border across a whole multi-tile wall, then slices it into tiles that connect seamlessly — perfect for, say, water creeping up a 3×3 stone wall.',
+            what: 'Designs one continuous A→B border across a whole multi-tile wall, then slices it into tiles that connect seamlessly, perfect for, say, water creeping up a 3×3 stone wall.',
             how: [
                 '<strong>Right-click</strong> tile A → <strong>Make Transition Grid</strong>, then click tile B.',
-                'Set <strong>Columns × Rows</strong> to match the wall, pick a start preset, then <strong>drag</strong> the anchors — the border flows across cell edges, so neighbours always line up. <strong>Drag the line itself</strong> to move the whole border at once, and <strong>scroll</strong> the wheel over an anchor to cycle its curve (straight → bow out → bow in).',
-                'Switch the <strong>Tool</strong> to <strong>Add patch</strong> or <strong>Carve patch</strong> and <strong>drag</strong> to drop a circular patch of the overlay into any single cell (scroll over it to resize, right-click to remove) — or tick <strong>Stamps only</strong> to skip the A→B border entirely and place free-floating islands, like a puddle inside one cell.',
+                'Set <strong>Columns × Rows</strong> to match the wall, pick a start preset, then <strong>drag</strong> the anchors, the border flows across cell edges, so neighbours always line up. <strong>Drag the line itself</strong> to move the whole border at once, and <strong>scroll</strong> the wheel over an anchor to cycle its curve (straight → bow out → bow in).',
+                'Switch the <strong>Tool</strong> to <strong>Add patch</strong> or <strong>Carve patch</strong> and <strong>drag</strong> to drop a circular patch of the overlay into any single cell (scroll over it to resize, right-click to remove), or tick <strong>Stamps only</strong> to skip the A→B border entirely and place free-floating islands, like a puddle inside one cell.',
                 'Raise <strong>🌊 Border warp</strong> to bend the whole border into a slow, natural wave (<strong>🎲</strong> rerolls the pattern); the warp is applied across the full wall before slicing, so cells still line up.',
                 'Click <strong>Add … Tiles</strong> to drop one transition tile per cell into the atlas (use the <strong>Alpha</strong> blend to keep the seam continuous between cells).'
             ],
@@ -178,7 +178,7 @@
         },
         {
             id: 'organic', icon: '🌿', title: 'Organic transitions',
-            what: 'Scatters one texture into another as <em>organic, noise-driven patches</em> instead of a clean line — grass breaking up into sand, moss creeping over stone — and generates several random <em>variations</em> from a seed so no two tiles repeat.',
+            what: 'Scatters one texture into another as <em>organic, noise-driven patches</em> instead of a clean line, grass breaking up into sand, moss creeping over stone, and generates several random <em>variations</em> from a seed so no two tiles repeat.',
             how: [
                 '<strong>Right-click</strong> tile A → <strong>Make Organic Transition</strong>, then click tile B.',
                 'Optionally <strong>paint a hint</strong> on tile A to steer where the overlay lands (or leave it blank for a fully random scatter); tune <strong>Coverage</strong>, <strong>Patch size</strong> and <strong>Roughness</strong>.',
@@ -193,7 +193,7 @@
             what: 'Blends two textures by their <em>height</em> instead of a drawn line: the overlay settles into the <strong>low ground</strong> (mortar joints, cracks) or caps the <strong>high ground</strong> (stones poking through). Perfect for sand pooling between Roman cobbles, or laying stone tiles over grass so the grass shows in the gaps. Because the joints sink in, the generated normal / AO / height maps get real depth for free.',
             how: [
                 '<strong>Right-click</strong> tile A → <strong>Make Height Transition</strong>, then click the overlay texture B.',
-                'Pick a <strong>Preset</strong> (Sand in the joints, Stones over grass, Snow on ledges, Water in cracks…). Each sets <strong>Height from</strong> (Base or Overlay) × <strong>Fills</strong> (Low/High) plus the level and a suggested overlay material — leave <strong>Assign … material</strong> ticked so the fill’s PBR maps read correctly.',
+                'Pick a <strong>Preset</strong> (Sand in the joints, Stones over grass, Snow on ledges, Water in cracks…). Each sets <strong>Height from</strong> (Base or Overlay) × <strong>Fills</strong> (Low/High) plus the level and a suggested overlay material, leave <strong>Assign … material</strong> ticked so the fill’s PBR maps read correctly.',
                 'Tune the <strong>Fill level</strong> and <strong>Edge hardness</strong>; open <strong>⛰️ Height field</strong> to set how much <strong>Detail</strong> vs broad shape the height keys off.',
                 'Layer in variation: <strong>🌿 Organic breakup</strong> (+🎲) wobbles the fill edges; the <strong>📈 Response curve</strong> reshapes how abruptly the overlay appears as height drops; <strong>🗺️ Spatial drift</strong> makes the fill drift deeper toward one side (a “tide line”) or masks it to a region. Both editors take the same anchors as the transition tools, so you can drag the line itself to shift the whole curve.',
                 'Click <strong>Add Transition Tile</strong>. Later, <strong>right-click → Edit Height Transition</strong> to reopen the exact recipe and tweak it in place.'
@@ -217,14 +217,14 @@
         {
             id: 'heal', icon: '🩹', title: 'Heal / Fill',
             what: 'Paints out blemishes, logos or scratches by filling the area with surrounding colour or re-synthesised texture.',
-            how: ['<strong>Right-click</strong> a tile → <strong>Heal / Fill</strong>.', 'Paint over the <em>whole</em> blemish so the selection touches clean texture on every side.', 'Pick <strong>Neighbour-aware</strong> (default), <strong>Texture</strong> (whole-tile synthesis) or <strong>Smooth</strong> (diffusion), then <strong>Save to Tile</strong>.', 'The result on the right updates as you paint. <strong>Drag the divider</strong> across it to wipe between before and after, or press and hold <strong>👁 Hold to see the original</strong> to flick the whole tile back — both land on the same pixels, which is how you spot a smear or a seam. Raise <strong>Edge softness</strong> to feather the selection edge; <strong>Paint</strong> and <strong>Erase</strong> are separate buttons.'],
-            before: 'heal', tip: '<strong>Neighbour-aware</strong> matches the local tone, so a dark mark on a light surface heals light (and vice-versa) instead of going grey — just be sure to paint over the entire mark.'
+            how: ['<strong>Right-click</strong> a tile → <strong>Heal / Fill</strong>.', 'Paint over the <em>whole</em> blemish so the selection touches clean texture on every side.', 'Pick <strong>Neighbour-aware</strong> (default), <strong>Texture</strong> (whole-tile synthesis) or <strong>Smooth</strong> (diffusion), then <strong>Save to Tile</strong>.', 'The result on the right updates as you paint. <strong>Drag the divider</strong> across it to wipe between before and after, or press and hold <strong>👁 Hold to see the original</strong> to flick the whole tile back, both land on the same pixels, which is how you spot a smear or a seam. Raise <strong>Edge softness</strong> to feather the selection edge; <strong>Paint</strong> and <strong>Erase</strong> are separate buttons.'],
+            before: 'heal', tip: '<strong>Neighbour-aware</strong> matches the local tone, so a dark mark on a light surface heals light (and vice-versa) instead of going grey, just be sure to paint over the entire mark.'
         },
         {
             id: 'transforms', icon: '↻', title: 'Transforms',
             what: 'Quick per-tile geometry: rotate 90°, flip, or offset (roll) to move seams to the centre for healing.',
             how: ['<strong>Right-click</strong> a tile → <strong>Rotate 90°</strong>, <strong>Flip Horizontal</strong> / <strong>Vertical</strong>, or <strong>Offset ½</strong>.', 'Each is instant and undoable.'],
-            slideshow: 'Examples/Bricks.png', tip: '<strong>Offset ½</strong> then <strong>Heal</strong> is a fast way to kill a stubborn seam. (The demo above cycles through the transforms automatically — hover to pause.)'
+            slideshow: 'Examples/Bricks.png', tip: '<strong>Offset ½</strong> then <strong>Heal</strong> is a fast way to kill a stubborn seam. (The demo above cycles through the transforms automatically, hover to pause.)'
         },
         {
             id: 'delight', icon: '☀', title: 'De-light',
@@ -237,18 +237,18 @@
         },
         {
             id: 'colour', icon: '🎚', title: 'Colour adjust & recolour',
-            what: 'Two ways to re-grade a tile’s colours — handy for rebalancing a preset that blows out, or matching a texture to a level’s palette.',
+            what: 'Two ways to re-grade a tile’s colours, handy for rebalancing a preset that blows out, or matching a texture to a level’s palette.',
             how: [
                 '<strong>Right-click</strong> a tile → <strong>Adjust Colours</strong> for manual control: <strong>Hue</strong>, <strong>Saturation</strong>, <strong>Brightness</strong>, <strong>Contrast</strong>, <strong>Gamma</strong>, <strong>Temperature</strong> / <strong>Tint</strong> and <strong>Vibrance</strong>, with a live preview.',
-                '<strong>Right-click</strong> a tile → <strong>Recolor from Texture</strong>, then click a reference tile — its colour palette is sampled and this tile is shifted toward it. Tune <strong>Strength</strong> and the light grade, then <strong>Apply</strong>.',
-                'Both work on a <strong>whole selection</strong>: select the tiles first, then right-click one of them. The menu entry reads <em>“— N tiles”</em> and the modal says how many it will write. Recolor then offers <strong>Match each tile to the reference</strong> (every tile lands on the reference’s tone, even if they started far apart) or <strong>Apply the same shift to every tile</strong> (variants keep their differences). The reference tile is never recoloured, even if it is selected.'
+                '<strong>Right-click</strong> a tile → <strong>Recolor from Texture</strong>, then click a reference tile, its colour palette is sampled and this tile is shifted toward it. Tune <strong>Strength</strong> and the light grade, then <strong>Apply</strong>.',
+                'Both work on a <strong>whole selection</strong>: select the tiles first, then right-click one of them. The menu entry reads <em>“, N tiles”</em> and the modal says how many it will write. Recolor then offers <strong>Match each tile to the reference</strong> (every tile lands on the reference’s tone, even if they started far apart) or <strong>Apply the same shift to every tile</strong> (variants keep their differences). The reference tile is never recoloured, even if it is selected.'
             ],
             gallery: [
                 { src: 'recolor-before.png', cap: 'Original tile' },
                 { src: 'recolor-ref.png', cap: 'Reference (Grass)' },
                 { src: 'recolor-after.png', cap: 'Recoloured to match' }
             ],
-            tip: 'Recolor uses mean / standard-deviation transfer, so it matches the overall tone of the reference rather than copying it pixel-for-pixel — great for making mismatched textures sit together. Above, a stone tile is shifted toward the grass palette.'
+            tip: 'Recolor uses mean / standard-deviation transfer, so it matches the overall tone of the reference rather than copying it pixel-for-pixel, great for making mismatched textures sit together. Above, a stone tile is shifted toward the grass palette.'
         },
         {
             id: 'variations', icon: '✨', title: 'Variations',
@@ -258,19 +258,19 @@
                 'Set the count and the jitters. <strong>Grain</strong> adds a subtle per-copy noise overlay; <strong>Random wrap shift</strong> offsets each copy with wrap-around, so a seamless tile stays seamless but its repeats stop lining up.',
                 '<strong>🎲 Shuffle</strong> rerolls the <strong>Seed</strong> (or type one to get the exact same set back later), then click <strong>Add</strong>.'
             ],
-            before: 'variations', tip: 'Each variation is a fresh source tile you can edit independently. Variations of a seamless tile keep the seamless badge — every jitter preserves tileability.'
+            before: 'variations', tip: 'Each variation is a fresh source tile you can edit independently. Variations of a seamless tile keep the seamless badge, every jitter preserves tileability.'
         },
         {
             id: 'buildpattern', icon: '🏗️', title: 'Build Pattern',
-            what: 'Turns a plain material — stone, sand, metal, timber — into a <em>built surface</em>: a <strong>brick wall</strong>, <strong>coursed</strong> or <strong>cobbled stone</strong>, a <strong>tile floor</strong>, a <strong>herringbone</strong> weave, <strong>wood planks</strong>, a staggered <strong>plank floor</strong>, roof <strong>shingles / scales</strong> or <strong>metal pipes</strong>. It lays the source into cells split by recessed joints so the result is one fresh tile that <strong>tiles seamlessly</strong>, and because the dark joints sink in, the generated normal / AO / height maps get real depth for free.',
+            what: 'Turns a plain material, stone, sand, metal, timber, into a <em>built surface</em>: a <strong>brick wall</strong>, <strong>coursed</strong> or <strong>cobbled stone</strong>, a <strong>tile floor</strong>, a <strong>herringbone</strong> weave, <strong>wood planks</strong>, a staggered <strong>plank floor</strong>, roof <strong>shingles / scales</strong> or <strong>metal pipes</strong>. It lays the source into cells split by recessed joints so the result is one fresh tile that <strong>tiles seamlessly</strong>, and because the dark joints sink in, the generated normal / AO / height maps get real depth for free.',
             how: [
                 '<strong>Right-click</strong> a source tile → <strong>🏗️ Build Pattern</strong>.',
-                'Pick a <strong>Pattern</strong> — regular <strong>Brick</strong>, random <strong>Coursed stone</strong> (varied course heights &amp; stone widths, like ashlar rubble), <strong>Cobblestone</strong> (rounded Voronoi stones with mortar), <strong>Tile</strong>, <strong>Herringbone</strong>, <strong>Planks</strong>, <strong>Plank floor</strong> (boards with staggered butt-joints), <strong>Shingles / scales</strong>, or <strong>Pipes</strong> — and a <strong>Fill</strong>: <strong>Slice</strong> gives each cell a different random crop (most variation); <strong>Overlay</strong> lets the whole texture flow unbroken with just the joints carved over it; <strong>Random from atlas tiles</strong> gives each brick a random <em>different</em> tile from your atlas (mix stone &amp; grass bricks, say).',
-                'Set the cell count, the joint <strong>width</strong> and the <strong>Edge irregularity</strong> — a seeded wobble on the joint lines so cells read hand-laid instead of ruler-drawn (masonry defaults higher, planks lower, pipes straight; it stays seamless). Per pattern you also get: brick <strong>aspect</strong> &amp; <strong>row offset</strong> (50% = running bond, 0% = stacked); coursed <strong>course flatness</strong>; cobble <strong>stone roundness</strong>; shingle <strong>overlap</strong>; plank-floor <strong>board length</strong>; a <strong>direction</strong> for planks / floor / herringbone / pipes; and a pipe <strong>cylinder-shading</strong> amount.',
-                '<strong>🏚️ Age &amp; deformation</strong> breaks up the machine-perfect grid. Flush and straight is right for a city wall; a temple that has been standing for two thousand years is not. <strong>Course sag</strong> makes rows wander instead of running dead level, and bricks tilt to follow the slope. <strong>Laying jitter</strong> nudges each cell within its joint so nothing lines up exactly. <strong>Tilt</strong> turns cells a degree or two. <strong>Depth variation</strong> pushes them proud or sunk, which becomes real relief in the height and normal maps. <strong>Missing pieces</strong> leaves cells out. <strong>Edge erosion</strong> crumbles corners and edges away, corners first, like real masonry. All of it is seeded and stays seamless, and all of it is off at zero — an existing build is unchanged until you touch a slider.',
-                'Under <strong>🧱 Behind the cells</strong>, <strong>Backing</strong> decides what shows through the joints — and through anything <strong>Missing pieces</strong> took out. <em>Blurred source</em> and <em>Flat colour</em> are the old behaviour; <em>Atlas tile…</em> lets you pick another texture from your atlas, so sandstone blocks sit on a sandstone wall instead of on a smear. The <strong>Hue shift / Saturation / Brightness</strong> sliders below tint it — drop the brightness to push it back behind the cells. The backing is read when you build the tile and is not linked afterwards, so you can delete it later without touching what you made.',
+                'Pick a <strong>Pattern</strong>, regular <strong>Brick</strong>, random <strong>Coursed stone</strong> (varied course heights &amp; stone widths, like ashlar rubble), <strong>Cobblestone</strong> (rounded Voronoi stones with mortar), <strong>Tile</strong>, <strong>Herringbone</strong>, <strong>Planks</strong>, <strong>Plank floor</strong> (boards with staggered butt-joints), <strong>Shingles / scales</strong>, or <strong>Pipes</strong>, and a <strong>Fill</strong>: <strong>Slice</strong> gives each cell a different random crop (most variation); <strong>Overlay</strong> lets the whole texture flow unbroken with just the joints carved over it; <strong>Random from atlas tiles</strong> gives each brick a random <em>different</em> tile from your atlas (mix stone &amp; grass bricks, say).',
+                'Set the cell count, the joint <strong>width</strong> and the <strong>Edge irregularity</strong>, a seeded wobble on the joint lines so cells read hand-laid instead of ruler-drawn (masonry defaults higher, planks lower, pipes straight; it stays seamless). Per pattern you also get: brick <strong>aspect</strong> &amp; <strong>row offset</strong> (50% = running bond, 0% = stacked); coursed <strong>course flatness</strong>; cobble <strong>stone roundness</strong>; shingle <strong>overlap</strong>; plank-floor <strong>board length</strong>; a <strong>direction</strong> for planks / floor / herringbone / pipes; and a pipe <strong>cylinder-shading</strong> amount.',
+                '<strong>🏚️ Age &amp; deformation</strong> breaks up the machine-perfect grid. Flush and straight is right for a city wall; a temple that has been standing for two thousand years is not. <strong>Course sag</strong> makes rows wander instead of running dead level, and bricks tilt to follow the slope. <strong>Laying jitter</strong> nudges each cell within its joint so nothing lines up exactly. <strong>Tilt</strong> turns cells a degree or two. <strong>Depth variation</strong> pushes them proud or sunk, which becomes real relief in the height and normal maps. <strong>Missing pieces</strong> leaves cells out. <strong>Edge erosion</strong> crumbles corners and edges away, corners first, like real masonry. All of it is seeded and stays seamless, and all of it is off at zero, an existing build is unchanged until you touch a slider.',
+                'Under <strong>🧱 Behind the cells</strong>, <strong>Backing</strong> decides what shows through the joints, and through anything <strong>Missing pieces</strong> took out. <em>Blurred source</em> and <em>Flat colour</em> are the old behaviour; <em>Atlas tile…</em> lets you pick another texture from your atlas, so sandstone blocks sit on a sandstone wall instead of on a smear. The <strong>Hue shift / Saturation / Brightness</strong> sliders below tint it, drop the brightness to push it back behind the cells. The backing is read when you build the tile and is not linked afterwards, so you can delete it later without touching what you made.',
                 'Open <strong>🧱 Mortar / joints</strong> to tune the mortar. The default, <strong>Natural (from texture)</strong>, fills the joints with a blurred, desaturated, darkened copy of the texture itself plus seeded grain, so the mortar shares the material’s character; the <strong>Hue shift / Saturation / Brightness</strong> sliders re-tint it. <strong>Flat colour</strong> is the plain fill (with <strong>🎨 Sample from texture</strong> to pull a darker tint of the source’s own colour). Either way, joints also get a soft ambient-occlusion darkening so they read recessed. <strong>Noise</strong> (Speckle / Grain / Clouds) is seeded and adjustable in both modes.',
-                'Add <strong>hue</strong> / <strong>brightness jitter</strong> so cells vary, reroll the <strong>Seed</strong> (<strong>🎲</strong>) until you like it — the preview updates live — then leave <strong>Assign … material preset</strong> ticked and click <strong>➕ Add Tile</strong>.'
+                'Add <strong>hue</strong> / <strong>brightness jitter</strong> so cells vary, reroll the <strong>Seed</strong> (<strong>🎲</strong>) until you like it, the preview updates live, then leave <strong>Assign … material preset</strong> ticked and click <strong>➕ Add Tile</strong>.'
             ],
             before: 'buildpattern',
             tip: 'The output already tiles, so you usually don’t need Make Seamless afterwards. Joints come from the diffuse, so darker / noisier mortar automatically deepens and roughens the recesses in the height/normal maps. Overlay fill tiles best from an already-seamless source.'
@@ -282,7 +282,7 @@
                 '<strong>Right-click</strong> a tile → <strong>Origami Frame</strong>.',
                 'Pick a <strong>Ring shape</strong> (Square / Diamond / Circle). <strong>Detail axis</strong> tells it which way the source’s ridges run (Auto usually gets it right), and <strong>Repeats</strong> mirrors the source into more nested rings.',
                 '<strong>Ring thickness</strong> biases ring widths toward the centre or the rim, <strong>Origin X/Y</strong> moves the fold centre off-middle (the frame still reaches all four edges), and <strong>Outer shape</strong> morphs the rings from one shape at the centre into another at the rim: circle centre flowing into a square frame, say.',
-                'Click <strong>➕ Add Folded Tile</strong> — it lands next to the source and inherits its material.'
+                'Click <strong>➕ Add Folded Tile</strong>, it lands next to the source and inherits its material.'
             ],
             before: 'origami',
             tip: 'Works best on textures with directional detail: planks, mouldings, ridges, rope. The single-texture mode of Borders &amp; Corners uses the same fold to build a whole trim set.'
@@ -293,7 +293,7 @@
             how: [
                 '<strong>Right-click</strong> a tile → <strong>🪟 Stained Glass</strong>.',
                 'Pick a <strong>Cell pattern</strong>: <strong>Glass blobs</strong> (organic Voronoi), <strong>Rect / Diamond / Hex quarry</strong> (classic window lattices), <strong>Rose window</strong> (concentric rings and spokes, cathedral style) or <strong>Follow image</strong> (panes trace the picture’s colour regions). Everything except the rose window tiles seamlessly.',
-                'Set <strong>Cells across</strong>, <strong>Jitter</strong>, the <strong>Leading width</strong> and the <strong>Came metal</strong> — lead, pewter, copper or gold; this also picks the metal material preset for the strips.',
+                'Set <strong>Cells across</strong>, <strong>Jitter</strong>, the <strong>Leading width</strong> and the <strong>Came metal</strong>, lead, pewter, copper or gold; this also picks the metal material preset for the strips.',
                 '<strong>Glass colours</strong>: <strong>From texture</strong> tints each pane from the source, with <strong>Source detail</strong> blending a faint copy of the original back into the glass; or pick a palette (Jewel, Medieval, Amber, Emerald, Ruby).',
                 '<strong>Mottling</strong> streaks each pane so the glass doesn’t read flat, and <strong>Glow strength</strong> sets how bright the emissive map is (0 = no glow map). Reroll the <strong>Seed</strong> (<strong>🎲</strong>), then click <strong>➕ Add Stained Glass Tile</strong>.',
                 '<strong>Right-click</strong> the result → <strong>🪟 Edit Stained Glass</strong> to reopen the exact recipe and change it in place.'
@@ -317,61 +317,61 @@
         },
         {
             id: 'heightmap', icon: '🏔️', title: 'Height maps (parallax)',
-            what: 'A <strong>height map</strong> drives real <strong>parallax</strong> in Tomb Engine: high points shift in front of low ones as the camera moves, so mortar joints, ladder rungs and carved reliefs genuinely recede instead of being faked by shading. White is the polygon surface, darker is deeper — parallax only ever carves <em>in</em>, it never pushes a texel out in front of the wall.',
+            what: 'A <strong>height map</strong> drives real <strong>parallax</strong> in Tomb Engine: high points shift in front of low ones as the camera moves, so mortar joints, ladder rungs and carved reliefs genuinely recede instead of being faked by shading. White is the polygon surface, darker is deeper, parallax only ever carves <em>in</em>, it never pushes a texel out in front of the wall.',
             how: [
                 '<strong>Right-click</strong> a tile → <strong>🏔️ Make Height Map</strong>, under <strong>Set Material</strong>. The Height sliders in <strong>Set Material</strong> still work; this is the per-texture editor, and it is where the edge controls live.',
-                '<strong>What the relief is read from</strong> decides which part of the texture becomes deep. <strong>Light &amp; dark</strong> uses the whole texture. <strong>A colour I pick</strong> and <strong>A hue range</strong> select one thing — click the tile to eyedrop the mortar, say — so the joints carve in while the stones stay flat, which light-and-dark cannot do on a wall whose stones are darker than its joints. <strong>Which side sinks</strong> flips it, and the line underneath spells out what ends up deep and what ends up on the surface.',
-                '<strong>Relief depth</strong> is how far the recesses sit below the surface. <strong>Smoothing</strong> blurs the texture before reading it as elevation — raise it if the relief looks noisy, because parallax on fine grain reads as the surface swimming.',
-                '<strong>Edges — fade to white</strong> is the part you cannot skip, and it is on by default. Tomb Engine marches the UV <em>out of the texture\'s own box</em> in the atlas page, so without a white border it samples whatever the packer put next door: the black and smeared bars along texture edges. White is the surface plane, so a white border stops the march dead.',
+                '<strong>What the relief is read from</strong> decides which part of the texture becomes deep. <strong>Light &amp; dark</strong> uses the whole texture. <strong>A colour I pick</strong> and <strong>A hue range</strong> select one thing, click the tile to eyedrop the mortar, say, so the joints carve in while the stones stay flat, which light-and-dark cannot do on a wall whose stones are darker than its joints. <strong>Which side sinks</strong> flips it, and the line underneath spells out what ends up deep and what ends up on the surface.',
+                '<strong>Relief depth</strong> is how far the recesses sit below the surface. <strong>Smoothing</strong> blurs the texture before reading it as elevation, raise it if the relief looks noisy, because parallax on fine grain reads as the surface swimming.',
+                '<strong>Edges, fade to white</strong> is the part you cannot skip, and it is on by default. Tomb Engine marches the UV <em>out of the texture\'s own box</em> in the atlas page, so without a white border it samples whatever the packer put next door: the black and smeared bars along texture edges. White is the surface plane, so a white border stops the march dead.',
                 'The <strong>Band</strong> defaults to what your tile size actually needs and warns if you go under it. This is not a preference: the march is a fixed distance in <em>atlas-page</em> pixels (~36px), so it eats 3.5% of a 1024px texture and 14% of a 256px one. Below 128px there is barely any interior left, which is why parallax wants big textures.',
-                '<strong>Profile</strong> shapes the fade. <strong>Smooth</strong> is the default and matches the Tomb Engine team\'s own reference images. <strong>Tight</strong> keeps more interior on large textures, <strong>Rough</strong> wanders in and out for rubble, and <strong>Joint-aware</strong> ends the fade on a mortar line instead of slicing a stone in half — it needs a texture with real coursed joints and quietly falls back to Smooth on anything else.',
-                'Untick an edge under <strong>Fade these edges</strong> if the texture never shows it — a floor tile that always meets a wall on one side keeps its detail there.',
-                'Paint a region under the tile and <strong>Raise or lower the painted area</strong> pushes it proud or sinks it: an alcove, a deeper joint, a panel. The full paint toolbar is there, and its <strong>Value</strong> slider sets how deep <em>that</em> region goes — so a shallow dent and a deep alcove can live on one tile. The slider itself is the master for all of them.',
-                'The <strong>In Tomb Engine</strong> pane is the real parallax shader, not an approximation — and you <strong>grab it and turn it</strong>, live, like any 3D view (arrow keys work too; double-click or <strong>⟳ Reset view</strong> to recentre). Watch the relief flatten as you rotate away: that is what parallax does in game, not a fault in your map. It is deliberately not a 3D model, because Tomb Engine never moves geometry — a parallax wall keeps a flat silhouette, and a displaced mesh would look better and be wrong. Drop <strong>Amount</strong> to 0 to watch the edge artifact appear.'
+                '<strong>Profile</strong> shapes the fade. <strong>Smooth</strong> is the default and matches the Tomb Engine team\'s own reference images. <strong>Tight</strong> keeps more interior on large textures, <strong>Rough</strong> wanders in and out for rubble, and <strong>Joint-aware</strong> ends the fade on a mortar line instead of slicing a stone in half, it needs a texture with real coursed joints and quietly falls back to Smooth on anything else.',
+                'Untick an edge under <strong>Fade these edges</strong> if the texture never shows it, a floor tile that always meets a wall on one side keeps its detail there.',
+                'Paint a region under the tile and <strong>Raise or lower the painted area</strong> pushes it proud or sinks it: an alcove, a deeper joint, a panel. The full paint toolbar is there, and its <strong>Value</strong> slider sets how deep <em>that</em> region goes, so a shallow dent and a deep alcove can live on one tile. The slider itself is the master for all of them.',
+                'The <strong>In Tomb Engine</strong> pane is the real parallax shader, not an approximation, and you <strong>grab it and turn it</strong>, live, like any 3D view (arrow keys work too; double-click or <strong>⟳ Reset view</strong> to recentre). Watch the relief flatten as you rotate away: that is what parallax does in game, not a fault in your map. It is deliberately not a 3D model, because Tomb Engine never moves geometry, a parallax wall keeps a flat silhouette, and a displaced mesh would look better and be wrong. Drop <strong>Amount</strong> to 0 to watch the edge artifact appear.'
             ],
             before: 'heightmap',
-            beforeLabel: 'White edge off — the texture\'s right border smears',
-            afterLabel: 'The shipped default — same parallax, clean border',
-            tip: 'Use it sparingly. Parallax is expensive, and it also switches <strong>SSAO off</strong> for that material and disables <strong>bullet holes, explosion marks and other decals</strong> on it. It cannot be combined with animated, double-sided or mirror textures either. A handful of hero surfaces per level — a brick wall you walk past, a ladder, a carved door — not the whole atlas.'
+            beforeLabel: 'White edge off, the texture\'s right border smears',
+            afterLabel: 'The shipped default, same parallax, clean border',
+            tip: 'Use it sparingly. Parallax is expensive, and it also switches <strong>SSAO off</strong> for that material and disables <strong>bullet holes, explosion marks and other decals</strong> on it. It cannot be combined with animated, double-sided or mirror textures either. A handful of hero surfaces per level, a brick wall you walk past, a ladder, a carved door, not the whole atlas.'
         },
         {
             id: 'animated', icon: '🎞️', title: 'Animated textures',
-            what: 'Generates a procedural, seamlessly-<em>looping</em> animation — water, lava, clouds, smoke, energy, plus directional effects like <strong>fire, waterfalls and rivers</strong> — as a group of frames you drop straight into the atlas. There’s a wide preset library (caustic/deep/boiling water, lava &amp; molten metal, blood, ice, mercury, honey, poison gas, steam, electric plasma, aurora sky…). Every frame also tiles on its own, so you can emit a <strong>single seamless tile</strong> for UV-rotate instead of a sequence.',
+            what: 'Generates a procedural, seamlessly-<em>looping</em> animation, water, lava, clouds, smoke, energy, plus directional effects like <strong>fire, waterfalls and rivers</strong>, as a group of frames you drop straight into the atlas. There’s a wide preset library (caustic/deep/boiling water, lava &amp; molten metal, blood, ice, mercury, honey, poison gas, steam, electric plasma, aurora sky…). Every frame also tiles on its own, so you can emit a <strong>single seamless tile</strong> for UV-rotate instead of a sequence.',
             how: [
                 'Click <strong>🎞️ Add Animated…</strong> in the grid header.',
                 'Pick a <strong>Preset</strong> (Caustic Water, Lava, Clouds, Blood Pool, Frozen Ice, Steam, Electric Plasma, Aurora Sky…). The live preview loops while the 2×2 panel shows it tiling, and a <strong>Suggested material</strong> is applied automatically (emissive presets also switch the <strong>Emissive</strong> export map on).',
                 'On the <strong>🌀 Shape &amp; motion</strong> tab choose the <strong>Output</strong>: an <strong>Animated sequence</strong> (set <strong>Frames</strong>, 2–64) or a <strong>Single seamless tile</strong> for UV-rotate. Shape the look with <strong>Style</strong>, <strong>Pattern scale</strong>, <strong>Churn speed</strong>, <strong>Detail</strong>, <strong>Roughness</strong>, <strong>Swirl</strong>, <strong>Contrast</strong> and the <strong>Seed</strong> (<strong>🎲</strong> rerolls).',
-                'For things that <em>travel</em> rather than churn in place, set a <strong>Flow direction</strong> (↑↓←→ or diagonals) and <strong>Flow speed</strong> — the field scrolls that way while staying perfectly seamless and looping. <strong>Stretch ↕</strong> elongates the pattern into vertical streaks; together they make fire, waterfalls, rivers, rising smoke and blowing sand (see those presets).',
-                'On the <strong>🎨 Colour</strong> tab pick a <strong>Gradient</strong> (mix any palette onto any structure — clouds shape with a lava palette, say), then micro-edit it: <strong>click the bar</strong> to add a colour stop, <strong>drag</strong> handles to move them, and click a stop to set its colour &amp; <strong>alpha</strong> (for transparent smoke/dust). The <strong>Hue / Saturation / Brightness / Contrast / Gamma / Posterize</strong> sliders and <strong>Invert</strong> re-grade the whole ramp.',
-                'On the <strong>✨ Glow</strong> tab tick <strong>Emissive glow</strong> to bake a glow map onto every frame. Each frame’s glow is derived from that frame, so it moves with the animation — a lava range glows along its shifting cracks. Choose what glows (<strong>Bright areas</strong> or a <strong>Hue range</strong>), the glow colour (the texture’s own or a flat <strong>Tint</strong>), <strong>Strength</strong> and <strong>Bloom</strong>. Tick <strong>💓 Pulse</strong> to throb the glow on a sine over the loop (set <strong>cycles</strong> and <strong>depth</strong>) — a beacon or breathing lava that changes even when the surface barely moves. The <strong>Emissive</strong> export map switches on automatically.',
+                'For things that <em>travel</em> rather than churn in place, set a <strong>Flow direction</strong> (↑↓←→ or diagonals) and <strong>Flow speed</strong>, the field scrolls that way while staying perfectly seamless and looping. <strong>Stretch ↕</strong> elongates the pattern into vertical streaks; together they make fire, waterfalls, rivers, rising smoke and blowing sand (see those presets).',
+                'On the <strong>🎨 Colour</strong> tab pick a <strong>Gradient</strong> (mix any palette onto any structure, clouds shape with a lava palette, say), then micro-edit it: <strong>click the bar</strong> to add a colour stop, <strong>drag</strong> handles to move them, and click a stop to set its colour &amp; <strong>alpha</strong> (for transparent smoke/dust). The <strong>Hue / Saturation / Brightness / Contrast / Gamma / Posterize</strong> sliders and <strong>Invert</strong> re-grade the whole ramp.',
+                'On the <strong>✨ Glow</strong> tab tick <strong>Emissive glow</strong> to bake a glow map onto every frame. Each frame’s glow is derived from that frame, so it moves with the animation, a lava range glows along its shifting cracks. Choose what glows (<strong>Bright areas</strong> or a <strong>Hue range</strong>), the glow colour (the texture’s own or a flat <strong>Tint</strong>), <strong>Strength</strong> and <strong>Bloom</strong>. Tick <strong>💓 Pulse</strong> to throb the glow on a sine over the loop (set <strong>cycles</strong> and <strong>depth</strong>), a beacon or breathing lava that changes even when the surface barely moves. The <strong>Emissive</strong> export map switches on automatically.',
                 'Building low-res, in the spirit of the classics? The preview shows real pixels, so a 32 or 64px tile looks chunky here because it <em>will</em> be chunky in-engine. <strong>Preview at</strong> re-bakes at another size (handy for checking how a 256px texture reads at 64) without changing what gets exported. The line under <strong>Detail</strong> tells you how many pixels each feature gets at your tile size, and warns when <strong>Pattern scale</strong> is set so fine the result turns to confetti: as a rule keep it at or under tile size ÷ 8, so 4 at 32px, 8 at 64px. <strong>✨ Crisp</strong> renders at 4× and averages down for a cleaner small tile; it defaults on at 64px and below.',
-                'Click <strong>Add … Frames</strong> — they’re appended as a group (purple <strong>A</strong> badge). <strong>Right-click</strong> any frame → <strong>Edit Animation…</strong> to regenerate, recolour, retune the glow or change the frame count in place.'
+                'Click <strong>Add … Frames</strong>, they’re appended as a group (purple <strong>A</strong> badge). <strong>Right-click</strong> any frame → <strong>Edit Animation…</strong> to regenerate, recolour, retune the glow or change the frame count in place.'
             ],
             before: 'anim',
             gallery: [
-                { src: 'lava-still.png', cap: 'Lava — one frame' },
+                { src: 'lava-still.png', cap: 'Lava, one frame' },
                 { src: 'lava-anim.gif', cap: 'Animated, looping' },
-                { src: 'lava-emissive.png', cap: 'Emissive map — one frame' },
+                { src: 'lava-emissive.png', cap: 'Emissive map, one frame' },
                 { src: 'lava-emissive.gif', cap: 'Emissive, looping' }
             ],
-            tip: 'Frames are kept consecutive and loop (last → first). The exported <code>manifest.json</code> lists each animation’s tile range, gradient + fps, so you can set it up as an <em>animated texture range</em> (or <em>UV-Rotate</em>) in Tomb Editor. An animation isn’t one image — it’s <em>N</em> tiles, and every map (normal, emissive, …) exports as a matching atlas with the same layout, so a glow lines up frame-for-frame with the diffuse and animates with it. Deleting one frame removes the whole group, and animations — including the gradient and glow recipe — are saved/restored with your project.'
+            tip: 'Frames are kept consecutive and loop (last → first). The exported <code>manifest.json</code> lists each animation’s tile range, gradient + fps, so you can set it up as an <em>animated texture range</em> (or <em>UV-Rotate</em>) in Tomb Editor. An animation isn’t one image, it’s <em>N</em> tiles, and every map (normal, emissive, …) exports as a matching atlas with the same layout, so a glow lines up frame-for-frame with the diffuse and animates with it. Deleting one frame removes the whole group, and animations, including the gradient and glow recipe, are saved/restored with your project.'
         },
         {
             id: 'materials', icon: '🎨', title: 'Materials (PBR)',
             what: 'Assigns a material so the tile exports Normal / AO / Specular / Roughness (and more) maps for Tomb Engine.',
-            how: ['<strong>Right-click</strong> a tile → <strong>Set Material</strong>.', 'Pick an aesthetic (<strong>Realistic</strong>, <strong>Decal</strong> for thin transparent surfaces like cobwebs/dust/leaves, <strong>Fantasy</strong>, …) and a preset, or tweak the advanced sliders.', '<strong>Drag</strong> the lit preview to move the light and check how it reads.', 'In <strong>Export</strong>, tick which maps to generate. The <strong>Height</strong> map drives parallax — it’s GPU-heavy, so prefer it per-texture; when it’s on, keep <strong>Seamless height edges</strong> ticked so a tiling texture doesn’t show a parallax “cliff” where it repeats.'],
+            how: ['<strong>Right-click</strong> a tile → <strong>Set Material</strong>.', 'Pick an aesthetic (<strong>Realistic</strong>, <strong>Decal</strong> for thin transparent surfaces like cobwebs/dust/leaves, <strong>Fantasy</strong>, …) and a preset, or tweak the advanced sliders.', '<strong>Drag</strong> the lit preview to move the light and check how it reads.', 'In <strong>Export</strong>, tick which maps to generate. The <strong>Height</strong> map drives parallax, it’s GPU-heavy, so prefer it per-texture; when it’s on, keep <strong>Seamless height edges</strong> ticked so a tiling texture doesn’t show a parallax “cliff” where it repeats.'],
             before: 'materials', widget: 'maps',
-            tip: '<strong>Decal</strong> presets keep maps flat where the texture is transparent, so the decal’s edges don’t get embossed. Transition &amp; Wang tiles inherit materials from their sources. <strong>Seamless height edges</strong> blurs just the height map’s border toward the wrap so opposite edges meet flush — the interior relief is untouched.'
+            tip: '<strong>Decal</strong> presets keep maps flat where the texture is transparent, so the decal’s edges don’t get embossed. Transition &amp; Wang tiles inherit materials from their sources. <strong>Seamless height edges</strong> blurs just the height map’s border toward the wrap so opposite edges meet flush, the interior relief is untouched.'
         },
         {
             id: 'saved-materials', icon: '⭐', title: 'Save & reuse materials',
-            what: 'Dial in a material once — a preset plus any advanced-slider tweaks — then <strong>save it as your own preset</strong> and reapply it to any tile, in this project or the next. No more re-tuning the same sandstone on every batch.',
+            what: 'Dial in a material once, a preset plus any advanced-slider tweaks, then <strong>save it as your own preset</strong> and reapply it to any tile, in this project or the next. No more re-tuning the same sandstone on every batch.',
             how: [
                 'In <strong>Set Material</strong>, pick a preset and tweak the sliders until it reads right, then click <strong>⭐ Save as preset…</strong> and give it a name.',
                 'Your presets live under the <strong>⭐ My presets</strong> aesthetic, and also appear as one-click chips along the top of <strong>Set Material</strong> once you have saved any. Click a chip to load that preset, then <strong>Assign Material</strong>. <strong>Rename</strong> or <strong>Delete</strong> from the same bar.',
                 'Use <strong>⬇ Export</strong> to save your whole preset set to a JSON file, and <strong>⬆ Import</strong> to load it on another machine or share it with your team.'
             ],
-            tip: 'Saved presets are <em>baked into</em> the tile when you assign them, so a tile keeps its look even if you later edit or delete the preset. Presets are stored in your browser — <strong>Export</strong> them if you want a backup.'
+            tip: 'Saved presets are <em>baked into</em> the tile when you assign them, so a tile keeps its look even if you later edit or delete the preset. Presets are stored in your browser, <strong>Export</strong> them if you want a backup.'
         },
         {
             id: 'paint-tools', icon: '🖌', title: 'The paint tools (shared by every brush)',
@@ -386,43 +386,58 @@
             before: 'painttools',
             beforeLabel: 'One intensity for the whole map',
             afterLabel: 'Three stamps painted at Brightness 100, 55 and 25',
-            tip: 'The slider marked <strong>Master strength</strong> (Emissive) or <strong>Raise or lower</strong> (Height) scales <em>everything</em> at once, painted areas included. Use <strong>Brightness</strong> / <strong>Depth</strong> for the difference between regions and the master for the overall level. Note you cannot paint a lower level over a higher one — erase that area first.'
+            tip: 'The slider marked <strong>Master strength</strong> (Emissive) or <strong>Raise or lower</strong> (Height) scales <em>everything</em> at once, painted areas included. Use <strong>Brightness</strong> / <strong>Depth</strong> for the difference between regions and the master for the overall level. Note you cannot paint a lower level over a higher one, erase that area first.'
         },
         {
             id: 'multi-material', icon: '🎭', title: 'Multiple materials on one tile',
-            what: 'A single texture often mixes surfaces — a wall that is <strong>brick + a wooden door + a metal knob</strong>. Multi-material lets you paint a different material onto each region, so the brick reads as stone, the door as wood and the knob as metal in one tile.',
+            what: 'A single texture often mixes surfaces, a wall that is <strong>brick + a wooden door + a metal knob</strong>. Multi-material lets you paint a different material onto each region, so the brick reads as stone, the door as wood and the knob as metal in one tile.',
             how: [
-                'In <strong>Set Material</strong>, tick <strong>🎭 Multiple materials</strong>. The <strong>Base</strong> layer covers the whole tile — set its material (e.g. Brick) with the normal controls.',
-                '<strong>＋ Add layer</strong> for each extra surface, then <strong>select where it applies</strong> using the shared paint tools above — brush, stamp, lasso, rectangle, ellipse or wand. With a layer selected, the material controls below edit <em>that</em> layer.',
-                '<strong>Order matters</strong> — layers stack bottom→top, each painting over the ones beneath. For a wall it’s <em>Base = Brick → Wooden door → Metal knob</em>. Reorder with ▲▼, soften a boundary with <strong>Feather</strong>, then <strong>Assign</strong>.'
+                'In <strong>Set Material</strong>, tick <strong>🎭 Multiple materials</strong>. The <strong>Base</strong> layer covers the whole tile, set its material (e.g. Brick) with the normal controls.',
+                '<strong>＋ Add layer</strong> for each extra surface, then <strong>select where it applies</strong> using the shared paint tools above, brush, stamp, lasso, rectangle, ellipse or wand. With a layer selected, the material controls below edit <em>that</em> layer.',
+                '<strong>Order matters</strong>, layers stack bottom→top, each painting over the ones beneath. For a wall it’s <em>Base = Brick → Wooden door → Metal knob</em>. Reorder with ▲▼, soften a boundary with <strong>Feather</strong>, then <strong>Assign</strong>.'
             ],
             tip: 'The lit preview and 🧊 3D preview show the <em>composited</em> result as you paint, so you can see brick meet wood meet metal. Transition/Wang tiles inherit materials and so don’t take layers. Each tile’s layers are saved in your project file.'
         },
         {
             id: 'transparency', icon: '🫥', title: 'Transparency & decals',
-            what: 'Author transparent textures — cobwebs, dust, leaves, foliage — that fade into a surface instead of ending at a hard edge, and export them so Tomb Engine / Tomb Editor render the transparency.',
+            what: 'Author transparent textures, cobwebs, dust, leaves, foliage, that fade into a surface instead of ending at a hard edge, and export them so Tomb Engine / Tomb Editor render the transparency.',
             how: [
                 '<strong>Right-click</strong> a tile → <strong>Fade to Transparent</strong>; choose <strong>Edges</strong> (vignette), a <strong>Direction / slope</strong>, or paint a <strong>Custom</strong> area, then click <strong>Apply Fade</strong>.',
-                'Transitions and Wang sets preserve alpha too — blending a transparent texture stays transparent.',
+                'Transitions and Wang sets preserve alpha too, blending a transparent texture stays transparent.',
                 'In <strong>Export</strong>, pick <strong>PNG</strong> or <strong>TGA</strong> to keep real alpha, or tick <strong>Magenta color-key</strong> for classic Tomb Editor.'
             ],
             gallery: [
                 { src: 'transparency-before.png', cap: 'Leaf tile (opaque)' },
                 { src: 'transparency-after.png', cap: 'Faded edges → transparent', checker: true }
             ],
-            tip: 'The fade preview’s checkerboard shows exactly where the tile has become transparent — above, the leaves fade out at the edges so the foliage blends onto a wall instead of ending in a hard square.'
+            tip: 'The fade preview’s checkerboard shows exactly where the tile has become transparent, above, the leaves fade out at the edges so the foliage blends onto a wall instead of ending in a hard square.'
         },
         {
             id: 'emissive', icon: '✨', title: 'Emissive (glow)',
-            what: 'Authors a glow map so parts of a tile shine on their own — lava, neon, runes, screens, lit windows — independent of scene lighting.',
+            what: 'Authors a glow map so parts of a tile shine on their own, lava, neon, runes, screens, lit windows, independent of scene lighting.',
             how: [
                 '<strong>Right-click</strong> a tile → <strong>Make Emissive</strong>.',
                 'Choose what glows: <strong>Pick a colour</strong> (eyedrop the preview), a <strong>Hue range</strong>, <strong>Bright areas</strong>, or <strong>Paint</strong> it by hand.',
-                'Colour it with the <strong>Texture’s own colours</strong> or a flat <strong>Tint</strong>, set <strong>Master strength</strong> and <strong>Feather / bloom</strong>, then click <strong>Apply</strong> — the <strong>Emissive</strong> export map switches on automatically.',
+                'Colour it with the <strong>Texture’s own colours</strong> or a flat <strong>Tint</strong>, set <strong>Master strength</strong> and <strong>Feather / bloom</strong>, then click <strong>Apply</strong>, the <strong>Emissive</strong> export map switches on automatically.',
                 'In <strong>Paint</strong> mode the toolbar carries a <strong>Value</strong> slider. That is what makes one rune brighter than the next: <strong>Master strength</strong> scales the whole map together, <strong>Value</strong> is per region. See <em>The paint tools</em> above.'
             ],
             before: 'emissive',
-            tip: 'The preview sits on black because emissive is what you still see in the dark. Most materials glow nowhere — use it only for light sources and effects.'
+            tip: 'The preview sits on black because emissive is what you still see in the dark. Most materials glow nowhere, use it only for light sources and effects.'
+        },
+        {
+            id: 'roomview', icon: '🏛', title: 'Room View',
+            what: 'Opens your atlas on real Tomb Raider room geometry, lit the way Tomb Editor bakes a room and shaded the way Tomb Engine draws one. It is the only preview here that can show you what the material maps do <em>in a room</em>, because a tile preview always lights the tile directly and a room does not.',
+            how: [
+                'Slice an atlas, then click <strong>🏛 Room View</strong> on the toolbar. It opens a second window and carries your atlas and its maps across. Press it again after editing and the same window refreshes, it does not open a second one.',
+                'Texture it the way you would in Tomb Editor: pick a tile on the right, then <strong>drag across faces</strong> to paint them. Hold <strong>Shift</strong> and drag a box to select a group, <strong>Alt</strong> to take faces back out, then <strong>Apply to selection</strong>. <strong>Apply to all</strong> does a whole role (walls, floors, ceilings) at once. One tile covers one sector, and a short face shows the part of the tile it covers rather than a squashed copy.',
+                'Lights live in the strip along the bottom. Add a <strong>Point</strong>, <strong>Spot</strong>, <strong>Sun</strong> or <strong>Shadow</strong>, set its colour, <strong>Intensity</strong>, ranges and angles, and drag the coloured handles in the view to move it. A <strong>Sun</strong> and a <strong>Spot</strong> get a yellow handle to aim them instead, since direction is all a sun has.',
+                '<strong>Quality</strong> is how many shadow samples a bulb takes. Leave it on <strong>Default</strong> while you work; the view drops to it during a drag anyway and goes back to full when you let go.',
+                '<strong>🔥 Flame emitters</strong> are the one light that reaches room geometry while the room is running. Tick <strong>Carry it in a circle</strong> to walk one around the room and watch your maps under a moving light.',
+                'The map checkboxes on the left turn <strong>Normal</strong>, <strong>AO</strong>, <strong>Specular</strong>, <strong>Roughness</strong> and <strong>Emissive</strong> on and off one at a time, so you can see what each one is actually worth on this texture.',
+                '<strong>🌅 Time of day</strong> swings the first <strong>Sun</strong> through a day and re-lights as it goes, with <strong>Play</strong> to animate it. The angles are Tomb Editor’s <strong>Dir X</strong> and <strong>Dir Y</strong>. <strong>Warm at the horizon</strong> is ours, not the editor’s, so untick it to see the sun you actually built.'
+            ],
+            before: 'roomview',
+            tip: 'The example above is the same room, the same camera and the same two flames, with the maps off and then on. Notice where the difference is: on the floor the flames reach, and almost nowhere else. That is not this preview being cautious, it is how a room works. A bulb you place in Tomb Editor reaches room geometry only through vertex colours baked at compile time, and a vertex colour cannot respond to a normal map. <strong>Normal</strong>, <strong>Specular</strong> and <strong>Roughness</strong> are read only where a dynamic light reaches, which in a real level means a flame, a flare or gunfire. <strong>AO</strong> and <strong>Emissive</strong> work everywhere, because one multiplies the finished pixel and the other is added to it. The panel says which case you are in as you tick the boxes.'
         },
         {
             id: 'export', icon: '📦', title: 'Export & projects',
@@ -436,28 +451,28 @@
                 '<strong>Load Project</strong> takes either file: the <code>.atlasproj.json</code>, or an export ZIP that was made with the project file included. One ZIP is both the textures you ship and the session you keep editing. If you have unsaved edits, it asks before replacing them.',
                 'To edit tiles elsewhere, use <strong>Export Tiles Individually</strong> (one image per tile + any enabled maps, named <code>tile_r{row}_c{col}</code>), or right-click a single tile → <strong>Download PNG</strong>; bring edits back with <strong>Replace Image</strong>. With <strong>PSD</strong> selected you get one layered PSD per tile instead, maps included.',
                 'The tool autosaves to your browser as you work. If it crashes or you close the tab by accident, the next visit offers to restore that session. It is a safety net, not a filing system: one session is kept, and saving to a file clears it. The <strong>Session</strong> block at the top of the left rail shows when it last saved and how much is held, with <strong>Clear stored session</strong> to drop it by hand.',
-                'Browsers can discard stored data when disk space runs low. <strong>Protect from cleanup</strong> asks yours not to — Firefox will ask your permission, Chrome decides on its own. Optional either way: it only affects the autosave, never your files.'
+                'Browsers can discard stored data when disk space runs low. <strong>Protect from cleanup</strong> asks yours not to, Firefox will ask your permission, Chrome decides on its own. Optional either way: it only affects the autosave, never your files.'
             ],
-            tip: 'An <strong>● unsaved changes</strong> marker sits next to <strong>Save Project</strong> whenever you have edits that are not in a save file, and the browser asks before you close the tab. Autosave covers crashes, not backups — clearing your browser data deletes it, so keep real work in exported files. Use PNG/TGA alpha for Tomb Engine; use the magenta key for classic Tomb Editor workflows.'
+            tip: 'An <strong>● unsaved changes</strong> marker sits next to <strong>Save Project</strong> whenever you have edits that are not in a save file, and the browser asks before you close the tab. Autosave covers crashes, not backups, clearing your browser data deletes it, so keep real work in exported files. Tomb Editor takes either kind of transparency, so use whichever you prefer: a PNG or TGA with a real alpha channel, or pure magenta as a colour key. Magenta is the older convention because the classic level formats had no alpha channel at all, just one reserved palette slot for "invisible", so the texture had to say which colour meant it. Tomb Editor still converts it for you, and the <strong>Magenta to alpha</strong> tick box in Level Settings is <em>on by default</em> for every texture file you add. Two things follow: magenta keying works with no setup, and a pure magenta pixel you actually wanted in a texture will be punched transparent. The match is exact (255, 0, 255), so a resaved or resampled magenta will not key.'
         },
         {
             id: 'filetypes', icon: '🗂️', title: 'File types',
             what: 'What each format does on the way in and on the way out, and which one to reach for.',
             how: [
-                '<strong>PNG</strong> — lossless, keeps alpha. Loads and exports. This is the default and the right answer unless you need something specific.',
-                '<strong>TGA</strong> — lossless, 32-bit, keeps alpha. Loads and exports. Uncompressed, so files are several times larger than the same PNG.',
-                '<strong>JPG</strong> — loads only, never exports. Lossy: it throws away detail every time it is saved, and the damage accumulates across saves. It also has no alpha. Fine as a photo you are about to turn into a texture, bad as the texture itself.',
-                '<strong>BMP</strong> and <strong>WebP</strong> — load only. Both come in fine; pick PNG or TGA to go back out.',
-                '<strong>PSD</strong> — loads and exports, with layers. Exporting as PSD packs the diffuse and every enabled map into one file as separate layers instead of writing a folder of images.',
+                '<strong>PNG</strong>, lossless, keeps alpha. Loads and exports. This is the default and the right answer unless you need something specific.',
+                '<strong>TGA</strong>, lossless, 32-bit, keeps alpha. Loads and exports. Uncompressed, so files are several times larger than the same PNG.',
+                '<strong>JPG</strong>, loads only, never exports. Lossy: it throws away detail every time it is saved, and the damage accumulates across saves. It also has no alpha. Fine as a photo you are about to turn into a texture, bad as the texture itself.',
+                '<strong>BMP</strong> and <strong>WebP</strong>, load only. Both come in fine; pick PNG or TGA to go back out.',
+                '<strong>PSD</strong>, loads and exports, with layers. Exporting as PSD packs the diffuse and every enabled map into one file as separate layers instead of writing a folder of images.',
                 'Loading a PSD reads those layers back. Any layer named <code>diffuse</code>, <code>normal</code>, <code>ao</code>, <code>specular</code>, <code>roughness</code>, <code>emissive</code> or <code>height</code> is picked up as that map, as is any layer whose name ends in the export suffix (<code>_n</code>, <code>_ao</code>, <code>_s</code>, <code>_r</code>, <code>_e</code>, <code>_h</code>). Everything else is ignored.',
                 'An imported map <em>replaces</em> the one the tool would have generated. Export a PSD, repaint the normal map by hand in Photoshop, load it back, and your version is what ships. Slicing an atlas PSD cuts every map layer on the same grid, so tile positions stay lined up.',
                 '<strong>Replace Image</strong> drops a tile\'s imported maps, since they described the old pixels. Resetting a tile keeps them: they came in with the file.'
             ],
-            tip: 'PSD is the slow one. PNG, JPG and the rest are decoded by the browser itself; PSD is parsed and written in JavaScript, so a large atlas takes noticeably longer both ways. It runs in the background and will not freeze the tool, and the library it needs (about 170 KB) downloads the first time you touch a PSD and not before. If a PSD loads blank or flattens oddly, it was probably saved with <em>Maximize PSD File Compatibility</em> switched off — the tool rebuilds the image from the layers, but unusual blend modes can only be approximated. Flatten a copy in Photoshop if you need an exact match.<br><br>Please contact me if you face issues — PSD implementation threw a fit a couple of times!'
+            tip: 'PSD is the slow one. PNG, JPG and the rest are decoded by the browser itself; PSD is parsed and written in JavaScript, so a large atlas takes noticeably longer both ways. It runs in the background and will not freeze the tool, and the library it needs (about 170 KB) downloads the first time you touch a PSD and not before. If a PSD loads blank or flattens oddly, it was probably saved with <em>Maximize PSD File Compatibility</em> switched off, the tool rebuilds the image from the layers, but unusual blend modes can only be approximated. Flatten a copy in Photoshop if you need an exact match.<br><br>Please contact me if you face issues, PSD implementation threw a fit a couple of times!'
         },
         {
             id: 'accessibility', icon: '♿', title: 'Accessibility',
-            what: 'The header has a <strong>Font size</strong> control (A− / A / A+) and a <strong>Dark / light mode</strong> toggle. Both persist — and this tutorial follows them too.',
+            what: 'The header has a <strong>Font size</strong> control (A− / A / A+) and a <strong>Dark / light mode</strong> toggle. Both persist, and this tutorial follows them too.',
             how: ['Use the <strong>Font size</strong> and <strong>Dark / light mode</strong> controls (top-right of the tool).', 'Everything is keyboard-navigable with visible focus rings.'],
             tip: ''
         }
@@ -469,44 +484,44 @@
         {
             id: 'about', icon: '🧭', title: 'About Atlas Tool',
             html: `<p>Atlas Tool is a tool I made while facing problems during crossplatform levelbuilding and tool using. I got the idea to make it whilst learning materials for Tomb Engine usage. I tried to combine batch material making from a Materialize fork with PowerShell scripts.</p>
-                   <p>Potato wise, it was really difficult to run Photoshop, Illustrator or the alternatives (Photopea, Affinity) together with Blender and with multiple browser tabs, especially because I had to allocate resources to Windows emulators too.</p>`
+ <p>Potato wise, it was really difficult to run Photoshop, Illustrator or the alternatives (Photopea, Affinity) together with Blender and with multiple browser tabs, especially because I had to allocate resources to Windows emulators too.</p>`
         },
         {
             id: 'about-what', icon: '🧰', title: 'What it does',
             html: `<p>The result is a web based tool utilizing WebGL which allows you to do the usual builder stuff within browser either to "feel things out" or utilize for the final version of your level:</p>
-                   <ul class="tut-how">
-                       <li>cut up texture atlases</li>
-                       <li>rearrange texture atlases</li>
-                       <li>make textures seamless</li>
-                       <li>make texture transitions, including different materials</li>
-                       <li>appoint material presets or manually adjust materials</li>
-                       <li>debake lighting from textures which have baked shadows</li>
-                       <li>export textures with atlases and so on...</li>
-                   </ul>
-                   <p>This allows for quicker style unit testing if you want to feel a concept out and don't want to spend an hour or two jumping from tool to tool.</p>`
+ <ul class="tut-how">
+ <li>cut up texture atlases</li>
+ <li>rearrange texture atlases</li>
+ <li>make textures seamless</li>
+ <li>make texture transitions, including different materials</li>
+ <li>appoint material presets or manually adjust materials</li>
+ <li>debake lighting from textures which have baked shadows</li>
+ <li>export textures with atlases and so on...</li>
+ </ul>
+ <p>This allows for quicker style unit testing if you want to feel a concept out and don't want to spend an hour or two jumping from tool to tool.</p>`
         },
         {
             id: 'about-limits', icon: '⚖️', title: 'Limitations',
             html: `<p>This tool is trying to be as GRID optimized as possible and sacrafices for example materials map functionalities for the sake of being avaliable on web and not being resource heavy. You will always have more micromanaging options and better results if you decide to use dedicated tools for these tasks. I'm not sure how far I'll push the tool but there is a limit since it could just turn into Photoshop and then what's the point :D</p>
-                   <p>For example, presets I made for materials is what looked good to me on a couple of textures. Sandstone, marbley and clay bricks look nice but darker ones get blown out so you need to manually adjust them etc.</p>
-                   <p>Pushing hardness too hard will make you lose seamlessness etc.</p>`
+ <p>For example, presets I made for materials is what looked good to me on a couple of textures. Sandstone, marbley and clay bricks look nice but darker ones get blown out so you need to manually adjust them etc.</p>
+ <p>Pushing hardness too hard will make you lose seamlessness etc.</p>`
         },
         {
             id: 'about-thanks', icon: '🙏', title: 'Research & thanks',
             html: `<p><a href="https://github.com/BoundingBoxSoftware/Materialize" target="_blank" rel="noopener"><strong>MATERIALIZE</strong> by BoundingBoxSoftware</a></p>
-                   <p>The tool started as an attempt to recreate something simmilar to Materialize, but instead using WebGL over Unity, as the tool seems to be more or less abandoned.</p>
-                   <p><a href="https://github.com/JohnnyJF10/TgaBuilder" target="_blank" rel="noopener"><strong>TGA BUILDER</strong> by JohnnyJF10</a></p>
-                   <p>Originally I have drawn SVG masks for transitions which worked well for diffuse maps, but started creating problems for material transitions. The transition feature of TGA Builder alleviated this issue and preserved seamlessness.</p>
-                   <p style="font-size:0.85rem;opacity:0.85;">Atlas Tool is <strong>MIT licensed</strong> (see <code>LICENSE</code>) — all of it, including the seamless-tiling shaders. It was GPL-3.0 until 2026-09-13 because two shaders were ported from Materialize; those were replaced with independent implementations, so there are no copyleft strings on reusing anything the tool ships. TgaBuilder's reused code is MIT. Full notices ship in <code>THIRD-PARTY-NOTICES.md</code>.</p>`
+ <p>The tool started as an attempt to recreate something simmilar to Materialize, but instead using WebGL over Unity, as the tool seems to be more or less abandoned.</p>
+ <p><a href="https://github.com/JohnnyJF10/TgaBuilder" target="_blank" rel="noopener"><strong>TGA BUILDER</strong> by JohnnyJF10</a></p>
+ <p>Originally I have drawn SVG masks for transitions which worked well for diffuse maps, but started creating problems for material transitions. The transition feature of TGA Builder alleviated this issue and preserved seamlessness.</p>
+ <p style="font-size:0.85rem;opacity:0.85;">Atlas Tool is <strong>MIT licensed</strong> (see <code>LICENSE</code>), all of it, including the seamless-tiling shaders. It was GPL-3.0 until 2026-09-13 because two shaders were ported from Materialize; those were replaced with independent implementations, so there are no copyleft strings on reusing anything the tool ships. TgaBuilder's reused code is MIT. Full notices ship in <code>THIRD-PARTY-NOTICES.md</code>.</p>`
         },
         {
             id: 'about-contrib', icon: '🤝', title: 'Contributions',
             html: `<p>Any kind of contributions and suggestions are more than welcome, but I'm really new to github so you'll have to hit me up so I set things up.</p>
-                   <p>If you have specific knowledge about parts of this tool and want to adapt it in some way, feel free to do so.</p>
-                   <details class="tut-spoiler">
-                       <summary>📨 How to reach me</summary>
-                       <p>Discord: <strong>heyitscrazed</strong></p>
-                   </details>`
+ <p>If you have specific knowledge about parts of this tool and want to adapt it in some way, feel free to do so.</p>
+ <details class="tut-spoiler">
+ <summary>📨 How to reach me</summary>
+ <p>Discord: <strong>heyitscrazed</strong></p>
+ </details>`
         }
     ];
 
@@ -522,94 +537,94 @@
        difference where naming what you are looking at is the whole point. */
     function buildCompare(name, labels) {
         const esc = t => String(t).replace(/[&<>"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
-        const capBefore = labels && labels[0] ? esc(labels[0]) : 'Before';
-        const capAfter = labels && labels[1] ? esc(labels[1]) : 'After';
-        const wrap = el('div', 'tut-compare');
-        wrap.innerHTML = `
-            <div class="tut-badge">🖐 Test for yourself</div>
-            <div class="cmp-frame" style="--pos:50%">
-                <img class="cmp-before" alt="before" src="${IMG}${name}-before.png" draggable="false">
-                <img class="cmp-after"  alt="after"  src="${IMG}${name}-after.png" draggable="false">
-                <div class="cmp-divider"></div>
-            </div>
-            <input type="range" class="cmp-range" min="0" max="100" value="50" aria-label="Reveal amount — drag to compare before and after">
-            <div class="cmp-foot"><span>${capBefore}</span><span>${capAfter}</span></div>`;
-        const frame = wrap.querySelector('.cmp-frame');
-        const range = wrap.querySelector('.cmp-range');
-        const set = v => frame.style.setProperty('--pos', v + '%');
-        range.addEventListener('input', () => set(range.value));
-        // Allow dragging on the image directly too.
-        const drag = e => {
-            const r = frame.getBoundingClientRect();
-            const v = Math.max(0, Math.min(100, ((e.clientX - r.left) / r.width) * 100));
-            range.value = v; set(v);
-        };
-        let down = false;
-        frame.addEventListener('pointerdown', e => { down = true; frame.setPointerCapture(e.pointerId); drag(e); });
-        frame.addEventListener('pointermove', e => { if (down) drag(e); });
-        frame.addEventListener('pointerup', () => { down = false; });
-        return wrap;
-    }
+ const capBefore = labels && labels[0] ? esc(labels[0]) : 'Before';
+ const capAfter = labels && labels[1] ? esc(labels[1]) : 'After';
+ const wrap = el('div', 'tut-compare');
+ wrap.innerHTML = `
+ <div class="tut-badge">🖐 Test for yourself</div>
+ <div class="cmp-frame" style="--pos:50%">
+ <img class="cmp-before" alt="before" src="${IMG}${name}-before.png" draggable="false">
+ <img class="cmp-after" alt="after" src="${IMG}${name}-after.png" draggable="false">
+ <div class="cmp-divider"></div>
+ </div>
+ <input type="range" class="cmp-range" min="0" max="100" value="50" aria-label="Reveal amount, drag to compare before and after">
+ <div class="cmp-foot"><span>${capBefore}</span><span>${capAfter}</span></div>`;
+ const frame = wrap.querySelector('.cmp-frame');
+ const range = wrap.querySelector('.cmp-range');
+ const set = v => frame.style.setProperty('--pos', v + '%');
+ range.addEventListener('input', () => set(range.value));
+ // Allow dragging on the image directly too.
+ const drag = e => {
+ const r = frame.getBoundingClientRect();
+ const v = Math.max(0, Math.min(100, ((e.clientX - r.left) / r.width) * 100));
+ range.value = v; set(v);
+ };
+ let down = false;
+ frame.addEventListener('pointerdown', e => { down = true; frame.setPointerCapture(e.pointerId); drag(e); });
+ frame.addEventListener('pointermove', e => { if (down) drag(e); });
+ frame.addEventListener('pointerup', () => { down = false; });
+ return wrap;
+ }
 
-    /* Auto-crossfading example (CSS-driven). */
-    function buildExample(name) {
-        const wrap = el('div', 'tut-example');
-        wrap.innerHTML = `
-            <div class="tut-badge">▶ Example</div>
-            <div class="ex-frame">
-                <img class="ex-before" alt="before" src="${IMG}${name}-before.png" draggable="false">
-                <img class="ex-after"  alt="after"  src="${IMG}${name}-after.png" draggable="false">
-            </div>
-            <div class="ex-cap">before&nbsp;⇄&nbsp;after</div>`;
-        return wrap;
-    }
+ /* Auto-crossfading example (CSS-driven). */
+ function buildExample(name) {
+ const wrap = el('div', 'tut-example');
+ wrap.innerHTML = `
+ <div class="tut-badge">▶ Example</div>
+ <div class="ex-frame">
+ <img class="ex-before" alt="before" src="${IMG}${name}-before.png" draggable="false">
+ <img class="ex-after" alt="after" src="${IMG}${name}-after.png" draggable="false">
+ </div>
+ <div class="ex-cap">before&nbsp;⇄&nbsp;after</div>`;
+ return wrap;
+ }
 
-    /* Interactive material-maps demo: tick which maps to generate for a brick
-       texture and see them rendered live by the real engine. */
-    function buildMapsWidget() {
-        const wrap = el('div', 'tut-maps');
-        wrap.innerHTML = `
-            <div class="tut-badge">🧪 Try it — generate maps</div>
-            <div class="tut-maps-controls">
-                <span class="tut-maps-label">Maps to generate:</span>
-                <label><input type="checkbox" data-map="normal" checked> Normal</label>
-                <label><input type="checkbox" data-map="ao" checked> AO</label>
-                <label><input type="checkbox" data-map="specular"> Specular</label>
-                <label><input type="checkbox" data-map="roughness"> Roughness</label>
-                <label><input type="checkbox" data-map="height"> Height</label>
-            </div>
-            <div class="tut-maps-grid" id="tut-maps-grid"></div>
-            <div class="tut-prev2x">
-                <figure><canvas class="tut-prev-2d" width="256" height="256"></canvas><figcaption>2D lit preview (flat)</figcaption></figure>
-                <figure><canvas class="tut-prev-3d" width="256" height="256"></canvas><figcaption>🧊 3D displaced preview<span class="tut-3d-status"></span></figcaption></figure>
-            </div>
-            <p class="tut-maps-note">Left is the flat shaded preview; right is a real <strong>3D engine</strong> (Babylon.js) that displaces a mesh by the height map — drag to orbit, scroll to zoom. It loads when this section scrolls into view.</p>`;
-        setTimeout(() => initMapsWidget(wrap), 0);
-        return wrap;
-    }
+ /* Interactive material-maps demo: tick which maps to generate for a brick
+ texture and see them rendered live by the real engine. */
+ function buildMapsWidget() {
+ const wrap = el('div', 'tut-maps');
+ wrap.innerHTML = `
+ <div class="tut-badge">🧪 Try it, generate maps</div>
+ <div class="tut-maps-controls">
+ <span class="tut-maps-label">Maps to generate:</span>
+ <label><input type="checkbox" data-map="normal" checked> Normal</label>
+ <label><input type="checkbox" data-map="ao" checked> AO</label>
+ <label><input type="checkbox" data-map="specular"> Specular</label>
+ <label><input type="checkbox" data-map="roughness"> Roughness</label>
+ <label><input type="checkbox" data-map="height"> Height</label>
+ </div>
+ <div class="tut-maps-grid" id="tut-maps-grid"></div>
+ <div class="tut-prev2x">
+ <figure><canvas class="tut-prev-2d" width="256" height="256"></canvas><figcaption>2D lit preview (flat)</figcaption></figure>
+ <figure><canvas class="tut-prev-3d" width="256" height="256"></canvas><figcaption>🧊 3D displaced preview<span class="tut-3d-status"></span></figcaption></figure>
+ </div>
+ <p class="tut-maps-note">Left is the flat shaded preview; right is a real <strong>3D engine</strong> (Babylon.js) that displaces a mesh by the height map, drag to orbit, scroll to zoom. It loads when this section scrolls into view.</p>`;
+ setTimeout(() => initMapsWidget(wrap), 0);
+ return wrap;
+ }
 
-    function initMapsWidget(wrap) {
-        const grid = wrap.querySelector('.tut-maps-grid');
-        const E = window.TRLE && window.TRLE.Engine;
-        if (!E || !E.init(document.getElementById('tut-gl'))) {
-            grid.innerHTML = '<p class="tut-maps-note">This live preview needs WebGL 2.0 — open the tool itself to try it.</p>';
-            return;
-        }
-        const preset = TRLE.getSolidPreset('brick', 'realistic');
-        const LABELS = { normal: 'Normal', ao: 'AO', specular: 'Specular', roughness: 'Roughness', height: 'Height' };
-        const S = 256;
-        const img = new Image();
-        img.onload = () => {
-            let diff = el('canvas'); diff.width = S; diff.height = S;
-            diff.getContext('2d').drawImage(img, 0, 0, S, S);
-            let diffTex;
-            try {
-                diffTex = E.createTextureFromImage(diff);
-            } catch (e) {
-                // Opened from file:// → the loaded PNG taints the canvas (file URLs are
-                // unique origins), so WebGL upload/readback is blocked. Fall back to a
-                // procedural brick on a fresh, untainted canvas so the demo still works.
-                console.warn('[tutorial] demo image blocked (file://?); using a procedural brick instead');
+ function initMapsWidget(wrap) {
+ const grid = wrap.querySelector('.tut-maps-grid');
+ const E = window.TRLE && window.TRLE.Engine;
+ if (!E || !E.init(document.getElementById('tut-gl'))) {
+ grid.innerHTML = '<p class="tut-maps-note">This live preview needs WebGL 2.0. Open the tool itself to try it.</p>';
+ return;
+ }
+ const preset = TRLE.getSolidPreset('brick', 'realistic');
+ const LABELS = { normal: 'Normal', ao: 'AO', specular: 'Specular', roughness: 'Roughness', height: 'Height' };
+ const S = 256;
+ const img = new Image();
+ img.onload = () => {
+ let diff = el('canvas'); diff.width = S; diff.height = S;
+ diff.getContext('2d').drawImage(img, 0, 0, S, S);
+ let diffTex;
+ try {
+ diffTex = E.createTextureFromImage(diff);
+ } catch (e) {
+ // Opened from file:// → the loaded PNG taints the canvas (file URLs are
+ // unique origins), so WebGL upload/readback is blocked. Fall back to a
+ // procedural brick on a fresh, untainted canvas so the demo still works.
+ console.warn('[tutorial] demo image blocked (file://?); using a procedural brick instead');
                 diff = el('canvas'); diff.width = S; diff.height = S;
                 drawDemoBrick(diff.getContext('2d'), S);
                 diffTex = E.createTextureFromImage(diff);
@@ -686,7 +701,7 @@
         const c2d = wrap.querySelector('.tut-prev-2d');
         const c3d = wrap.querySelector('.tut-prev-3d');
         const status = wrap.querySelector('.tut-3d-status');
-        const setStatus = m => { if (status) status.textContent = m ? ' — ' + m : ''; };
+        const setStatus = m => { if (status) status.textContent = m ? ', ' + m : ''; };
         if (c2d) { c2d.width = S; c2d.height = S; }
         if (c3d) { c3d.width = 256; c3d.height = 256; }
 
@@ -733,7 +748,7 @@
             try {
                 p3d = TRLE.Preview3D.create(c3d, { relief: 0.5, onStatus: setStatus });
                 p3d.setMaps(mapCanvas).then(ok => { if (ok) setTimeout(() => p3d.resize(), 60); else setStatus('failed to load'); });
-            } catch (err) { console.error('[tutorial 3D preview]', err); setStatus('error — see console'); }
+            } catch (err) { console.error('[tutorial 3D preview]', err); setStatus('error, see console'); }
         };
         if ('IntersectionObserver' in window) {
             const io = new IntersectionObserver(ents => {
@@ -774,8 +789,8 @@
     function buildTransformSlideshow(imgSrc) {
         const wrap = el('div', 'tut-xform');
         wrap.innerHTML = `
-            <div class="tut-xform-stage"><img alt="transform demo" src="${imgSrc}" draggable="false"></div>
-            <div class="tut-xform-cap" aria-live="polite">Original</div>`;
+ <div class="tut-xform-stage"><img alt="transform demo" src="${imgSrc}" draggable="false"></div>
+ <div class="tut-xform-cap" aria-live="polite">Original</div>`;
         const img = wrap.querySelector('img'), cap = wrap.querySelector('.tut-xform-cap');
         let i = 0;
         const apply = () => {
@@ -837,7 +852,7 @@
 
         // ── About / colophon, behind a clear "end of tutorial" divider ──
         const divider = el('div', 'tut-about-divider');
-        divider.innerHTML = '<span>End of tutorial — About the tool</span>';
+        divider.innerHTML = '<span>End of tutorial, About the tool</span>';
         main.appendChild(divider);
 
         toc.appendChild(el('div', 'tut-toc-title', 'About'));

@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<!-- TextureTool — Copyright (c) 2026 KainM-77. MIT Licensed. See LICENSE & THIRD-PARTY-NOTICES.md. -->
+<html lang="en">
+<head>
+ <meta charset="UTF-8">
+ <meta name="viewport" content="width=device-width, initial-scale=1.0">
+ <title>TRLE Atlas Tool, Demo course</title>
+ <link rel="icon" type="image/svg+xml" href="favicon.svg">
+ <link rel="stylesheet" href="style.css">
+</head>
+<body class="demo-body">
+
+<header class="app-header">
+ <div class="header-top">
+ <a class="logo" href="index.html" style="text-decoration:none;color:inherit;" title="Back to the Atlas Tool">
+ <svg class="logo-mark" viewBox="0 0 32 32" width="20" height="20" aria-hidden="true" focusable="false">
+ <rect width="32" height="32" rx="4" fill="#1e1e1e"/>
+ <path d="M16 4L27 16L16 28L5 16Z" fill="#e8852a"/>
+ <path d="M16 8L23 16L16 24L9 16Z" fill="#f09030" opacity="0.4"/>
+ </svg>
+ Atlas Tool <span class="logo-beta">(Beta)</span> · Demo course
+ </a>
+ <div class="app-controls">
+ <a class="ctrl-btn tut-back-btn" href="tutorial.html" style="text-decoration:none;margin-right:6px;">📖 How to use the tool</a>
+ <a class="ctrl-btn tut-back-btn" href="materials.html" style="text-decoration:none;margin-right:6px;">🎨 Materials</a>
+ <a class="ctrl-btn tut-back-btn" href="index.html" style="text-decoration:none;">← Back to the tool</a>
+ </div>
+ </div>
+</header>
+
+<div class="demo-shell" id="demo-shell">
+ <!-- The STAGE is a real, complete AtlasTool. Not a clone, not a mock: the
+         course drives the shipped UI so what you practise is what you use.
+         ?demo namespaces its storage so nothing here touches your own work. -->
+ <div class="demo-stage" id="demo-stage">
+ <iframe class="demo-frame" id="demo-frame" src="index.html?demo"
+ title="Atlas Tool (demo sandbox)"></iframe>
+ <div class="demo-frame-veil" id="demo-frame-veil"><span>Loading the tool…</span></div>
+
+ <!-- Shown when the page cannot reach into the frame. Under file:// every
+             local file gets its own opaque origin, so the parent is blocked from
+             reading contentWindow.TRLE — and driving the framed tool is the whole
+             mechanism of the course. The TOOL itself runs fine from file://,
+             which is exactly why people arrive here expecting this to as well. -->
+ <div class="demo-blocked" id="demo-blocked" hidden>
+ <div class="demo-blocked-card">
+ <h2>The demo course needs a local web server</h2>
+ <p id="demo-blocked-why"></p>
+ <p>Run this from <strong id="demo-blocked-dir">the folder holding this page</strong>:</p>
+ <pre id="demo-blocked-cmd">python3 server.py</pre>
+ <p>then open <a id="demo-blocked-url" href="#"></a></p>
+ <p class="demo-blocked-note">
+ The Atlas Tool itself works fine opened straight from a file, it is only
+ the course that needs the server, because it drives the real tool in a frame
+ and the browser will not let one local file reach into another.
+ </p>
+ <div class="demo-blocked-actions">
+ <a class="btn btn-primary" id="demo-blocked-tool" href="index.html">Open the tool instead</a>
+ <a class="btn btn-secondary" href="tutorial.html">Read the written tutorial</a>
+ </div>
+ </div>
+ </div>
+ </div>
+
+ <aside class="demo-rail" id="demo-rail" aria-label="Lesson">
+ <div class="demo-rail-head">
+ <label class="demo-lesson-pick">
+ <span>Lesson</span>
+ <select id="demo-lesson-select" aria-label="Choose a lesson"></select>
+ </label>
+ <div class="demo-dots" id="demo-dots" role="tablist" aria-label="Steps"></div>
+ </div>
+
+ <div class="demo-rail-body" id="demo-rail-body">
+ <!-- Shown only when there is saved progress that has gone cold (see
+             RESUME_ASK_AFTER in demo.js). Resuming silently is right when someone
+             steps out of the tool and back in; it is wrong a day later, when the
+             course opens three lessons deep with no explanation. -->
+ <div class="demo-resume" id="demo-resume" hidden>
+ <h2>Pick up where you left off?</h2>
+ <p id="demo-resume-where"></p>
+ <div class="demo-resume-actions">
+ <button class="btn btn-primary btn-sm" id="demo-resume-yes">Continue</button>
+ <button class="btn btn-secondary btn-sm" id="demo-resume-no">Start from the beginning</button>
+ </div>
+ <p class="demo-resume-note">Either way the sandbox starts clean, nothing you did is kept.</p>
+ </div>
+ <h2 class="demo-step-title" id="demo-step-title"></h2>
+ <div class="demo-step-say" id="demo-step-say"></div>
+ <div class="demo-handoff" id="demo-handoff" hidden>
+ <div class="demo-handoff-label">Your turn</div>
+ <div id="demo-handoff-text"></div>
+ </div>
+ <div class="demo-status" id="demo-status" role="status" aria-live="polite"></div>
+ </div>
+
+ <div class="demo-rail-foot">
+ <div class="demo-nav">
+ <button class="btn btn-secondary btn-sm" id="demo-prev">← Back</button>
+ <button class="btn btn-primary btn-sm" id="demo-next">Next →</button>
+ </div>
+ <div class="demo-nav demo-nav-minor">
+ <button class="btn btn-secondary btn-sm" id="demo-replay" title="Run this step's animation again">↻ Replay</button>
+ <button class="btn btn-secondary btn-sm" id="demo-skip" title="Stop the animation and take over">⏭ Skip animation</button>
+ <button class="btn btn-secondary btn-sm" id="demo-restart" title="Reset the sandbox and start this lesson again">⟲ Restart lesson</button>
+ </div>
+ <p class="demo-foot-note">
+ This is a sandbox. Nothing you do here touches your own atlas, projects or
+ saved materials. <a href="index.html">Open the real tool</a> when you're ready.
+ </p>
+ </div>
+ </aside>
+</div>
+
+<!-- Four-quadrant scrim: the hole is real, so the spotlit control stays live. -->
+<div class="demo-scrim" id="demo-scrim-top"></div>
+<div class="demo-scrim" id="demo-scrim-bottom"></div>
+<div class="demo-scrim" id="demo-scrim-left"></div>
+<div class="demo-scrim" id="demo-scrim-right"></div>
+<div class="demo-ring" id="demo-ring"></div>
+
+<script src="js/demo-lessons.js"></script>
+<script src="js/demo-runner.js"></script>
+<script src="js/demo.js"></script>
+</body>
+</html>
