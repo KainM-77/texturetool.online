@@ -25,7 +25,9 @@ window.TRLE = window.TRLE || {};
         imageLayers: null,  // atlas-sized material maps read from a PSD's layers, sliced alongside `image`
         tileSize: 256,
         cols: 0,
-        elements: [],       // render order == atlas order
+        rows: 0,            // slot rows; see LAYOUT below
+        layout: [],         // cols × rows slots, row-major: element id or null
+        elements: [],       // processing order (transitions after their parents)
         nextId: 1,
         selectedId: null,   // primary of the selection (last clicked)
         selSet: new Set(),  // unified multi-selection (Windows-style icon select)
@@ -39,7 +41,10 @@ window.TRLE = window.TRLE || {};
         flipNormalY: false, // global: export normals in DirectX (flipped green) vs OpenGL/TombEngine
         lastMaterial: null,      // last assigned material descriptor (for "Apply Last Material")
         lastMatLayers: null,     // …and its layer stack, when the last assign was multi-material
-        dirty: false             // unsaved edits since the last save / load
+        dirty: false,            // unsaved edits since the last save / load
+        emptyFill: null,         // what empty slots become at export: 'compact' | 'black' | 'transparent' | null (ask)
+        lockCols: false,         // a push may not add a column (GRID-SLOT-PLAN D6)
+        lockRows: false          // a push may not add a row
     };
 
     /* element: {
@@ -52,6 +57,218 @@ window.TRLE = window.TRLE || {};
        } */
     const byId = id => state.elements.find(e => e.id === id);
     const indexOf = id => state.elements.findIndex(e => e.id === id);
+
+    /* ============ LAYOUT ============
+       WHERE each element sits in the atlas, separate from state.elements, which
+       is the order transitions are refreshed in (GRID-SLOT-PLAN D1/D2).
+       `state.layout` is cols × rows slots, row-major, each an element id or null
+       (an EMPTY SLOT, which Columns / Rows and deleting leave behind).
+
+       The layout is authoritative. Code that edits `state.elements` directly
+       (add, delete, drag, the order repairs) keeps working because the layout
+       RECONCILES to it on the next read (`syncLayout`), with one invariant:
+       element order equals the reading order of the occupied slots.
+         - a reorder permutes the tiles among the slots already occupied, so
+           empty slots stay where they are;
+         - a deleted element leaves an empty slot;
+         - a new element takes the first empty slot after the element it was
+           inserted behind (a push to the first hole, D5), or goes after the
+           last occupied slot (D9), growing rows when there is no hole;
+         - a set added through confirmResizeCols lands as a rectangle on a
+           fresh row (`pendingRect`);
+         - tiles added AT an empty slot (clicked, dropped on, pasted into)
+           fill it and then the empty slots after it (`pendingSlot`), so
+           nothing already placed moves.
+       Setting `state.cols` directly (slice, import, a new atlas) is a fresh
+       start: the layout re-derives row-major, the placement the tool always
+       had. Columns / Rows go through setColumns / setRows, which remap. */
+    let layoutSigSeen = null;
+    let layoutColsSeen = null;
+    let layoutNumbers = null;   // Map id -> 1-based number, rebuilt lazily
+    let layoutObjs = new Map(); // id -> the element OBJECT the layout was last assigned for
+    let pendingRect = 0;        // width of a set about to be appended, see above
+    let pendingSlot = null;     // the empty slot the next appended tiles start at, see above
+    let pendingPlace = null;    // Map id -> slot: exact slots for new tiles (an animation's shape)
+    /* The signature is over element OBJECTS, not ids. Ids restart at 1 on every
+       new atlas, so an id signature could not tell a freshly sliced atlas of the
+       same size from the one it replaced, and the old one's layout (its holes,
+       its grown rows, its arrangement) survived onto the new tiles. */
+    const objSerial = new WeakMap();
+    let objSerialNext = 1;
+    const serialOf = el => { let n = objSerial.get(el); if (!n) { n = objSerialNext++; objSerial.set(el, n); } return n; };
+    const layoutSig = () => state.elements.map(serialOf).join(',');
+
+    function layoutFromOrder() {
+        const cols = Math.max(1, state.cols), N = state.elements.length;
+        state.rows = N ? Math.ceil(N / cols) : 0;
+        state.layout = new Array(cols * state.rows).fill(null);
+        state.elements.forEach((el, i) => { state.layout[i] = el.id; });
+        pendingRect = 0; pendingSlot = null; pendingPlace = null;   // a fresh atlas is row-major already
+        layoutAssigned();
+    }
+    /* Call after anything assigns state.layout / state.rows directly. */
+    function layoutAssigned() {
+        layoutSigSeen = layoutSig(); layoutColsSeen = state.cols; layoutNumbers = null;
+        layoutObjs = new Map(state.elements.map(e => [e.id, e]));
+    }
+    function syncLayout() {
+        if (layoutColsSeen !== state.cols) layoutFromOrder();
+        else if (layoutSigSeen !== layoutSig()) reconcileLayout();
+    }
+
+    /* Re-slot the layout at `n` columns, keeping every tile's (col, row).
+       Callers have already checked that any column being removed is empty. */
+    function remapColumns(n) {
+        const old = Math.max(1, state.cols), rows = state.rows;
+        const out = new Array(n * rows).fill(null);
+        state.layout.forEach((id, s) => {
+            const c = s % old, r = Math.floor(s / old);
+            if (id != null && c < n) out[r * n + c] = id;
+        });
+        state.cols = n;
+        state.layout = out;
+        layoutAssigned();
+    }
+
+    function reconcileLayout() {
+        const cols = Math.max(1, state.cols);
+        const order = state.elements.map(e => e.id);
+        /* An id only counts as the same tile if it is the same element OBJECT:
+           slicing or importing a fresh atlas restarts ids at 1, and matching
+           those to the old layout's slots would scatter the new atlas over the
+           old one's holes. When nothing survives, it is a fresh atlas. */
+        const objNow = new Map(state.elements.map(e => [e.id, e]));
+        const known = new Map();                  // id -> slot, for tiles still present
+        state.layout.forEach((id, s) => {
+            if (id != null && objNow.has(id) && layoutObjs.get(id) === objNow.get(id)) known.set(id, s);
+        });
+        /* ...except into an atlas with no tiles at all (a blank one), or one
+           whose every tile was just replaced (an edited animation that was the
+           whole atlas), when the new tiles were aimed at slots or a shape. */
+        const aimedAtSlots = pendingSlot != null || !!pendingPlace || !!pendingRect;
+        if (!known.size && !(aimedAtSlots && state.layout.every(id => id == null || !objNow.has(id)))) { layoutFromOrder(); return; }
+
+        /* Since phase 6 element order is processing order only (transitions after
+           their parents), so a tile already placed KEEPS ITS SLOT whatever the
+           order does, and a deleted one leaves an empty slot. Only new tiles
+           need placing. */
+        const layout = state.layout.map(id => (id != null && known.has(id) ? id : null));
+        let rows = state.rows;
+        const grow = () => { rows++; layout.push(...new Array(cols).fill(null)); };
+        const fresh = order.filter(id => !known.has(id));
+        const lastOcc = () => { for (let s = layout.length - 1; s >= 0; s--) if (layout[s] != null) return s; return -1; };
+
+        /* New tiles given exact slots (an edited animation keeping its place, or
+           reshaped where it was): they go there when the slot is free. */
+        const placed = new Map();
+        if (pendingPlace) {
+            for (const [id, sl] of pendingPlace) {
+                if (known.has(id) || !objNow.has(id)) continue;
+                while (sl >= layout.length) grow();
+                if (layout[sl] == null) { layout[sl] = id; placed.set(id, sl); }
+            }
+            pendingPlace = null;
+        }
+
+        // A set appended at the end lands as a width-wide rectangle on a fresh row.
+        let rect = null;
+        if (pendingRect && fresh.length && order.slice(order.length - fresh.length).every(id => !known.has(id))) {
+            const w = pendingRect;
+            const start = Math.floor(lastOcc() / cols) + 1, need = start + Math.ceil(fresh.length / w);
+            while (rows < need) grow();
+            rect = new Map(fresh.map((id, k) => [id, (start + Math.floor(k / w)) * cols + (k % w)]));
+            for (const [id, sl] of rect) layout[sl] = id;
+        }
+        pendingRect = 0;
+
+        /* Other new tiles: one appended at the end of element order goes after the
+           last occupied slot (D9); one inserted next to a tile (a variation, an
+           origami frame) takes the first empty slot after that tile. */
+        let tailStart = order.length;
+        while (tailStart > 0 && !known.has(order[tailStart - 1])) tailStart--;
+        let prev = -1, at = pendingSlot;
+        pendingSlot = null;
+        order.forEach((id, i) => {
+            if (known.has(id)) { prev = known.get(id); return; }
+            if (rect && rect.has(id)) { prev = rect.get(id); return; }
+            if (placed.has(id)) { prev = placed.get(id); return; }
+            const aimed = i >= tailStart && at != null;
+            let sl = aimed ? at : (i >= tailStart ? lastOcc() : prev) + 1;
+            while (true) {
+                while (sl >= layout.length) grow();
+                if (layout[sl] == null) break;
+                sl++;
+            }
+            layout[sl] = id;
+            prev = sl;
+            if (aimed) at = sl + 1;
+        });
+        state.rows = rows;
+        state.layout = layout;
+        layoutAssigned();
+    }
+
+    /* Occupied slots in reading order: { el, slot, col, row, n } with n the
+       1-based texture number (empties are not counted, GRID-SLOT-PLAN D17).
+       Built fresh on every call and never cached: undo and load rebuild the
+       element OBJECTS under the same ids, so a cached `el` would be stale. */
+    function layoutCells() {
+        syncLayout();
+        const cols = Math.max(1, state.cols);
+        const byIdMap = new Map(state.elements.map(e => [e.id, e]));
+        const cells = [];
+        state.layout.forEach((id, slot) => {
+            const el = id == null ? null : byIdMap.get(id);
+            if (el) cells.push({ el, slot, col: slot % cols, row: Math.floor(slot / cols), n: cells.length + 1 });
+        });
+        return cells;
+    }
+    /* Map id -> the number a tile shows in the grid and in every "Tile N"
+       label. A loop over tiles takes this ONCE: numberOf re-checks the layout
+       on every call, which is O(n) and turns a per-tile loop quadratic
+       (measured 0.5 ms per check at 4,096 tiles, so ~2 s for one picker). */
+    function tileNumbers() {
+        syncLayout();
+        if (!layoutNumbers) {
+            layoutNumbers = new Map();
+            const ids = new Set(state.elements.map(e => e.id));
+            for (const lid of state.layout) if (lid != null && ids.has(lid)) layoutNumbers.set(lid, layoutNumbers.size + 1);
+        }
+        return layoutNumbers;
+    }
+    function numberOf(id) { return tileNumbers().get(id) || 0; }
+    function slotOf(id) { syncLayout(); return state.layout.indexOf(id); }
+
+    /* Problems with the layout, or [] when it is sound: the right length, every
+       element exactly once, nothing that is not an element. */
+    function checkLayout() {
+        const out = [];
+        const cols = Math.max(1, state.cols);
+        if (state.layout.length !== cols * state.rows)
+            out.push(`length ${state.layout.length} != ${cols} x ${state.rows}`);
+        const ids = new Set(state.elements.map(e => e.id)), seen = new Set();
+        for (const id of state.layout) {
+            if (id == null) continue;
+            if (!ids.has(id)) out.push(`unknown id ${id}`);
+            if (seen.has(id)) out.push(`id ${id} twice`);
+            seen.add(id);
+        }
+        for (const id of ids) if (!seen.has(id)) out.push(`id ${id} missing`);
+        return out;
+    }
+
+    /* Take a saved layout (undo snapshot or project file) if it is sound for the
+       elements now in state; otherwise derive it. A file written before layouts
+       existed has none, and derives exactly the placement it always had. */
+    function adoptLayout(rows, layout) {
+        if (Number.isInteger(rows) && Array.isArray(layout)) {
+            state.rows = rows;
+            state.layout = layout.map(id => (id == null ? null : id));
+            if (!checkLayout().length) { layoutAssigned(); return true; }
+        }
+        layoutFromOrder();
+        return false;
+    }
 
     /* ============ TRANSITION MODES + MASKS (ported from app.js) ============ */
     const TRANS_MODES = [
@@ -158,6 +375,21 @@ window.TRLE = window.TRLE || {};
         EdgeLeft:          CORNER_NW | CORNER_SW,
         EdgeRight:         CORNER_NE | CORNER_SE
     });
+    /* Legacy ratio-field mode -> its corner-state counterpart. ONE table for both
+       places that swap families: the Full Set's 'seamless' style (transSetCells)
+       and the Single tab's "Seamless corners" checkbox. The edge rows matter as
+       much as the corners: a seamless corner only meets an edge tile that also
+       came through the corner builder (see the Edge* entries above). Modes not
+       listed (Top/Bottom/Left/Right, the Slopes) have no counterpart and pass
+       through unchanged. */
+    const SEAMLESS_MODE_OF = Object.assign(Object.create(null), {
+        DiagonalTopLeft:  'CornerTopLeft',  DiagonalTopRight:  'CornerTopRight',
+        DiagonalBottomLeft: 'CornerBottomLeft', DiagonalBottomRight: 'CornerBottomRight',
+        TopLeftFull:      'NotchTopLeft',   TopRightFull:      'NotchTopRight',
+        BottomLeftFull:   'NotchBottomLeft', BottomRightFull:  'NotchBottomRight',
+        TopFull: 'EdgeTop', BottomFull: 'EdgeBottom', LeftFull: 'EdgeLeft', RightFull: 'EdgeRight'
+    });
+    const seamlessModeOf = mode => SEAMLESS_MODE_OF[mode] || mode;
     /* Narrowest blend band, in g units, at "hard cut". The ratio field antialiases
        its step by blurring the finished mask; that can't be used here because a
        blur reads pixels from outside the tile, which is the one place a mask in a
@@ -923,9 +1155,13 @@ window.TRLE = window.TRLE || {};
                 ovSelectionOpts(p, S));
         }
         if (!sel) return op >= 1 ? null : ovFlatMask(S, op);
-        if (op >= 1) return sel;
-        // Scale the whole selection by opacity. 'multiply' against a grey field
-        // is exact on a greyscale mask and needs no per-pixel loop.
+        return ovScaleMask(sel, S, op);
+    }
+    /* Scale a coverage mask by opacity. 'multiply' against a grey field is exact
+       on a greyscale mask and needs no per-pixel loop. */
+    function ovScaleMask(sel, S, opacity) {
+        const op = opacity == null ? 1 : opacity;
+        if (!sel || op >= 1) return sel;
         const out = cloneCanvas(sel);
         const ctx = out.getContext('2d');
         ctx.globalCompositeOperation = 'multiply';
@@ -1051,6 +1287,529 @@ window.TRLE = window.TRLE || {};
         const parts = overlayParts(el, S);
         if (!parts) return null;
         return composeOverlayDiffuse(parts.base, parts.placed, parts.cov, S, parts.params.blend);
+    }
+
+    /* ============ ANIMATION OVERLAY ============
+       Lays a STATIC tile over (or under) every frame of an animation: a well rim
+       around moving water, stepping stones on lava, a grate the liquid shows
+       through, a window behind falling rain.
+
+       It is a field on the animation's own recipe (`el.anim.overlay`), NOT a
+       separate transition element per frame. Building it the other way looks
+       natural — `ovParams` already does this job for one tile — but it loses
+       every group invariant (contiguity, atomic delete, material propagation,
+       the manifest range) and walks into anAdd's rebuild, which hands every
+       frame a fresh state.nextId. Pointing FROM a frame AT a static tile
+       survives that; pointing at a frame does not.
+
+       The compositing itself is the overlay feature's, reused whole:
+       composeOverlayDiffuse does real source-over (a lerp would darken the base
+       under a cutout, so a well rim would arrive inside a grey box) and
+       ovCoverage is the same colour / hue / brightness picker.
+
+       WHAT IS DELIBERATELY NOT HERE IN THIS PHASE:
+         - paint coverage. Its mask is PIXELS, and `e.anim` is stored as plain
+           JSON by buildProjectData, so carrying one would be a persistence
+           format change. The other four modes recompute from the recipe.
+         - rot/flip on the source. Transform -> Rotate on the tile itself is
+           already batchable and does the same job.
+       Both are recorded in ANIMATED-OVERLAY-PLAN.md rather than half-built. */
+
+    /* The source is a plain `tile` or, from round three (2026-09-24), a
+       `transition`. It was tile-only because refreshAnims() ran before
+       refreshTransitions() and a transition source would have been composited
+       against last pass's canvas. refreshTransitions() now recomposes overlaid
+       groups in DEPENDENCY order (derivedOrder), which is what lifted it. An
+       anim frame is still refused: it would be a second animation, and that
+       is `layer2`, generated at this group's own frame count. */
+    const animOverlaySource = ovl => {
+        if (!ovl || ovl.tileId == null) return null;
+        const t = byId(ovl.tileId);
+        return t && (t.kind === 'tile' || t.kind === 'transition') && t.canvas ? t : null;
+    };
+
+    /* Emissive-only animation (round three): every frame's DIFFUSE is one
+       static texture and only the glow moves. Same source rule as an overlay,
+       and it is a source in exactly the same sense: the group is derived from
+       it, so derivedOrder recomposes the group when it changes and deleting it
+       takes the group. */
+    const animStillSource = st => animOverlaySource(st);
+
+    /* Does element `id` depend, through any chain of transition parents and
+       animation sources, on a frame of animation `group`? Offering such an
+       element as that group's own overlay source would be a cycle, so the
+       picker leaves it out. */
+    function elDependsOnGroup(id, group, seen) {
+        seen = seen || new Set();
+        if (id == null || seen.has(id)) return false;
+        seen.add(id);
+        const el = byId(id);
+        if (!el) return false;
+        if (el.kind === 'anim' && el.anim) {
+            if (el.anim.group === group) return true;
+            return animGroupSources(el.anim).some(s => elDependsOnGroup(s, group, seen));
+        }
+        if (el.kind === 'transition')
+            return elDependsOnGroup(el.base, group, seen) || elDependsOnGroup(el.overlay, group, seen);
+        return false;
+    }
+
+    /* ---- Phase 3: the organic contour, and the moving level ----
+
+       Both displace a CONTOUR, so both go through the same signed distance
+       field, and both are functions of (x, y) alone — which is what keeps the
+       tile wrapping. Read ANIMATED-OVERLAY-PLAN.md §2.4 before changing any of
+       it; the short version of why this is the bset primitive and not
+       makeOrganic is that a coverage mask is a raster with no analytic g(x, y)
+       and no gradient to hand the local boundary frame. */
+
+    /* The displacement scale. Borders & Corners passes its band width, which is
+       the natural amplitude there; an overlay contour has no width, so this is
+       the one number that has to be CHOSEN rather than derived, and the panel's
+       sliders are calibrated against it.
+
+       A quarter of the tile, taken from the two references already in the file:
+       Borders & Corners defaults its band to 20% of a tile, and makeOrganic's
+       own note puts "+/-20% of a tile at the full slider" at the point where a
+       boundary "stops reading as a curve and starts reading as a coastline".
+       With amp = w * 0.55 * styleAmp * wobble, w = 0.25*S puts `blobs` at its
+       style default (55%) on ~7.6% of the tile and at the full slider on ~14%.
+
+       It was 0.10*S first, and that was measured wrong rather than argued wrong:
+       a Learn-page montage of a lava line with `drips` at 80% came out visually
+       indistinguishable from the plain one, because the teeth styles are sparse
+       by design and 0.10 left their mean displacement under a pixel. */
+    const ANORG_W = S => Math.max(3, Math.round(S * 0.25));
+
+    function animOrgField(S, org) {
+        // bsetOrgFields returns null when the panel is off, which is what makes
+        // the whole feature inert: every consumer below then short-circuits.
+        return org ? bsetOrgFields(S, ANORG_W(S), org) : null;
+    }
+
+    /* Signed distance to a greyscale mask's 50% contour, positive inside, plus
+       the mask's own EDGE WIDTH in pixels.
+
+       The width is measured, not assumed. A displaced contour has to be rebuilt
+       from scratch, and rebuilding it with a fixed 1px ramp would make every
+       organic overlay visibly crisper than the plain one it replaced — the
+       Edge softness slider would look like it had stopped working. For a ramp
+       of width W running along a contour of length L, the partial-coverage
+       integral sum(1 - |2m - 1|) is L*W/2 and the count of pixels the contour
+       passes through is ~L, so W falls straight out of the two. */
+    function animCovDistance(cov, S, maxD) {
+        const m = resizeCanvas(cov, S, S).getContext('2d').getImageData(0, 0, S, S).data;
+        const inC = document.createElement('canvas');  inC.width  = inC.height  = S;
+        const outC = document.createElement('canvas'); outC.width = outC.height = S;
+        const ic = inC.getContext('2d'), oc = outC.getContext('2d');
+        const ii = ic.createImageData(S, S), oi = oc.createImageData(S, S);
+        let band = 0;
+        for (let p = 0, i = 0; i < m.length; i += 4, p++) {
+            const v = m[i] / 255;
+            band += 1 - Math.abs(2 * v - 1);
+            const inside = m[i] > 127;
+            ii.data[p * 4 + 3] = inside ? 255 : 0;
+            oi.data[p * 4 + 3] = inside ? 0 : 255;
+        }
+        ic.putImageData(ii, 0, 0); oc.putImageData(oi, 0, 0);
+        const dIn = alphaEdgeDistance(inC, S, maxD), dOut = alphaEdgeDistance(outC, S, maxD);
+        const sgn = new Float32Array(S * S);
+        let contour = 0;
+        for (let p = 0; p < sgn.length; p++) {
+            sgn[p] = dIn[p] - dOut[p];
+            if (Math.abs(sgn[p]) <= 1) contour++;
+        }
+        const width = contour ? Math.min(S / 8, Math.max(1, 2 * band / contour)) : 1;
+        return { sgn, width };
+    }
+
+    /* The measured edge width and the ramp SPAN to rebuild it with are not the
+       same number, and conflating them made every organic contour come out about
+       three times crisper than the mask it replaced (measured: a 5.15px edge
+       rebuilt at 1.58px, which reads as Edge softness having stopped working).
+       For a profile v(t) over a span W the statistic animCovDistance reports is
+       W * integral(1 - |2v - 1|); a linear ramp gives W/2 and the smoothstep
+       this rebuilds with gives 3W/8, so the span to ask for is width / (3/8). */
+    const SMOOTHSTEP_SPAN = 8 / 3;
+
+    /* Rebuild a mask from a signed distance field with a `span`-wide ramp. */
+    function animCovFromDistance(sgn, S, span, feather, og, dirVertical) {
+        const out = document.createElement('canvas'); out.width = out.height = S;
+        const ctx = out.getContext('2d');
+        const im = ctx.createImageData(S, S);
+        const w = ANORG_W(S);
+        for (let y = 0, p = 0; y < S; y++) for (let x = 0; x < S; x++, p++) {
+            const pert = og ? og.at(x, y, dirVertical, null, false) : 0;
+            // Detail softness widens the ramp only where the contour actually
+            // moved, so flat stretches keep the width they had. Same rule and
+            // same arithmetic as bsetBand, so the two panels behave alike.
+            const ww = feather
+                ? span * (1 + feather * 2 * Math.min(1, Math.abs(pert) / Math.max(1, w)))
+                : span;
+            const t = Math.max(0, Math.min(1, (sgn[p] + pert) / ww + 0.5));
+            const v = Math.round(255 * t * t * (3 - 2 * t));
+            im.data[p * 4] = im.data[p * 4 + 1] = im.data[p * 4 + 2] = v;
+            im.data[p * 4 + 3] = 255;
+        }
+        ctx.putImageData(im, 0, 0);
+        return out;
+    }
+
+    /* Roughen a coverage mask's contour. Returns the mask untouched when there
+       is no field (panel off) or no mask to displace.
+
+       NO sin(pi*nx)*sin(pi*ny) window, and no bsetOrgWin either, deliberately.
+       A border slot is windowed because it has to sit flush against a DIFFERENT
+       tile of the same set; an animation frame has no sibling slot, and both the
+       noise and the distance field are toroidal, so the contour can go ragged
+       right across the tile border and the tile still repeats. That is the Fade
+       vignette decision reached from the other direction. */
+    function animOrgDisplace(cov, S, org, og) {
+        if (!cov || !og || !org) return cov;
+        const w = ANORG_W(S);
+        // The field's own reach, so the chamfer apron is exactly as wide as it
+        // needs to be: amp is w*0.55*ST.amp*wobble and scatter adds w*0.30.
+        const maxD = w * 1.2 + 3;
+        const { sgn, width } = animCovDistance(cov, S, maxD);
+        return animCovFromDistance(sgn, S, width * SMOOTHSTEP_SPAN, org.feather || 0, og, false);
+    }
+
+    /* Where the level sits at frame k of N, in 0..1. Both curves are periodic
+       over the loop by construction, exactly like anGlowPulseFactor: the last
+       frame meets the first with no snap, whatever the cycle count. */
+    function animLevelPos(lv, k, N) {
+        const cycles = Math.max(1, Math.round(lv.cycles || 1));
+        const lo = (lv.low == null ? 0 : lv.low) / 100;
+        const hi = (lv.high == null ? 70 : lv.high) / 100;
+        const p = N > 0 ? (k % N) / N : 0;
+        let s;
+        if (lv.curve === 'hold') {
+            // Rise, hold, fall, hold — a trapezoid, and closed at the loop for
+            // the same reason. A sawtooth would snap back on the wrap frame.
+            const u = (cycles * p) % 1;
+            s = u < 0.25 ? u / 0.25 : u < 0.5 ? 1 : u < 0.75 ? 1 - (u - 0.5) / 0.25 : 0;
+        } else {
+            s = (1 - Math.cos(2 * Math.PI * cycles * p)) / 2;
+        }
+        return lo + (hi - lo) * s;
+    }
+
+    const animLevelOn = lv => !!(lv && lv.dir && lv.dir !== 'off');
+    /* Does this direction's level line run VERTICALLY? A level rising from the
+       bottom is a horizontal line, one sweeping in from the left is a vertical
+       one. bsetOrgFields builds two fields for exactly this — noise sampled fast
+       ALONG the contour and slow across it, which is what makes a tooth a tooth
+       rather than a blob — so reading the wrong one is not a crash, it is teeth
+       pointing sideways and a wobble that barely shows. Measured: with this
+       inverted, `drips` at 80% on a rising lava line was visually identical to
+       no organic edge at all in a Learn-page montage. */
+    const ANIM_LEVEL_VERTICAL = { up: false, down: false, left: true, right: true };
+
+    /* The level mask for one frame: 1 where the overlay still shows, 0 where the
+       animation has flooded over it. Multiplied into the coverage, so it works
+       in every mode — including "All of it", where it is the whole coverage and
+       a grate simply disappears under the rising lava. */
+    function animLevelApply(cov, S, lv, k, N, og, dist, shape) {
+        if (!animLevelOn(lv)) return cov;
+        const pos = animLevelPos(lv, k, N);
+        const soft = Math.max(0.75, (lv.soft == null ? 3 : lv.soft) * (S / 256));
+        let mask;
+        if (lv.dir === 'grow') {
+            // Dilate/erode the coverage's own contour. `dist` is hoisted by the
+            // caller when the selection does not change frame to frame, which is
+            // the usual case — the contour is a property of the edge, not of the
+            // moment (ANIMATED-OVERLAY-PLAN.md §6).
+            const d = dist || animCovDistance(cov || shape || ovFlatMask(S, 1), S, S * 0.3);
+            // 50% is the contour as drawn; the ends push it a quarter tile either way.
+            mask = animCovFromDistance(d.sgn.map(v => v + (pos - 0.5) * S * 0.5),
+                                       S, Math.max(d.width * SMOOTHSTEP_SPAN, soft), 0, og, false);
+        } else {
+            const vert = !!ANIM_LEVEL_VERTICAL[lv.dir];
+            const out = document.createElement('canvas'); out.width = out.height = S;
+            const ctx = out.getContext('2d');
+            const im = ctx.createImageData(S, S);
+            const levelPx = pos * S;
+            for (let y = 0, p = 0; y < S; y++) for (let x = 0; x < S; x++, p++) {
+                // Distance from the edge the level travels away from.
+                const c = lv.dir === 'up' ? S - y : lv.dir === 'down' ? y
+                        : lv.dir === 'right' ? x : S - x;
+                const pert = og ? og.at(x, y, vert, null, false) : 0;
+                const t = Math.max(0, Math.min(1, (c - levelPx + pert) / soft + 0.5));
+                const v = Math.round(255 * t * t * (3 - 2 * t));
+                im.data[p * 4] = im.data[p * 4 + 1] = im.data[p * 4 + 2] = v;
+                im.data[p * 4 + 3] = 255;
+            }
+            ctx.putImageData(im, 0, 0);
+            mask = out;
+        }
+        if (!cov) return mask;
+        const merged = cloneCanvas(resizeCanvas(cov, S, S));
+        const mc = merged.getContext('2d');
+        mc.globalCompositeOperation = 'multiply';   // exact on a greyscale mask
+        mc.drawImage(mask, 0, 0);
+        mc.globalCompositeOperation = 'source-over';
+        return merged;
+    }
+
+    /* ---- The height-map coverage mode (`Where it shows` = depth) ----
+
+       "We already have a transition from height maps, are we utilising that
+       here? It would be cool to lay water or lava into the mortar of a texture."
+       Yes, and it needed no new maths and no new GLSL: `htGenHeightField` is a
+       pure function (canvas in, canvas out, TRLE.Engine only), and the threshold
+       is `htBuildMask`'s own band, reproduced constant for constant so the two
+       features agree on what a given Fill level means.
+
+       The field reads the STATIC TEXTURE, never the animation, and that is not
+       a simplification. It is the texture with mortar joints in it, and it is
+       frame-independent, which is what lets the whole thing hoist. So the
+       "Read colours from" picker is hidden in this mode rather than left to do
+       nothing. */
+    const animDepthMode = ovl => !!(ovl && ovl.params && ovl.params.mode === 'depth');
+
+    /* The height field for the overlay's texture, as raw bytes. Hoisted into the
+       plan: this is a GPU pass plus a readback, the depth band on top of it is a
+       loop over S² and costs nothing.
+
+       A tile that already has an authored `hgParams` recipe uses THAT, rather
+       than getting a second, differently-derived height map — someone who has
+       carved their mortar by hand in Make Height Map should not find the water
+       settling somewhere else.
+
+       The white edge is forced OFF on that path, and it has to be. A white
+       border exists so TEN's parallax march terminates at a tile's edge; here
+       the field is a SELECTION, and white is "raised", so the border would
+       select a frame of overlay around every tile. */
+    function animDepthField(tile, S, p) {
+        if (!tile || !tile.canvas) return null;
+        let map = null;
+        if (tile.hgParams) {
+            const preset = Object.assign({}, resolvePreset(tile), heightPresetOverrides(tile),
+                                         { alphaFlatten: canvasHasAlpha(tile.canvas), heightEdge: { amount: 0 } });
+            const tex = TRLE.Engine.createTextureFromImage(resizeCanvas(tile.canvas, S, S));
+            const maps = TRLE.Engine.generateMaps(tex, S, S, preset, { height: true });
+            map = maps.height ? TRLE.Engine.fboToCanvas(maps.height) : null;
+            Object.values(maps).forEach(f => f && TRLE.Engine.deleteFBO(f));
+            TRLE.Engine.deleteTexture(tex);
+        }
+        if (!map) {
+            const detail = p.dDetail == null ? 80 : p.dDetail;
+            const contrast = p.dContrast == null ? 50 : p.dContrast;
+            map = htGenHeightField(resizeCanvas(tile.canvas, S, S),
+                                   (1 - detail / 100) * 9 + 0.5, contrast / 50);
+        }
+        const d = map.getContext('2d').getImageData(0, 0, S, S).data;
+        /* NORMALISE to the tile's own range, which the Height Transition does not
+           and which this mode needs. `simpleHeight` is a contrast stretch about
+           mid-grey, so a real texture's field occupies a narrow band: measured on
+           Bricks, 66-105 out of 255, and on Stonetiles 74-155. Thresholding that
+           raw leaves most of the Fill level slider dead (coverage was 0.84 at 20%,
+           0.12 at 50% and exactly 0 at 80%), and it would leave the moving level's
+           Low/High just as dead, which is the control this mode exists to drive.
+
+           A min/max over the whole tile is a GLOBAL statistic, so it is invariant
+           under a roll and the field still commutes with one exactly — which is
+           what keeps "the band tiles if the texture does" true. A flat field
+           (max === min) is left alone rather than divided by zero. */
+        let lo = 255, hi = 0;
+        for (let i = 0; i < d.length; i += 4) { const v = d[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+        if (hi > lo) {
+            const k = 255 / (hi - lo);
+            for (let i = 0; i < d.length; i += 4) d[i] = Math.round((d[i] - lo) * k);
+        }
+        return d;
+    }
+
+    /* The depth band at one level, as a coverage mask. `level` is 0..1 and comes
+       from ONE of two places: the Fill level slider, or the moving level's own
+       scalar when that panel is on. One number, two sources, and no third
+       control — which is what makes "water rising in the mortar joints" fall out
+       of two features that already existed.
+
+       Same width/span arithmetic as htBuildMask, deliberately. */
+    function animDepthCov(depth, S, p, level) {
+        const hard = p.dHard == null ? 65 : p.dHard;
+        const width = (1 - hard / 100) * 0.4 + 0.02;
+        const span = Math.max(1e-4, 2 * width);
+        const low = p.dFill === 'low';
+        const out = document.createElement('canvas'); out.width = out.height = S;
+        const ctx = out.getContext('2d');
+        const im = ctx.createImageData(S, S);
+        for (let i = 0, q = 0; i < depth.length; i += 4, q += 4) {
+            let t = (depth[i] / 255 - (level - width)) / span;
+            t = t < 0 ? 0 : t > 1 ? 1 : t;
+            t = t * t * (3 - 2 * t);
+            if (low) t = 1 - t;
+            const v = (t * 255) | 0;
+            im.data[q] = im.data[q + 1] = im.data[q + 2] = v; im.data[q + 3] = 255;
+        }
+        ctx.putImageData(im, 0, 0);
+        return out;
+    }
+
+    /* Where the depth band's threshold sits for frame k: the moving level's
+       scalar when that panel is on, the static slider otherwise. */
+    function animDepthLevel(ovl, k, N) {
+        if (animLevelOn(ovl.level)) return animLevelPos(ovl.level, k, N);
+        return (ovl.params.dLevel == null ? 50 : ovl.params.dLevel) / 100;
+    }
+
+    /* Compose one frame with its overlay. `z` decides which of the two is the
+       thing being laid ON, which flips what "base" and "overlay" mean all the
+       way down — including which texture ovCoverage's "read colours from"
+       samples, so the two stay consistent by construction.
+
+         front  : static on top of the animation (grate over lava, stones on lava)
+         behind : static underneath it (a window behind rain, a wall behind drips),
+                  which only reads as anything when the animation has transparency. */
+    function composeAnimOverlay(frame, ovl, S, plan, k, N) {
+        const tile = animOverlaySource(ovl);
+        if (!tile) return frame;
+        const placed = resizeCanvas(tile.canvas, S, S);
+        const base   = resizeCanvas(frame, S, S);
+        const behind = ovl.z === 'behind';
+        let lower    = behind ? placed : base;
+        const upper  = behind ? base : placed;
+        const cov    = animOverlayCovAt(ovl, lower, upper, S, plan, k, N);
+        // Contact shadow: the rim sits ON the water rather than being inlaid in
+        // it. Onto the LOWER texture only, before compositing, so the thing
+        // casting it stays clean — the same placement renderBsetVariant uses.
+        // With no coverage mask (mode "All of it") the shadow follows the
+        // texture's own alpha, which is what a cut-out rim or grate has.
+        const org = ovl.org;
+        if (org && org.shadow > 0 && shadowHitsDiffuse(org))
+            lower = applyContactShadow(lower, cov || ovMapMask(upper, null, S), S,
+                                       org.shadow, shadowOpts(org));
+        return composeOverlayDiffuse(lower, upper, cov, S, ovl.params.blend);
+    }
+
+    /* The frame-independent half of a group's overlay, computed ONCE. Hoisting
+       matters on the interactive path: the modal's preview re-composites every
+       frame on every debounce tick, and a selection-mode coverage is a GPU blit
+       plus a readback, an organic contour is two chamfer passes, and a "spreads
+       out" level needs a third.
+
+       `cov: undefined` means "not hoistable, recompute per frame" — which is not
+       the same as `cov: null`, a mask ovCoverage legitimately returns for the
+       "All of it" mode. */
+    function animOverlayPlan(ovl, frameForShape, S) {
+        if (!ovl || !animOverlaySource(ovl) || !frameForShape) return null;
+        const plan = { og: animOrgField(S, ovl.org), cov: undefined, dist: null, depth: null };
+        // The GPU half of the depth mode is frame-independent whatever else is
+        // on, so it hoists unconditionally. Only the threshold moves per frame.
+        if (animDepthMode(ovl)) plan.depth = animDepthField(animOverlaySource(ovl), S, ovl.params);
+        // A depth band whose threshold is being driven by the moving level is a
+        // different mask every frame, so its COVERAGE cannot hoist — but the
+        // field above still did, which is the part that costs.
+        const movesWithLevel = animDepthMode(ovl) && animLevelOn(ovl.level);
+        if (!animOverlayVaries(ovl) && !movesWithLevel) {
+            const tile   = animOverlaySource(ovl);
+            const placed = resizeCanvas(tile.canvas, S, S);
+            const base   = resizeCanvas(frameForShape, S, S);
+            const behind = ovl.z === 'behind';
+            const upper = behind ? base : placed;
+            plan.cov = animOverlayBaseCov(ovl, behind ? placed : base, upper, S, plan.og, plan.depth, 0, 1);
+            if (animLevelOn(ovl.level) && ovl.level.dir === 'grow')
+                plan.dist = animCovDistance(plan.cov || ovMapMask(upper, null, S), S, S * 0.3);
+        }
+        return plan;
+    }
+
+    /* Selection coverage plus the organic contour: everything that does not
+       depend on the frame index. */
+    function animOverlayBaseCov(ovl, lower, upper, S, og, depth, k, N) {
+        // Opacity is applied here in the depth branch because ovCoverage applies
+        // it in the other one, and a slider that silently stops working in one
+        // mode is the dead-control shape.
+        const cov = depth
+            ? ovScaleMask(animDepthCov(depth, S, ovl.params, animDepthLevel(ovl, k || 0, N || 1)),
+                          S, ovl.params.opacity)
+            : ovCoverage(ovl.params, lower, upper, S, null);
+        return og ? animOrgDisplace(cov, S, ovl.org, og) : cov;
+    }
+
+    /* The coverage for frame k, taking whatever the plan already worked out. */
+    function animOverlayCovAt(ovl, lower, upper, S, plan, k, N) {
+        const og = plan ? plan.og : animOrgField(S, ovl.org);
+        const depth = plan ? plan.depth
+            : (animDepthMode(ovl) ? animDepthField(animOverlaySource(ovl), S, ovl.params) : null);
+        const cov = (plan && plan.cov !== undefined)
+            ? plan.cov : animOverlayBaseCov(ovl, lower, upper, S, og, depth, k, N);
+        // In depth mode the level has ALREADY been spent: it drove the band's
+        // threshold rather than sweeping a line across the tile. Applying it
+        // again here would flood the tile twice over.
+        if (animDepthMode(ovl)) return cov;
+        if (!animLevelOn(ovl.level)) return cov;
+        // The overlay's own alpha stands in for the shape in "All of it" mode,
+        // which is the grate case. Built only when "Spreads out" actually needs
+        // it: it is a full readback.
+        const shape = (!cov && ovl.level.dir === 'grow') ? ovMapMask(upper, null, S) : null;
+        return animLevelApply(cov, S, ovl.level, k || 0, N || 1, og,
+                              plan ? plan.dist : null, shape);
+    }
+
+    /* The coverage a frame's MAPS composite through: the upper texture's own
+       alpha times the recipe's coverage, exactly as an overlay tile does. */
+    function animOverlayMapMask(frame, ovl, S, plan, k, N) {
+        const tile = animOverlaySource(ovl);
+        if (!tile) return null;
+        const placed = resizeCanvas(tile.canvas, S, S);
+        const base   = resizeCanvas(frame, S, S);
+        const behind = ovl.z === 'behind';
+        const lower  = behind ? placed : base;
+        const upper  = behind ? base : placed;
+        return ovMapMask(upper, animOverlayCovAt(ovl, lower, upper, S, plan, k, N), S);
+    }
+
+    /* Draw one frame into a member's canvas, compositing its overlay if it has
+       one, and KEEP THE RAW FRAME on `el.animRaw`.
+
+       The raw frame is needed because `el.canvas` is the composed result, and
+       deriveMaps has to recompute the same coverage to composite the maps — if
+       it sampled the composed canvas for a recipe that reads the animation's own
+       colours, it would be measuring the answer it is trying to compute. It is
+       transient: never persisted, never snapshotted, regenerated by whichever of
+       anAdd / refreshAnims ran last. */
+    function animDrawMember(el, src, ovl, plan) {
+        const S = el.canvas.width;
+        el.animRaw = src || null;
+        // Emissive-only: the diffuse is the static texture on every frame, and
+        // the raw frame stays on animRaw for the glow to follow. An overlay is
+        // not offered alongside it (the modal disables one while the other is
+        // on), and ignored here if a hand-edited recipe has both.
+        const still = el.anim && animStillSource(el.anim.still);
+        if (still) { drawReplace(el.canvas, resizeCanvas(still.canvas, S, S), S, S); return; }
+        let out = src;
+        if (ovl && src && animOverlaySource(ovl))
+            out = composeAnimOverlay(src, ovl, S, plan, el.anim.index, el.anim.total);
+        // A second layer set to sit on top of everything goes on LAST, over the
+        // overlay too. Transient like animRaw: rebuilt by refreshAnims / anAdd.
+        if (out && el.animTop) out = animComposeLayer2(out, el.animTop, el.anim.layer2);
+        // drawReplace, never a bare drawImage: el.canvas is reused on every
+        // refresh, and a cutout overlay (a grate, a well rim) has real holes for
+        // the previous pass to show through. The eleven-site alpha bug, and this
+        // is precisely the shape that shows it.
+        if (out) drawReplace(el.canvas, out, S, S);
+        else el.canvas.getContext('2d').clearRect(0, 0, S, S);
+    }
+
+    /* Does this recipe's SELECTION change frame to frame? It does not, unless it
+       reads the ANIMATION's own colours — which is the one case that has to be
+       recomputed per frame, and is also what makes a splash follow the liquid
+       for free. The level curve is deliberately not part of this answer: it
+       moves every frame by definition, but it is cheap and applies on top of the
+       hoisted selection, so it never costs the hoist. */
+    function animOverlayVaries(ovl) {
+        if (!ovl || !ovl.params) return false;
+        const m = ovl.params.mode;
+        if (m === 'all') return false;
+        // Depth reads the STATIC texture's height, whatever `sample` happens to
+        // say — the picker is hidden in this mode, but a recipe saved in another
+        // mode still carries a value, and honouring it here would lose the hoist.
+        if (m === 'depth') return false;
+        const readsAnim = ovl.z === 'behind' ? ovl.params.sample === 'overlay'
+                                             : ovl.params.sample === 'base';
+        return readsAnim;
     }
 
     /* Flatten transparent pixels to opaque magenta (#FF00FF) — Tomb Editor treats
@@ -1978,6 +2737,220 @@ window.TRLE = window.TRLE || {};
         return resizeCanvas(src, src.width, src.height);
     }
 
+    /* ============ VISUAL TILE PICKER (TILE-PICKER-PLAN.md) ============
+       `attachTilePicker(select, opts)` ENHANCES a `<select>` of atlas tiles, it does
+       not replace it. Users pick a texture by looking at it; everything else keeps
+       reading and writing the select:
+
+       - the select keeps its OPTIONS, so each caller's filtering rule stays where it
+         is (kind === 'tile', "(this one)", …), and the popover lists exactly those,
+         in that order;
+       - the select keeps its VALUE, so every reader, the demo course's
+         api.setValue(…, 'change') and the validators that set .value are untouched.
+         A pick sets the value and dispatches exactly ONE 'change'.
+
+       A programmatic `.value =` fires no event, so a caller that sets one calls
+       `picker.sync()` (or `tilePickerSync(select)`); the trigger also re-reads on every
+       open, so a stale trigger is never what a user acts on.
+
+       The popover is one shared, `position: fixed` element (so it costs a modal no
+       height). It does NOT close on scroll, it repositions: Firefox fires `scroll`
+       when focus() lands inside an overflow:auto container and Chrome does not,
+       which is exactly how the context menu once died in Firefox only. Esc is
+       stopped at the popover so it closes the popover, not the modal under it.
+
+       Use it for ANY new control that picks a second texture (author, 2026-09-24).
+       Never add another `Tile N` select on its own.
+
+       Not only tiles (push-markings 2c): `opts.thumb(option)` returns the image to
+       show for an option instead of that tile's canvas, and `opts.rows` lists the
+       options as wide rows (thumbnail + name) under their <optgroup> headings, which
+       is how 🖌 Draw's brush dropdown shows each brush's own sample stroke (D10). */
+    const TP_THUMB = 64;
+    let tpOpen = null;             // { sel, trigger, pop, opts } while a popover is up
+    function tpDrawThumb(cv, src) {
+        const ctx = cv.getContext('2d');
+        ctx.clearRect(0, 0, cv.width, cv.height);
+        if (!src) return;
+        ctx.imageSmoothingEnabled = true;       // downscale: smoothing on (the anim-preview rule)
+        ctx.imageSmoothingQuality = 'medium';
+        ctx.drawImage(src, 0, 0, cv.width, cv.height);
+    }
+    const tpElOf = opt => opt ? byId(parseInt(opt.value, 10)) : null;
+    const tpSrcOf = (opt, opts) => {
+        if (!opt) return null;
+        if (opts.thumb) return opts.thumb(opt);
+        const el = tpElOf(opt);
+        return el ? el.canvas : null;
+    };
+    function tilePickerSync(sel) { if (sel && sel._tp) sel._tp.sync(); }
+    function attachTilePicker(sel, opts = {}) {
+        if (!sel) return null;
+        if (sel._tp) return sel._tp;
+        const base = (sel.id || 'at-tp') + '-picker';
+        const trigger = document.createElement('button');
+        trigger.type = 'button';
+        trigger.id = base;
+        trigger.className = 'at-tp-trigger' + (opts.compact ? ' at-tp-compact' : '');
+        trigger.setAttribute('aria-haspopup', 'listbox');
+        trigger.setAttribute('aria-expanded', 'false');
+        const tcv = document.createElement('canvas');
+        tcv.width = opts.rows ? 80 : 32; tcv.height = opts.rows ? 24 : 32;
+        tcv.className = 'at-tp-thumb' + (opts.rows ? ' at-tp-wide' : '');
+        trigger.appendChild(tcv);
+        const label = document.createElement('span');
+        label.className = 'at-tp-label';
+        trigger.appendChild(label);
+        if (!opts.compact) {       // compact (a slot cell) is one slim row, no caret
+            const caret = document.createElement('span');
+            caret.className = 'at-tp-caret'; caret.textContent = '▾';
+            trigger.appendChild(caret);
+        }
+        sel.classList.add('at-tp-native');
+        sel.setAttribute('aria-hidden', 'true');
+        sel.tabIndex = -1;
+        sel.insertAdjacentElement('afterend', trigger);
+
+        const sync = () => {
+            const opt = sel.options[sel.selectedIndex] || null;
+            tpDrawThumb(tcv, tpSrcOf(opt, opts));
+            const txt = opt ? opt.textContent : 'No tiles to pick';
+            if (label) label.textContent = txt;
+            trigger.title = (opts.title ? opts.title + ': ' : '') + txt;
+            trigger.disabled = sel.disabled || !sel.options.length;
+        };
+        // Repopulating the options is a DOM change, so that one syncs itself.
+        new MutationObserver(sync).observe(sel, { childList: true });
+        sel.addEventListener('change', sync);
+        trigger.addEventListener('click', e => {
+            // Defensive: a container may have a click of its own. (Borders & Corners
+            // cycles a slot's mode on the slot's CANVAS, a sibling, so it is safe
+            // there by structure, not because of this.)
+            e.stopPropagation();
+            if (tpOpen && tpOpen.sel === sel) { tpClose(true); return; }
+            tpOpenFor(sel, trigger, opts);
+        });
+        sel._tp = { sync, trigger, open: () => tpOpenFor(sel, trigger, opts), close: () => tpClose(false) };
+        sync();
+        return sel._tp;
+    }
+    /* Scroll ONLY the popover to show a cell. focus() with scrolling, or
+       scrollIntoView, may scroll every scrollable ancestor to reveal it, including
+       the scroll-locked page behind the modal. */
+    function tpReveal(pop, cell) {
+        const top = cell.offsetTop - pop.clientTop, bottom = top + cell.offsetHeight;
+        if (top < pop.scrollTop) pop.scrollTop = top - 4;
+        else if (bottom > pop.scrollTop + pop.clientHeight) pop.scrollTop = bottom - pop.clientHeight + 4;
+    }
+    function tpClose(refocus) {
+        if (!tpOpen) return;
+        const { trigger, pop } = tpOpen;
+        pop.remove();
+        trigger.setAttribute('aria-expanded', 'false');
+        window.removeEventListener('resize', tpPlace);
+        document.removeEventListener('scroll', tpPlace, true);
+        document.removeEventListener('pointerdown', tpOutside, true);
+        tpOpen = null;
+        if (refocus) trigger.focus({ preventScroll: true });
+    }
+    function tpOutside(e) {
+        if (!tpOpen) return;
+        if (tpOpen.pop.contains(e.target) || tpOpen.trigger.contains(e.target)) return;
+        tpClose(false);
+    }
+    /* Under the trigger if it fits, above it otherwise, clamped to the viewport. */
+    function tpPlace(e) {
+        if (!tpOpen) return;
+        const { trigger, pop } = tpOpen;
+        /* The popover's OWN scroll (arrow keys revealing a cell) must not re-place
+           it. And nothing here clears maxHeight to measure: that re-clamps the
+           popover's scroll position, which fires scroll and lands back here.
+           scrollHeight is the natural height whatever maxHeight is. */
+        if (e && e.target instanceof Node && pop.contains(e.target)) return;
+        const r = trigger.getBoundingClientRect(), m = 8;
+        const ph = pop.scrollHeight + 2, pw = pop.offsetWidth;
+        const below = innerHeight - r.bottom - m, above = r.top - m;
+        let top;
+        if (ph <= below || below >= above) { top = r.bottom + 4; pop.style.maxHeight = Math.max(120, below - 4) + 'px'; }
+        else { const h = Math.min(ph, above - 4); top = r.top - 4 - h; pop.style.maxHeight = (above - 4) + 'px'; }
+        pop.style.top = Math.max(m, top) + 'px';
+        pop.style.left = Math.max(m, Math.min(r.left, innerWidth - pw - m)) + 'px';
+    }
+    function tpOpenFor(sel, trigger, opts) {
+        tpClose(false);
+        if (trigger.disabled) return;
+        sel._tp.sync();
+        const pop = document.createElement('div');
+        pop.className = 'at-tp-pop' + (opts.rows ? ' at-tp-rows' : '');
+        pop.id = trigger.id + '-pop';
+        pop.setAttribute('role', 'listbox');
+        pop.setAttribute('aria-label', opts.title || 'Pick a texture');
+        const cells = [];
+        let group = null;
+        [...sel.options].forEach((opt, i) => {
+            // Rows keep the select's <optgroup>s as headings (not focusable, not cells).
+            const og = opt.parentElement && opt.parentElement.tagName === 'OPTGROUP' ? opt.parentElement : null;
+            if (opts.rows && og && og !== group) {
+                const h = document.createElement('div');
+                h.className = 'at-tp-group'; h.textContent = og.label;
+                pop.appendChild(h);
+            }
+            group = og;
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'at-tp-opt' + (i === sel.selectedIndex ? ' current' : '');
+            b.setAttribute('role', 'option');
+            b.setAttribute('aria-selected', i === sel.selectedIndex ? 'true' : 'false');
+            b.dataset.value = opt.value;
+            b.title = opt.textContent;
+            const cv = document.createElement('canvas');
+            const src = tpSrcOf(opt, opts);
+            cv.width = opts.rows && src ? src.width : TP_THUMB; cv.height = opts.rows && src ? src.height : TP_THUMB;
+            tpDrawThumb(cv, src);
+            const badge = document.createElement('span');
+            badge.className = 'at-tp-badge';
+            // The number from "Tile 12", plus anything the caller appended.
+            badge.textContent = opts.rows ? opt.textContent : opt.textContent.replace(/^Tile\s*/, '');
+            b.appendChild(cv); b.appendChild(badge);
+            b.addEventListener('click', e => {
+                e.stopPropagation();
+                const changed = sel.value !== opt.value;
+                sel.value = opt.value;
+                if (changed) sel.dispatchEvent(new Event('change', { bubbles: true }));
+                sel._tp.sync();
+                tpClose(true);
+            });
+            cells.push(b);
+            pop.appendChild(b);
+        });
+        pop.addEventListener('keydown', e => {
+            const i = cells.indexOf(document.activeElement);
+            const cols = Math.max(1, Math.round(pop.clientWidth / (cells[0] ? cells[0].offsetWidth + 6 : 1)));
+            const go = j => { j = Math.max(0, Math.min(cells.length - 1, j)); tpReveal(pop, cells[j]); cells[j].focus({ preventScroll: true }); };
+            if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); tpClose(true); }
+            /* Enter / Space picked by US on keydown, with the default prevented: one
+               activation in every browser, and never the browser's own on a cell the
+               pick is about to remove from the DOM. */
+            else if ((e.key === 'Enter' || e.key === ' ') && i >= 0) { e.preventDefault(); e.stopPropagation(); cells[i].click(); }
+            else if (e.key === 'Tab') { tpClose(false); }
+            else if (e.key === 'ArrowRight') { e.preventDefault(); go(i + 1); }
+            else if (e.key === 'ArrowLeft') { e.preventDefault(); go(i - 1); }
+            else if (e.key === 'ArrowDown') { e.preventDefault(); go(i + cols); }
+            else if (e.key === 'ArrowUp') { e.preventDefault(); go(i - cols); }
+            else if (e.key === 'Home') { e.preventDefault(); go(0); }
+            else if (e.key === 'End') { e.preventDefault(); go(cells.length - 1); }
+        });
+        document.body.appendChild(pop);
+        tpOpen = { sel, trigger, pop, opts };
+        trigger.setAttribute('aria-expanded', 'true');
+        tpPlace();
+        window.addEventListener('resize', tpPlace);
+        document.addEventListener('scroll', tpPlace, true);
+        document.addEventListener('pointerdown', tpOutside, true);
+        const cur = cells[Math.max(0, sel.selectedIndex)];
+        if (cur) { tpReveal(pop, cur); cur.focus({ preventScroll: true }); }
+    }
+
     /* Draw `src` into `dst`, REPLACING whatever was there — the only correct way
        to put a new image on a canvas that is reused.
 
@@ -2020,6 +2993,80 @@ window.TRLE = window.TRLE || {};
         const d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
         for (let i = 3; i < d.length; i += 4) if (d[i] < 255) return true;
         return false;
+    }
+
+    /* Transparency advisory (#at-alpha-advice, TRANSPARENCY-PLAN phase 2). A
+       PER-TILE canvasHasAlpha stays deliberately uncached (see above), but
+       scanning EVERY tile on every renderGrid() call is a different cost: 88
+       call sites, some mid-drag, and the worst case (64 tiles at 1024px, all
+       opaque so the loop never early-exits) measured 74ms -- one dropped frame,
+       repeated. So the aggregate scan is debounced off renderGrid and chunked
+       with a time budget so no single task blocks the main thread; re-rendering
+       the TEXT (tile numbers, the Magenta color-key wording) runs synchronously
+       off the last completed scan, so ticking the checkbox or dragging a tile to
+       a new slot updates instantly without a rescan.
+
+       No per-tile cache keyed by element id: undo/redo and Reset to Original
+       swap in element OBJECTS under the same id with different pixels (the same
+       trap layoutCells's own comment warns about for a cached `el`), so a
+       cache keyed on id would need invalidating at every one of those sites to
+       stay correct. A single generation counter, bumped and rescanned from
+       scratch on every renderGrid(), has no such trap: renderGrid already runs
+       after every one of them. */
+    const ALPHA_ADVICE_DELAY = 350, ALPHA_ADVICE_BUDGET_MS = 8;
+    let alphaAdviceTimer = null, alphaAdviceGen = 0, alphaAdviceIds = null;
+    let alphaAdviceChunkMs = [];      // test-only: each chunk's wall time, so a
+                                       // validator can assert the budget held on a
+                                       // real (chunked, not flushed) large-atlas scan
+    let alphaAdviceCompletedGen = 0;  // test-only: the gen a scan last FINISHED at,
+                                       // so alphaAdviceChunkTimes can tell "still
+                                       // running" from "done" (gen alone only says
+                                       // a scan STARTED, not that it finished)
+
+    function scheduleAlphaAdvice() {
+        clearTimeout(alphaAdviceTimer);
+        alphaAdviceTimer = setTimeout(computeAlphaAdvice, ALPHA_ADVICE_DELAY);
+    }
+
+    async function computeAlphaAdvice() {
+        const gen = ++alphaAdviceGen;
+        const ids = [], chunkMs = [];
+        let chunkStart = performance.now();
+        for (const el of state.elements) {
+            if (canvasHasAlpha(el.canvas)) ids.push(el.id);
+            const elapsed = performance.now() - chunkStart;
+            if (elapsed > ALPHA_ADVICE_BUDGET_MS) {
+                chunkMs.push(elapsed);
+                await new Promise(r => setTimeout(r, 0));
+                if (gen !== alphaAdviceGen) return;   // superseded by a newer edit
+                chunkStart = performance.now();
+            }
+        }
+        chunkMs.push(performance.now() - chunkStart);   // the final, possibly-partial chunk
+        if (gen !== alphaAdviceGen) return;
+        alphaAdviceIds = ids;
+        alphaAdviceChunkMs = chunkMs;
+        alphaAdviceCompletedGen = gen;
+        renderAlphaAdvice();
+    }
+
+    function renderAlphaAdvice() {
+        const box = $('at-alpha-advice');
+        if (!box) return;
+        const nums = alphaAdviceIds && tileNumbers();
+        const list = alphaAdviceIds
+            ? alphaAdviceIds.map(id => nums.get(id)).filter(n => n != null).sort((a, b) => a - b)
+            : [];
+        if (!list.length) { box.style.display = 'none'; return; }
+        const magentaCb = $('at-export-magenta'), magenta = magentaCb && magentaCb.checked;
+        const label = list.length === 1 ? `Tile ${list[0]}`
+            : list.length <= 4 ? `Tiles ${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`
+            : `${list.length} of your tiles`;
+        const verb = list.length === 1 ? 'has' : 'have';
+        box.querySelector('.at-alpha-advice-text').innerHTML = magenta
+            ? `<strong>${label} ${verb} transparency</strong>, exported as magenta. With <strong>Magenta to alpha</strong> on in Tomb Editor, Normal blending gives Alpha Test, the cheap option.`
+            : `<strong>${label} ${verb} transparency.</strong> Performance suggestion for Tomb Editor's <strong>Blending mode</strong>: <strong>Alpha Test</strong> is cheap and suits holes (fences, grates, plants); <strong>Normal</strong> draws them blended, which keeps glass or smoke looking right but costs more; <strong>Additive</strong> is cheap and suits glow and haze. Your other tiles are not affected.`;
+        box.style.display = 'flex';
     }
 
     /* Cut one tile-sized region out of each atlas-wide PSD map layer. `layers` is
@@ -2122,12 +3169,15 @@ window.TRLE = window.TRLE || {};
        Generates each layer's maps from the same diffuse, then composites them in
        order through each region layer's (optionally feathered) mask. Returns a
        { mapType: canvas } object. Later layers win where masks overlap. */
-    function composeLayerMaps(diffuseCanvas, layers, enabledMaps, S) {
+    /* `extra` (Pushable Markings, phase 6) is merged into EVERY layer's preset last:
+       the groove (`reliefPaint`) and the source's height settings, so each material
+       sees the same relief. Absent, nothing changes. */
+    function composeLayerMaps(diffuseCanvas, layers, enabledMaps, S, extra) {
         const tex = TRLE.Engine.createTextureFromImage(diffuseCanvas);
         const alphaFlatten = canvasHasAlpha(diffuseCanvas);   // once, not per layer
         const genLayer = (layer) => {
             const preset = Object.assign({}, presetFromMaterial(layer.material),
-                Object.assign({ flipNormalY: state.flipNormalY, alphaFlatten }, heightPresetOverrides(null)));
+                Object.assign({ flipNormalY: state.flipNormalY, alphaFlatten }, heightPresetOverrides(null)), extra || {});
             const maps = TRLE.Engine.generateMaps(tex, S, S, preset, enabledMaps);
             const out = {};
             for (const mt of TRLE.MapOrder) if (maps[mt]) { out[mt] = TRLE.Engine.fboToCanvas(maps[mt]); TRLE.Engine.deleteFBO(maps[mt]); }
@@ -2155,8 +3205,9 @@ window.TRLE = window.TRLE || {};
          - multi-material: the full brush/lasso/rect/ellipse/wand toolkit, welded to
            the matMulti globals so nothing else could reach it.
 
-       All SEVEN surfaces now run on this one: multi-material, Make Emissive, Heal,
-       Fade, De-light, the transition custom mask and Make Height Map.
+       All NINE surfaces now run on this one: multi-material, Make Emissive, Heal,
+       Fade, De-light, the transition custom mask, Make Height Map, Overlay Texture
+       and Adjust Colours' Paint a region.
 
        createMaskEditor owns the interaction and the history; the caller still owns
        DRAWING the display canvas (every modal composites its mask differently) and
@@ -3006,7 +4057,9 @@ window.TRLE = window.TRLE || {};
         return ed;
     }
 
+    let downloadHook = null;   // test-only: _cap.captureDownloads() records instead of saving
     function downloadBlob(blob, filename) {
+        if (downloadHook) { downloadHook(blob, filename); return; }
         const a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
         a.download = filename;
@@ -3257,12 +4310,24 @@ window.TRLE = window.TRLE || {};
     }
 
     /* ============ GRID ============ */
-    function visCols() { return Math.min(Math.max(1, state.cols), 12); }
+    /* Every column is drawn now (GRID-SLOT-PLAN phase 3); the grid scrolls
+       sideways instead of wrapping at 12, which drew a sliced 16-wide atlas as
+       12 + 4 while exporting it 16 wide (audit §I.12). */
+    function visCols() { return Math.max(1, state.cols); }
+
+    /* The atlas's pixel ceiling, per side: 16384 is the largest canvas every
+       browser we support will allocate and a common MAX_TEXTURE_SIZE. It
+       replaces the old flat 12-column cap, which cost classic-level users with
+       32 and 64 px tiles most of their width (512 columns at 32 px). */
+    const MAX_ATLAS_PX = 16384;
+    const maxSlotsPerSide = () => Math.max(1, Math.floor(MAX_ATLAS_PX / Math.max(1, state.tileSize || getTileSize())));
+    const ceilingSentence = (word, n) =>
+        `An atlas can be at most ${MAX_ATLAS_PX} px ${word === 'Columns' ? 'wide' : 'tall'}, which is ${n} ${word.toLowerCase()} of ${state.tileSize} px tiles.`;
     function cellById(id) { return $('at-grid').querySelector(`.at-cell[data-id="${id}"]`); }
 
     function cellAriaLabel(el, i) {
         const kindWord = el.kind !== 'transition' ? 'tile'
-            : el.ovParams ? 'overlay tile' : 'transition tile';
+            : el.ovParams ? 'overlay tile' : el.push ? 'pushable-marking tile' : 'transition tile';
         const parts = [`Element ${i + 1}`, kindWord];
         parts.push(el.kind === 'transition' ? 'material inherited' : materialLabel(el));
         if (el.seamless) parts.push('seamless');
@@ -3271,29 +4336,66 @@ window.TRLE = window.TRLE || {};
         return parts.join(', ');
     }
 
+    let renderGridCalls = 0;   // test-only: a drag must not re-render (validate-grid-dnd)
     function renderGrid() {
+        renderGridCalls++;
         const grid = $('at-grid');
         // Preserve keyboard focus across re-render if a cell was focused.
         const active = document.activeElement;
         const hadCellFocus = !!(active && active.classList && active.classList.contains('at-cell'));
+        const hadSlotFocus = (active && active.classList && active.classList.contains('at-slot-empty') && grid.contains(active))
+            ? Number(active.dataset.slot) : null;
         grid.innerHTML = '';
         const cols = Math.max(1, state.cols);
-        grid.style.gridTemplateColumns = `repeat(${Math.min(cols, 12)}, 1fr)`;
-        grid.style.maxWidth = `${Math.min(cols, 12) * 116}px`;
+        // 112 px cells, squeezing to 56 px before the grid scrolls sideways.
+        grid.style.gridTemplateColumns = `repeat(${cols}, minmax(56px, 112px))`;
+        grid.style.maxWidth = '';
 
         // Keep the layout (columns/rows) controls in sync with the current grid.
         const colsInput = $('at-cols-input'), rowsInput = $('at-rows-input'), note = $('at-layout-note');
-        const N = state.elements.length, rows = N ? Math.ceil(N / cols) : 0;
-        if (colsInput) colsInput.value = cols;
-        if (rowsInput) rowsInput.value = rows;
+        const cells = layoutCells();
+        const N = state.elements.length, rows = state.rows;
+        if (colsInput) { colsInput.value = cols; colsInput.max = maxSlotsPerSide(); colsInput.disabled = !!state.lockCols; }
+        if (rowsInput) { rowsInput.value = rows; rowsInput.max = maxSlotsPerSide(); rowsInput.disabled = !!state.lockRows; }
+        for (const [k, on] of [['cols', state.lockCols], ['rows', state.lockRows]]) {
+            const b = $(`at-lock-${k}`);
+            if (b) { b.setAttribute('aria-pressed', on ? 'true' : 'false'); b.textContent = on ? '🔒' : '🔓'; }
+        }
         if (note) note.textContent = N ? `${N} tile${N !== 1 ? 's' : ''}` : 'empty';
+        if (atlasViewOn()) {
+            if (N) renderAtlasView(); else setAtlasView(false);
+        }
+        const holes = holeSlots().length, holesBtn = $('at-empty-slots');
+        if (holesBtn) {
+            holesBtn.style.display = holes ? '' : 'none';
+            holesBtn.textContent = `🔲 ${holes} empty slot${holes !== 1 ? 's' : ''}…`;
+        }
 
         // Keep the roving-tabindex target valid.
         if (!state.elements.some(e => e.id === state.focusedId)) {
             state.focusedId = state.elements.length ? state.elements[0].id : null;
         }
 
-        state.elements.forEach((el, i) => {
+        /* Every slot is drawn, in reading order. An empty one is a dashed
+           placeholder with no .at-cell class, so everything that counts or
+           addresses tiles by `.at-cell` still sees exactly the textures. */
+        const cellAt = new Map(cells.map(c => [c.slot, c]));
+        for (let slot = 0; slot < state.layout.length; slot++) {
+            if (!cellAt.has(slot)) {
+                const empty = document.createElement('div');
+                empty.className = 'at-slot-empty';
+                empty.dataset.slot = slot;
+                empty.setAttribute('role', 'gridcell');
+                // Focusable (arrow keys walk onto it, paste lands in it) but not
+                // a Tab stop: the roving tabindex stays on a tile.
+                empty.tabIndex = -1;
+                empty.setAttribute('aria-label', `Empty slot, row ${Math.floor(slot / cols) + 1}, column ${slot % cols + 1}. Enter adds an image`);
+                empty.title = 'Empty slot: click to add an image, drop files or paste here, right-click for more';
+                grid.appendChild(empty);
+                continue;
+            }
+            const { el, n } = cellAt.get(slot);
+            const i = n - 1;
             const cell = document.createElement('div');
             cell.className = 'at-cell';
             cell.dataset.id = el.id;
@@ -3305,6 +4407,11 @@ window.TRLE = window.TRLE || {};
             if (isSel) cell.classList.add('selected');
             // A block has to be visible before it is allowed to be fragile — see
             // the comment on validateBlocks.
+            const gk = groupKeyOf(el);
+            if (gk && !el.block) {
+                cell.classList.add('at-in-block');
+                cell.title = gk[0] === 'a' ? 'Animation frame, the frames move together' : 'In a group, moves as one piece (Ctrl/Cmd+Shift+G ungroups)';
+            }
             if (el.block) {
                 cell.classList.add('at-in-block');
                 cell.title = `Part of a ${el.block.label}, keeps its ${el.block.cols}-column shape when the atlas is resized`;
@@ -3325,6 +4432,7 @@ window.TRLE = window.TRLE || {};
             if (el.seamless && el.kind !== 'anim') badges.innerHTML += '<span class="at-badge at-badge-s" title="Seamless applied">S</span>';
             if (el.kind === 'transition') badges.innerHTML += el.ovParams
                 ? '<span class="at-badge at-badge-t" title="Overlay tile, one texture laid on top of another">T</span>'
+                : el.push ? '<span class="at-badge at-badge-t" title="Pushable-marking tile, rebuilt from its source tile">T</span>'
                 : '<span class="at-badge at-badge-t" title="Transition tile">T</span>';
             if (el.kind === 'anim') {
                 const a = el.anim || {};
@@ -3344,66 +4452,35 @@ window.TRLE = window.TRLE || {};
             lbl.textContent = materialLabel(el);
             cell.appendChild(lbl);
 
-            cell.addEventListener('click', e => { setGridFocus(el.id, false); onCellClick(el.id, e); });
-            cell.addEventListener('contextmenu', e => {
-                e.preventDefault();
-                setGridFocus(el.id, false);
-                // Right-clicking a tile outside the current multi-selection makes it
-                // the single selection, so context actions act on what you clicked.
-                if (!state.selSet.has(el.id)) selectSingle(el.id);
-                openCtxMenu(el.id, e.clientX, e.clientY);
-            });
-
-            // Drag-to-reorder (disabled during transition pick-partner mode).
-            cell.draggable = (state.pickBaseId === null);
-            cell.addEventListener('dragstart', e => {
-                state.dragId = el.id;
-                e.dataTransfer.effectAllowed = 'move';
-                // Dim the whole block when dragging inside a multi-selection, so
-                // it's clear that all of it is coming along.
-                (ctxActsOnSelection(el.id) ? selectedIdsInOrder() : [el.id])
-                    .forEach(id => { const c = cellById(id); if (c) c.classList.add('at-dragging'); });
-            });
-            cell.addEventListener('dragend', () => {
-                state.dragId = null;
-                grid.querySelectorAll('.at-dragging').forEach(c => c.classList.remove('at-dragging'));
-                grid.querySelectorAll('.at-drop-target').forEach(c => c.classList.remove('at-drop-target'));
-            });
-            cell.addEventListener('dragover', e => {
-                if (state.dragId == null || state.dragId === el.id) return;
-                // No drop target inside the block being moved — it would be a no-op.
-                if (ctxActsOnSelection(state.dragId) && state.selSet.has(el.id)) return;
-                e.preventDefault();
-                cell.classList.add('at-drop-target');
-            });
-            cell.addEventListener('dragleave', () => cell.classList.remove('at-drop-target'));
-            cell.addEventListener('drop', e => {
-                e.preventDefault();
-                cell.classList.remove('at-drop-target');
-                reorderElements(state.dragId, el.id);
-            });
+            // Click and context menu are handled ONCE on the grid
+            // (setupGridDelegation): per-cell listeners were ~28,000 on a
+            // 64 x 64 page and a third of a full redraw's script time. Moving
+            // tiles is a pointer drag (setupGridDrag), not HTML5 drag-and-drop.
             grid.appendChild(cell);
-        });
+        }
 
-        // Persistent "+" add-tile cell at the end of the grid (Phase A).
-        const addCell = document.createElement('div');
-        addCell.className = 'at-add-cell';
-        addCell.tabIndex = 0;
-        addCell.setAttribute('role', 'button');
-        addCell.setAttribute('aria-label', 'Add image tiles');
-        addCell.title = 'Add image tiles';
-        addCell.innerHTML = '<span class="at-add-plus">＋</span>';
-        addCell.addEventListener('click', triggerAddImages);
-        addCell.addEventListener('keydown', e => {
-            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); triggerAddImages(); }
-        });
-        grid.appendChild(addCell);
-
-        if (hadCellFocus && state.focusedId != null) {
+        /* The "+" cell that used to end the grid is gone (GRID-SLOT-PLAN phase
+           9): every empty slot takes a click, a file drop or a paste, and the
+           toolbar's Add Image(s) still appends. */
+        if (hadSlotFocus != null && hadSlotFocus < state.layout.length) {
+            // Focus stays on the slot, or moves onto what now fills it.
+            if (state.layout[hadSlotFocus] == null) focusSlot(hadSlotFocus);
+            else setGridFocus(state.layout[hadSlotFocus]);
+        } else if (hadCellFocus && state.focusedId != null) {
             const c = cellById(state.focusedId);
             if (c) c.focus();
         }
         updateBulkBar();
+        renderAlphaAdvice();     // cheap: tile numbers off the last completed scan
+        scheduleAlphaAdvice();   // debounced: rescans pixels in case they changed
+    }
+
+    /* Focus the grid's slot `s`: its tile, or the empty placeholder. */
+    function focusSlot(s) {
+        const id = state.layout[s];
+        if (id != null) { setGridFocus(id); return; }
+        const e = $('at-grid').querySelector(`.at-slot-empty[data-slot="${s}"]`);
+        if (e) e.focus();
     }
 
     /* Move the roving-tabindex target without a full re-render. */
@@ -3415,32 +4492,70 @@ window.TRLE = window.TRLE || {};
         if (focusEl) { const c = cellById(id); if (c) c.focus(); }
     }
 
+    /* Arrow keys walk the SLOTS as drawn, empty ones included, so an empty slot
+       can be reached from the keyboard to add or paste into (phase 9). Stays
+       put at the edge of the grid. */
+    function slotStep(s, key) {
+        const vc = visCols(), n = state.layout.length;
+        const t = key === 'ArrowLeft' ? s - 1 : key === 'ArrowRight' ? s + 1
+                : key === 'ArrowUp' ? s - vc : key === 'ArrowDown' ? s + vc : s;
+        return t >= 0 && t < n ? t : s;
+    }
+
+    function onEmptySlotKeydown(e, slot) {
+        const tiles = layoutCells();
+        switch (e.key) {
+            case 'ArrowLeft': case 'ArrowRight': case 'ArrowUp': case 'ArrowDown':
+                e.preventDefault(); focusSlot(slotStep(slot, e.key)); return;
+            case 'Home': if (tiles.length) { e.preventDefault(); setGridFocus(tiles[0].el.id); } return;
+            case 'End':  if (tiles.length) { e.preventDefault(); setGridFocus(tiles[tiles.length - 1].el.id); } return;
+            case 'Enter': e.preventDefault(); triggerAddImages(slot); return;
+            // Space adds on RELEASE, when no pan happened (setupGridPan).
+            case ' ': e.preventDefault(); return;
+            case 'ContextMenu': e.preventDefault(); openSlotMenuForSlot(slot); return;
+            case 'F10': if (e.shiftKey) { e.preventDefault(); openSlotMenuForSlot(slot); } return;
+            default: return;
+        }
+    }
+
     function onGridKeydown(e) {
+        const emptyEl = e.target.closest && e.target.closest('.at-slot-empty');
+        if (emptyEl) { onEmptySlotKeydown(e, Number(emptyEl.dataset.slot)); return; }
         const cellEl = e.target.closest && e.target.closest('.at-cell');
         if (!cellEl) return;
         const id = Number(cellEl.dataset.id);
-        const i = indexOf(id);
+        const order = layoutCells().map(c => c.el.id);   // reading order, as drawn
+        const i = order.indexOf(id);
         if (i < 0) return;
-        const vc = visCols();
-        const last = state.elements.length - 1;
+        const last = order.length - 1;
         let target = null;
 
-        // Ctrl/Cmd+Arrow = move (reorder) the focused element.
-        if ((e.ctrlKey || e.metaKey) && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+        // Ctrl/Cmd+G groups the selection, +Shift ungroups the focused tile's
+        // group. Only here, with a tile focused: anywhere else Cmd+G is the
+        // browser's Find Next and stays that.
+        if ((e.ctrlKey || e.metaKey) && (e.key === 'g' || e.key === 'G')) {
             e.preventDefault();
-            moveElement(id, e.key === 'ArrowLeft' ? -1 : 1);
+            if (e.shiftKey) ungroupTile(id);
+            else groupSelection(state.selSet.size >= 2 ? null : [id]);
+            return;
+        }
+        // Ctrl/Cmd+Arrow = move the focused tile one slot that way.
+        const MOVES = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+        if ((e.ctrlKey || e.metaKey) && MOVES[e.key]) {
+            e.preventDefault();
+            moveElement(id, ...MOVES[e.key]);
             return;
         }
 
         switch (e.key) {
-            case 'ArrowLeft':  target = i - 1; break;
-            case 'ArrowRight': target = i + 1; break;
-            case 'ArrowUp':    target = i - vc; break;
-            case 'ArrowDown':  target = i + vc; break;
+            case 'ArrowLeft': case 'ArrowRight': case 'ArrowUp': case 'ArrowDown':
+                e.preventDefault(); focusSlot(slotStep(slotOf(id), e.key)); return;
             case 'Home':       target = 0; break;
             case 'End':        target = last; break;
-            case 'Enter':
-            case ' ':          e.preventDefault(); onCellClick(id); return;
+            case 'Enter':      e.preventDefault(); onCellClick(id); return;
+            // Space selects on RELEASE, when no pan happened (setupGridPan):
+            // holding it and dragging pans the grid instead.
+            case ' ':          e.preventDefault(); return;
             case 'ContextMenu': e.preventDefault(); openCtxMenuForCell(id); return;
             case 'F10':        if (e.shiftKey) { e.preventDefault(); openCtxMenuForCell(id); } return;
             case 's': case 'S': e.preventDefault(); runCtxAction('seamless', id); return;
@@ -3455,8 +4570,478 @@ window.TRLE = window.TRLE || {};
         if (target != null) {
             e.preventDefault();
             target = Math.max(0, Math.min(last, target));
-            setGridFocus(state.elements[target].id);
+            setGridFocus(order[target]);
         }
+    }
+
+    /* Space + left-drag pans a grid wider (or taller) than the window, the way
+       image editors do. A Space tapped on a focused tile still selects it, on
+       key-up, like a native button, and only if no pan happened in between;
+       selecting on key-down would select on the way to every pan. Ignored while
+       a text field, select or button has focus, or a modal is open. */
+    function setupGridPan() {
+        const scroller = $('at-grid-scroll'), grid = $('at-grid');
+        if (!scroller) return;
+        let held = false, panned = false, pan = null, swallowClick = false;
+        const skip = t => !t || /^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(t.tagName) || t.isContentEditable;
+        const off = () => {
+            held = false; panned = false; pan = null;
+            scroller.classList.remove('at-pan-ready', 'at-panning');
+        };
+        document.addEventListener('keydown', e => {
+            if (e.key !== ' ') return;
+            if (held) { e.preventDefault(); return; }                  // auto-repeat
+            if (skip(e.target) && e.target !== document.body) return;
+            if ($('at-overlay').style.display !== 'none' || $('at-grid-card').style.display === 'none') return;
+            held = true; panned = false;
+            scroller.classList.add('at-pan-ready');
+            e.preventDefault();                                         // no page scroll
+        });
+        document.addEventListener('keyup', e => {
+            if (e.key !== ' ' || !held) return;
+            const didPan = panned;
+            held = false; panned = false;
+            scroller.classList.remove('at-pan-ready');                  // a drag in progress runs on to mouseup
+            if (didPan) return;
+            const ae = document.activeElement, cell = ae && ae.closest && ae.closest('.at-cell');
+            if (cell && grid.contains(cell)) onCellClick(Number(cell.dataset.id));
+            else if (ae && ae.classList && ae.classList.contains('at-slot-empty') && grid.contains(ae)) triggerAddImages(Number(ae.dataset.slot));
+        });
+        window.addEventListener('blur', off);
+        // Capture phase, so neither the marquee nor a tile's native drag starts.
+        scroller.addEventListener('mousedown', e => {
+            if (!held || e.button !== 0) return;
+            e.preventDefault(); e.stopPropagation();
+            const page = document.scrollingElement || document.documentElement;
+            pan = { x: e.clientX, y: e.clientY, left: scroller.scrollLeft, top: page.scrollTop, page, moved: false };
+            scroller.classList.add('at-panning');
+        }, true);
+        scroller.addEventListener('dragstart', e => { if (held || pan) e.preventDefault(); }, true);
+        document.addEventListener('mousemove', e => {
+            if (!pan) return;
+            const dx = e.clientX - pan.x, dy = e.clientY - pan.y;
+            if (Math.abs(dx) + Math.abs(dy) > 2) { pan.moved = true; panned = true; }
+            scroller.scrollLeft = pan.left - dx;
+            pan.page.scrollTop = pan.top - dy;
+        });
+        document.addEventListener('mouseup', () => {
+            if (!pan) return;
+            // The click that ends a pan is not a click on a tile. It fires right
+            // after this mouseup, so the flag only has to outlive this task.
+            if (pan.moved) { swallowClick = true; setTimeout(() => { swallowClick = false; }, 0); }
+            pan = null;
+            scroller.classList.remove('at-panning');
+        });
+        scroller.addEventListener('click', e => { if (swallowClick) { e.stopPropagation(); e.preventDefault(); } }, true);
+    }
+
+    /* The tile's click, context menu and drag-to-reorder handlers, attached
+       once to the grid and resolved to a tile by `closest('.at-cell')`. They
+       used to be seven listeners per cell, rebuilt on every renderGrid. */
+    function setupGridDelegation() {
+        const grid = $('at-grid');
+        const cellOf = e => { const c = e.target.closest && e.target.closest('.at-cell'); return c && grid.contains(c) ? c : null; };
+        const emptyOf = e => { const c = e.target.closest && e.target.closest('.at-slot-empty'); return c && grid.contains(c) ? c : null; };
+        grid.addEventListener('click', e => {
+            const empty = emptyOf(e);
+            if (empty) {
+                // Not while picking a partner texture, and not the click that
+                // ends a marquee drag.
+                if (state.pickBaseId !== null || marqueeJustDragged) return;
+                empty.focus();
+                triggerAddImages(Number(empty.dataset.slot));
+                return;
+            }
+            const cell = cellOf(e); if (!cell) return;
+            const id = Number(cell.dataset.id);
+            setGridFocus(id, false); onCellClick(id, e);
+        });
+        grid.addEventListener('contextmenu', e => {
+            const empty = emptyOf(e);
+            if (empty) {
+                e.preventDefault();
+                empty.focus();
+                openSlotMenu(Number(empty.dataset.slot), e.clientX, e.clientY);
+                return;
+            }
+            const cell = cellOf(e); if (!cell) return;
+            const id = Number(cell.dataset.id);
+            e.preventDefault();
+            closeSlotMenu();
+            setGridFocus(id, false);
+            // Right-clicking a tile outside the current multi-selection makes it
+            // the single selection, so context actions act on what you clicked.
+            if (!state.selSet.has(id)) selectSingle(id);
+            openCtxMenu(id, e.clientX, e.clientY);
+        });
+    }
+
+    /* The grid's drag (GRID-SLOT-PLAN phase 6, D8): pointer events, so it can
+       show what will happen and (phase 7) animate it; HTML5 drag-and-drop can
+       do neither. A press on a tile becomes a drag after 6 px, so a click is
+       still a click. Hit-testing uses the geometry captured when the drag
+       starts, never the live cells: with the live preview moving cells out
+       from under the pointer, reading them would flip the zone back and forth
+       (audit §I.7). The plan is recomputed only when the zone changes. */
+    function setupGridDrag() {
+        const grid = $('at-grid'), scroller = $('at-grid-scroll');
+        let d = null, swallowClick = false, raf = 0;
+        const marker = document.createElement('div');
+        marker.className = 'at-drop-marker';
+        marker.hidden = true;
+        document.body.appendChild(marker);
+        const GAP = 16;
+
+        /* Live preview (phase 7, animations on): every tile the plan would move
+           slides to its new slot with a transform; nothing is re-rendered and
+           nothing is committed. A new zone waits a short dwell first, so
+           sweeping across the grid does not set every tile twitching. */
+        let previewKey = null, previewTimer = 0;
+        const clearPreview = () => {
+            clearTimeout(previewTimer);
+            previewKey = null;
+            grid.querySelectorAll('.at-cell[data-pv]').forEach(c => { c.style.transform = ''; delete c.dataset.pv; });
+            grid.querySelectorAll('.at-slot-ghost').forEach(g => g.remove());
+        };
+        const preview = () => {
+            if (!d || !d.started || (TRLE.Motion && TRLE.Motion.reduced())) return;
+            const plan = d.plan;
+            if (!plan || plan.refused || plan.noop) { clearPreview(); return; }
+            if (previewKey === d.key) return;
+            previewKey = d.key;
+            const { px, py } = d.geo, curCols = Math.max(1, state.cols), cur = new Map();
+            state.layout.forEach((id, sl) => { if (id != null) cur.set(id, sl); });
+            plan.cells.forEach((id, sl) => {
+                if (id == null || !cur.has(id)) return;
+                const from = cur.get(id), cell = cellById(id);
+                if (!cell) return;
+                const dx = ((sl % plan.cols) - (from % curCols)) * px;
+                const dy = (Math.floor(sl / plan.cols) - Math.floor(from / curCols)) * py;
+                if (dx || dy) { cell.style.transform = `translate(${dx}px, ${dy}px)`; cell.dataset.pv = '1'; }
+                else if (cell.dataset.pv) { cell.style.transform = ''; delete cell.dataset.pv; }
+            });
+            /* A tile sliding away leaves bare background where it was. Where the
+               drop will leave an EMPTY slot, draw the dashed placeholder the
+               grid will show after release (the author, 2026-09-25), so a
+               dragged group does not leave an unexplained hole. */
+            grid.querySelectorAll('.at-slot-ghost').forEach(g => g.remove());
+            const { x0, y0, w, h } = d.geo;
+            cur.forEach((from, id) => {
+                const r = Math.floor(from / curCols), c = from % curCols;
+                if (c >= plan.cols || plan.cells[r * plan.cols + c] != null) return;
+                const g = document.createElement('div');
+                g.className = 'at-slot-ghost';
+                Object.assign(g.style, { left: x0 + c * px + 'px', top: y0 + r * py + 'px', width: w + 'px', height: h + 'px' });
+                grid.appendChild(g);
+            });
+        };
+        const clearMarks = () => {
+            marker.hidden = true;
+            grid.querySelectorAll('.at-swap-target, .at-swap-source').forEach(c => c.classList.remove('at-swap-target', 'at-swap-source'));
+            document.body.classList.remove('at-drop-refused');
+        };
+        const slotRect = sl => d.rects.get(sl);
+        /* Grid-local geometry of the slot pitch, from two cells measured once. */
+        const hit = (lx, ly) => {
+            const { cols, rows, x0, y0, px, py, w, h } = d.geo;
+            let c = Math.floor((lx - x0 + GAP / 2) / px), r = Math.floor((ly - y0 + GAP / 2) / py);
+            if (r < 0 || lx < x0 - px || lx > x0 + cols * px + px) return null;
+            if (c < 0) return { zone: 'row', target: { r: Math.min(r, rows - 1), c: 0 } };
+            if (c >= cols) return { zone: 'row', target: { r: Math.min(r, rows - 1), c: cols } };
+            if (r >= rows) return r === rows ? { zone: 'col', target: { r: rows, c } } : null;
+            const sl = r * cols + c;
+            if (state.layout[sl] == null) return { zone: 'place', target: sl };
+            const u = (lx - (x0 + c * px - GAP / 2)) / px, v = (ly - (y0 + r * py - GAP / 2)) / py;
+            const du = Math.min(u, 1 - u), dv = Math.min(v, 1 - v);
+            if (Math.min(du, dv) >= 0.3) return { zone: 'swap', target: sl };
+            if (du <= dv) return { zone: 'row', target: { r, c: u < 0.5 ? c : c + 1 } };
+            return { zone: 'col', target: { r: v < 0.5 ? r : r + 1, c } };
+        };
+        const show = () => {
+            clearMarks();
+            const { h: hitNow, plan } = d;
+            if (!hitNow || !plan) return;
+            if (plan.refused) { document.body.classList.add('at-drop-refused'); return; }
+            if (plan.noop) return;
+            const gr = grid.getBoundingClientRect(), { x0, y0, px, py, w, h, cols, rows } = d.geo;
+            const box = (l, t, bw, bh, cls) => {
+                marker.className = 'at-drop-marker ' + cls;
+                Object.assign(marker.style, { left: gr.left + l + 'px', top: gr.top + t + 'px', width: bw + 'px', height: bh + 'px' });
+                marker.hidden = false;
+            };
+            const { zone, target } = hitNow;
+            // A group or selection: its landing slots (drawLanding) say where it goes.
+            if (d.ids.length > 1) return;
+            if (zone === 'swap') {
+                const t = cellById(state.layout[target]); if (t) t.classList.add('at-swap-target');
+                d.ids.forEach(id => { const c = cellById(id); if (c) c.classList.add('at-swap-source'); });
+            } else if (zone === 'place') {
+                // drawLanding outlines the slot.
+            } else if (zone === 'row') {
+                box(x0 + target.c * px - GAP / 2 - 2, y0 + target.r * py, 4, h, 'at-mark-insert');
+            } else if (zone === 'col') {
+                box(x0 + target.c * px, y0 + target.r * py - GAP / 2 - 2, w, 4, 'at-mark-insert');
+            }
+        };
+        const update = () => {
+            if (!d || !d.started) return;
+            d.ghost.style.transform = `translate(${d.cx + 12}px, ${d.cy + 12}px)`;
+            const gr = grid.getBoundingClientRect();
+            const h = hit(d.cx - gr.left, d.cy - gr.top);
+            const key = h ? h.zone + JSON.stringify(h.target) : '';
+            if (key !== d.key) {
+                d.key = key; d.h = h;
+                d.plan = h ? planDrop(d.ids, h.zone, h.target) : null;
+                clearTimeout(previewTimer);
+                if (!d.plan || d.plan.refused || d.plan.noop) clearPreview();
+                else previewTimer = setTimeout(preview, 90);
+                drawLanding();
+            }
+            show();
+        };
+        /* Where the dragged tiles will snap (the author, 2026-09-25): a dashed
+           accent slot at each one's destination, with or without Animations,
+           redrawn only when the zone changes. The slots are placed from the
+           drag geometry and the plan's own column count, so a drop that grows
+           the grid shows its landing past the current edge too. */
+        const clearLanding = () => grid.querySelectorAll('.at-slot-landing').forEach(g => g.remove());
+        const drawLanding = () => {
+            clearLanding();
+            const plan = d && d.plan;
+            if (!plan || plan.refused || plan.noop) return;
+            const { x0, y0, px, py, w, h } = d.geo;
+            d.ids.forEach(id => {
+                const sl = plan.cells.indexOf(id);
+                if (sl < 0) return;
+                const g = document.createElement('div');
+                g.className = 'at-slot-landing';
+                Object.assign(g.style, { left: x0 + (sl % plan.cols) * px + 'px', top: y0 + Math.floor(sl / plan.cols) * py + 'px', width: w + 'px', height: h + 'px' });
+                grid.appendChild(g);
+            });
+        };
+        /* Auto-scroll while the pointer is near the grid's left or right edge,
+           or near the top or bottom of the window. */
+        const tick = () => {
+            if (!d || !d.started) { raf = 0; return; }
+            const sr = scroller.getBoundingClientRect(), EDGE = 40, SPEED = 14;
+            if (d.cx < sr.left + EDGE) scroller.scrollLeft -= SPEED;
+            else if (d.cx > sr.right - EDGE) scroller.scrollLeft += SPEED;
+            if (d.cy < EDGE) window.scrollBy(0, -SPEED);
+            else if (d.cy > window.innerHeight - EDGE) window.scrollBy(0, SPEED);
+            update();
+            raf = requestAnimationFrame(tick);
+        };
+        const start = () => {
+            d.ids = dragSet(d.id);
+            // Geometry, measured once: the first cell and its neighbours give the pitch.
+            const gr = grid.getBoundingClientRect(), kids = [...grid.children].filter(k => k.matches('.at-cell, .at-slot-empty'));
+            const cols = Math.max(1, state.cols), rows = state.rows;
+            const r0 = kids[0].getBoundingClientRect();
+            const rx = kids[1] && cols > 1 ? kids[1].getBoundingClientRect() : null;
+            const ry = kids[cols] ? kids[cols].getBoundingClientRect() : null;
+            d.geo = { cols, rows, x0: r0.left - gr.left, y0: r0.top - gr.top, w: r0.width, h: r0.height,
+                      px: rx ? rx.left - r0.left : r0.width + GAP, py: ry ? ry.top - r0.top : r0.height + GAP };
+            const src = cellById(d.id), cv = src && src.querySelector('canvas');
+            const ghost = document.createElement('canvas');
+            ghost.width = ghost.height = 64;
+            ghost.className = 'at-drag-ghost';
+            if (cv) ghost.getContext('2d').drawImage(cv, 0, 0, 64, 64);
+            document.body.appendChild(ghost);
+            d.ghost = ghost;
+            d.ids.forEach(id => { const c = cellById(id); if (c) c.classList.add('at-dragging'); });
+            document.body.classList.add('at-grid-dragging');
+            d.started = true;
+            if (!raf) raf = requestAnimationFrame(tick);
+        };
+        const finish = (commit) => {
+            const was = d; d = null;
+            if (!was || !was.started) return;
+            cancelAnimationFrame(raf); raf = 0;
+            clearMarks();
+            clearLanding();
+            clearPreview();   // on a commit renderGrid redraws at the previewed places in this same task
+            was.ghost.remove();
+            document.body.classList.remove('at-grid-dragging');
+            grid.querySelectorAll('.at-dragging').forEach(c => c.classList.remove('at-dragging'));
+            swallowClick = true; setTimeout(() => { swallowClick = false; }, 0);
+            if (!commit || !was.plan) return;
+            if (was.plan.refused) { showToast(was.plan.refused, 'info'); return; }
+            if (was.plan.noop) return;
+            const n = was.ids.length, z = was.h.zone;
+            commitPlan(was.plan, n > 1 ? `Move ${n} tiles` : z === 'swap' ? 'Swap tiles' : z === 'place' ? 'Move tile' : 'Insert tile', was.id);
+        };
+
+        grid.addEventListener('pointerdown', e => {
+            if (e.button !== 0 || state.pickBaseId !== null || scroller.classList.contains('at-pan-ready')) return;
+            const cell = e.target.closest('.at-cell');
+            if (!cell || !grid.contains(cell)) return;
+            d = { id: Number(cell.dataset.id), x0: e.clientX, y0: e.clientY, cx: e.clientX, cy: e.clientY, started: false, key: null };
+        });
+        document.addEventListener('pointermove', e => {
+            if (!d) return;
+            d.cx = e.clientX; d.cy = e.clientY;
+            if (!d.started) { if (Math.hypot(d.cx - d.x0, d.cy - d.y0) < 6) return; start(); }
+            update();
+        });
+        document.addEventListener('pointerup', () => finish(true));
+        document.addEventListener('pointercancel', () => finish(false));
+        document.addEventListener('keydown', e => { if (e.key === 'Escape' && d && d.started) { e.stopPropagation(); finish(false); } }, true);
+        grid.addEventListener('click', e => { if (swallowClick) { e.stopPropagation(); e.preventDefault(); } }, true);
+        // A text-selection drag must not start from a tile.
+        grid.addEventListener('dragstart', e => { if (e.target.closest && e.target.closest('.at-cell')) e.preventDefault(); });
+
+        for (const k of ['cols', 'rows']) {
+            const b = $(`at-lock-${k}`);
+            if (!b) continue;
+            b.addEventListener('click', () => {
+                const key = k === 'cols' ? 'lockCols' : 'lockRows';
+                state[key] = !state[key];
+                renderGrid();
+                markDirty();
+            });
+        }
+    }
+
+    /* ---- Empty slots (GRID-SLOT-PLAN phase 9, D20) ----
+       Click adds an image there, files dropped from disk land there, a paste
+       lands in the focused or hovered one, and right-click opens this menu.
+       Tiles added at a slot fill it and then the empty slots after it
+       (reconcileLayout's pendingSlot); nothing already placed moves. */
+
+    /* Why an empty row or column cannot be deleted: null when it can, 'occupied'
+       when it is not wholly empty (the entry is hidden), else a reason shown
+       on the disabled entry. */
+    function emptyLineBlocker(kind, i) {
+        syncLayout();
+        const cols = Math.max(1, state.cols), rows = state.rows;
+        const slots = kind === 'row'
+            ? Array.from({ length: cols }, (_, c) => i * cols + c)
+            : Array.from({ length: rows }, (_, r) => r * cols + i);
+        if (slots.some(sl => state.layout[sl] != null)) return 'occupied';
+        if (kind === 'row' ? rows <= 1 : cols <= 1) return `The atlas needs at least one ${kind}`;
+        if (kind === 'row' ? state.lockRows : state.lockCols) return `${kind === 'row' ? 'Rows' : 'Columns'} is locked`;
+        // A group keeps its shape: a line running through one would split it.
+        const span = new Map();
+        state.layout.forEach((id, sl) => {
+            const k = id != null && groupKeyOf(byId(id));
+            if (!k) return;
+            const v = kind === 'row' ? Math.floor(sl / cols) : sl % cols;
+            const m = span.get(k) || { lo: v, hi: v, el: byId(id) };
+            m.lo = Math.min(m.lo, v); m.hi = Math.max(m.hi, v);
+            span.set(k, m);
+        });
+        for (const m of span.values()) if (m.lo < i && i < m.hi) return `It runs through ${aGroup(m.el)}`;
+        return null;
+    }
+
+    function deleteEmptyLine(kind, i) {
+        const why = emptyLineBlocker(kind, i);
+        if (why) { if (why !== 'occupied') showToast(why, 'info'); return; }
+        const cols = Math.max(1, state.cols);
+        if (kind === 'row') {
+            state.layout.splice(i * cols, cols);
+            state.rows--;
+        } else {
+            state.layout = state.layout.filter((_, sl) => sl % cols !== i);
+            state.cols = cols - 1;
+        }
+        layoutAssigned();
+        renderGrid();
+        pushHistory(`Delete empty ${kind} ${i + 1}`);
+    }
+
+    let slotMenuSlot = null;
+    function openSlotMenu(slot, x, y) {
+        closeCtxMenu();
+        const menu = $('at-slot-ctx'), cols = Math.max(1, state.cols);
+        slotMenuSlot = slot;
+        const r = Math.floor(slot / cols), c = slot % cols;
+        for (const [kind, i, n] of [['row', r, 'delrow'], ['col', c, 'delcol']]) {
+            const b = menu.querySelector(`[data-action="slot-${n}"]`), why = emptyLineBlocker(kind, i);
+            b.style.display = why === 'occupied' ? 'none' : '';
+            b.disabled = !!why;
+            b.title = why && why !== 'occupied' ? why : '';
+            b.textContent = `🗑️ Delete Empty ${kind === 'row' ? 'Row' : 'Column'} ${i + 1}`;
+        }
+        menu.style.display = 'flex';
+        const mw = menu.offsetWidth, mh = menu.offsetHeight;
+        menu.style.left = Math.max(8, Math.min(x, window.innerWidth - mw - 8)) + 'px';
+        menu.style.top  = Math.max(8, Math.min(y, window.innerHeight - mh - 8)) + 'px';
+        const first = slotMenuItems()[0];
+        if (first) first.focus();
+    }
+    function openSlotMenuForSlot(slot) {
+        const e = $('at-grid').querySelector(`.at-slot-empty[data-slot="${slot}"]`);
+        const r = e ? e.getBoundingClientRect() : { left: 100, bottom: 120 };
+        openSlotMenu(slot, r.left + 8, r.bottom - 6);
+    }
+    const slotMenuItems = () => [...$('at-slot-ctx').querySelectorAll('button')].filter(b => !b.disabled && b.offsetParent !== null);
+    function closeSlotMenu() {
+        const menu = $('at-slot-ctx');
+        if (!menu || menu.style.display === 'none') return;
+        const wasIn = menu.contains(document.activeElement);
+        menu.style.display = 'none';
+        if (wasIn && slotMenuSlot != null && slotMenuSlot < state.layout.length) focusSlot(slotMenuSlot);
+    }
+    function setupSlotMenu() {
+        const menu = $('at-slot-ctx');
+        menu.addEventListener('click', e => {
+            const b = e.target.closest('button');
+            if (!b || b.disabled) return;
+            const slot = slotMenuSlot, cols = Math.max(1, state.cols);
+            closeSlotMenu();
+            switch (b.dataset.action) {
+                case 'slot-image':  triggerAddImages(slot); break;
+                case 'slot-blank':  addBlankTile(slot); break;
+                case 'slot-paste':  pasteFromClipboardInto(slot); break;
+                case 'slot-delrow': deleteEmptyLine('row', Math.floor(slot / cols)); break;
+                case 'slot-delcol': deleteEmptyLine('col', slot % cols); break;
+            }
+        });
+        menu.addEventListener('keydown', e => {
+            const items = slotMenuItems();
+            if (!items.length) return;
+            const cur = items.indexOf(document.activeElement);
+            switch (e.key) {
+                case 'ArrowDown': e.preventDefault(); items[(cur + 1) % items.length].focus(); break;
+                case 'ArrowUp':   e.preventDefault(); items[(cur - 1 + items.length) % items.length].focus(); break;
+                case 'Home':      e.preventDefault(); items[0].focus(); break;
+                case 'End':       e.preventDefault(); items[items.length - 1].focus(); break;
+                case 'Tab':       e.preventDefault(); closeSlotMenu(); break;
+            }
+        });
+        // Outside clicks, Esc and scrolling close it through closeCtxMenu.
+    }
+
+    /* Files dragged in from the desktop. Moving TILES is a pointer drag
+       (setupGridDrag); this is HTML5 drag-and-drop, which only files use (D8).
+       Dropped on an empty slot they fill it and the empty slots after it;
+       anywhere else on the grid they go after the last tile. */
+    function setupGridFileDrop() {
+        const grid = $('at-grid');
+        const hasFiles = e => !!e.dataTransfer && [...(e.dataTransfer.types || [])].includes('Files');
+        const emptyAt = e => { const t = e.target.closest && e.target.closest('.at-slot-empty'); return t && grid.contains(t) ? t : null; };
+        const mark = t => {
+            grid.querySelectorAll('.at-slot-drop').forEach(x => { if (x !== t) x.classList.remove('at-slot-drop'); });
+            if (t) t.classList.add('at-slot-drop');
+        };
+        grid.addEventListener('dragover', e => {
+            if (!hasFiles(e) || !state.tileSize) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'copy';
+            mark(emptyAt(e));
+        });
+        grid.addEventListener('dragleave', e => { if (!e.relatedTarget || !grid.contains(e.relatedTarget)) mark(null); });
+        grid.addEventListener('drop', e => {
+            if (!hasFiles(e) || !state.tileSize) return;
+            e.preventDefault();
+            const t = emptyAt(e);
+            mark(null);
+            if (e.dataTransfer.files.length) addImageTiles(e.dataTransfer.files, t ? Number(t.dataset.slot) : null);
+        });
+        // The empty slot under the pointer, for a paste (pasteTargetSlot).
+        grid.addEventListener('pointerover', e => { const t = emptyAt(e); hoverSlot = t ? Number(t.dataset.slot) : null; });
+        grid.addEventListener('pointerleave', () => { hoverSlot = null; });
     }
 
     function setupGrid() {
@@ -3464,39 +5049,352 @@ window.TRLE = window.TRLE || {};
         grid.setAttribute('role', 'grid');
         grid.setAttribute('aria-label', 'Atlas elements, arrow keys to move, Enter to select, S/T/M for actions');
         grid.addEventListener('keydown', onGridKeydown);
+        setupGridDelegation();
+        setupGridPan();
+        setupGridDrag();
+        setupSlotMenu();
+        setupGridFileDrop();
         $('at-cols-input').addEventListener('change', e => setColumns(parseInt(e.target.value)));
         $('at-rows-input').addEventListener('change', e => setRows(parseInt(e.target.value)));
     }
 
-    /* Reflow the atlas into a new column count (elements keep their order). */
-    /* Column changes preserve blocks silently and leave an undo entry, rather
-       than opening a modal. Padding is non-destructive and one Ctrl+Z away, so a
-       dialog on every tweak of the Columns box is pure friction — and an atlas
-       with no blocks in it (most of them) never has anything to decide. */
+    /* Columns adds or removes columns on the right; every tile in a column
+       that stays keeps its (col, row). Textures in a column being removed move
+       to new rows at the bottom, in reading order (the author's revision of
+       GRID-SLOT-PLAN D7, 2026-09-24: refusing stranded anyone who widened by
+       accident and then added something, since appended tiles fill the new
+       columns). A group with any tile in a removed column moves whole, keeping
+       its shape, on rows of its own. */
     function setColumns(n) {
         if (!Number.isFinite(n)) { renderGrid(); return; }
-        n = Math.max(1, Math.min(12, Math.round(n)));
-        if (n === state.cols) { renderGrid(); return; }
-        state.cols = n;
-        if (!hasBlocks()) { renderGrid(); pushHistory(`Columns: ${n}`); return; }
-        const r = reflowPreservingBlocks(n);
+        n = Math.max(1, Math.round(n));
+        if (n > maxSlotsPerSide()) {
+            showToast(ceilingSentence('Columns', maxSlotsPerSide()), 'info');
+            renderGrid();
+            return;
+        }
+        syncLayout();
+        const cols = Math.max(1, state.cols);
+        if (n === cols) { renderGrid(); return; }
+        let moved = 0;
+        if (n < cols && state.layout.some((id, s) => id != null && s % cols >= n)) {
+            const r = shrinkColumnsMoving(n);
+            if (r.refused) { showToast(r.refused, 'info'); renderGrid(); return; }
+            moved = r.moved;
+        } else remapColumns(n);
         renderGrid();
-        pushHistory(`Columns: ${n}` + (r.added ? ` (+${r.added} spacer${r.added > 1 ? 's' : ''})` : ''));
-        if (r.tooWide.length) {
-            showToast(`${r.tooWide.join(', ')} is wider than ${n} columns, it now flows with the loose tiles`, 'info');
-        } else if (r.added) {
-            showToast(`Kept ${r.kept} block${r.kept > 1 ? 's' : ''} in shape · ${r.added} spacer${r.added > 1 ? 's' : ''} added · Undo in History`, 'success');
+        pushHistory(`Columns: ${n}`);
+        if (moved) {
+            const span = n + 1 === cols ? `column ${cols}` : `columns ${n + 1} to ${cols}`;
+            showToast(`${moved} texture${moved !== 1 ? 's' : ''} from ${span} moved to new rows at the bottom`, 'info', 4000);
         }
     }
 
-    /* Set columns indirectly by target row count (cols = ceil(N / rows)). */
+    /* Lower Columns to `n` when the columns being removed hold textures. The
+       tiles that stay are remapped as remapColumns would; the displaced ones
+       (expanded to whole groups) go below the last occupied row: loose tiles
+       left to right in reading order, a group as its own shape starting on a
+       fresh row. Returns { moved } or { refused: sentence }. */
+    function shrinkColumnsMoving(n) {
+        const cols = Math.max(1, state.cols);
+        const num = tileNumbers();
+        const moving = new Set();
+        state.layout.forEach((id, s) => {
+            if (id == null || s % cols < n) return;
+            const k = groupKeyOf(byId(id));
+            if (k) groupMembers(k).forEach(m => moving.add(m)); else moving.add(id);
+        });
+        // Units in reading order of their first slot: a loose tile, or a group's shape.
+        const units = [], seenGroup = new Set();
+        state.layout.forEach((id, s) => {
+            if (id == null || !moving.has(id)) return;
+            const el = byId(id), k = groupKeyOf(el);
+            if (!k) { units.push({ ids: [id] }); return; }
+            if (seenGroup.has(k)) return;
+            seenGroup.add(k);
+            const ms = groupMembers(k).map(m => ({ id: m, s: state.layout.indexOf(m) }));
+            const r0 = Math.min(...ms.map(m => Math.floor(m.s / cols))), c0 = Math.min(...ms.map(m => m.s % cols));
+            const w = Math.max(...ms.map(m => m.s % cols)) - c0 + 1;
+            if (w > n) {
+                const ns = ms.map(m => num.get(m.id)).sort((a, b) => a - b);
+                return units.push({ refuse: `Tiles ${ns[0]} to ${ns[ns.length - 1]} are ${aGroup(el)} ${w} columns wide, which does not fit in ${n}. Ungroup it or move it first.` });
+            }
+            units.push({ group: true, cells: ms.map(m => ({ id: m.id, dr: Math.floor(m.s / cols) - r0, dc: m.s % cols - c0 })) });
+        });
+        const refusal = units.find(u => u.refuse);
+        if (refusal) return { refused: refusal.refuse };
+        if (state.lockRows) {
+            const span = n + 1 === cols ? `Column ${cols}` : `Columns ${n + 1} to ${cols}`;
+            return { refused: `${span} still hold textures, and Rows is locked, so there is no new row to move them to. Unlock Rows, or move them first.` };
+        }
+        const out = [];
+        state.layout.forEach((id, s) => {
+            if (id == null || moving.has(id)) return;
+            const sl = Math.floor(s / cols) * n + (s % cols);
+            while (out.length <= sl) out.push(null);
+            out[sl] = id;
+        });
+        let rows = Math.max(0, ...out.map((id, sl) => (id != null ? Math.floor(sl / n) + 1 : 0)));
+        let r = rows, c = 0;
+        const put = (rr, cc, id) => { const sl = rr * n + cc; while (out.length <= sl) out.push(null); out[sl] = id; };
+        for (const u of units) {
+            if (!u.group) {
+                if (c >= n) { r++; c = 0; }
+                put(r, c++, u.ids[0]);
+                continue;
+            }
+            if (c > 0) { r++; c = 0; }
+            u.cells.forEach(k => put(r + k.dr, k.dc, k.id));
+            r += Math.max(...u.cells.map(k => k.dr)) + 1;
+        }
+        rows = Math.max(state.rows, Math.ceil(out.length / n));
+        if (rows > maxSlotsPerSide()) return { refused: ceilingSentence('Rows', maxSlotsPerSide()) };
+        while (out.length < rows * n) out.push(null);
+        state.cols = n; state.rows = rows; state.layout = out;
+        layoutAssigned();
+        return { moved: moving.size };
+    }
+
+    /* Rows adds or removes rows at the bottom. Textures in a row being removed
+       move up into the empty slots above, and only when those run out does the
+       atlas gain columns on the right for the rest (the author, 2026-09-25: the
+       same trap as Columns, since anything added after raising Rows lands in
+       the new rows). Every tile in a row that stays keeps its slot. */
     function setRows(r) {
         if (!Number.isFinite(r)) { renderGrid(); return; }
-        const N = Math.max(1, state.elements.length);
-        r = Math.max(1, Math.min(99, Math.round(r)));
-        const n = Math.max(1, Math.min(12, Math.ceil(N / r)));
-        if (n === state.cols) { renderGrid(); return; }
-        setColumns(n);          // Rows is just Columns by another route — same block handling
+        r = Math.max(1, Math.round(r));
+        if (r > maxSlotsPerSide()) {
+            showToast(ceilingSentence('Rows', maxSlotsPerSide()), 'info');
+            renderGrid();
+            return;
+        }
+        syncLayout();
+        const cols = Math.max(1, state.cols), rows = state.rows;
+        if (r === rows) { renderGrid(); return; }
+        let moved = null;
+        if (r < rows && state.layout.slice(r * cols).some(id => id != null)) {
+            moved = shrinkRowsMoving(r);
+            if (moved.refused) { showToast(moved.refused, 'info'); renderGrid(); return; }
+        } else {
+            state.layout = r < rows ? state.layout.slice(0, r * cols)
+                : state.layout.concat(new Array((r - rows) * cols).fill(null));
+            state.rows = r;
+            layoutAssigned();
+        }
+        renderGrid();
+        pushHistory(`Rows: ${r}`);
+        if (moved) {
+            const span = r + 1 === rows ? `row ${rows}` : `rows ${r + 1} to ${rows}`, n = moved.moved;
+            showToast(`${n} texture${n !== 1 ? 's' : ''} from ${span} moved up into empty slots`
+                + (moved.added ? `, and ${moved.added} column${moved.added !== 1 ? 's were' : ' was'} added on the right to fit them` : ''), 'info', 4500);
+        }
+    }
+
+    /* Lower Rows to `r` when the rows being removed hold textures. The
+       displaced tiles (expanded to whole groups) go, in reading order, into the
+       first empty slot above (a group into the first place its own shape fits,
+       scanning top-left corners in reading order); when nothing fits, a column
+       is added on the right and the search runs again. Returns { moved, added }
+       or { refused: sentence }. */
+    function shrinkRowsMoving(r) {
+        const cols0 = Math.max(1, state.cols), num = tileNumbers();
+        const moving = new Set();
+        state.layout.forEach((id, s) => {
+            if (id == null || Math.floor(s / cols0) < r) return;
+            const k = groupKeyOf(byId(id));
+            if (k) groupMembers(k).forEach(m => moving.add(m)); else moving.add(id);
+        });
+        const units = [], seenGroup = new Set();
+        for (let s = 0; s < state.layout.length; s++) {
+            const id = state.layout[s];
+            if (id == null || !moving.has(id)) continue;
+            const el = byId(id), k = groupKeyOf(el);
+            if (!k) { units.push([{ id, dr: 0, dc: 0 }]); continue; }
+            if (seenGroup.has(k)) continue;
+            seenGroup.add(k);
+            const ms = groupMembers(k).map(m => ({ id: m, s: state.layout.indexOf(m) }));
+            const r0 = Math.min(...ms.map(m => Math.floor(m.s / cols0))), c0 = Math.min(...ms.map(m => m.s % cols0));
+            const cells = ms.map(m => ({ id: m.id, dr: Math.floor(m.s / cols0) - r0, dc: m.s % cols0 - c0 }));
+            const h = Math.max(...cells.map(k2 => k2.dr)) + 1;
+            if (h > r) {
+                const ns = ms.map(m => num.get(m.id)).sort((a, b) => a - b);
+                return { refused: `Tiles ${ns[0]} to ${ns[ns.length - 1]} are ${aGroup(el)} ${h} rows tall, which does not fit in ${r}. Ungroup it or move it first.` };
+            }
+            units.push(cells);
+        }
+        // The rows that stay, minus everything that moves, as a grid we can widen.
+        let W = cols0;
+        let grid = [];
+        for (let rr = 0; rr < r; rr++) for (let cc = 0; cc < W; cc++) {
+            const id = state.layout[rr * W + cc];
+            grid.push(id != null && !moving.has(id) ? id : null);
+        }
+        const widen = () => {
+            const g = [];
+            for (let rr = 0; rr < r; rr++) { for (let cc = 0; cc < W; cc++) g.push(grid[rr * W + cc]); g.push(null); }
+            W++; grid = g;
+        };
+        const fitAt = (cells, rr, cc) => cells.every(k => rr + k.dr < r && cc + k.dc < W && grid[(rr + k.dr) * W + cc + k.dc] == null);
+        const maxW = maxSlotsPerSide();
+        for (const cells of units) {
+            for (;;) {
+                let spot = null;
+                for (let sl = 0; sl < r * W && !spot; sl++) if (fitAt(cells, Math.floor(sl / W), sl % W)) spot = [Math.floor(sl / W), sl % W];
+                if (spot) { cells.forEach(k => { grid[(spot[0] + k.dr) * W + spot[1] + k.dc] = k.id; }); break; }
+                if (state.lockCols) {
+                    const span = r + 1 === state.rows ? `Row ${state.rows}` : `Rows ${r + 1} to ${state.rows}`;
+                    return { refused: `${span} still hold textures, the empty slots above cannot take them all, and Columns is locked. Unlock Columns, or move them first.` };
+                }
+                if (W >= maxW) return { refused: ceilingSentence('Columns', maxW) };
+                widen();
+            }
+        }
+        state.cols = W; state.rows = r; state.layout = grid;
+        layoutAssigned();
+        return { moved: moving.size, added: W - cols0 };
+    }
+
+    /* ============ EMPTY SLOTS AT EXPORT (GRID-SLOT-PLAN phase 4, D18) ============
+       A HOLE is an empty slot before the last texture in reading order. Empty
+       slots after the last texture are the partial last row every atlas has
+       always had: they export transparent, as they always did, and are never
+       asked about, so an old project exports byte-identically and without a
+       new question. Holes are resolved before an export, the Room View, or on
+       request: Compact moves loose textures up into them, Fill turns each into
+       a real tile (black = exactly a spacer; transparent = alpha 0, whose maps
+       are already neutral: flat normal, white AO, measured). The choice is kept
+       on the project and applied without asking next time. One Undo reverts. */
+    function holeSlots() {
+        syncLayout();
+        let last = -1;
+        state.layout.forEach((id, s) => { if (id != null) last = s; });
+        const out = [];
+        for (let s = 0; s < last; s++) if (state.layout[s] == null) out.push(s);
+        return out;
+    }
+
+    /* Re-read element order from the layout, the invariant reconcileLayout
+       relies on, after a function has written the layout directly. */
+    function elementsFromLayout() {
+        const byIdMap = new Map(state.elements.map(e => [e.id, e]));
+        state.elements = state.layout.filter(id => id != null).map(id => byIdMap.get(id));
+        layoutAssigned();
+        if (enforceTransitionOrder()) syncLayout();   // a set member moved ahead of a parent: repair
+    }
+
+    function makeTransparentTile() {
+        const S = state.tileSize;
+        const canvas = document.createElement('canvas');
+        canvas.width = canvas.height = S;
+        return { id: state.nextId++, kind: 'tile', canvas, original: cloneCanvas(canvas),
+                 seamless: false, edited: false, material: null };
+    }
+
+    function fillHoles(kind) {
+        const holes = holeSlots();
+        for (const s of holes) {
+            const el = kind === 'black' ? makeSpacerTile() : makeTransparentTile();
+            state.elements.push(el);           // order is re-read from the layout below
+            state.layout[s] = el.id;
+        }
+        elementsFromLayout();
+        return holes.length;
+    }
+
+    /* Everything moves up, in reading order, to the first place it fits: a
+       loose texture to the first empty slot, a group (transition set,
+       animation, user group) as one piece, keeping its shape, to the first
+       top-left corner where the whole shape is free. Loose textures after a
+       group fill the gaps beside it. Rows left wholly empty at the bottom are
+       removed. (Until 2026-09-25 groups kept their slots and blocked the
+       compaction, leaving a field of empty slots above a set; the author
+       asked for them to snap up like everything else.) */
+    function compactHoles() {
+        syncLayout();
+        const cols = Math.max(1, state.cols);
+        const before = holeSlots().length;
+        const units = [], seen = new Set();
+        state.layout.forEach((id, s) => {
+            if (id == null) return;
+            const k = groupKeyOf(byId(id));
+            if (!k) { units.push([{ id, dr: 0, dc: 0 }]); return; }
+            if (seen.has(k)) return;
+            seen.add(k);
+            const ms = groupMembers(k).map(m => ({ id: m, s: state.layout.indexOf(m) })).filter(m => m.s >= 0);
+            const r0 = Math.min(...ms.map(m => Math.floor(m.s / cols))), c0 = Math.min(...ms.map(m => m.s % cols));
+            units.push(ms.map(m => ({ id: m.id, dr: Math.floor(m.s / cols) - r0, dc: m.s % cols - c0 })));
+        });
+        const out = [];
+        let firstFree = 0;   // every slot before this is taken
+        for (const cells of units) {
+            for (let sl = firstFree; ; sl++) {
+                const r = Math.floor(sl / cols), c = sl % cols;
+                if (!cells.every(k => c + k.dc < cols && out[(r + k.dr) * cols + c + k.dc] == null)) continue;
+                cells.forEach(k => { out[(r + k.dr) * cols + c + k.dc] = k.id; });
+                break;
+            }
+            while (out[firstFree] != null) firstFree++;
+        }
+        const rows = Math.max(1, Math.ceil(out.length / cols));
+        state.layout = Array.from({ length: rows * cols }, (_, sl) => (out[sl] == null ? null : out[sl]));
+        state.rows = rows;
+        elementsFromLayout();
+        return before - holeSlots().length;
+    }
+
+    /* Returns how many holes it closed. Nothing moved = no history step and no
+       toast: a saved Compact re-runs before every export, and holes beside a
+       transition set can outlive it when no loose texture is left to move up
+       (they then export transparent, like a partial last row). */
+    function applyEmptyChoice(kind) {
+        const before = JSON.stringify(state.layout);
+        const n = kind === 'compact' ? compactHoles() : fillHoles(kind);
+        renderGrid();
+        if (JSON.stringify(state.layout) === before) return 0;
+        pushHistory(kind === 'compact' ? `Compact (${n} gap${n !== 1 ? 's' : ''} closed)`
+            : `Fill ${n} empty slot${n !== 1 ? 's' : ''} ${kind}`);
+        return n;
+    }
+
+    let emptyFillThen = null;
+    function openEmptyFill(then) {
+        const n = holeSlots().length;
+        emptyFillThen = then || null;
+        $('at-emptyfill-msg').textContent =
+            `${n} empty slot${n !== 1 ? 's sit' : ' sits'} between your textures. `
+            + (then ? 'What should the exported atlas have there?' : 'Close the gaps, or fill them?');
+        openModal('emptyfill');
+    }
+
+    /* Call first thing in anything that exports. Returns true when it has
+       taken over: the choice is being asked, and `then` re-runs the caller from
+       the answer's click (which is a fresh user gesture, so the Room View can
+       still open its window). Returns false when the caller should carry on:
+       no holes, or a saved choice it has just applied. */
+    function emptiesPending(then) {
+        if (!holeSlots().length) return false;
+        if (state.emptyFill) {
+            const n = applyEmptyChoice(state.emptyFill);
+            if (n) showToast(state.emptyFill === 'compact'
+                ? `Compacted the atlas first (${n} gap${n !== 1 ? 's' : ''}), as chosen for this project`
+                : `Filled ${n} empty slot${n !== 1 ? 's' : ''} ${state.emptyFill} first, as chosen for this project`, 'info');
+            return false;
+        }
+        openEmptyFill(then);
+        return true;
+    }
+
+    function setupEmptyFill() {
+        document.querySelectorAll('#at-modal-emptyfill [data-fill]').forEach(b => b.addEventListener('click', () => {
+            const kind = b.dataset.fill, then = emptyFillThen;
+            emptyFillThen = null;
+            state.emptyFill = kind;
+            closeModal();
+            applyEmptyChoice(kind);
+            markDirty();
+            if (then) then();
+        }));
+        $('at-empty-slots').addEventListener('click', () => { if (holeSlots().length) openEmptyFill(null); });
     }
 
     /* Effective tile size from the picker: a preset value, or the Custom field,
@@ -3530,16 +5428,17 @@ window.TRLE = window.TRLE || {};
     /* ============ GRID BLOCKS ============
        A "block" is a run of tiles a set builder added that only reads correctly
        at a particular column count — a 4x4 Wang sheet, a 3x3 island. Elements
-       carry `el.block = { id, cols, label }`.
+       carry `el.block = { id, cols, label }`, and a block is one kind of group
+       (groupKeyOf): it moves whole and keeps its shape.
 
-       The invariant is contiguity-modulo-spacers: from the first member to the
-       last, every element is either a member of this block or an auto-spacer.
-       Padding interleaves spacers into the block's rows (a 4-wide block in a
-       5-column atlas is 4 tiles + 1 spacer per row), so plain contiguity would
-       be false the moment the block is padded.
+       The invariant is positional (validateBlocks): the members fill a
+       rectangle `block.cols` wide, in order, wherever it sits in the grid. It
+       used to be contiguity-modulo-spacers in element order, from when a
+       column change reflowed the atlas and padded blocks with black spacers;
+       the slot grid (GRID-SLOT-PLAN) does neither.
 
-       Blocks are DELIBERATELY fragile: drag a tile out or drop a foreign tile in
-       and the metadata is dropped, because the claim "this is a 4-wide block" has
+       Blocks are DELIBERATELY fragile: if a member leaves the rectangle or a
+       foreign tile lands in it, the metadata is dropped, because the claim "this is a 4-wide block" has
        stopped being true. That is only honest if the user can see the block in
        the first place, hence the outline in renderGrid — an invisible property
        that silently disappears is the same failure mode as a glow that Reset
@@ -3550,21 +5449,27 @@ window.TRLE = window.TRLE || {};
     /* Drop the metadata from any block that is no longer intact. Returns the
        labels of the blocks that were dropped, so the caller can say so. */
     function validateBlocks() {
-        const seen = new Map();          // block id -> {first, last, members, label}
-        state.elements.forEach((el, i) => {
-            if (!el.block) return;
+        /* Positional: a block is intact while its members fill a rectangle
+           `block.cols` wide, in order, wherever it sits in the grid. Anything
+           else in the rectangle, or a member outside it, breaks the claim. */
+        syncLayout();
+        const cols = Math.max(1, state.cols);
+        const byIdMap = new Map(state.elements.map(e => [e.id, e]));
+        const seen = new Map();          // block id -> {slots, label, cols}
+        state.layout.forEach((id, s) => {
+            const el = id == null ? null : byIdMap.get(id);
+            if (!el || !el.block) return;
             const r = seen.get(el.block.id);
-            if (r) { r.last = i; r.members++; }
-            else seen.set(el.block.id, { first: i, last: i, members: 1, label: el.block.label, cols: el.block.cols });
+            if (r) r.slots.push(s);
+            else seen.set(el.block.id, { slots: [s], label: el.block.label, cols: el.block.cols, n: el.block.n });
         });
         const dropped = [];
         for (const [id, r] of seen) {
-            let intact = r.members % r.cols === 0;
-            for (let i = r.first; intact && i <= r.last; i++) {
-                const el = state.elements[i];
-                if (el.spacer) continue;
-                if (!el.block || el.block.id !== id) intact = false;
-            }
+            const bc = r.cols, m = r.slots, first = m[0];
+            /* `n` (Pushable Markings): a block of exactly n members whose last row
+               may be short, because copies are per slot. Without it, full rows. */
+            const intact = (r.n ? m.length === r.n : m.length % bc === 0) && (first % cols) + bc <= cols
+                && m.every((s, k) => s === first + Math.floor(k / bc) * cols + (k % bc));
             if (!intact) {
                 dropped.push(r.label || 'block');
                 state.elements.forEach(el => { if (el.block && el.block.id === id) delete el.block; });
@@ -3573,76 +5478,29 @@ window.TRLE = window.TRLE || {};
         return dropped;
     }
 
-    /* Re-lay the atlas at `newCols` so every intact block keeps its own width,
-       padding each of its rows out with spacers. Old auto-spacers are stripped
-       first (otherwise they accumulate a row at a time); an edited spacer is
-       treated as a real tile and kept. A block wider than newCols cannot be
-       preserved — it flows like loose tiles and loses its metadata. */
-    function reflowPreservingBlocks(newCols) {
-        const src = state.elements.filter(e => !(e.spacer && !e.edited));
-        const out = [];
-        let added = 0, kept = 0, tooWide = [];
-        let i = 0;
-        while (i < src.length) {
-            const b = src[i].block;
-            if (!b) { out.push(src[i++]); continue; }
-            let j = i;
-            while (j < src.length && src[j].block && src[j].block.id === b.id) j++;
-            const run = src.slice(i, j);
-            i = j;
-            if (b.cols > newCols) {
-                tooWide.push(b.label || 'block');
-                run.forEach(el => { delete el.block; out.push(el); });
-                continue;
-            }
-            while (out.length % newCols) { out.push(makeSpacerTile()); added++; }
-            for (let k = 0; k < run.length; k += b.cols) {
-                const row = run.slice(k, k + b.cols);
-                out.push(...row);
-                for (let p = row.length; p < newCols; p++) { out.push(makeSpacerTile()); added++; }
-            }
-            kept++;
-        }
-        state.elements = out;
-        return { kept, added, tooWide };
-    }
-
-    const hasBlocks = () => state.elements.some(e => e.block);
-
-    /* Add a grid-shaped block of tiles that reads best at `width` columns. If the
-       atlas already holds tiles in a different column count, ask whether to reflow
-       it to `width` so the block lines up. The last row is padded with blank
-       spacer tiles when needed so the block starts on a fresh row (otherwise the
-       arrangement would shear). Falsy width = just add (no reflow, no padding). */
+    /* Add a grid-shaped set of tiles that reads correctly at `width` columns.
+       It lands as a `width`-wide rectangle starting on a fresh row, below
+       everything already in the atlas (reconcileLayout's `pendingRect`). An
+       atlas narrower than the set gains empty columns first; one that is wider
+       keeps its width, with empty slots beside the set. Nothing already placed
+       moves, so there is no longer anything to ask about. Falsy width = just
+       add, like any other new tile. (The name is historical: this used to offer
+       to reflow the atlas to the set's width.) */
     function confirmResizeCols(width, addFn) {
-        const padThenAdd = () => {
-            if (width) while (state.elements.length % width) state.elements.push(makeSpacerTile());
-            addFn();
-        };
-        if (!width || state.cols === width || state.elements.length === 0) {
-            if (width && state.elements.length === 0) state.cols = width;
-            padThenAdd();
-            return;
+        if (width) {
+            syncLayout();
+            if (state.lockCols && state.elements.length && state.cols < width) {
+                showToast(`This set is ${width} columns wide and Columns is locked at ${state.cols}. Unlock Columns to add it.`, 'info');
+                return;
+            }
+            if (!state.elements.length) { state.cols = width; layoutFromOrder(); }
+            else if (state.cols < width) {
+                remapColumns(width);
+                showToast(`Atlas widened to ${width} columns so the set fits`, 'info');
+            }
+            pendingRect = width;
         }
-        // Blocks already in the atlas keep their own width through the reflow, so
-        // "resize" no longer means "shear whatever is already here" — say so.
-        const blocks = hasBlocks();
-        const pads = (width - (state.elements.length % width)) % width;
-        openConfirm(
-            '🧩 Arrange as a grid?',
-            `This set reads best as a ${width}-column block, but the atlas is ${state.cols} columns. ` +
-            `Resize the atlas to ${width} columns so the tiles line up?` +
-            (blocks ? ' Blocks already in the atlas keep their own shape, their rows are padded with spacers.'
-                    : ` Existing tiles reflow into ${width} columns.`) +
-            (pads ? ` ${pads} blank spacer tile${pads > 1 ? 's' : ''} will pad the last row so the block starts on a fresh row.` : ''),
-            `Resize to ${width} columns & add`,
-            () => {
-                state.cols = width;
-                if (blocks) reflowPreservingBlocks(width);
-                padThenAdd();
-            },
-            { danger: false, cancelLabel: 'Cancel' }
-        );
+        addFn();
     }
 
     function onCellClick(id, e) {
@@ -3699,11 +5557,12 @@ window.TRLE = window.TRLE || {};
         state.selAnchor = id;
     }
     function selectRange(anchorId, toId, additive) {
-        const a = indexOf(anchorId), b = indexOf(toId);
+        const order = layoutCells().map(c => c.el.id);   // a range runs in reading order
+        const a = order.indexOf(anchorId), b = order.indexOf(toId);
         if (a < 0 || b < 0) return;
         if (!additive) state.selSet.clear();
         const lo = Math.min(a, b), hi = Math.max(a, b);
-        for (let i = lo; i <= hi; i++) state.selSet.add(state.elements[i].id);
+        for (let i = lo; i <= hi; i++) state.selSet.add(order[i]);
         state.selectedId = toId;   // anchor stays put for further Shift+clicks
     }
     /* Replace the selection with a set of ids (used by marquee/select-all). */
@@ -3728,7 +5587,7 @@ window.TRLE = window.TRLE || {};
             cell.scrollIntoView({ behavior: 'smooth', block: 'center' });
             cell.focus({ preventScroll: true });
         }
-        showToast(`Jumped to tile ${indexOf(srcId) + 1}, set its material here`, 'info', 2500);
+        showToast(`Jumped to tile ${numberOf(srcId)}, set its material here`, 'info', 2500);
     }
     /* Selected ids in atlas order (so bulk ops preserve relative order). */
     function selectedIdsInOrder() {
@@ -3752,38 +5611,22 @@ window.TRLE = window.TRLE || {};
         $('at-bulk-delete').addEventListener('click', () => { const ids = selectedIdsInOrder(); if (ids.length) confirmDelete(ids); });
         $('at-bulk-material').addEventListener('click', bulkApplyMaterial);
         $('at-bulk-lastmaterial').addEventListener('click', () => applyLastMaterial(selectedIdsInOrder()));
-        $('at-bulk-gather').addEventListener('click', gatherSelection);
+        $('at-bulk-group').addEventListener('click', () => groupSelection());
         $('at-bulk-front').addEventListener('click', () => moveSelection(true));
         $('at-bulk-back').addEventListener('click', () => moveSelection(false));
     }
 
     /* Gather the selected tiles into one contiguous block at the position of the
        earliest selected tile (relative order preserved). "Group together". */
-    function gatherSelection() {
-        const ids = selectedIdsInOrder();
-        if (ids.length < 2) return;
-        const idSet = new Set(ids);
-        const anchorIdx = Math.min(...ids.map(indexOf));
-        const sel  = state.elements.filter(e => idSet.has(e.id));
-        const rest = state.elements.filter(e => !idSet.has(e.id));
-        const insertPos = state.elements.slice(0, anchorIdx).filter(e => !idSet.has(e.id)).length;
-        rest.splice(insertPos, 0, ...sel);
-        state.elements = rest;
-        enforceAnimOrder(); enforceTransitionOrder();
-        renderGrid();
-        pushHistory('Group tiles together');
-        showToast(`Grouped ${ids.length} tiles together`, 'success');
-    }
-
-    /* Move the selected tiles to the start / end of the atlas (relative order kept). */
+    /* Move the selected tiles to the start / end of the atlas (relative order
+       kept), across the occupied slots; empty slots stay put. */
     function moveSelection(toFront) {
-        const ids = selectedIdsInOrder();
+        const order = readingOrder();
+        const ids = order.filter(id => state.selSet.has(id));
         if (!ids.length) return;
-        const idSet = new Set(ids);
-        const sel  = state.elements.filter(e => idSet.has(e.id));
-        const rest = state.elements.filter(e => !idSet.has(e.id));
-        state.elements = toFront ? [...sel, ...rest] : [...rest, ...sel];
-        enforceAnimOrder(); enforceTransitionOrder();
+        const idSet = new Set(ids), rest = order.filter(id => !idSet.has(id));
+        permuteOccupied(animRuns(toFront ? [...ids, ...rest] : [...rest, ...ids]));
+        blocksChanged('the move');
         renderGrid();
         pushHistory(toFront ? 'Move to front' : 'Move to back');
         showToast(`Moved ${ids.length} tile${ids.length !== 1 ? 's' : ''} to ${toFront ? 'front' : 'back'}`, 'success');
@@ -3858,12 +5701,14 @@ window.TRLE = window.TRLE || {};
     }
 
     /* ---- Rubber-band marquee selection over the grid background ---- */
+    let marqueeJustDragged = false;   // the click that ends a marquee is not a click on a slot
     function setupSelectionMarquee() {
         const grid = $('at-grid');
         grid.addEventListener('mousedown', e => {
             if (e.button !== 0 || state.pickBaseId !== null) return;
-            if (e.target.closest('.at-cell') || e.target.closest('.at-add-cell')) return;  // drags start on background only
+            if (e.target.closest('.at-cell')) return;  // drags start on background only (empty slots count)
             const additive = e.ctrlKey || e.metaKey || e.shiftKey;
+            const onEmpty = !!e.target.closest('.at-slot-empty');
             const baseSel = new Set(state.selSet);
             const start = { x: e.clientX, y: e.clientY };
             let moved = false;
@@ -3893,6 +5738,10 @@ window.TRLE = window.TRLE || {};
                 document.removeEventListener('mousemove', onMove);
                 document.removeEventListener('mouseup', onUp);
                 if (box.parentNode) box.parentNode.removeChild(box);
+                // A plain click on an empty slot adds an image there (the click
+                // handler), so leave the grid alone for it to land on.
+                if (!moved && onEmpty && !additive) return;
+                if (moved) { marqueeJustDragged = true; setTimeout(() => { marqueeJustDragged = false; }, 0); }
                 if (!moved && !additive) clearSelection();   // plain click on empty background → clear
                 renderGrid();
             };
@@ -3910,6 +5759,289 @@ window.TRLE = window.TRLE || {};
             e.preventDefault();
             selectAll();
         });
+    }
+
+    /* ============ LAYOUT MOVES (GRID-SLOT-PLAN phase 6) ============
+       Every move acts on the LAYOUT; element order (processing order) is left
+       alone, which is what retired the old "transition kept after its source"
+       repair on the grid and the set it reversed (audit §7).
+
+       planDrop() is pure: it returns the grid a drop WOULD produce, or why it is
+       refused, and changes nothing, so the drag can show what will happen (and
+       phase 7 can animate it) before anything is committed. Zones (D4):
+         place  an empty slot: the tile moves there;
+         swap   a tile's centre: the two trade places;
+         row    a left/right edge or the gap beside it: insert, pushing right;
+         col    a top/bottom edge or the gap above/below: insert, pushing down.
+       A push runs to the FIRST empty slot and stops (D5). With none left the
+       locks decide (D6): an unlocked side grows; Columns locked wraps a row push
+       into the next row, Rows locked wraps a column push into the next column;
+       both locked refuses. A grouped tile (a transition set's block, a
+       multi-frame animation) cannot be moved on its own or pushed out of its
+       group; moving groups whole is phase 8 (D10). */
+    /* GROUPS (phase 8, D12 to D16). A tile is in at most one group:
+         a transition set's block ('b'), a multi-frame animation ('a', unless
+         its frames were ungrouped), or a user group made with Group ('u').
+       groupKeyOf() is the one accessor, so a future set builder only has to
+       tag its tiles. Dragging any member drags the whole group. */
+    let nextGroupId = 1;
+    function groupKeyOf(el) {
+        if (!el) return null;
+        if (el.block) return 'b' + el.block.id;
+        if (el.kind === 'anim' && el.anim && el.anim.total > 1 && !el.anim.loose) return 'a' + el.anim.group;
+        if (el.group) return 'u' + el.group.id;
+        return null;
+    }
+    const isGrouped = el => !!groupKeyOf(el);
+    const groupName = el => (!el ? 'group' : el.block ? el.block.label || 'transition set'
+        : (el.kind === 'anim' && el.anim && !el.anim.loose && el.anim.total > 1) ? 'animation' : 'group');
+    // "a transition set", "an animation": for sentences that name a group.
+    const aGroup = el => { const g = groupName(el); return (/^[aeiou]/i.test(g) ? 'an ' : 'a ') + g; };
+    const groupMembers = key => state.elements.filter(e => groupKeyOf(e) === key).map(e => e.id);
+    /* A drag's tiles: the pressed one first, then the rest of the selection (if
+       it is in one), each with its whole group. */
+    function dragSet(id) {
+        const base = ctxActsOnSelection(id) ? [id, ...readingOrder().filter(x => state.selSet.has(x) && x !== id)] : [id];
+        const out = [], seen = new Set();
+        for (const x of base) {
+            const key = groupKeyOf(byId(x));
+            for (const m of key ? [x, ...groupMembers(key).filter(y => y !== x)] : [x]) if (!seen.has(m)) { seen.add(m); out.push(m); }
+        }
+        return out;
+    }
+
+    function planDrop(ids, zone, target) {
+        syncLayout();
+        const byIdMap = new Map(state.elements.map(e => [e.id, e]));
+        const num = tileNumbers();
+        const g = { cols: Math.max(1, state.cols), rows: state.rows, cells: state.layout.slice() };
+        const start = JSON.stringify(g.cells) + g.cols;
+        const moving = new Set(ids);
+        const keyOf = id => (id == null ? null : groupKeyOf(byIdMap.get(id)));
+        const refuseSplit = id => ({ refused: `Tile ${num.get(id)} belongs to ${aGroup(byIdMap.get(id))} and can't be split from it` });
+        const refuseBlocker = id => ({ refused: `Tile ${num.get(id)} belongs to ${aGroup(byIdMap.get(id))}, which can't be pushed aside; move it first` });
+        const done = () => ({ cols: g.cols, rows: g.rows, cells: g.cells, noop: JSON.stringify(g.cells) + g.cols === start });
+        // Nothing moves as part of a group unless the whole group moves.
+        for (const id of ids) { const k = keyOf(id); if (k && groupMembers(k).some(m => !moving.has(m))) return refuseSplit(id); }
+        const at = (r, c) => r * g.cols + c;
+        const growCol = () => {
+            const n = g.cols + 1, out = new Array(n * g.rows).fill(null);
+            g.cells.forEach((id, sl) => { out[Math.floor(sl / g.cols) * n + (sl % g.cols)] = id; });
+            g.cols = n; g.cells = out;
+        };
+        const growRow = () => { g.cells.push(...new Array(g.cols).fill(null)); g.rows++; };
+        const FULL = { refused: 'The atlas is full and both Columns and Rows are locked, so there is nowhere to push to' };
+        /* Move every tile along `seq` (slots ending in an empty one) one step and
+           put `x` at the front. A tile in a group (other than the ones being
+           moved) cannot be pushed. Returns a refusal, or null. */
+        const shift = (seq, x) => {
+            for (let k = 0; k < seq.length - 1; k++) {
+                const y = g.cells[seq[k]];
+                if (keyOf(y) && !moving.has(y)) return refuseBlocker(y);
+            }
+            for (let k = seq.length - 1; k > 0; k--) g.cells[seq[k]] = g.cells[seq[k - 1]];
+            g.cells[seq[0]] = x;
+            return null;
+        };
+        /* Insert `x` at row r, column c (c may be g.cols: after the row), pushing
+           right. `skip(r, c)` marks cells the push must step OVER rather than
+           shove: a group that has just landed, when this pushes the tiles it
+           displaced (otherwise the push could run through the group and break
+           its shape). Single inserts skip nothing. */
+        const rowPush = (r, c, x, skip = () => false) => {
+            if (c < g.cols) {
+                const seq = [];
+                for (let cc = c; cc < g.cols; cc++) {
+                    if (skip(r, cc)) continue;
+                    seq.push(at(r, cc));
+                    if (g.cells[at(r, cc)] == null) break;
+                }
+                if (seq.length && g.cells[seq[seq.length - 1]] == null) return shift(seq, x);
+            }
+            if (!state.lockCols) {
+                growCol();
+                const seq = [];
+                for (let cc = c; cc < g.cols; cc++) if (!skip(r, cc)) seq.push(at(r, cc));
+                return shift(seq, x);
+            }
+            const seq = [];                       // Columns locked: wrap in reading order
+            for (let sl = c < g.cols ? at(r, c) : at(r + 1, 0); ; sl++) {
+                if (sl >= g.cells.length) { if (state.lockRows) return FULL; growRow(); }
+                if (skip(Math.floor(sl / g.cols), sl % g.cols)) continue;
+                seq.push(sl);
+                if (g.cells[sl] == null) break;
+            }
+            return shift(seq, x);
+        };
+        const colPush = (r, c, x) => {
+            if (r < g.rows) {
+                const seq = [];
+                for (let rr = r; rr < g.rows; rr++) { seq.push(at(rr, c)); if (g.cells[at(rr, c)] == null) break; }
+                if (g.cells[seq[seq.length - 1]] == null) return shift(seq, x);
+            }
+            if (!state.lockRows) {
+                growRow();
+                const seq = [];
+                for (let rr = r; rr < g.rows; rr++) seq.push(at(rr, c));
+                return shift(seq, x);
+            }
+            // Rows locked: continue at the top of the next column (column-major).
+            const ps = [];
+            const cm = p => at(p % g.rows, Math.floor(p / g.rows));
+            for (let p = c * g.rows + r; ; p++) {
+                if (p >= g.cols * g.rows) { if (state.lockCols) return FULL; growCol(); }
+                ps.push(p);
+                if (g.cells[cm(p)] == null) break;
+            }
+            return shift(ps.map(cm), x);
+        };
+
+        if (ids.length > 1) {
+            /* A group or a selection keeps its shape. It lands with its first
+               tile on the target, the grid growing to fit where the locks allow,
+               and the tiles it covers are pushed along their rows to the first
+               empty slot (the author's choice, 2026-09-24), like single inserts. */
+            const cols0 = g.cols;
+            const anchor = g.cells.indexOf(ids[0]);
+            const ar = zone === 'place' || zone === 'swap' ? Math.floor(target / cols0) : target.r;
+            const ac = zone === 'place' || zone === 'swap' ? target % cols0 : target.c;
+            const offs = ids.map(id => { const sl = g.cells.indexOf(id); return [id, Math.floor(sl / cols0) - Math.floor(anchor / cols0), (sl % cols0) - (anchor % cols0)]; });
+            const dest = offs.map(([id, dr, dc]) => [id, ar + dr, ac + dc]);
+            if (dest.some(([, r, c]) => r < 0 || c < 0)) return { refused: "The group doesn't fit there" };
+            const needCols = Math.max(...dest.map(([, , c]) => c)) + 1, needRows = Math.max(...dest.map(([, r]) => r)) + 1;
+            if (needCols > g.cols && state.lockCols) return { refused: "The group doesn't fit there with Columns locked" };
+            if (needRows > g.rows && state.lockRows) return { refused: "The group doesn't fit there with Rows locked" };
+            for (const id of ids) g.cells[g.cells.indexOf(id)] = null;          // lift
+            while (g.cols < needCols) growCol();
+            while (g.rows < needRows) growRow();
+            const footRC = new Set(dest.map(([, r, c]) => r + ',' + c));   // survives a column growing
+            const inFoot = (r, c) => footRC.has(r + ',' + c);
+            const displaced = [];
+            for (const [, r, c] of dest) {
+                const y = g.cells[at(r, c)];
+                if (y == null) continue;
+                if (keyOf(y)) return refuseBlocker(y);
+                displaced.push([y, r, c]);
+            }
+            for (const [id, r, c] of dest) g.cells[at(r, c)] = id;
+            displaced.sort((p, q) => p[1] - q[1] || p[2] - q[2]);
+            /* Each displaced tile goes in one column AFTER the one before it in
+               its row. Inserting them all at the same column would push each
+               one past the last and come out reversed, the audit's §7 shape. */
+            let prev = null;   // the previous displaced tile from the same row, wherever it landed
+            for (const [y, r, c0] of displaced) {
+                let tr = r, tc = c0;
+                if (prev && prev.r === r) {
+                    const ps = g.cells.indexOf(prev.y);          // may have wrapped (Columns locked)
+                    tr = Math.floor(ps / g.cols); tc = ps % g.cols + 1;
+                }
+                while (tr === r && tc < g.cols && inFoot(tr, tc)) tc++;
+                const bad = rowPush(tr, tc, y, inFoot);
+                if (bad) return bad;
+                prev = { r, y };
+            }
+            return done();
+        }
+
+        const x = ids[0], origin = g.cells.indexOf(x);
+        if (origin < 0) return { refused: 'That tile is not in the atlas' };
+        if (zone === 'swap') {
+            const y = g.cells[target];
+            if (y === x) return done();
+            if (keyOf(y)) return refuseBlocker(y);
+            g.cells[target] = x; g.cells[origin] = y;
+            return done();
+        }
+        g.cells[origin] = null;      // lift it: its old slot is a hole a push may use
+        if (zone === 'place') {
+            if (g.cells[target] != null) return { refused: 'That slot is taken' };
+            g.cells[target] = x;
+            return done();
+        }
+        const bad = zone === 'row' ? rowPush(target.r, target.c, x)
+                  : zone === 'col' ? colPush(target.r, target.c, x)
+                  : { refused: 'Nothing to drop onto there' };
+        return bad || done();
+    }
+
+    function commitPlan(plan, label, focusId) {
+        state.cols = plan.cols; state.rows = plan.rows; state.layout = plan.cells;
+        layoutAssigned();
+        blocksChanged('the move');
+        if (focusId != null) state.focusedId = focusId;
+        renderGrid();
+        pushHistory(label);
+    }
+
+    /* Tiles in reading order, and a way to write a new reading order back onto
+       the slots that are occupied now (empty slots stay where they are). The
+       bulk bar's Group together / To front / To back are reading-order edits. */
+    const readingOrder = () => { syncLayout(); return state.layout.filter(id => id != null); };
+    function permuteOccupied(order) {
+        syncLayout();
+        const slots = [];
+        state.layout.forEach((id, sl) => { if (id != null) slots.push(sl); });
+        order.forEach((id, i) => { state.layout[slots[i]] = id; });
+        layoutAssigned();
+    }
+    /* Keep each multi-frame animation's frames together and in frame order
+       within a reading order, at its first frame's place. */
+    function animRuns(order) {
+        const byIdMap = new Map(state.elements.map(e => [e.id, e])), seen = new Set(), out = [];
+        for (const id of order) {
+            const el = byIdMap.get(id);
+            if (el && el.kind === 'anim' && el.anim && el.anim.total > 1) {
+                if (seen.has(el.anim.group)) continue;
+                seen.add(el.anim.group);
+                out.push(...order.filter(i => { const e = byIdMap.get(i); return e && e.kind === 'anim' && e.anim && e.anim.group === el.anim.group; })
+                    .sort((a, b) => byIdMap.get(a).anim.index - byIdMap.get(b).anim.index));
+            } else out.push(id);
+        }
+        return out;
+    }
+
+    /* Group (Ctrl/Cmd+G): tie the selection together so it moves as one
+       piece, keeping its shape. Refused over a tile already in a group (D14). */
+    function groupSelection(ids) {
+        ids = ids || readingOrder().filter(id => state.selSet.has(id));
+        if (ids.length < 2) { showToast('Select two or more tiles to group them', 'info'); return false; }
+        const num = tileNumbers();
+        for (const id of ids) {
+            const el = byId(id);
+            if (isGrouped(el)) { showToast(`Tile ${num.get(id)} is already in ${aGroup(el)}. Ungroup it first.`, 'info'); return false; }
+        }
+        const grp = { id: nextGroupId++ };
+        ids.forEach(id => { byId(id).group = grp; });
+        renderGrid();
+        pushHistory(`Group ${ids.length} tiles`);
+        showToast(`Grouped ${ids.length} tiles: they move as one piece now`, 'success');
+        return true;
+    }
+
+    /* Ungroup: the group the tile is in. A set loses its block (its tiles can
+       move apart); an animation keeps animating, its frames just stop moving
+       together (the author's option A), after a warning; a user group is
+       simply dissolved. */
+    function ungroupTile(id, confirmed) {
+        const el = byId(id), key = groupKeyOf(el);
+        if (!key) { showToast('That tile is not in a group', 'info'); return false; }
+        const members = groupMembers(key).map(byId);
+        if (key[0] === 'a' && !confirmed) {
+            openConfirm('⚠️ Ungroup animation',
+                'Warning: you could lose seamlessness if you ungroup animation textures. '
+                + 'The frames keep animating, but they can then be moved apart and out of order in the atlas.',
+                'Ungroup', () => ungroupTile(id, true), { danger: true, cancelLabel: 'Cancel' });
+            return false;
+        }
+        for (const m of members) {
+            if (key[0] === 'b') delete m.block;
+            else if (key[0] === 'a') m.anim.loose = true;
+            else delete m.group;
+        }
+        renderGrid();
+        pushHistory(`Ungroup ${members.length} tiles`);
+        showToast(`Ungrouped ${members.length} tiles`, 'success');
+        return true;
     }
 
     /* ============ REORDER (Phase 8) ============
@@ -3984,54 +6116,45 @@ window.TRLE = window.TRLE || {};
         return dropped.length;
     }
 
+    /* Drop X on Y = X takes Y's place in READING order and the tiles between
+       shift one place, across the occupied slots (empty slots stay put). This
+       was the HTML5 drag's gesture; the grid's own drag is planDrop now, and
+       this stays for `_cap.reorder`. On a grid with no holes it is exactly the
+       old result. */
     function reorderElements(dragId, targetId) {
         if (dragId == null || dragId === targetId) return;
-        const to = indexOf(targetId);
+        const order = readingOrder();
+        const to = order.indexOf(targetId);
         if (to < 0) return;
-
-        /* Dragging any tile of a multi-selection moves the whole selection, the
-           same way right-clicking inside one acts on all of it (ctxActsOnSelection).
-           The block keeps its internal order and lands together at the target. */
-        const ids = ctxActsOnSelection(dragId) ? selectedIdsInOrder() : [dragId];
-        if (ids.includes(targetId)) return;      // dropped inside the block itself
-        const moving = ids.map(byId).filter(Boolean);
-        if (!moving.length) return;
-
-        const firstFrom = indexOf(ids[0]);
-        const rest = state.elements.filter(e => !ids.includes(e.id));
-        let at = rest.indexOf(byId(targetId));
-        if (at < 0) return;
-        // Same rule as a single tile: coming from earlier in the atlas the block
-        // lands after the target, coming from later it displaces it.
+        const ids = ctxActsOnSelection(dragId) ? order.filter(id => state.selSet.has(id)) : [dragId];
+        if (ids.includes(targetId)) return;
+        const firstFrom = order.indexOf(ids[0]);
+        const rest = order.filter(id => !ids.includes(id));
+        let at = rest.indexOf(targetId);
         if (firstFrom < to) at += 1;
-        rest.splice(at, 0, ...moving);
-        state.elements = rest;
-
-        enforceAnimOrder();
-        const repaired = enforceTransitionOrder();
+        rest.splice(at, 0, ...ids);
+        permuteOccupied(animRuns(rest));
         blocksChanged('the move');
         state.focusedId = dragId;
         renderGrid();
-        pushHistory(moving.length > 1 ? `Reorder ${moving.length} tiles` : 'Reorder');
-        showToast(
-            repaired ? 'Reordered (transitions kept after their sources)'
-            : moving.length > 1 ? `Reordered ${moving.length} tiles` : 'Reordered',
-            'success');
+        pushHistory(ids.length > 1 ? `Reorder ${ids.length} tiles` : 'Reorder');
+        showToast(ids.length > 1 ? `Reordered ${ids.length} tiles` : 'Reordered', 'success');
     }
 
-    /* Keyboard reorder: move the focused element one slot (Ctrl/Cmd+Arrow). */
-    function moveElement(id, dir) {
-        const i = indexOf(id), j = i + dir;
-        if (i < 0 || j < 0 || j >= state.elements.length) return;
-        const a = state.elements;
-        [a[i], a[j]] = [a[j], a[i]];
-        enforceAnimOrder();
-        blocksChanged('the move');
-        enforceTransitionOrder();
-        state.focusedId = id;
-        renderGrid();
-        const c = cellById(id); if (c) c.focus();
-        pushHistory('Move element');
+    /* Keyboard move (Ctrl/Cmd+Arrow): into the neighbouring slot in that
+       direction, swapping with a tile there or moving into an empty slot. */
+    function moveElement(id, dc, dr) {
+        syncLayout();
+        const cols = Math.max(1, state.cols), from = slotOf(id);
+        if (from < 0) return;
+        const c = (from % cols) + dc, r = Math.floor(from / cols) + dr;
+        if (c < 0 || c >= cols || r < 0 || r >= state.rows) return;
+        const t = r * cols + c;
+        const plan = planDrop([id], state.layout[t] == null ? 'place' : 'swap', t);
+        if (plan.refused) { showToast(plan.refused, 'info'); return; }
+        if (plan.noop) return;
+        commitPlan(plan, 'Move element', id);
+        const cell = cellById(id); if (cell) cell.focus();
     }
 
     /* ============ DELETE (single + iOS-style multi-select) ============
@@ -4048,12 +6171,26 @@ window.TRLE = window.TRLE || {};
             for (const el of state.elements)
                 if (el.kind === 'anim' && el.anim && groups.has(el.anim.group)) set.add(el.id);
         }
+        /* An animation that overlays a tile or a transition depends on it
+           exactly the way a transition depends on its parents, so deleting that
+           source has to take the whole animation, whole GROUPS since a group is
+           atomic. One fixed-point loop over BOTH kinds of edge: a transition can
+           take an anim frame as its partner and an animation can read a
+           transition, so the two used to be separate passes and would now miss
+           a chain that alternates between them. */
         let changed = true;
         while (changed) {
             changed = false;
             for (const el of state.elements) {
-                if (el.kind !== 'transition' || set.has(el.id)) continue;
-                if (set.has(el.base) || set.has(el.overlay)) { set.add(el.id); changed = true; }
+                if (set.has(el.id)) continue;
+                if (el.kind === 'transition') {
+                    if (set.has(el.base) || set.has(el.overlay)) { set.add(el.id); changed = true; }
+                } else if (el.kind === 'anim' && el.anim && animGroupSources(el.anim).some(s => set.has(s))) {
+                    for (const m of state.elements)
+                        if (m.kind === 'anim' && m.anim && m.anim.group === el.anim.group && !set.has(m.id)) {
+                            set.add(m.id); changed = true;
+                        }
+                }
             }
         }
         return set;
@@ -4095,6 +6232,16 @@ window.TRLE = window.TRLE || {};
         }
         if (extraTrans > 0) {
             msg += `\n\nThis also removes ${extraTrans} dependent transition${extraTrans !== 1 ? 's' : ''} built on ${ids.length === 1 ? 'it' : 'them'}.`;
+        }
+        // Animations that overlay (or otherwise read) what is being deleted go
+        // with it, whole groups. Phase 2 of ANIMATED-OVERLAY-PLAN asked for the
+        // confirm to say so and it never did; a transition source made it more
+        // likely to surprise, since the tile deleted can be two steps away.
+        const ownGroups = new Set(ids.map(byId).filter(e => e && e.kind === 'anim' && e.anim).map(e => e.anim.group));
+        const extraAnims = new Set([...closure].map(byId)
+            .filter(e => e && e.kind === 'anim' && e.anim && !ownGroups.has(e.anim.group)).map(e => e.anim.group)).size;
+        if (extraAnims > 0) {
+            msg += `\n\nIt also takes ${extraAnims} animation${extraAnims !== 1 ? 's' : ''} that use${extraAnims !== 1 ? '' : 's'} ${ids.length === 1 ? 'it' : 'them'} as an overlay, with every frame.`;
         }
         msg += '\n\nYou can undo this with Ctrl+Z.';
         openConfirm('🗑️ Confirm delete', msg, `Delete ${closure.size}`, () => {
@@ -4151,10 +6298,19 @@ window.TRLE = window.TRLE || {};
         }));
     }
 
+    /* A height-map recipe: plain settings plus an optional paint mask canvas. */
+    function cloneHgParams(p) {
+        if (!p) return null;
+        const { mask, ...rest } = p;
+        return Object.assign(JSON.parse(JSON.stringify(rest)), { mask: mask ? cloneCanvas(mask) : null });
+    }
+
     function snapshotState() {
         return {
             nextId: state.nextId,
             cols: state.cols,
+            rows: (syncLayout(), state.rows),
+            layout: state.layout.slice(),
             tileSize: state.tileSize,
             selectedId: state.selectedId,
             selSet: [...state.selSet],
@@ -4171,8 +6327,11 @@ window.TRLE = window.TRLE || {};
                 blendMethod: el.blendMethod,
                 wangBits: el.wangBits,
                 bset: el.bset ? JSON.parse(JSON.stringify(el.bset)) : null,  // border-set recipe
+                push: el.push ? JSON.parse(JSON.stringify(el.push)) : null,  // pushable-marking recipe
+                pushHandPx: el.pushHandPx || null,                    // immutable ref: always replaced, never drawn into
                 organic: el.organic ? { ...el.organic } : null,         // organic-edge recipe
                 block: el.block ? { ...el.block } : null,               // grid-block membership
+                group: el.group ? { ...el.group } : null,               // user group (phase 8)
                 spacer: !!el.spacer,
                 customMask: el.customMask || null,                     // immutable ref (set once at add)
                 overlayGeom: el.overlayGeom ? { ...el.overlayGeom } : null, // transition overlay re-orient
@@ -4184,6 +6343,9 @@ window.TRLE = window.TRLE || {};
                 htParams: el.htParams ? JSON.parse(JSON.stringify(el.htParams)) : null, // height-transition recipe (re-editable)
                 ovParams: el.ovParams ? JSON.parse(JSON.stringify(el.ovParams)) : null, // overlay recipe (re-editable)
                 sgParams: el.sgParams ? JSON.parse(JSON.stringify(el.sgParams)) : null, // stained-glass recipe (re-editable)
+                // Make Height Map's recipe. Missing until 2026-09-26, so undoing ANY
+                // later edit silently removed every tile's height map.
+                hgParams: cloneHgParams(el.hgParams),
                 original: el.original || null,                          // immutable ref (tiles)
                 // Snapshot the canvas whenever it diverges from `original`
                 // (seamless or healed/transformed); otherwise rebuild from original.
@@ -4223,8 +6385,11 @@ window.TRLE = window.TRLE || {};
                 blendMethod: s.blendMethod,
                 wangBits: s.wangBits,
                 bset: s.bset ? JSON.parse(JSON.stringify(s.bset)) : null,
+                push: s.push ? JSON.parse(JSON.stringify(s.push)) : null,
+                pushHandPx: s.pushHandPx || null,
                 organic: s.organic ? { ...s.organic } : null,
                 block: s.block ? { ...s.block } : null,
+                group: s.group ? { ...s.group } : null,
                 spacer: !!s.spacer,
                 customMask: s.customMask || null,
                 overlayGeom: s.overlayGeom ? { ...s.overlayGeom } : null,
@@ -4234,12 +6399,64 @@ window.TRLE = window.TRLE || {};
                 htParams: s.htParams ? JSON.parse(JSON.stringify(s.htParams)) : null,
                 ovParams: s.ovParams ? JSON.parse(JSON.stringify(s.ovParams)) : null,
                 sgParams: s.sgParams ? JSON.parse(JSON.stringify(s.sgParams)) : null,
+                hgParams: cloneHgParams(s.hgParams),
                 edited: s.edited
             };
         });
+        adoptLayout(snap.rows, snap.layout);
         refreshAnims();         // regenerate animation frames from restored params
         refreshTransitions();   // rebuild transition canvases from restored parents
         renderGrid();
+    }
+
+    /* An animation's RAW frames: layer 1, plus layer 2 composited in when the
+       recipe has one (round three). Layer 2 generates at layer 1's size, frame
+       count and supersample, so frame k of each closes the loop at the same
+       place and the composite loops exactly as both layers do. Everything
+       downstream (overlay, glow, maps, an emissive-only drive) reads this
+       composite as "the animation", so a second layer needed no change there.
+       With no layer 2 this is the old call, byte for byte. */
+    function animGenerateComposite(p1, l2, single, flatten) {
+        return animGenerateLayers(p1, l2, single, flatten).frames;
+    }
+
+    /* The same, split for `z: 'top'`: a layer that sits over the static
+       OVERLAY as well (steam in front of the grate the lava shows through).
+       That one cannot be part of the raw frame, since the overlay composites
+       onto the raw frame, so it comes back separately as `top` and
+       animDrawMember lays it on last. It stays out of the maps for the same
+       reason as the blend mode: steam changes how the wall looks, not what the
+       wall is. `flatten` treats top as front, for emissive-only groups where
+       there is no overlay to be above and the layer only drives the glow. */
+    function animGenerateLayers(p1, l2, single, flatten) {
+        const all = TRLE.AnimGen.generateFrames(p1);
+        const frames = single ? [all[0]] : all;
+        if (!l2 || !l2.params || single) return { frames, top: null };
+        const p2 = Object.assign({}, l2.params,
+            { size: p1.size, frames: p1.frames, supersample: p1.supersample || 1 });
+        const L = TRLE.AnimGen.generateFrames(p2);
+        if (l2.z === 'top' && !flatten) return { frames, top: frames.map((f, k) => L[k % L.length]) };
+        return { frames: frames.map((f, k) => animComposeLayer2(f, L[k % L.length], l2)), top: null };
+    }
+
+    /* Source-over, never a lerp: layer 2 is usually a mostly-transparent field
+       (steam, rain, sparks) and a canvas stores 0 in a transparent pixel's RGB,
+       so a lerp would darken layer 1 wherever layer 2 is empty. Opacity scales
+       layer 2 whichever side it is on. */
+    function animComposeLayer2(base, top, l2) {
+        const S = base.width, c = document.createElement('canvas');
+        c.width = c.height = S;
+        const ctx = c.getContext('2d');
+        const a = Math.max(0, Math.min(1, l2.opacity == null ? 1 : l2.opacity));
+        if (l2.z === 'behind') {
+            ctx.globalAlpha = a; ctx.drawImage(top, 0, 0, S, S);
+            ctx.globalAlpha = 1; ctx.drawImage(base, 0, 0);
+        } else {
+            ctx.drawImage(base, 0, 0);
+            ctx.globalAlpha = a; ctx.drawImage(top, 0, 0, S, S);
+            ctx.globalAlpha = 1;
+        }
+        return c;
     }
 
     /* Regenerate every animation group's frames from its stored params and draw
@@ -4255,15 +6472,18 @@ window.TRLE = window.TRLE || {};
             const meta = members[0].anim;
             let frames;
             try {
-                const all = TRLE.AnimGen.generateFrames(meta.params);
-                frames = meta.single ? [all[0]] : all;
+                const L = animGenerateLayers(meta.params, meta.layer2, meta.single, !!animStillSource(meta.still));
+                frames = L.frames;
+                members.forEach(el => { el.animTop = L.top ? L.top[el.anim.index % L.top.length] : null; });
             } catch (e) { console.error(e); continue; }
+            const plan = frames.length
+                ? animOverlayPlan(meta.overlay, frames[0], members[0].canvas.width) : null;
             members.forEach(el => {
-                const src = frames[el.anim.index % frames.length];
-                const ctx = el.canvas.getContext('2d');
-                ctx.clearRect(0, 0, el.canvas.width, el.canvas.height);
-                if (src) ctx.drawImage(src, 0, 0, el.canvas.width, el.canvas.height);
-                anBakeMemberGlow(el);   // re-derive the glow from the recipe + fresh frame
+                animDrawMember(el, frames[el.anim.index % frames.length], meta.overlay, plan);
+                // Glow derives from the COMPOSED frame on purpose: whatever is
+                // visible is what glows, so dark stepping stones stay dark and
+                // the lava between them lights up, with no extra control.
+                anBakeMemberGlow(el);
             });
         }
     }
@@ -4469,11 +6689,6 @@ window.TRLE = window.TRLE || {};
     }
 
     /* ============ CONTEXT MENU ============ */
-    function ctxVisibleItems() {
-        return [...$('at-ctx').querySelectorAll('button')]
-            .filter(b => !b.disabled && b.offsetParent !== null);
-    }
-
     /* True when the right-clicked tile is part of a ≥2 multi-selection, i.e. the
        material actions should act on every selected tile, not just this one. */
     function ctxActsOnSelection(id) {
@@ -4514,7 +6729,9 @@ window.TRLE = window.TRLE || {};
     /* "Applying to all N selected tiles" under a batchable modal's title.
        Inserted rather than marked up in five places, so the wording stays in one
        spot; hidden entirely for a single target, which is the common case. */
-    function setBatchNote(modalId, n, previewNo) {
+    /* `text` overrides the wording for a modal whose preview is not one tile
+       (🖌 Draw shows the whole selection). */
+    function setBatchNote(modalId, n, previewNo, text) {
         const modal = $(modalId);
         if (!modal) return;
         let note = modal.querySelector('.at-batch-note');
@@ -4525,7 +6742,7 @@ window.TRLE = window.TRLE || {};
         }
         note.style.display = n > 1 ? '' : 'none';
         note.textContent = n > 1
-            ? `🎯 Applying to all ${n} selected tiles, the preview shows tile ${previewNo}.`
+            ? (text || `🎯 Applying to all ${n} selected tiles, the preview shows tile ${previewNo}.`)
             : '';
     }
 
@@ -4534,6 +6751,7 @@ window.TRLE = window.TRLE || {};
         if (!el) return;
         state.ctxTargetId = id;
         const menu = $('at-ctx');
+        ctxReset();
         // 'flex', not 'block' — the inline style wins over the stylesheet, and
         // 'block' would stack the groups vertically again.
         menu.style.display = 'flex';
@@ -4564,6 +6782,18 @@ window.TRLE = window.TRLE || {};
                 + (many ? ` · ${state.selSet.size} tiles` : '');
             lastBtn.title = 'Re-apply the last material you assigned, without opening the editor';
         }
+        // File: Copy and Duplicate split into Original + Modified only when there
+        // is a difference to show (CONTEXT-MENU-PLAN D7). "Original" is what Reset
+        // to Original would give, so a glow alone makes Duplicate a pair, while
+        // Copy, which is pixels only, stays one entry. Set before the batch
+        // suffix below, which rebuilds each label from dataset.baseLabel.
+        const differs = tilePixelsDiffer(el);
+        const dupPair = el.kind === 'tile' && (differs || !!el.emissive);
+        const cpBtn = menu.querySelector('[data-action="copy"]');
+        const dpBtn = menu.querySelector('[data-action="duplicate"]');
+        if (cpBtn) cpBtn.textContent = differs ? '📋 Copy Modified' : '📋 Copy Image';
+        if (dpBtn) dpBtn.dataset.baseLabel = dupPair ? '📑 Duplicate Modified' : '📑 Duplicate';
+
         // Every other action that can run over the selection says so too. Only
         // Set Material used to, which is exactly why "Recolor applied to one
         // tile" read as a bug rather than as a limitation — see ctxTargets.
@@ -4574,6 +6804,14 @@ window.TRLE = window.TRLE || {};
             const n = many ? ctxTargets(id, b.dataset.batch || 'tile').length : 1;
             b.textContent = b.dataset.baseLabel + (n > 1 ? ` · ${n} tiles` : '');
         });
+
+        // Group needs a selection of two or more; Ungroup a tile that is in one.
+        const grpBtn = menu.querySelector('[data-action="group"]'), ungBtn = menu.querySelector('[data-action="ungroup"]');
+        if (grpBtn) grpBtn.style.display = many ? '' : 'none';
+        if (ungBtn) {
+            ungBtn.style.display = isGrouped(el) ? '' : 'none';
+            ungBtn.textContent = `✂️ Ungroup ${groupName(el)}`;
+        }
 
         // Transition-only helpers: jump to the tiles this transition was built from.
         menu.querySelectorAll('[data-transonly]').forEach(b => {
@@ -4590,6 +6828,10 @@ window.TRLE = window.TRLE || {};
         menu.querySelectorAll('[data-animhide]').forEach(b => {
             b.style.display = el.kind === 'anim' ? 'none' : '';
         });
+        const cpoBtn = menu.querySelector('[data-action="copyorig"]');
+        const dpoBtn = menu.querySelector('[data-action="duporig"]');
+        if (cpoBtn) cpoBtn.style.display = differs ? '' : 'none';
+        if (dpoBtn) dpoBtn.style.display = dupPair ? '' : 'none';
         // Make Emissive doubles as the editor, so name the tile's current state —
         // the menu is the first place someone looks to check whether a glow stuck.
         const emBtn = menu.querySelector('[data-action="emissive"]');
@@ -4605,29 +6847,22 @@ window.TRLE = window.TRLE || {};
         menu.querySelectorAll('[data-ovonly]').forEach(b => {
             b.style.display = el.ovParams ? '' : 'none';
         });
+        menu.querySelectorAll('[data-pushonly]').forEach(b => {
+            b.style.display = el.push ? '' : 'none';
+        });
+        // One texture on both sides (a push set, an origami border): one Go to.
+        const goOv = menu.querySelector('[data-action="gotooverlay"]');
+        if (goOv && el.kind === 'transition' && el.base === el.overlay) goOv.style.display = 'none';
         // Edit Stained Glass — only on tiles that carry a stored stained-glass recipe.
         menu.querySelectorAll('[data-sgonly]').forEach(b => {
             b.style.display = el.sgParams ? '' : 'none';
         });
 
-        // A column with nothing visible left in it is just a stray heading, so
-        // drop it — that's what makes an anim frame or a transition show only
-        // the groups that apply to it.
-        menu.querySelectorAll('.at-ctx-col').forEach(col => {
-            const live = [...col.querySelectorAll('button')].some(b => b.style.display !== 'none');
-            col.style.display = live ? '' : 'none';
-        });
-
-        // Clamp to viewport. Measured after the hiding above, since that changes
-        // both dimensions. Math.max floors it at 8: the menu is wide now, and on
-        // a narrow window the old upper-bound-only clamp went negative and put
-        // the menu off the left edge.
-        const mw = menu.offsetWidth, mh = menu.offsetHeight;
-        menu.style.left = Math.max(8, Math.min(x, window.innerWidth - mw - 8)) + 'px';
-        menu.style.top  = Math.max(8, Math.min(y, window.innerHeight - mh - 8)) + 'px';
-
-        const first = ctxVisibleItems()[0];
-        if (first) first.focus();
+        // A category (or the pinned block) with nothing left to offer is not
+        // shown, which is what makes an anim frame or a transition show only
+        // the groups that apply to it. Placed after, since that sets the size.
+        ctxSyncTree();
+        ctxPlaceRoot(x, y);
     }
 
     /* Open the menu anchored to a cell (keyboard ContextMenu / Shift+F10). */
@@ -4638,9 +6873,11 @@ window.TRLE = window.TRLE || {};
     }
 
     function closeCtxMenu() {
+        closeSlotMenu();
         const menu = $('at-ctx');
         if (menu.style.display === 'none') return;
         const wasInMenu = menu.contains(document.activeElement);
+        ctxReset();
         menu.style.display = 'none';
         // Return focus to the source cell when the menu was driven by keyboard.
         if (wasInMenu && state.ctxTargetId != null) {
@@ -4649,11 +6886,986 @@ window.TRLE = window.TRLE || {};
         }
     }
 
+    /* ============ THE CATEGORISED MENU (CONTEXT-MENU-PLAN) ============
+       A root column and one submenu at a time, replacing a 1304px grid of
+       columns (the default since phase 2, 2026-09-26). index.html holds a flat
+       list of every action's canonical button; buildCtxTree moves each into its
+       pane at start-up, so openCtxMenu's visibility rules, the batch labels and
+       every validator that clicks `#at-ctx [data-action=x]` work unchanged
+       (D15). Two rules keep it so:
+         - ONE canonical [data-action] per action. A second place an action
+           shows (the pinned entries repeated in File) is an alias carrying
+           data-run, or querySelector would find the alias.
+         - The submenus are CHILDREN of #at-ctx, positioned `fixed`, so hiding
+           the menu hides them (demo-runner hides #at-ctx by id). Never put a
+           transform on #at-ctx: it would make them position against it. */
+    const CTX_Q = new URLSearchParams(location.search);
+    /* Hover intent (D14), two delays, not one. `switchMs` is the rest on another
+       category before it takes over: the author tried 250 ("mega slow"), 150
+       and 25, and settled on 25 (2026-09-26). `aimMs` holds the open submenu
+       while the pointer heads INTO it (the safe triangle), restarted on every
+       move. They are separate because 25 ms cannot do both: as the hold it
+       would let one hesitation mid-diagonal flip the submenu. Readable from the
+       URL for tuning: ?ctxswitch=40, ?ctxaimms=200, ?ctxaim=0 (no triangle;
+       the author wants it on). */
+    const ctxNum = (k, d) => CTX_Q.has(k) ? Math.max(0, Number(CTX_Q.get(k)) || 0) : d;
+    const CTX_TIMING = {
+        switchMs: ctxNum('ctxswitch', 25),
+        aimMs: ctxNum('ctxaimms', 150),
+        aim: CTX_Q.get('ctxaim') !== '0',
+        // D10: the preview panel's first appearance needs this long a rest on
+        // one highlighted action (hover or keyboard); after that it stays warm
+        // for the rest of this menu opening and every highlight change updates
+        // it at once. ?ctxpreviewms= for tuning, same pattern as the others.
+        previewMs: ctxNum('ctxpreviewms', 2000),
+    };
+    /* D1, D4-D6. '@x' is an alias of x. The order is the author's: File first,
+       then Transform and Edit, the things you do to a texture BEFORE you build
+       transitions and sets from it. "Edit" was "Adjust" until the author renamed
+       it (2026-09-26): File, Edit reads the way application menus do. */
+    const CTX_TREE = {
+        pinned: ['editanim', 'edithtrans', 'editoverlay', 'editstainedglass', 'editpushmarks', 'gotobase', 'gotooverlay'],
+        root: [
+            { cat: 'file', label: 'File' },
+            { cat: 'transform', label: 'Transform' },
+            { cat: 'edit', label: 'Edit' },
+            { action: 'draw' },
+            { cat: 'transitions', label: 'Transitions' },
+            { cat: 'generate', label: 'Create' },
+            { cat: 'material', label: 'Material' },
+        ],
+        tail: ['addanim', 'addsprite'],
+        cats: {
+            file: ['view', 'copyorig', 'copy', 'duporig', 'duplicate',
+                   'download', 'replace', 'reset', 'group', 'ungroup',
+                   '@editanim', '@edithtrans', '@editoverlay', '@editstainedglass', '@editpushmarks',
+                   '@gotobase', '@gotooverlay', 'delete'],
+            transform: ['rotate', 'fliph', 'flipv', 'offset'],
+            /* seamless sits in Edit, above De-light, not in Create: users went
+               looking for it there (2026-09-28), and it edits the tile in
+               place rather than building a new one. */
+            edit: ['coloradj', 'recolor', 'seamless', 'delight', 'heal', 'fade'],
+            transitions: ['transition', 'wang', 'anchor', 'transgrid', 'organic', 'heighttrans', 'overlay'],
+            generate: ['borderset', 'pushmarks', 'variations', 'buildpattern', 'origami', 'stainedglass', 'surfacenoise'],
+            material: ['material', 'lastmaterial', 'emissive', 'heightmap'],
+        },
+    };
+    /* The cell shortcut keys (setupGrid's keydown), live all along and shown
+       nowhere. Drawn by a ::after on data-key, so the label's textContent,
+       which the batch suffix rewrites and validators read, is untouched. */
+    const CTX_KEYS = { seamless: 'S', transition: 'T', material: 'M', heal: 'H', reset: 'R', delete: 'Del' };
+    /* D8. Search matches the label AND these, because people search with their
+       own word for a thing: the author calls Make Emissive "glow". One place,
+       beside the tree; a new action gets a row here as well. */
+    const CTX_KEYWORDS = {
+        editanim: ['animation', 'frames', 'water', 'lava'],
+        edithtrans: ['height', 'transition', 'crevices'],
+        editoverlay: ['overlay', 'decal', 'layer'],
+        editstainedglass: ['stained', 'glass', 'window', 'leaded'],
+        editpushmarks: ['pushable', 'push', 'block', 'tracks', 'scrape', 'drips'],
+        gotobase: ['jump', 'source', 'parent', 'base'],
+        gotooverlay: ['jump', 'source', 'parent', 'overlay'],
+        view: ['preview', 'look', 'inspect', 'zoom', '2x2', 'repeat', 'tiling', 'seam'],
+        copyorig: ['clipboard', 'original', 'unedited', 'paste'],
+        copy: ['clipboard', 'paste', 'png'],
+        duporig: ['clone', 'dupe', 'original', 'unedited'],
+        duplicate: ['clone', 'dupe', 'copy'],
+        download: ['save', 'export', 'png', 'file'],
+        replace: ['swap', 'load', 'image', 'file'],
+        reset: ['undo', 'revert', 'restore', 'original'],
+        group: ['link', 'tie', 'together'],
+        ungroup: ['unlink', 'split', 'separate'],
+        delete: ['remove', 'trash', 'erase'],
+        rotate: ['turn', 'spin', '90'],
+        fliph: ['mirror', 'horizontal'],
+        flipv: ['mirror', 'vertical'],
+        offset: ['roll', 'shift', 'wrap', 'seam', 'half'],
+        coloradj: ['colour', 'color', 'brightness', 'contrast', 'saturation', 'hue', 'levels', 'curves', 'tint'],
+        recolor: ['recolour', 'colour', 'color', 'match', 'transfer', 'tint'],
+        delight: ['delight', 'shadows', 'lighting', 'baked', 'flatten'],
+        heal: ['fill', 'clone', 'patch', 'remove', 'spot', 'fix', 'brush'],
+        fade: ['transparent', 'alpha', 'cutout', 'edge', 'vignette'],
+        draw: ['paint', 'brush', 'pen'],
+        transition: ['blend', 'mix', 'edge'],
+        wang: ['blob', 'set', 'connect', 'autotile'],
+        anchor: ['anchor', 'points', 'blend', 'line'],
+        transgrid: ['grid', 'map', 'blend'],
+        organic: ['blobby', 'natural', 'blend'],
+        heighttrans: ['height', 'crevices', 'depth', 'blend'],
+        overlay: ['decal', 'layer', 'stack', 'top'],
+        seamless: ['tile', 'tileable', 'seam', 'repeat', 'wrap'],
+        borderset: ['border', 'corner', 'edge', 'trim', 'frame', 'set'],
+        pushmarks: ['pushable', 'push', 'block', 'tracks', 'scrape', 'drips'],
+        variations: ['variants', 'random', 'copies', 'generate'],
+        buildpattern: ['bricks', 'tiles', 'mortar', 'grout', 'masonry', 'planks', 'pattern'],
+        origami: ['fold', 'rings', 'border', 'frame'],
+        stainedglass: ['window', 'leaded', 'glass'],
+        surfacenoise: ['grain', 'grit', 'scratches', 'cracks', 'pitting', 'weathering', 'dirt'],
+        material: ['pbr', 'normal', 'roughness', 'specular', 'maps'],
+        lastmaterial: ['repeat', 'again', 'material'],
+        emissive: ['glow', 'light', 'neon', 'lava'],
+        heightmap: ['parallax', 'depth', 'displacement', 'bump'],
+        addanim: ['animation', 'animated', 'water', 'lava', 'fire', 'rain', 'snow', 'sparks'],
+        addsprite: ['sprite', 'sprites', 'particle', 'wadtool', 'twinkle', 'star', 'flare', 'glow', 'spark', 'smoke', 'fire'],
+    };
+    /* D10/D11. The preview panel, one row per action (phase 5). `blurb` is a
+       trimmed, unaltered clause from the Learn page's own `what:` text for that
+       section (js/tutorial.js), never invented copy. `learn` is a tutorial.html
+       section id, or null where none exists yet (the five File additions have
+       no Learn section — see plan phase 7). `media` is one of:
+         true    — an animated WebP at menu-img/<action>.webp (tools/capture-menu-previews.mjs)
+         'css'   — no asset: draws the RIGHT-CLICKED tile through the real
+                   transform function (rotateTile90 / flipTile / offsetTileHalf)
+                   and shows the exact result — truer than a CSS transform for
+                   Offset, which is a wraparound a plain `transform:` cannot do
+                   (D11 said "with CSS"; this reuses the app's own tested
+                   canvas math instead, exact rather than approximated, still
+                   zero new assets — a deliberate, better read of the same intent)
+         false   — no image, blurb only
+         a string — alias: reuse menu-img/<that action>.webp (an edit-in-place
+                   entry reuses its generator's media; Apply Last Material
+                   reuses Set Material's)
+       Wang, Anchored, Transition Grid and Borders & Corners had only a modal
+       screenshot to start from (the author's own words at the start of this
+       plan: "show actual anchors, not the tuners"), so phase 6's
+       `captureLive()` drives the real tool for their pairs instead: Wang
+       through the same compositor the modal itself calls (no UI needed),
+       Anchored/Transition Grid cropped to the live editor canvas with and
+       without its own "Hide handles" toggle, Borders & Corners cropped to
+       the modal's own "set assembled" sample wall. Every one of the 48
+       actions is accounted for above: 25 have `media: true`, 4 are `'css'`,
+       13 are `false`, 6 alias another action's file. */
+    const CTX_PREVIEW = {
+        view:      { blurb: 'Shows the texture at its resolution, plus a 2×2 so seams are easy to spot.', learn: null, media: false },
+        copyorig:  { blurb: 'Copies this tile’s original pixels to the clipboard.', learn: null, media: false },
+        copy:      { blurb: 'Copies this tile’s current pixels to the clipboard.', learn: null, media: false },
+        duporig:   { blurb: 'Duplicates this tile as it was before any edits.', learn: null, media: false },
+        duplicate: { blurb: 'Duplicates this tile as it stands now.', learn: null, media: false },
+        download:  { blurb: 'Downloads this tile as a PNG.', learn: null, media: false },
+        replace:   { blurb: 'Swaps in a different image, keeping this tile’s position, material and transitions.', learn: null, media: false },
+        reset:     { blurb: 'Restores the tile to its original pixels, undoing every edit.', learn: null, media: false },
+        group:     { blurb: 'Ties the selected tiles together so they move as one.', learn: null, media: false },
+        ungroup:   { blurb: 'Splits a group back into loose tiles.', learn: null, media: false },
+        delete:    { blurb: 'Removes the tile, or the whole selection, from the atlas.', learn: null, media: false },
+
+        rotate: { blurb: 'Rotates the tile 90°.', learn: 'transforms', media: 'css' },
+        fliph:  { blurb: 'Flips the tile horizontally.', learn: 'transforms', media: 'css' },
+        flipv:  { blurb: 'Flips the tile vertically.', learn: 'transforms', media: 'css' },
+        offset: { blurb: 'Rolls the tile by half its size, moving a seam to the centre so it’s easy to heal.', learn: 'transforms', media: 'css' },
+
+        coloradj: { blurb: 'Re-grades a tile’s colours by hand: hue, saturation, brightness, contrast, channel levels or curves.', learn: 'colour', media: true },
+        recolor:  { blurb: 'Samples another texture’s palette and shifts this tile toward it.', learn: 'colour', media: true },
+        delight:  { blurb: 'Flattens baked-in lighting so a found texture reacts correctly to Tomb Engine’s dynamic lights.', learn: 'delight', media: true },
+        heal:     { blurb: 'Paints out blemishes, logos or scratches with surrounding colour or re-synthesised texture.', learn: 'heal', media: true },
+        fade:     { blurb: 'Fades a texture’s edge into transparency instead of ending at a hard line.', learn: 'transparency', media: true },
+
+        draw: { blurb: 'Paints on the texture with a photo editor’s brush; nothing changes until Apply.', learn: 'draw', media: true },
+
+        transition:  { blurb: 'Blends two textures along an edge or corner so terrain types meet without a hard line.', learn: 'transitions', media: true },
+        wang:        { blurb: 'Creates the full 16-tile edge set so an overlay terrain connects in every direction.', learn: 'wang', media: true },
+        anchor:      { blurb: 'Like a transition, but the seam is a chain of movable anchors you can bend into any shape.', learn: 'anchored', media: true },
+        transgrid:   { blurb: 'Designs one continuous border across a multi-tile wall, then slices it into tiles that connect.', learn: 'transgrid', media: true },
+        organic:     { blurb: 'Scatters one texture into another as noise-driven patches instead of a clean line.', learn: 'organic', media: true },
+        heighttrans: { blurb: 'Blends two textures by height: the overlay settles into the low ground or caps the high ground.', learn: 'heighttrans', media: true },
+        overlay:     { blurb: 'Lays one texture on top of another, respecting its transparency, instead of blending them.', learn: 'overlay', media: true },
+
+        seamless:     { blurb: 'Removes the visible seam so a texture repeats cleanly across a surface.', learn: 'seamless', media: true },
+        borderset:    { blurb: 'Builds a reusable border tile set from a fill and a trim texture.', learn: 'borderset', media: true },
+        pushmarks:    { blurb: 'Builds the 16-tile set of scrape marks a pushed block leaves on the floor.', learn: 'pushmarks', media: true },
+        variations:   { blurb: 'Creates jittered copies to break up obvious repetition across a wall or floor.', learn: 'variations', media: true },
+        buildpattern: { blurb: 'Turns a plain material into a built surface: brick, cobbles, planks, tile or shingles.', learn: 'buildpattern', media: true },
+        origami:      { blurb: 'Folds a texture into a concentric frame, as if the strip were wrapped around all four edges.', learn: 'origami', media: true },
+        stainedglass: { blurb: 'Splits a tile into glass panes separated by lead came, with a glow map for the panes.', learn: 'stainedglass', media: true },
+        surfacenoise: { blurb: 'Lays procedural grain into a texture: grit, pitting, cracks, scuffs, weave.', learn: 'surfacenoise', media: true },
+
+        material:     { blurb: 'Assigns a material so the tile exports Normal, AO, Specular, Roughness and more.', learn: 'materials', media: true },
+        lastmaterial: { blurb: 'Re-applies the last material you assigned, without opening the editor.', learn: 'materials', media: 'material' },
+        emissive:     { blurb: 'Authors a glow map so parts of a tile shine on their own, independent of scene lighting.', learn: 'emissive', media: true },
+        heightmap:    { blurb: 'Drives real parallax in Tomb Engine: high points shift in front of low ones as the camera moves.', learn: 'heightmap', media: true },
+
+        addanim: { blurb: 'Generates a seamlessly-looping animation: water, lava, rain, sparks, or a static overlay baked over it.', learn: 'animated', media: true },
+        // No Learn section or media yet: both land with SPRITE-PLAN phase 7.
+        addsprite: { blurb: 'Makes sprites for WadTool: twinkles, flares, glows, sparks. Exported as numbered frames for one sprite slot.', learn: null, media: false },
+
+        editanim:         { blurb: 'Reopens this animation’s recipe to change its settings.', learn: 'animated', media: 'addanim' },
+        edithtrans:       { blurb: 'Reopens this height transition’s recipe to change its settings.', learn: 'heighttrans', media: 'heighttrans' },
+        editoverlay:      { blurb: 'Reopens this overlay’s recipe to change its settings.', learn: 'overlay', media: 'overlay' },
+        editstainedglass: { blurb: 'Reopens this stained glass tile’s recipe to change its settings.', learn: 'stainedglass', media: 'stainedglass' },
+        editpushmarks:    { blurb: 'Reopens this pushable-marking set’s recipe to change its settings.', learn: 'pushmarks', media: 'pushmarks' },
+        gotobase:         { blurb: 'Jumps to the base texture this tile was built from.', learn: null, media: false },
+        gotooverlay:      { blurb: 'Jumps to the overlay texture this tile was built from.', learn: null, media: false },
+    };
+    /* D9. The last actions run, most recent first, in this browser only. Not
+       project state: a per-viewer convenience, so localStorage, every access
+       wrapped, and a copy in memory for when storage throws (private windows,
+       blocked site data). Delete is never recorded: a recent sits right under
+       the search box, where a misclick should not be able to delete. */
+    const CTX_RECENT_KEY = 'atlas.ctxRecent', CTX_RECENT_KEEP = 10, CTX_RECENT_SHOW = 3;
+    const CTX_NOT_RECENT = new Set(['delete']);
+    let ctxRecentMem = null;
+    const CTX_MARGIN = 8;
+    /* open: the category whose submenu is showing. pane: where the keyboard is.
+       hl: the highlighted row, shared by pointer and keyboard as in a native
+       menu. hover/timer: a pending switch to another row; holding: that wait is
+       the heading hold (aimMs), not the rest (switchMs). trail: the last few
+       pointer positions, for the safe triangle. */
+    const ctxv = { open: null, pane: 'root', hl: null, hover: null, timer: null, holding: false, trail: [],
+        previewTimer: null, previewWarm: false };
+
+    /* A second place an action shows: never a [data-action] (D15). `where` keeps
+       the id unique: a category, 'recent' or 'q' (a search result). */
+    function ctxAlias(a, where) {
+        const b = document.createElement('button');
+        b.dataset.run = a;
+        b.id = `at-ctx-r-${where}-${a}`;
+        b.setAttribute('role', 'menuitem');
+        return b;
+    }
+    /* A label without its leading emoji or symbol: the root column is text only (D17). */
+    const ctxBare = t => t.replace(/^[^\p{L}\p{N}]+/u, '').trim();
+
+    function buildCtxTree() {
+        const menu = $('at-ctx');
+        const take = a => {
+            const b = menu.querySelector(`[data-action="${a}"]`);
+            if (!b) { console.error(`[ctx menu] no button for "${a}"`); return null; }
+            b.id = b.id || 'at-ctx-a-' + a;
+            if (CTX_KEYS[a]) b.dataset.key = CTX_KEYS[a];
+            return b;
+        };
+        const alias = ctxAlias;
+        const group = cls => { const d = document.createElement('div'); d.className = cls; d.setAttribute('role', 'group'); return d; };
+        const loose = [...menu.querySelectorAll(':scope > [data-action]')];
+        menu.tabIndex = -1;
+        const pinned = group('at-ctx-pinned'), body = group('at-ctx-body'), tail = group('at-ctx-tail'), subs = [];
+        // Search (D8) on top, then the recents (D9). Focus lives in the box (D12).
+        const search = document.createElement('input');
+        search.type = 'text';
+        search.id = 'at-ctx-search';
+        search.className = 'at-ctx-search';
+        search.placeholder = 'Search actions…';
+        search.autocomplete = 'off';
+        search.spellcheck = false;
+        search.setAttribute('role', 'combobox');
+        search.setAttribute('aria-label', 'Search actions');
+        search.setAttribute('aria-autocomplete', 'list');
+        search.setAttribute('aria-controls', 'at-ctx');
+        search.addEventListener('input', ctxSearchRun);
+        const recent = group('at-ctx-recent'), results = group('at-ctx-results');
+        const none = document.createElement('div');
+        none.className = 'at-ctx-none';
+        none.setAttribute('role', 'status');
+        CTX_TREE.pinned.forEach(a => { const b = take(a); if (b) pinned.appendChild(b); });
+        for (const r of CTX_TREE.root) {
+            if (r.action) { const b = take(r.action); if (b) body.appendChild(b); continue; }
+            const row = document.createElement('button');
+            row.className = 'at-ctx-cat';
+            row.dataset.cat = r.cat;
+            row.id = 'at-ctx-c-' + r.cat;
+            row.textContent = r.label;
+            row.setAttribute('role', 'menuitem');
+            row.setAttribute('aria-haspopup', 'menu');
+            row.setAttribute('aria-expanded', 'false');
+            body.appendChild(row);
+            const sub = document.createElement('div');
+            sub.className = 'at-ctx-sub';
+            sub.dataset.cat = r.cat;
+            sub.setAttribute('role', 'menu');
+            sub.setAttribute('aria-label', r.label);
+            for (const a of CTX_TREE.cats[r.cat]) {
+                const b = a[0] === '@' ? alias(a.slice(1), r.cat) : take(a);
+                if (b) sub.appendChild(b);
+            }
+            subs.push(sub);
+        }
+        CTX_TREE.tail.forEach(a => { const b = take(a); if (b) tail.appendChild(b); });
+        /* The preview panel (D10/D11), a fixed child of #at-ctx like the subs
+           (D15). Its <img> gets NO src attribute here, not even '', so nothing
+           in menu-img/ is requested until the first preview actually shows
+           (phase 5's "Done when"). The <canvas> is the CSS-preview path's own
+           surface (transforms, drawn from the real transform functions). */
+        const preview = document.createElement('div');
+        preview.className = 'at-ctx-preview';
+        preview.id = 'at-ctx-preview';
+        preview.setAttribute('role', 'note');
+        preview.style.display = 'none';
+        const pvMedia = document.createElement('div');
+        pvMedia.className = 'at-ctx-preview-media';
+        const pvImg = document.createElement('img');
+        pvImg.className = 'at-ctx-preview-img';
+        pvImg.alt = '';
+        const pvCanvas = document.createElement('canvas');
+        pvCanvas.className = 'at-ctx-preview-css';
+        pvMedia.append(pvImg, pvCanvas);
+        const pvText = document.createElement('p');
+        pvText.className = 'at-ctx-preview-text';
+        const pvLearn = document.createElement('a');
+        pvLearn.className = 'at-ctx-preview-learn';
+        pvLearn.target = '_blank';
+        pvLearn.rel = 'noopener';
+        pvLearn.textContent = 'Learn more';
+        preview.append(pvMedia, pvText, pvLearn);
+        menu.append(search, recent, results, none, pinned, body, tail, preview, ...subs);
+        // An action the tree forgot still shows (at the bottom), and says so,
+        // rather than vanishing. validate-ctx-menu fails on it.
+        loose.filter(b => b.parentElement === menu).forEach(b => {
+            console.error(`[ctx menu] "${b.dataset.action}" is in no category`);
+            tail.appendChild(b);
+        });
+        menu.addEventListener('mouseleave', () => { clearTimeout(ctxv.timer); ctxv.timer = null; ctxv.hover = null; ctxv.holding = false; });
+    }
+
+    /* After openCtxMenu's visibility pass: aliases mirror their canonical
+       entry, and a category, or the pinned block, with nothing to offer this
+       element is not shown. A root entry is text only; its alias inside a
+       submenu gets the data-icon back, like every other submenu entry. */
+    function ctxSyncTree() {
+        const menu = $('at-ctx');
+        const shown = b => b.style.display !== 'none';
+        menu.querySelectorAll('.at-ctx-sub [data-run]').forEach(a => {
+            const c = menu.querySelector(`[data-action="${a.dataset.run}"]`);
+            a.textContent = (c.dataset.icon ? c.dataset.icon + ' ' : '') + c.textContent;
+            a.title = c.title;
+            a.disabled = c.disabled;
+            a.style.display = c.style.display;
+        });
+        menu.querySelectorAll('.at-ctx-sub').forEach(sub => {
+            menu.querySelector(`.at-ctx-cat[data-cat="${sub.dataset.cat}"]`).style.display =
+                [...sub.children].some(shown) ? '' : 'none';
+        });
+        const pin = menu.querySelector('.at-ctx-pinned');
+        pin.style.display = [...pin.children].some(shown) ? '' : 'none';
+        ctxRenderRecent();
+    }
+
+    /* ---- recents (D9) ---- */
+    function ctxRecentGet() {
+        if (ctxRecentMem) return ctxRecentMem;
+        try {
+            const v = JSON.parse(localStorage.getItem(CTX_RECENT_KEY) || '[]');
+            ctxRecentMem = Array.isArray(v) ? v.filter(a => typeof a === 'string') : [];
+        } catch { ctxRecentMem = []; }
+        return ctxRecentMem;
+    }
+    function ctxRecentSet(list) {
+        ctxRecentMem = list.slice(0, CTX_RECENT_KEEP);
+        try { localStorage.setItem(CTX_RECENT_KEY, JSON.stringify(ctxRecentMem)); } catch { /* memory copy stands */ }
+    }
+    /* Called by runCtxAction, so every route counts: menu, search, recents and
+       the cell shortcut keys. */
+    function ctxNoteRecent(action) {
+        if (CTX_NOT_RECENT.has(action) || !$('at-ctx').querySelector(`[data-action="${action}"]`)) return;
+        ctxRecentSet([action, ...ctxRecentGet().filter(a => a !== action)]);
+    }
+    /* The first three that THIS element can take: one it cannot is skipped, not
+       greyed, and a pinned entry already on show is not repeated. */
+    function ctxRenderRecent() {
+        const menu = $('at-ctx'), box = menu.querySelector('.at-ctx-recent');
+        box.replaceChildren();
+        const cap = document.createElement('div');
+        cap.className = 'at-ctx-caption';
+        cap.textContent = 'Recent';
+        box.appendChild(cap);
+        let n = 0;
+        for (const a of ctxRecentGet()) {
+            const c = menu.querySelector(`[data-action="${a}"]`);
+            if (!c || c.style.display === 'none' || c.disabled) continue;
+            if (CTX_TREE.pinned.includes(a)) continue;
+            const r = ctxAlias(a, 'recent');
+            r.textContent = ctxBare(c.textContent);
+            r.title = c.title;
+            if (c.dataset.key) r.dataset.key = c.dataset.key;
+            box.appendChild(r);
+            if (++n === CTX_RECENT_SHOW) break;
+        }
+        box.style.display = n ? '' : 'none';
+    }
+
+    /* ---- search (D8) ---- */
+    /* Every action in tree order, for ranking ties, with the category it is in. */
+    function ctxOrder() {
+        const out = CTX_TREE.pinned.map(a => ({ a, cat: null }));
+        for (const r of CTX_TREE.root) {
+            if (r.action) out.push({ a: r.action, cat: null });
+            else CTX_TREE.cats[r.cat].forEach(a => { if (a[0] !== '@') out.push({ a, cat: r.label }); });
+        }
+        CTX_TREE.tail.forEach(a => out.push({ a, cat: null }));
+        return out;
+    }
+    /* "an animation frame", for the no-match line: say WHY nothing matched. */
+    function ctxKindPhrase() {
+        const id = state.ctxTargetId, el = byId(id);
+        if (id != null && ctxActsOnSelection(id)) return 'this selection';
+        if (!el) return 'this element';
+        return el.kind === 'anim' ? 'an animation frame' : el.kind === 'transition' ? 'a transition tile' : 'this tile';
+    }
+    /* Global, whatever is open (the author). Every word must match somewhere:
+       a word of the label (100), a keyword (70), inside the label (50), inside a
+       keyword (30), or the category's name (20). Ties keep menu order. Only what
+       this element is offered can appear, exactly as in the submenus. */
+    function ctxSearchRun() {
+        const menu = $('at-ctx'), input = $('at-ctx-search');
+        const results = menu.querySelector('.at-ctx-results'), none = menu.querySelector('.at-ctx-none');
+        const raw = input.value.trim(), q = raw.toLowerCase();
+        ctxCloseSub();
+        results.replaceChildren();
+        none.textContent = '';
+        if (q && !menu.classList.contains('at-ctx-searching')) menu.style.minWidth = menu.offsetWidth + 'px';
+        menu.classList.toggle('at-ctx-searching', !!q);
+        if (!q) { ctxSetHL(null); return; }
+        const tokens = q.split(/\s+/);
+        const hits = [];
+        ctxOrder().forEach(({ a, cat }, i) => {
+            const c = menu.querySelector(`[data-action="${a}"]`);
+            if (!c || c.style.display === 'none') return;
+            const label = ctxBare(c.textContent).toLowerCase();
+            const words = label.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+            const keys = CTX_KEYWORDS[a] || [], catName = (cat || '').toLowerCase();
+            let score = 0;
+            for (const t of tokens) {
+                const s = words.some(w => w.startsWith(t)) ? 100 : keys.some(k => k.startsWith(t)) ? 70
+                        : label.includes(t) ? 50 : keys.some(k => k.includes(t)) ? 30
+                        : (catName && catName.startsWith(t)) ? 20 : 0;
+                if (!s) return;
+                score += s;
+            }
+            hits.push({ a, cat, c, score, i });
+        });
+        hits.sort((x, y) => y.score - x.score || x.i - y.i);
+        for (const { a, cat, c } of hits) {
+            const r = ctxAlias(a, 'q');
+            r.textContent = ctxBare(c.textContent);
+            r.title = c.title;
+            r.disabled = c.disabled;
+            r.classList.toggle('at-ctx-danger', c.classList.contains('at-ctx-danger'));
+            // Where it lives, so a search also teaches the menu, then its key.
+            const where = [cat, c.dataset.key].filter(Boolean).join(' · ');
+            if (where) r.dataset.key = where;
+            results.appendChild(r);
+        }
+        if (!hits.length) none.textContent = `Nothing for ${ctxKindPhrase()} matches “${raw}”`;
+        ctxv.pane = 'root';
+        ctxClampRoot();
+        // Type, then Enter: the top hit is already highlighted.
+        ctxSetHL(ctxItems('root')[0] || null);
+    }
+
+    /* While searching the root's width is a ratchet (min-width): a wider result
+       grows it, a narrower result list never shrinks it back, so it does not
+       jump with every keystroke. And it stays inside the window. */
+    function ctxClampRoot() {
+        const menu = $('at-ctx');
+        menu.style.minWidth = Math.max(parseFloat(menu.style.minWidth) || 0, menu.offsetWidth) + 'px';
+        const r = menu.getBoundingClientRect(), vw = window.innerWidth;
+        if (r.right > vw - CTX_MARGIN) menu.style.left = Math.max(CTX_MARGIN, vw - CTX_MARGIN - r.width) + 'px';
+    }
+
+    function ctxReset() {
+        clearTimeout(ctxv.timer);
+        ctxv.timer = null;
+        ctxv.holding = false;
+        ctxCloseSub();
+        // Explicit, not left to ctxSetHL(null)'s side effect: ctxSetHL no-ops
+        // when ctxv.hl is ALREADY null (the common case, right after opening or
+        // closing the menu with nothing yet highlighted), which would otherwise
+        // leave the preview's timer running and D10's "warm" flag on into the
+        // next menu opening.
+        clearTimeout(ctxv.previewTimer);
+        ctxv.previewTimer = null;
+        ctxv.previewWarm = false;
+        ctxHidePreview();
+        ctxSetHL(null);
+        ctxv.pane = 'root';
+        ctxv.hover = null;
+        ctxv.trail = [];
+        const menu = $('at-ctx'), input = $('at-ctx-search');
+        menu.classList.remove('at-ctx-kb', 'at-ctx-searching');
+        menu.style.minWidth = '';
+        if (input) input.value = '';
+        const results = menu.querySelector('.at-ctx-results');
+        if (results) results.replaceChildren();
+        const none = menu.querySelector('.at-ctx-none');
+        if (none) none.textContent = '';
+    }
+
+    /* D13. The root's top-left sits AT the cursor; near the right edge it flips
+       to the cursor's left rather than sliding away from it, which is what the
+       column menu did (960px away at 1440 wide, measured in the audit). */
+    function ctxPlaceRoot(x, y) {
+        const menu = $('at-ctx'), M = CTX_MARGIN;
+        const w = menu.offsetWidth, h = menu.offsetHeight, vw = window.innerWidth, vh = window.innerHeight;
+        let left = x + w > vw - M ? x - w : x;
+        left = Math.max(M, Math.min(left, vw - M - w));
+        menu.style.left = left + 'px';
+        menu.style.top = Math.max(M, Math.min(y, vh - M - h)) + 'px';
+        // Focus goes to the search box (D12), so typing searches at once.
+        // preventScroll: a focus that scrolls anything fires the capture-phase
+        // scroll listener, which closes the menu in the same tick in Firefox.
+        $('at-ctx-search').focus({ preventScroll: true });
+    }
+
+    /* A submenu sits beside its row, touching the root so the pointer never
+       crosses a gap, on the right unless that would leave the viewport. */
+    function ctxPlaceSub(row, sub) {
+        const M = CTX_MARGIN, vw = window.innerWidth, vh = window.innerHeight;
+        const root = $('at-ctx').getBoundingClientRect(), r = row.getBoundingClientRect();
+        const w = sub.offsetWidth, h = sub.offsetHeight;
+        let left = root.right;
+        if (left + w > vw - M) left = root.left - w;
+        left = Math.max(M, left);
+        const top = r.top - (parseFloat(getComputedStyle(sub).paddingTop) || 0);
+        sub.style.left = left + 'px';
+        sub.style.top = Math.max(M, Math.min(top, vh - M - h)) + 'px';
+    }
+
+    const ctxPane = cat => $('at-ctx').querySelector(`.at-ctx-sub[data-cat="${cat}"]`);
+    const ctxRow = cat => $('at-ctx').querySelector(`.at-ctx-cat[data-cat="${cat}"]`);
+
+    function ctxOpenSub(cat) {
+        if (ctxv.open === cat) return;
+        ctxCloseSub();
+        if (!cat) return;
+        const sub = ctxPane(cat), row = ctxRow(cat);
+        sub.style.display = 'flex';
+        row.classList.add('at-ctx-open');
+        row.setAttribute('aria-expanded', 'true');
+        ctxv.open = cat;
+        ctxPlaceSub(row, sub);
+    }
+
+    function ctxCloseSub() {
+        if (!ctxv.open) return;
+        const row = ctxRow(ctxv.open);
+        ctxPane(ctxv.open).style.display = 'none';
+        row.classList.remove('at-ctx-open');
+        row.setAttribute('aria-expanded', 'false');
+        ctxv.open = null;
+        ctxv.pane = 'root';
+    }
+
+    function ctxSetHL(b) {
+        if (b === ctxv.hl) return;   // no real change: don't restart the preview timer on every mousemove pixel
+        const menu = $('at-ctx');
+        if (ctxv.hl) ctxv.hl.classList.remove('at-ctx-hl');
+        ctxv.hl = b;
+        // On the search box: it holds focus, so it is what a screen reader follows.
+        const input = $('at-ctx-search') || menu;
+        if (b) { b.classList.add('at-ctx-hl'); input.setAttribute('aria-activedescendant', b.id); }
+        else input.removeAttribute('aria-activedescendant');
+        ctxArmPreview(b);
+    }
+
+    /* ---- The preview panel (D10/D11, phase 5) ------------------------------ */
+
+    /* (Re)start the wait before the FIRST preview of this menu opening; once
+       one has shown, ctxv.previewWarm makes every later highlight change
+       update at once, like an OS tooltip. */
+    function ctxArmPreview(b) {
+        clearTimeout(ctxv.previewTimer);
+        ctxv.previewTimer = null;
+        if (!b) { ctxHidePreview(); return; }
+        const action = b.dataset.action || b.dataset.run;
+        if (!action || !CTX_PREVIEW[action]) { ctxHidePreview(); return; }
+        if (ctxv.previewWarm) { ctxShowPreview(action, b); return; }
+        ctxv.previewTimer = setTimeout(() => {
+            ctxv.previewTimer = null;
+            ctxv.previewWarm = true;
+            ctxShowPreview(action, b);
+        }, CTX_TIMING.previewMs);
+    }
+
+    function ctxHidePreview() {
+        const prev = $('at-ctx-preview');
+        if (prev) prev.style.display = 'none';
+    }
+
+    /* Fill and place the panel for `action`, highlighted via row `b`. */
+    function ctxShowPreview(action, b) {
+        const p = CTX_PREVIEW[action];
+        if (!p) { ctxHidePreview(); return; }
+        const prev = $('at-ctx-preview');
+        prev.querySelector('.at-ctx-preview-text').textContent = p.blurb;
+        const learn = prev.querySelector('.at-ctx-preview-learn');
+        if (p.learn) { learn.href = 'tutorial.html#' + p.learn; learn.style.display = 'inline'; }
+        else learn.style.display = 'none';
+        const img = prev.querySelector('.at-ctx-preview-img'), cv = prev.querySelector('.at-ctx-preview-css');
+        // 'block', never '': the stylesheet's own default for both is display:none
+        // (so neither shows until JS picks one), and clearing an inline value falls
+        // back to THAT, not to visible — an empty string here left the canvas
+        // computing display:none while it drew and reported fine, invisible in a
+        // real browser despite every check that only read the inline property.
+        if (p.media === 'css') {
+            img.style.display = 'none';
+            cv.style.display = 'block';
+            ctxDrawTransformPreview(action, cv);
+        } else if (p.media) {
+            cv.style.display = 'none';
+            img.style.display = 'block';
+            const file = typeof p.media === 'string' ? p.media : action;
+            const src = 'menu-img/' + file + '.webp';
+            // Same file already showing (an alias row, or the same action again):
+            // leave it running rather than restarting the loop from frame one.
+            if (!img.src.endsWith(src)) img.src = src;
+        } else {
+            img.style.display = 'none';
+            cv.style.display = 'none';
+        }
+        prev.classList.remove('at-ctx-preview-in');
+        // Placed before it's shown (offsetWidth/Height need layout), then made
+        // visible; ctxPlacePreview may hide it again if nothing fits (D13).
+        prev.style.display = 'flex';
+        ctxPlacePreview();
+        if (prev.style.display !== 'none') void prev.offsetWidth, prev.classList.add('at-ctx-preview-in');   // fade in (TRLE.Motion via CSS)
+    }
+
+    /* Transforms need no asset (D11): draw the RIGHT-CLICKED tile through the
+       real transform function and show the exact result. */
+    function ctxDrawTransformPreview(action, cv) {
+        const el = byId(state.ctxTargetId);
+        if (!el || el.kind !== 'tile') { cv.style.display = 'none'; return; }
+        const out = action === 'rotate' ? rotateTile90(el.canvas)
+                  : action === 'fliph'  ? flipTile(el.canvas, true)
+                  : action === 'flipv'  ? flipTile(el.canvas, false)
+                  : action === 'offset' ? offsetTileHalf(el.canvas)
+                  : null;
+        if (!out) { cv.style.display = 'none'; return; }
+        const S = Math.min(out.width, 256);
+        cv.width = cv.height = S;
+        cv.getContext('2d').drawImage(out, 0, 0, S, S);
+    }
+
+    /* D13: beside the pane the highlight is actually in (the open submenu, or
+       the root itself when nothing is open), on the side away from the root,
+       the other side only if that clears the root too, hidden if neither fits.
+       Never overlaps the root or the open submenu, on either try. */
+    function ctxPlacePreview() {
+        const prev = $('at-ctx-preview');
+        if (prev.style.display === 'none') return;
+        const M = CTX_MARGIN, vw = window.innerWidth, vh = window.innerHeight;
+        const root = $('at-ctx').getBoundingClientRect();
+        const sub = ctxv.open ? ctxPane(ctxv.open).getBoundingClientRect() : null;
+        const anchor = sub || root;
+        const w = prev.offsetWidth, h = prev.offsetHeight;
+        const top = Math.max(M, Math.min(anchor.top, vh - M - h));
+        const clear = left => {
+            const r = { left, right: left + w, top, bottom: top + h };
+            const hits = box => r.left < box.right && r.right > box.left && r.top < box.bottom && r.bottom > box.top;
+            return !hits(root) && !(sub && hits(sub));
+        };
+        // "Away from the root": if the anchor sits at/right of the root (a
+        // submenu opened normally, or no submenu at all), away is further
+        // right; a submenu that flipped left of the root makes away further left.
+        const preferRight = !sub || sub.left >= root.right - 1;
+        const tryRight = () => (anchor.right + w <= vw - M && clear(anchor.right)) ? anchor.right : null;
+        const tryLeft  = () => (anchor.left - w >= M && clear(anchor.left - w)) ? anchor.left - w : null;
+        const left = preferRight ? (tryRight() ?? tryLeft()) : (tryLeft() ?? tryRight());
+        if (left == null) { prev.style.display = 'none'; return; }
+        prev.style.left = left + 'px';
+        prev.style.top = top + 'px';
+    }
+
+    /* The rows the keyboard can land on in a pane: shown and enabled. */
+    function ctxItems(pane) {
+        const menu = $('at-ctx');
+        const rows = pane === 'root'
+            ? [...menu.querySelectorAll('.at-ctx-recent > button, .at-ctx-results > button, .at-ctx-pinned > button, .at-ctx-body > button, .at-ctx-tail > button')]
+            : [...ctxPane(pane).children];
+        // offsetParent, not the inline display: while searching, CSS hides whole
+        // groups (.at-ctx-searching) without touching their inline style.
+        return rows.filter(b => b.offsetParent !== null && !b.disabled);
+    }
+
+    /* D14. Is the pointer heading INTO the open submenu? True when it lies in
+       the triangle between where it was a few events ago and the submenu's
+       near edge (the "safe triangle" of macOS menus and jQuery-menu-aim). */
+    function ctxHeading(x, y) {
+        if (!ctxv.open || ctxv.trail.length < 2) return false;
+        const [px, py] = ctxv.trail[0];
+        if (px === x && py === y) return false;
+        const r = ctxPane(ctxv.open).getBoundingClientRect();
+        const ex = r.left >= $('at-ctx').getBoundingClientRect().right - 1 ? r.left : r.right;
+        const side = (ax, ay, bx, by) => (x - bx) * (ay - by) - (ax - bx) * (y - by);
+        const d1 = side(px, py, ex, r.top), d2 = side(ex, r.top, ex, r.bottom), d3 = side(ex, r.bottom, px, py);
+        return !((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0));
+    }
+
+    function ctxMouseMove(e) {
+        const x = e.clientX, y = e.clientY;
+        ctxv.trail.push([x, y]);
+        if (ctxv.trail.length > 4) ctxv.trail.shift();
+        $('at-ctx').classList.remove('at-ctx-kb');
+        const btn = e.target.closest('button');
+        const sub = e.target.closest('.at-ctx-sub');
+        if (sub) {
+            // Inside the open submenu: it stays, and a pending switch is off.
+            clearTimeout(ctxv.timer);
+            ctxv.timer = null;
+            ctxv.hover = null;
+            ctxv.pane = sub.dataset.cat;
+            ctxSetHL(btn && !btn.disabled ? btn : null);
+            return;
+        }
+        if (btn) ctxRootHover(btn, x, y);
+        // Over the root but no row (padding, a separator): a pending switch
+        // still has to be held while the pointer heads into the open submenu.
+        else if (ctxv.timer && CTX_TIMING.aim && ctxHeading(x, y)) ctxArmSwitch(ctxv.hover, true);
+    }
+
+    function ctxRootHover(row, x, y) {
+        const target = row.dataset.cat || null;   // a direct item closes the open submenu
+        if (!ctxv.open || ctxv.open === target) {
+            clearTimeout(ctxv.timer);
+            ctxv.timer = null;
+            ctxv.hover = row;
+            ctxv.pane = 'root';
+            if (target) ctxOpenSub(target);
+            ctxSetHL(row);
+            return;
+        }
+        // Another submenu is open. Switch after a short rest on this row
+        // (switchMs). While the pointer heads into the open submenu, hold it
+        // instead (aimMs), restarted on every move, so a diagonal pass across
+        // this row never switches. A running rest is left alone, or constant
+        // small moves would postpone it forever.
+        const heading = CTX_TIMING.aim && ctxHeading(x, y);
+        if (ctxv.hover === row && !heading && ctxv.timer && !ctxv.holding) return;
+        ctxArmSwitch(row, heading);
+    }
+
+    /* (Re)start the wait after which `row` takes over from the open submenu:
+       the hold while heading into it, else the short rest. */
+    function ctxArmSwitch(row, heading) {
+        ctxv.hover = row;
+        ctxv.holding = !!heading;
+        clearTimeout(ctxv.timer);
+        ctxv.timer = setTimeout(() => {
+            ctxv.timer = null;
+            ctxv.holding = false;
+            if (ctxv.hover !== row) return;
+            if (row.dataset.cat) ctxOpenSub(row.dataset.cat); else ctxCloseSub();
+            ctxv.pane = 'root';
+            ctxSetHL(row);
+        }, heading ? CTX_TIMING.aimMs : CTX_TIMING.switchMs);
+    }
+
+    function ctxEnterSub(cat) {
+        clearTimeout(ctxv.timer);
+        ctxv.timer = null;
+        ctxOpenSub(cat);
+        ctxv.pane = cat;
+        ctxSetHL(ctxItems(cat)[0] || null);
+    }
+
+    function ctxLeaveSub() {
+        const cat = ctxv.open;
+        ctxCloseSub();
+        ctxSetHL(cat ? ctxRow(cat) : null);
+    }
+
+    /* D12. Focus stays in the search box; the highlight moves
+       (aria-activedescendant), so nothing calls focus() inside a pane. While a
+       query is typed, ← → Home End belong to the text, not the menu. */
+    function ctxKeydown(e) {
+        const menu = $('at-ctx'), items = ctxItems(ctxv.pane), cur = items.indexOf(ctxv.hl);
+        const input = $('at-ctx-search'), typing = !!(input && input.value);
+        if (typing && /^(ArrowLeft|ArrowRight|Home|End)$/.test(e.key)) return;
+        const kb = () => menu.classList.add('at-ctx-kb');
+        const move = i => {
+            kb();
+            if (!items.length) return;
+            const next = items[(i + items.length) % items.length];
+            // Moving off an open category by keyboard closes its submenu.
+            if (ctxv.pane === 'root' && ctxv.open && next.dataset.cat !== ctxv.open) ctxCloseSub();
+            ctxSetHL(next);
+        };
+        switch (e.key) {
+            case 'ArrowDown': e.preventDefault(); move(cur < 0 ? 0 : cur + 1); break;
+            case 'ArrowUp':   e.preventDefault(); move(cur < 0 ? items.length - 1 : cur - 1); break;
+            case 'Home':      e.preventDefault(); move(0); break;
+            case 'End':       e.preventDefault(); move(items.length - 1); break;
+            case 'ArrowRight':
+                if (ctxv.pane === 'root' && ctxv.hl && ctxv.hl.dataset.cat) { e.preventDefault(); kb(); ctxEnterSub(ctxv.hl.dataset.cat); }
+                break;
+            case 'ArrowLeft':
+                if (ctxv.pane !== 'root') { e.preventDefault(); kb(); ctxLeaveSub(); }
+                break;
+            case 'Enter':
+                if (!ctxv.hl) break;
+                e.preventDefault();
+                if (ctxv.hl.dataset.cat) { kb(); ctxEnterSub(ctxv.hl.dataset.cat); }
+                else ctxv.hl.click();
+                break;
+            case 'Escape':
+                // One level at a time: the search, then the submenu. With neither,
+                // the document's Esc handler closes the menu (and clears the
+                // selection, as before).
+                if (typing) { e.preventDefault(); e.stopPropagation(); input.value = ''; ctxSearchRun(); }
+                else if (ctxv.open) { e.preventDefault(); e.stopPropagation(); kb(); ctxLeaveSub(); }
+                break;
+            case 'Tab': e.preventDefault(); closeCtxMenu(); break;
+        }
+    }
+
     /* Shared action runner — used by both menu clicks and cell shortcut keys. */
+    /* ---- File: View, Copy, Duplicate (CONTEXT-MENU-PLAN phase 4) ---------- */
+
+    /* Do a tile's pixels differ from its `original`? Decides whether Copy and
+       Duplicate come as an Original / Modified pair. The flags alone cannot:
+       Make Seamless sets `seamless` and not `edited`, while Stained Glass and
+       Surface Noise's new tiles carry `seamless` with canvas == original. So the
+       flags only rule a tile OUT (every write to a tile's canvas sets one of
+       them, audited 2026-09-26), and a flagged tile is compared byte for byte.
+       Cost at 1024 px is in the plan (phase 4). */
+    function tilePixelsDiffer(el) {
+        if (!el || el.kind !== 'tile' || !el.original) return false;
+        if (!el.edited && !el.seamless) return false;
+        const a = el.canvas, b = el.original;
+        if (a.width !== b.width || a.height !== b.height) return true;
+        const pa = new Uint32Array(a.getContext('2d').getImageData(0, 0, a.width, a.height).data.buffer);
+        const pb = new Uint32Array(b.getContext('2d').getImageData(0, 0, b.width, b.height).data.buffer);
+        for (let i = 0; i < pa.length; i++) if (pa[i] !== pb[i]) return true;
+        return false;
+    }
+
+    /* Copy puts ONE PNG on the system clipboard. The ClipboardItem is built
+       synchronously, inside the click (or the Enter keydown) that ran the
+       action, with the encode as its promise: that is the form Safari needs,
+       and every browser refuses a write that happens after an await outliving
+       the gesture (tested, plan §1). The pixels are cloned first, so what lands
+       is the tile as it was when it was clicked. */
+    function copyTileImage(el, original) {
+        const n = numberOf(el.id);
+        if (!navigator.clipboard || !navigator.clipboard.write || typeof ClipboardItem === 'undefined') {
+            showToast('This browser cannot put an image on the clipboard. Use Download PNG instead.', 'info', 4000);
+            return;
+        }
+        const snap = cloneCanvas(original ? el.original : el.canvas);
+        let item;
+        try { item = new ClipboardItem({ 'image/png': TRLE.Engine.canvasToBlob(snap) }); }
+        catch (e) { showToast('This browser cannot put an image on the clipboard. Use Download PNG instead.', 'info', 4000); return; }
+        navigator.clipboard.write([item]).then(
+            () => showToast(original ? `Tile ${n}'s original copied to the clipboard` : `Tile ${n} copied to the clipboard`, 'success', 1800),
+            () => showToast('The browser blocked the copy. Try again from the menu, or use Download PNG.', 'error', 4000));
+    }
+
+    /* A duplicate of one element (D7), and fully UNLINKED from its source: no
+       shared canvas, no shared id reference anywhere, so an edit to the source
+       afterwards never reaches the copy (the author's call, 2026-09-26,
+       overriding D7's "still live" for a loose transition — a transition IS
+       its base and overlay ids, so the only way to unlink one is to bake it).
+       Tiles copy every field Reset to Original would keep, and with `original`
+       true they ARE a Reset: the original pixels, `seamless` / `edited`
+       cleared, no glow. EVERY transition (loose, or a member of a block,
+       Borders & Corners or pushable-marking set) bakes to a plain tile at its
+       current pixels, because a live `base`/`overlay` reference is exactly the
+       link being cut; it keeps a material only when both sides share one, and
+       a loose one's own material (never directly assigned — Set Material
+       refuses a lone transition) is dropped in favour of that same rule. Never
+       in a group: a copy is loose until it is grouped (plan §8). */
+    function duplicateOf(src, original) {
+        const id = state.nextId++;
+        if (src.kind === 'transition') {
+            const b = byId(src.base), o = byId(src.overlay);
+            const same = b && b.material && (!o || o === b || JSON.stringify(o.material) === JSON.stringify(b.material));
+            return {
+                id, kind: 'tile', canvas: cloneCanvas(src.canvas), original: cloneCanvas(src.canvas),
+                seamless: false, edited: false, baked: true,
+                material: same ? deepCopyMaterial(b.material) : null, emissive: null
+            };
+        }
+        return {
+            id, kind: 'tile',
+            canvas: cloneCanvas(original ? src.original : src.canvas),
+            original: cloneCanvas(src.original),
+            seamless: original ? false : !!src.seamless,
+            edited: original ? false : !!src.edited,
+            material: deepCopyMaterial(src.material), matLayers: cloneMatLayers(src.matLayers),
+            emissive: (!original && src.emissive) ? cloneCanvas(src.emissive) : null,
+            importedMaps: cloneImportedMaps(src.importedMaps),
+            hgParams: cloneHgParams(src.hgParams),
+            // sgParams.srcId names the tile Edit Stained Glass re-samples for its
+            // colour source (sgRender reads that tile's LIVE canvas) — copying it
+            // as-is would keep the duplicate reading a stranger's pixels on the
+            // next re-edit. null makes editStainedGlassModal fall back to "source
+            // gone → tile itself feeds texture modes", its existing path for
+            // exactly this shape of gap, which points it at the duplicate itself.
+            sgParams: src.sgParams ? Object.assign(JSON.parse(JSON.stringify(src.sgParams)), { srcId: null }) : null
+        };
+    }
+
+    /* Each copy lands in the first empty slot after its source (docs/notes/grid.md,
+       "Adding tiles"), given EXACTLY through pendingPlace: inserting it behind the
+       source in element order is not enough on its own, because a source that
+       is last in element order makes the copy an append, and an append goes
+       after the last occupied slot wherever the source sits. Growing past the
+       end is a new row, as any append would. One pushHistory for the batch. */
+    function duplicateElements(ids, original) {
+        const srcs = ids.map(byId).filter(e => e && e.kind !== 'anim' && (!original || e.kind === 'tile'));
+        if (!srcs.length) return;
+        // Read every slot BEFORE the first splice: slotOf syncs the layout, and a
+        // sync with a copy already spliced in would place it on its own.
+        syncLayout();
+        const nums = srcs.map(e => numberOf(e.id));
+        const from = srcs.map(e => state.layout.indexOf(e.id));
+        const place = new Map(), taken = new Set();
+        let baked = 0, last = null;
+        srcs.forEach((src, k) => {
+            const dup = duplicateOf(src, original);
+            if (dup.baked) { baked++; delete dup.baked; }
+            state.elements.splice(indexOf(src.id) + 1, 0, dup);
+            let sl = from[k] + 1;
+            while (taken.has(sl) || (sl < state.layout.length && state.layout[sl] != null)) sl++;
+            taken.add(sl);
+            place.set(dup.id, sl);
+            last = dup;
+        });
+        pendingPlace = place;   // set right before the render that consumes it
+        if (srcs.length === 1) state.selectedId = last.id;
+        refreshTransitions();
+        renderGrid();
+        const n = srcs.length;
+        pushHistory(original ? (n > 1 ? `Duplicate ${n} originals` : 'Duplicate original')
+                             : (n > 1 ? `Duplicate ${n} tiles` : 'Duplicate'));
+        const bakedNote = baked
+            ? (n > 1 ? `, ${baked} as plain tiles (set members are copied as pixels)` : ' as a plain tile (a set member is copied as pixels)')
+            : '';
+        showToast((n > 1 ? `${n} tiles duplicated` : `Tile ${nums[0]} duplicated`)
+            + (original ? ' from the original' : '') + bakedNote, 'success', baked ? 4000 : 2000);
+    }
+
+    /* View (D6): the texture and a 2×2 of it, each pane at most 512 CSS px.
+       Nearest-neighbour both ways; the captions say when a pane is scaled. */
+    const VIEW_MAX = 512;
+    function openViewModal(id) {
+        const el = byId(id);
+        if (!el) return;
+        const S = el.canvas.width;
+        const one = $('at-view-one'), tiled = $('at-view-tiled');
+        one.width = one.height = S;   // assigning a size also clears the canvas
+        one.getContext('2d').drawImage(el.canvas, 0, 0);
+        tiled.width = tiled.height = 2 * S;
+        const g = tiled.getContext('2d');
+        g.clearRect(0, 0, 2 * S, 2 * S);
+        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) g.drawImage(el.canvas, x * S, y * S);
+        const oneCss = Math.min(S, VIEW_MAX), tiledCss = Math.min(2 * S, VIEW_MAX);
+        one.style.width = oneCss + 'px';
+        tiled.style.width = tiledCss + 'px';
+        $('at-view-one-cap').textContent = S > VIEW_MAX ? `Scaled from ${S}×${S}` : `${S}×${S}`;
+        $('at-view-tiled-cap').textContent = 2 * S > VIEW_MAX ? `2×2 at ${Math.round(100 * VIEW_MAX / (2 * S))}%` : '2×2';
+        $('at-view-title').textContent = `🔍 View: Tile ${numberOf(id)}`;
+        openModal('view');
+    }
+
     function runCtxAction(action, id) {
         const el = byId(id);
         if (!el) return;
+        ctxNoteRecent(action);
         switch (action) {
+            case 'view':      openViewModal(id); break;
+            case 'copy':      copyTileImage(el, false); break;
+            case 'copyorig':  if (el.kind === 'tile') copyTileImage(el, true); break;
+            case 'duplicate': duplicateElements(ctxTargets(id, 'noanim'), false); break;
+            case 'duporig':   if (el.kind === 'tile') duplicateElements(ctxTargets(id), true); break;
             case 'seamless':   openSeamlessModal(ctxTargets(id, 'noanim')); break;
             case 'transition': enterPickMode(id, 'transition'); showToast('Now click the second texture', 'info'); break;
             case 'wang': enterPickMode(id, 'wang'); showToast('Now click the second texture for the Wang set', 'info'); break;
@@ -4668,11 +7880,31 @@ window.TRLE = window.TRLE || {};
             case 'heighttrans': enterPickMode(id, 'heighttrans'); showToast('Now click the texture to settle into the crevices (overlay)', 'info'); break;
             case 'overlay': enterPickMode(id, 'overlay'); showToast('Now click the texture to lay on top', 'info'); break;
             case 'editoverlay': if (el.ovParams) editOverlayModal(el); break;
+            case 'pushmarks':
+                if (el.kind !== 'tile') { showToast('Pushable Markings works on source tiles only', 'info'); return; }
+                openPushModal(id);
+                break;
+            case 'editpushmarks': if (el.push) openPushModal(el.base, el); break;
             case 'edithtrans': if (el.htParams) editHeightModal(el); break;
             case 'editanim':
                 if (el.kind !== 'anim' || !el.anim) { showToast('Not an animated tile', 'info'); return; }
                 openAnimModal(el.anim.group);
                 break;
+            case 'addsprite': openSpriteModal(); break;
+            case 'addanim': {
+                // The header button's modal, with the clicked tile pre-picked as the
+                // Overlay tab's Texture and the overlay itself left OFF, so what it
+                // makes is what the button makes until the user ticks the overlay
+                // (CONTEXT-MENU-PLAN D3). No option for it = not a valid overlay
+                // source (anSourcePopulate's rule), so nothing is picked.
+                openAnimModal();
+                const sel = $('at-anim-ov-tile');
+                if (sel && [...sel.options].some(o => Number(o.value) === id)) {
+                    sel.value = String(id);
+                    tilePickerSync(sel);   // a bare .value = fires no event
+                }
+                break;
+            }
             case 'material':
                 // A right-click inside a multi-selection acts on the whole selection,
                 // so Ctrl+click → Set Material matches the bulk bar's Apply Material.
@@ -4708,6 +7940,13 @@ window.TRLE = window.TRLE || {};
                 const t = ctxTargets(id);
                 noteSkipped(ctxTargets(id, 'any'), t, 'Adjust Colours works on source tiles only');
                 openColorAdjModal(t);
+                break;
+            }
+            case 'draw': {
+                if (el.kind !== 'tile') { showToast('Draw works on source tiles only', 'info'); return; }
+                // The WHOLE selection, recipe tiles included: they are shown in place,
+                // dimmed, so the picture of the area is complete (openDrawModal).
+                openDrawModal(ctxActsOnSelection(id) ? [id, ...selectedIdsInOrder().filter(i => i !== id)] : [id]);
                 break;
             }
             case 'recolor':
@@ -4754,7 +7993,7 @@ window.TRLE = window.TRLE || {};
                         const t = byId(tid);
                         if (!t) continue;
                         const b = await TRLE.Engine.canvasToBlob(t.canvas);
-                        downloadBlob(b, `tile_${indexOf(tid) + 1}.png`);
+                        downloadBlob(b, `tile_${numberOf(tid)}.png`);
                     }
                 })();
                 showToast(dls.length > 1 ? `Downloading ${dls.length} tile PNGs` : 'Downloading tile PNG', 'info', 1500);
@@ -4783,6 +8022,12 @@ window.TRLE = window.TRLE || {};
                     + (unticked ? ' (Emissive export map off)' : ''), 'success');
                 break;
             }
+            case 'group': {
+                closeCtxMenu();
+                groupSelection(ctxActsOnSelection(id) ? readingOrder().filter(x => state.selSet.has(x)) : [id]);
+                return;
+            }
+            case 'ungroup': closeCtxMenu(); ungroupTile(id); return;
             case 'delete':
                 // Same rule as everything else in the menu, and it was already the
                 // bulk bar's behaviour — confirmDelete takes a list, counts the
@@ -4795,26 +8040,19 @@ window.TRLE = window.TRLE || {};
 
     function setupCtxMenu() {
         const menu = $('at-ctx');
+        buildCtxTree();
         menu.addEventListener('click', e => {
             const btn = e.target.closest('button');
             if (!btn || btn.disabled) return;
+            // A category row opens its submenu on click too: that is the only
+            // way in on a touch screen, where there is no hover.
+            if (btn.dataset.cat) { ctxOpenSub(btn.dataset.cat); ctxSetHL(btn); return; }
             const id = state.ctxTargetId;
             closeCtxMenu();
-            runCtxAction(btn.dataset.action, id);
+            runCtxAction(btn.dataset.action || btn.dataset.run, id);
         });
-        // Keyboard navigation within the menu.
-        menu.addEventListener('keydown', e => {
-            const items = ctxVisibleItems();
-            if (!items.length) return;
-            const cur = items.indexOf(document.activeElement);
-            switch (e.key) {
-                case 'ArrowDown': e.preventDefault(); items[(cur + 1) % items.length].focus(); break;
-                case 'ArrowUp':   e.preventDefault(); items[(cur - 1 + items.length) % items.length].focus(); break;
-                case 'Home':      e.preventDefault(); items[0].focus(); break;
-                case 'End':       e.preventDefault(); items[items.length - 1].focus(); break;
-                case 'Tab':       e.preventDefault(); closeCtxMenu(); break;
-            }
-        });
+        menu.addEventListener('keydown', ctxKeydown);
+        menu.addEventListener('mousemove', ctxMouseMove);
         document.addEventListener('click', e => {
             if (!e.target.closest('.at-ctx')) closeCtxMenu();
         });
@@ -4836,50 +8074,146 @@ window.TRLE = window.TRLE || {};
     }
 
     /* ============ TRANSITION PROPAGATION ============
-       Transition parents always precede their children in the array,
-       so a single in-order pass re-composites everything correctly. */
+       Transition parents always precede their children in the array, so while
+       nothing else is derived an in-order pass re-composites everything
+       correctly, and that is still exactly what runs.
+
+       An animation with an OVERLAY is derived too: its frames are its raw
+       generated frames with the source tile composited in. Until 2026-09-24
+       only undo, redo and load recomposed them (refreshAnims), so Flip on a
+       grate left the lava-through-a-grate frames showing the old grate, and the
+       SAME state rendered two ways depending on the path to it (measured:
+       signature da21662a after the flip, 46a42f62 after undo + redo;
+       ANIMATED-OVERLAY-PLAN.md §12.2). Every edit path already ends here, so
+       this is where the recompose goes, and no call site had to change.
+
+       Array order is no longer enough once an overlay exists. A transition can
+       take an anim FRAME as its partner (the pick-partner click accepts one),
+       and an overlay can read a transition, so the dependencies can run
+       anim -> transition -> anim in any array order. derivedOrder() walks them
+       depth first, in array order among equals. A cycle cannot be built through
+       the UI (the picker excludes it); one from a hand-edited file is broken
+       at the back edge rather than looped on. */
     function refreshTransitions() {
         const S = state.tileSize;
-        state.elements.forEach(el => {
-            if (el.kind !== 'transition') return;
-            if (el.bset) {   // border-set slot — rebuilt from its recipe
-                const c = buildBsetTile(el, S);
-                if (c) {
-                    const tctx = el.canvas.getContext('2d');
-                    tctx.clearRect(0, 0, S, S);
-                    tctx.drawImage(c, 0, 0);
-                }
-                return;
+        const order = derivedOrder();
+        if (!order) {
+            state.elements.forEach(el => { if (el.kind === 'transition') refreshOneTransition(el, S); });
+            return;
+        }
+        order.forEach(n => (n.members ? recomposeAnimGroup(n.members) : refreshOneTransition(n.el, S)));
+    }
+
+    /* The animation groups that are derived from another element: an overlay,
+       keyed by group token. Empty map = nothing but transitions to refresh. */
+    function derivedAnimGroups() {
+        const groups = new Map();
+        for (const el of state.elements) {
+            if (el.kind !== 'anim' || !el.anim || !(el.anim.overlay || el.anim.still)) continue;
+            if (!groups.has(el.anim.group)) groups.set(el.anim.group, []);
+            groups.get(el.anim.group).push(el);
+        }
+        for (const m of groups.values()) m.sort((a, b) => a.anim.index - b.anim.index);
+        return groups;
+    }
+
+    /* Transitions and overlaid animation groups in dependency order, or null
+       when no group is derived (the plain in-order pass is then exact). */
+    function derivedOrder() {
+        const groups = derivedAnimGroups();
+        if (!groups.size) return null;
+        const key = el => el.kind === 'transition' ? 't' + el.id
+            : (el.kind === 'anim' && el.anim && groups.has(el.anim.group)) ? 'g' + el.anim.group : null;
+        const nodeOf = id => { const el = byId(id); return el ? key(el) : null; };
+        const nodes = new Map();
+        for (const el of state.elements) {
+            const k = key(el);
+            if (!k || nodes.has(k)) continue;
+            if (el.kind === 'transition') {
+                nodes.set(k, { el, deps: [nodeOf(el.base), nodeOf(el.overlay)] });
+            } else {
+                const members = groups.get(el.anim.group);
+                nodes.set(k, { members, deps: animGroupSources(members[0].anim).map(nodeOf) });
             }
-            // An overlay tile is checked BEFORE customMask: paint mode stores its
-            // mask there too, and a lerp is the wrong composite for a texture laid
-            // on top (see composeOverlayDiffuse).
-            if (el.ovParams) {
-                const c = buildOverlayTile(el, S);
-                if (c) drawReplace(el.canvas, c);
-                return;
-            }
-            const base = byId(el.base), overlay = byId(el.overlay);
-            if (!base || !overlay) return;
-            const mask = el.customMask
-                ? softenMask(el.customMask, S)
-                : el.wangBits != null
-                    ? buildWangMask(S, el.wangBits, el.pivot, el.hardness, el.organic)
-                    : buildTopologyMask(S, el.mode, el.pivot, el.hardness, el.organic);
-            const overlayCanvas = el.overlayGeom ? geomTransform(overlay.canvas, el.overlayGeom) : overlay.canvas;
-            let comp = composeTransitionDiffuse(base.canvas, overlayCanvas, mask, S, el.blendMethod);
-            // Diffuse only — it's a painted contact cue, not geometry. The maps in
-            // deriveMaps stay clean so a material can still light the tile itself.
-            if (el.organic && el.organic.shadow > 0 && shadowHitsDiffuse(el.organic))
-                comp = applyContactShadow(comp, mask, S, el.organic.shadow, shadowOpts(el.organic));
-            const tctx = el.canvas.getContext('2d');
-            tctx.clearRect(0, 0, S, S);   // clear so transparent transitions don't keep stale pixels
-            tctx.drawImage(comp, 0, 0);
+        }
+        const out = [], done = new Set(), onPath = new Set();
+        const visit = k => {
+            if (done.has(k) || onPath.has(k) || !nodes.has(k)) return;
+            onPath.add(k);
+            nodes.get(k).deps.forEach(d => d && visit(d));
+            onPath.delete(k); done.add(k);
+            out.push(nodes.get(k));
+        };
+        for (const k of nodes.keys()) visit(k);
+        return out;
+    }
+
+    /* The element ids an animation group's frames are composed FROM. */
+    function animGroupSources(anim) {
+        const ids = [];
+        if (anim && anim.overlay && anim.overlay.tileId != null) ids.push(anim.overlay.tileId);
+        if (anim && anim.still && anim.still.tileId != null) ids.push(anim.still.tileId);
+        return ids;
+    }
+
+    /* Recompose an overlaid group from its RAW frames: no regeneration, just the
+       composite and the glow bake refreshAnims does after it. Skipped until a
+       raw frame exists (refreshAnims / anAdd set it). */
+    function recomposeAnimGroup(members) {
+        const first = members[0];
+        if (!first || !first.animRaw) return;
+        const ovl = first.anim.overlay;
+        const plan = animOverlayPlan(ovl, first.animRaw, first.canvas.width);
+        members.forEach(el => {
+            if (!el.animRaw) return;
+            animDrawMember(el, el.animRaw, ovl, plan);
+            anBakeMemberGlow(el);
         });
     }
 
+    function refreshOneTransition(el, S) {
+        if (el.push) {   // pushable-marking slot: the source tile plus its marks
+            const c = buildPushTile(el, S);
+            if (c) drawReplace(el.canvas, c);
+            return;
+        }
+        if (el.bset) {   // border-set slot — rebuilt from its recipe
+            const c = buildBsetTile(el, S);
+            if (c) {
+                const tctx = el.canvas.getContext('2d');
+                tctx.clearRect(0, 0, S, S);
+                tctx.drawImage(c, 0, 0);
+            }
+            return;
+        }
+        // An overlay tile is checked BEFORE customMask: paint mode stores its
+        // mask there too, and a lerp is the wrong composite for a texture laid
+        // on top (see composeOverlayDiffuse).
+        if (el.ovParams) {
+            const c = buildOverlayTile(el, S);
+            if (c) drawReplace(el.canvas, c);
+            return;
+        }
+        const base = byId(el.base), overlay = byId(el.overlay);
+        if (!base || !overlay) return;
+        const mask = el.customMask
+            ? softenMask(el.customMask, S)
+            : el.wangBits != null
+                ? buildWangMask(S, el.wangBits, el.pivot, el.hardness, el.organic)
+                : buildTopologyMask(S, el.mode, el.pivot, el.hardness, el.organic);
+        const overlayCanvas = el.overlayGeom ? geomTransform(overlay.canvas, el.overlayGeom) : overlay.canvas;
+        let comp = composeTransitionDiffuse(base.canvas, overlayCanvas, mask, S, el.blendMethod);
+        // Diffuse only — it's a painted contact cue, not geometry. The maps in
+        // deriveMaps stay clean so a material can still light the tile itself.
+        if (el.organic && el.organic.shadow > 0 && shadowHitsDiffuse(el.organic))
+            comp = applyContactShadow(comp, mask, S, el.organic.shadow, shadowOpts(el.organic));
+        const tctx = el.canvas.getContext('2d');
+        tctx.clearRect(0, 0, S, S);   // clear so transparent transitions don't keep stale pixels
+        tctx.drawImage(comp, 0, 0);
+    }
+
     /* ============ MODAL INFRASTRUCTURE ============ */
-    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'bset', 'fade', 'emissive', 'heightmap', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'delight', 'overlay', 'import', 'origami', 'stainedglass', 'noise', 'atlaspreview', 'confirm'];
+    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'bset', 'fade', 'emissive', 'heightmap', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'delight', 'overlay', 'import', 'origami', 'stainedglass', 'noise', 'emptyfill', 'draw', 'push', 'view', 'sprite', 'confirm'];
 
     function visibleModal() {
         return MODAL_NAMES
@@ -4961,7 +8295,17 @@ window.TRLE = window.TRLE || {};
             ? null : $('at-confirm-input').value.trim();
     }
 
+    /* The user's own exits (Esc, Cancel, the corner ✕) come through here; a
+       modal that holds work it would lose asks first. Apply paths and code call
+       closeModal directly. Only Draw asks today (author, 2026-09-25): a drawing is
+       more work to lose than a mask. */
+    function requestCloseModal() {
+        if (drawAskDiscard()) return;
+        if (drawSetLeave(null)) return;   // Draw opened from Pushable Markings goes back there
+        closeModal();
+    }
     function closeModal() {
+        tpClose(false);            // a tile-picker popover belongs to the modal under it
         $('at-overlay').style.display = 'none';
         // Unlock background scroll and restore the pre-open scroll position.
         document.body.classList.remove('at-modal-open');
@@ -4976,12 +8320,15 @@ window.TRLE = window.TRLE || {};
         hgCleanup();
         anchorCleanup();
         bsetCleanup();
+        pushCleanup();
         htCleanup();
         ovCleanup();
         tgCleanup();
         orgCleanup();
         anCleanup();
+        spCleanup();
         caCleanup();
+        drawCleanup();
         rcCleanup();
         dlCleanup();
         importCleanup();
@@ -5030,7 +8377,7 @@ window.TRLE = window.TRLE || {};
 
     function flipMove(el, mutate) {
         // Honour the user's motion preference -- the CSS handles the rest globally.
-        const still = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        const still = TRLE.Motion ? TRLE.Motion.reduced() : false;
         if (still) { mutate(); return; }
         const first = el.getBoundingClientRect();
         mutate();
@@ -5105,7 +8452,7 @@ window.TRLE = window.TRLE || {};
             // Plain accordions drive themselves; the two docking ones (Set Material,
             // Make Transition) are bound by accBindSummary instead, because they also
             // have to change column and modal width in the same task.
-            if (d.id !== 'at-mat-adv' && d.id !== 'at-tr-org-acc' && d.id !== 'at-tr-sorg-acc'
+            if (d.id !== 'at-mat-adv' && d.id !== 'at-tr-org-acc' && d.id !== 'at-tr-sorg-acc' && d.id !== 'at-draw-dyn'
                 && d.id !== 'at-bset-org-acc') {
                 su.addEventListener('click', e => { e.preventDefault(); accSetOpen(d, !d.open); });
             }
@@ -5113,7 +8460,7 @@ window.TRLE = window.TRLE || {};
     }
 
     function accReduced() {
-        return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        return TRLE.Motion ? TRLE.Motion.reduced() : false;
     }
 
     /* Run `fn` when the height transition finishes, or on a timeout if the event is
@@ -5210,11 +8557,11 @@ window.TRLE = window.TRLE || {};
             // A ✕ in every modal's corner — a second deliberate exit alongside Cancel.
             const x = document.createElement('button');
             x.type = 'button'; x.className = 'at-modal-x'; x.setAttribute('aria-label', 'Close'); x.innerHTML = '✕';
-            x.addEventListener('click', closeModal);
+            x.addEventListener('click', requestCloseModal);
             modal.appendChild(x);   // appended (not prepended) so initial focus stays on the first real control
         });
         document.querySelectorAll('.at-modal [data-close]').forEach(btn =>
-            btn.addEventListener('click', closeModal));
+            btn.addEventListener('click', requestCloseModal));
         // NOTE: clicking the backdrop deliberately does NOT close — too easy to hit by
         // accident and lose a half-filled dialog. Exit via Cancel, the ✕, or Esc.
         // Focus trap + Ctrl/Cmd+Enter to confirm, scoped to the open dialog.
@@ -5228,7 +8575,7 @@ window.TRLE = window.TRLE || {};
         });
         document.addEventListener('keydown', e => {
             if (e.key !== 'Escape') return;
-            if ($('at-overlay').style.display !== 'none') closeModal();
+            if ($('at-overlay').style.display !== 'none') requestCloseModal();
             else if (state.pickBaseId !== null) exitPickMode();
             else if (state.selSet.size) { clearSelection(); renderGrid(); }
             closeCtxMenu();
@@ -5264,8 +8611,8 @@ window.TRLE = window.TRLE || {};
         smCleanup();
         sm.id = id;
         sm.batchIds = list.slice();
-        $('at-sm-tileno').textContent = indexOf(id) + 1;
-        setBatchNote('at-modal-seamless', list.length, indexOf(id) + 1);
+        $('at-sm-tileno').textContent = numberOf(id);
+        setBatchNote('at-modal-seamless', list.length, numberOf(id));
         sm.srcTex = TRLE.Engine.createTextureFromImage(el.canvas);
         openModal('seamless');
         smUpdateControls();
@@ -5427,7 +8774,14 @@ window.TRLE = window.TRLE || {};
     const an = { frames: [], playId: null, playIdx: 0, lastTs: 0, regenTimer: null, editGroup: null,
                  glowFrames: null, glowTimer: null,   // baked emissive strip for the preview
                  color: null,      // { gradient, stops:[{pos,color}], adjust:{...} }
-                 selStop: null };  // currently-selected gradient stop (object ref)
+                 selStop: null,    // currently-selected gradient stop (object ref)
+                 // Second animated layer: which layer the Shape/Colour tabs are
+                 // editing, and the parked state of the one they are not.
+                 layer: { active: 1, snap: { 1: null, 2: null } } };
+    // The organic panel's handle (it owns the reroll seed). Assigned by
+    // wireOrgPanel at init; the placeholder keeps anOvRead safe if the panel's
+    // markup is ever missing, which is what readOrgPanel itself guards for.
+    let anOrg = { seed: 1 };
 
     /* Directional-flow vectors (whole tiles per loop). +y points down in the
        tile, so "up" is -y. Diagonals scroll equally on both axes. */
@@ -5461,16 +8815,335 @@ window.TRLE = window.TRLE || {};
         an.editGroup = null;
     }
 
+    /* Which generator a preset drives. An ABSENT `generator` means the noise
+       field, which is what lets all 28 original presets and every saved project
+       stay untouched. Single source of truth — never test the key name. */
+    const anIsParticlePreset = key => {
+        const p = TRLE.AnimPresets[key];
+        return !!(p && p.params && p.params.generator === 'particles');
+    };
+    const anIsParticle = () => anIsParticlePreset($('at-anim-preset').value);
+    // A glitch preset is the noise generator plus a `glitch` stage, so it keeps
+    // every noise control; the key only decides which <optgroup> it sits in.
+    const anIsGlitchPreset = key => {
+        const p = TRLE.AnimPresets[key];
+        return !!(p && p.params && p.params.glitch);
+    };
+
+    /* Two <optgroup>s, because the two generators answer different questions and
+       a flat list of 36 made that invisible. */
     function anPopulatePresets() {
         const sel = $('at-anim-preset');
         if (sel.options.length) return;   // populate once
-        TRLE.AnimPresetOrder.forEach(key => {
-            const p = TRLE.AnimPresets[key];
+        const groups = [
+            ['Flowing surfaces (noise)', k => !anIsParticlePreset(k) && !anIsGlitchPreset(k)],
+            ['Falling & rising (particles)', anIsParticlePreset],
+            ['Glitch & corruption', anIsGlitchPreset]
+        ];
+        groups.forEach(([label, want]) => {
+            const keys = TRLE.AnimPresetOrder.filter(want);
+            if (!keys.length) return;
+            const g = document.createElement('optgroup');
+            g.label = label;
+            keys.forEach(key => {
+                const p = TRLE.AnimPresets[key];
+                const o = document.createElement('option');
+                o.value = key;
+                o.textContent = `${p.icon || ''} ${p.label}`.trim();
+                g.appendChild(o);
+            });
+            sel.appendChild(g);
+        });
+    }
+
+    /* Direction picker. Every entry is a pair of small INTEGERS (see
+       animparticles.js): the velocity has to stay whole tiles per loop or the
+       sequence stops closing, so the picker is a ladder rather than an angle
+       slider. The labels carry the angle so it still reads as a direction. */
+    function anPopulateDirs() {
+        const sel = $('at-anim-p-dir');
+        if (sel.options.length) return;
+        TRLE.AnimParticles.DIRS.forEach(d => {
             const o = document.createElement('option');
-            o.value = key;
-            o.textContent = `${p.icon || ''} ${p.label}`.trim();
+            o.value = d.key; o.textContent = d.label;
             sel.appendChild(o);
         });
+    }
+
+    /* Show the generator's own controls and hide the other's. Colour spread goes
+       with them: `u_equalize` is an animNoise uniform that flattens the noise's
+       value distribution, and a particle field has no such distribution to
+       flatten — leaving the slider on screen driving nothing is exactly the
+       inert-control bug the mask-editor naming rules exist to stop. */
+    function anSyncGenerator() {
+        const part = anIsParticle();
+        $('at-anim-noise-controls').style.display    = part ? 'none' : '';
+        $('at-anim-particle-controls').style.display = part ? '' : 'none';
+        $('at-anim-res-note').style.display          = part ? 'none' : '';
+        const spread = $('at-anim-col-spread');
+        if (spread) {
+            const row = spread.closest('.form-row');
+            if (row) row.style.display = part ? 'none' : '';
+        }
+        // A particle field is transparent between the drops, so UV-rotate is
+        // still fine, but the Crisp note and the frame advice both belong to
+        // whichever generator is showing.
+        $('at-anim-p-note').style.display = part ? '' : 'none';
+        $('at-anim-cost-note').style.display = part ? '' : 'none';
+    }
+
+    /* ---- 📼 Glitch (js/animglitch.js) ------------------------------------
+       Slider -> recipe scaling lives in these two functions only. */
+    const anGSliders = [
+        ['amount', v => (+v ? v + '%' : 'Off')],
+        ['blocks', v => v + ' across'],
+        ['bursts', v => v + ' / loop'],
+        ['calm',   v => v + '%'],
+        ['split',  v => (+v ? Math.max(1, Math.round(v / 1000 * (state.tileSize || 256))) + ' px' : 'Off')],
+        ['tear',   v => (+v ? v + '%' : 'Off')],
+        ['scan',   v => (+v ? v + '%' : 'Off')],
+        ['noise',  v => (+v === 0 ? '0%, collage only' : v + '%')]
+    ];
+    const anG = k => $('at-anim-g-' + k);
+    function anGlitchSyncLabels() {
+        anGSliders.forEach(([k, fmt]) => { const e = $('at-anim-g-' + k + '-val'); if (e) e.textContent = fmt(anG(k).value); });
+    }
+    /* Controls -> recipe, or NULL when the stage would change nothing, so a
+       plain noise recipe stays exactly the shape it always was. */
+    function anGlitchParams() {
+        const g = {
+            amount: +anG('amount').value / 100, blocks: +anG('blocks').value,
+            bursts: +anG('bursts').value, calm: +anG('calm').value / 100,
+            split: +anG('split').value / 1000, tear: +anG('tear').value / 100,
+            scan: +anG('scan').value / 100, noiseMix: +anG('noise').value / 100
+        };
+        return TRLE.AnimGlitch.isActive(g) ? g : null;
+    }
+    function anGlitchWrite(g) {
+        const q = Object.assign({}, TRLE.AnimGlitch.DEFAULTS, g || {});
+        anG('amount').value = Math.round(q.amount * 100);
+        anG('blocks').value = q.blocks;
+        anG('bursts').value = q.bursts;
+        anG('calm').value   = Math.round(q.calm * 100);
+        anG('split').value  = Math.round(q.split * 1000);
+        anG('tear').value   = Math.round(q.tear * 100);
+        anG('scan').value   = Math.round(q.scan * 100);
+        anG('noise').value  = Math.round(q.noiseMix * 100);
+        if (g && TRLE.AnimGlitch.isActive(g)) $('at-anim-g-acc').open = true;
+        anGlitchSyncLabels();
+        anGlitchNote();
+    }
+    /* State-aware line under the glitch sliders. A burst holds for N/bursts
+       frames; at one frame per burst the damage changes every frame, which
+       reads as flicker, and past N some bursts never land on a frame at all. */
+    function anGlitchNote() {
+        const e = $('at-anim-g-hint');
+        if (!e) return;
+        const g = anGlitchParams();
+        if (!g) { e.textContent = ''; return; }
+        const N = Math.max(2, TRLE.AnimGen.clampFrames($('at-anim-frames').value));
+        const tile = state.tileSize || 256;
+        const parts = [`Blocks about ${Math.round(tile / g.blocks)} px at ${tile}×${tile}`];
+        let warn = false;
+        const hold = N / g.bursts;
+        if (g.amount > 0 || g.tear > 0) {
+            if (g.bursts > N) {
+                warn = true;
+                parts.push(`${g.bursts} bursts in ${N} frames: some never show. Lower <strong>Bursts</strong> or add frames`);
+            } else if (hold < 2) {
+                parts.push('each burst lasts one frame, so the damage flickers every frame');
+            } else {
+                parts.push(`each burst holds for ${Number.isInteger(hold) ? hold : hold.toFixed(1)} frames`);
+            }
+        }
+        if (tile / g.blocks < 6) {
+            warn = true;
+            parts.push('blocks this small read as noise at this tile size, lower <strong>Block size</strong>');
+        }
+        e.innerHTML = parts.join(' · ') + '.';
+        e.style.color = warn ? 'var(--warning)' : 'var(--text-secondary)';
+    }
+
+    const anPSliders = [
+        ['count',   'at-anim-p-count',   v => String(v)],
+        ['speed',   'at-anim-p-speed',   v => v + '×'],
+        ['spread',  'at-anim-p-spread',  v => String(v)],
+        ['length',  'at-anim-p-length',  v => (v / 100).toFixed(2) + '×'],
+        ['width',   'at-anim-p-width',   v => (v / 10).toFixed(1) + ' px'],
+        ['taper',   'at-anim-p-taper',   v => (v / 100).toFixed(2)],
+        ['bjitter', 'at-anim-p-bjitter', v => (v / 100).toFixed(2)],
+        ['dscale',  'at-anim-p-dscale',  v => (v / 100).toFixed(2)],
+        ['defocus', 'at-anim-p-defocus', v => (+v ? v + ' px' : 'Off')],
+        ['sway',    'at-anim-p-sway',    v => (v / 100).toFixed(2)],
+        ['swayc',   'at-anim-p-swayc',   v => String(v)],
+        ['gustc',   'at-anim-p-gustc',   v => (+v ? v + ' / loop' : 'Off')],
+        ['gustd',   'at-anim-p-gustd',   v => v + '%'],
+        ['twk',     'at-anim-p-twk',     v => (+v ? v + '%' : 'Off')],
+        ['twkc',    'at-anim-p-twkc',    v => String(v)]
+    ];
+    function anParticleSyncLabels() {
+        anPSliders.forEach(([, id, fmt]) => {
+            const el = $(id + '-val');
+            if (el) el.textContent = fmt($(id).value);
+        });
+    }
+
+    /* The readout that stops the one trap in this generator: `dirX,dirY` is a
+       LATTICE PAIR, not a unit vector, so (1,4) has magnitude 4.12 and Speed 2
+       on it means 8.2 tiles per loop, not 2. Authoring the first presets from
+       the wrong mental model produced rain at 1.19 tiles per FRAME, which does
+       not fall, it strobes past the whole tile between frames. The number the
+       user needs is tiles per frame, so show that rather than the multiplier. */
+    function anParticleNote() {
+        const d = TRLE.AnimParticles.dirByKey($('at-anim-p-dir').value);
+        const N = Math.max(2, TRLE.AnimGen.clampFrames($('at-anim-frames').value));
+        const sp = +$('at-anim-p-speed').value, spread = +$('at-anim-p-spread').value;
+        const len = +$('at-anim-p-length').value / 100;
+        const dl = Math.hypot(d.dx, d.dy) || 1;
+        const lo = sp * dl / N, hi = (sp + Math.max(1, spread) - 1) * dl / N;
+        const tile = state.tileSize || 256;
+        const txt = lo === hi ? lo.toFixed(2) : `${lo.toFixed(2)} to ${hi.toFixed(2)}`;
+        if (hi === 0) {
+            // Velocity 0 is still a whole number of tiles per loop, so the loop
+            // closes and the tile wraps exactly as they always do. Nothing moves,
+            // which is the point: beads on glass rather than rain falling past it.
+            const e = $('at-anim-p-note');
+            e.innerHTML = 'Speed 0: the particles hold still, so this is beads on a surface rather than '
+                        + 'anything falling. Raise <strong>Depth spread</strong> to let some of them move.';
+            e.style.color = 'var(--text-secondary)';   // not a warning, it is a choice
+            return;
+        }
+        const parts = [`${txt} tiles per frame (${Math.round(lo * tile)}–${Math.round(hi * tile)} px)`];
+        let warn = false;
+
+        /* TWO failure modes, and one threshold cannot see both.
+
+           STROBE: what matters is not the speed, it is the UNBLURRED GAP between
+           where a particle was and where it lands. A streak `length` times the
+           per-frame travel bridges that much of it, so a fast streak with a long
+           trail is continuous while a slow ROUND particle at the same speed
+           jumps. gap = travel * max(0, 1 - length).
+
+           SMEAR: the opposite end. Once a trail is most of a tile long it stops
+           reading as a falling drop and starts reading as a static diagonal
+           line, however smooth the motion is. */
+        const gap = hi * Math.max(0, 1 - len);
+        const streak = hi * len;
+        if (hi > 0.9) {
+            warn = true;
+            parts.push('far too fast, a particle crosses most of the tile between frames. Lower Speed, or add frames');
+        } else if (gap > 0.25) {
+            warn = true;
+            parts.push(`jumps ${Math.round(gap * tile)} px between frames with no trail to bridge it, which reads as a flicker. `
+                     + 'Raise Streak length, lower Speed, or add frames');
+        } else if (streak > 0.6) {
+            warn = true;
+            parts.push('the trail is longer than most of the tile, which reads as a static line rather than falling. Lower Streak length or Speed');
+        }
+        const el = $('at-anim-p-note');
+        el.textContent = parts.join(' · ');
+        el.style.color = warn ? 'var(--warning)' : 'var(--text-secondary)';
+    }
+
+    /* Read the particle controls into a params bag. */
+    function anParticleParams() {
+        const d = TRLE.AnimParticles.dirByKey($('at-anim-p-dir').value);
+        return {
+            generator: 'particles',
+            count:        +$('at-anim-p-count').value,
+            dirX: d.dx, dirY: d.dy,
+            speed:        +$('at-anim-p-speed').value,
+            speedSpread:  +$('at-anim-p-spread').value,
+            length:       +$('at-anim-p-length').value / 100,
+            width:        +$('at-anim-p-width').value / 10,
+            taper:        +$('at-anim-p-taper').value / 100,
+            brightJitter: +$('at-anim-p-bjitter').value / 100,
+            depthScale:   +$('at-anim-p-dscale').value / 100,
+            defocus:      +$('at-anim-p-defocus').value,
+            sway:         +$('at-anim-p-sway').value / 100,
+            swayCycles:   +$('at-anim-p-swayc').value,
+            gustCycles:   +$('at-anim-p-gustc').value,
+            gustDepth:    +$('at-anim-p-gustd').value / 100,
+            twinkle:      +$('at-anim-p-twk').value / 100,
+            twinkleCycles: +$('at-anim-p-twkc').value
+        };
+    }
+
+    /* Params bag -> the particle controls (preset pick and edit-mode restore). */
+    function anParticleWrite(q) {
+        const D = TRLE.AnimParticles.DEFAULTS;
+        const g = (k) => (q[k] == null ? D[k] : q[k]);
+        $('at-anim-p-dir').value     = TRLE.AnimParticles.dirKeyFor(g('dirX'), g('dirY'));
+        $('at-anim-p-count').value   = g('count');
+        $('at-anim-p-speed').value   = g('speed');
+        $('at-anim-p-spread').value  = g('speedSpread');
+        $('at-anim-p-length').value  = Math.round(g('length') * 100);
+        $('at-anim-p-width').value   = Math.round(g('width') * 10);
+        $('at-anim-p-taper').value   = Math.round(g('taper') * 100);
+        $('at-anim-p-bjitter').value = Math.round(g('brightJitter') * 100);
+        $('at-anim-p-dscale').value  = Math.round(g('depthScale') * 100);
+        $('at-anim-p-defocus').value = g('defocus');
+        $('at-anim-p-sway').value    = Math.round(g('sway') * 100);
+        $('at-anim-p-swayc').value   = g('swayCycles');
+        $('at-anim-p-gustc').value   = g('gustCycles');
+        $('at-anim-p-gustd').value   = Math.round(g('gustDepth') * 100);
+        $('at-anim-p-twk').value     = Math.round(g('twinkle') * 100);
+        $('at-anim-p-twkc').value    = g('twinkleCycles');
+        anParticleSyncLabels();
+        anParticleNote();
+        anParticleDepthNote();
+        anParticleTwinkleNote();
+    }
+
+    /* State-aware line under the twinkle controls. A particle flashes between
+       Flashes and 2 x Flashes - 1 times per loop, and a flash needs a few frames
+       to read as one: past N/2 flashes per loop a cosine sampled N times aliases
+       into an on/off strobe (the Nyquist limit), which may be the look someone
+       wants for sparks, but it should be a choice rather than a surprise. */
+    function anParticleTwinkleNote() {
+        const e = $('at-anim-p-twk-hint');
+        if (!e) return;
+        const a = +$('at-anim-p-twk').value, c = +$('at-anim-p-twkc').value;
+        if (!a) { e.textContent = ''; return; }
+        const N = Math.max(2, TRLE.AnimGen.clampFrames($('at-anim-frames').value));
+        const hi = 2 * c - 1;
+        const range = hi === 1 ? 'once' : `${c} to ${hi} times`;
+        if (hi > N / 2) {
+            e.innerHTML = `Each particle flashes ${range} in ${N} frames, which is faster than the frames can show: `
+                + 'it strobes on and off rather than twinkling. Lower <strong>Flashes</strong> or add frames.';
+            e.style.color = 'var(--warning)';
+        } else {
+            e.textContent = `Each particle flashes ${range} per loop, out of step with its neighbours.`;
+            e.style.color = 'var(--text-secondary)';
+        }
+    }
+
+    /* State-aware line under the two depth controls. Both read the SAME draw
+       Depth spread already sorts particles by, so what they can do depends on
+       it: at a spread of 1 there is one plane, so Depth blur softens everything
+       evenly and Size by depth has nothing to grade between. Saying that beats
+       leaving someone to wonder why one slider stopped mattering. */
+    function anParticleDepthNote() {
+        const e = $('at-anim-p-depth-hint');
+        if (!e) return;
+        const spread = +$('at-anim-p-spread').value;
+        const ds = +$('at-anim-p-dscale').value, df = +$('at-anim-p-defocus').value;
+        if (!ds && !df) {
+            e.innerHTML = 'Both off: every particle is the same size and equally sharp. '
+                + 'Turn them up for depth, near particles bigger, brighter and in focus.';
+            return;
+        }
+        if (spread < 2) {
+            e.innerHTML = '<strong>Depth spread is 1, so there is only one plane.</strong> '
+                + (df ? 'Depth blur softens all of it evenly. ' : '')
+                + (ds ? 'Size by depth has nothing to grade between. ' : '')
+                + 'Raise <strong>Depth spread</strong> for real near and far.';
+            return;
+        }
+        e.innerHTML = `${spread} depth planes. `
+            + (ds ? 'Far particles are smaller and dimmer. ' : '')
+            + (df ? 'Far planes are blurred, the nearest stays sharp. ' : '')
+            + 'Both follow <strong>Depth spread</strong>, which also sets how much faster the near ones fall.';
     }
 
     /* The size the live preview bakes at. "Tile size" (auto) follows the atlas,
@@ -5503,6 +9176,55 @@ window.TRLE = window.TRLE || {};
             el.textContent = `Previewing at ${pv}×${pv}, but the atlas is ${tile}×${tile}, tiles export at ${tile}.`;
             el.style.color = 'var(--warning)';
         }
+    }
+
+    /* How long the loop LASTS, which is the number nothing in the tool stated
+       until now and the reason the motion was reported as too fast. Perceived
+       period is N / fps seconds, and a swell's period is that over `cycles`.
+
+       Three levers, and they are not equivalent, so the note names them in the
+       order they cost: fps slows everything including the churn, more frames
+       decouples the two and costs a tile each, and `Repeat` is free in atlas
+       pixels (see the manifest note). `cycles` is deliberately absent from that
+       list: it cannot go below 1, because a whole number of cycles over the
+       loop is what makes the last frame meet the first.
+
+       The 2-second threshold is not a taste judgement. The shipped default is
+       16 frames at 12 fps, which is 1.33 s, and that default IS the complaint,
+       so the hint has to fire there. */
+    function anDurationNote() {
+        const el = $('at-anim-duration');
+        if (!el) return;
+        const single = $('at-anim-output').value === 'single';
+        if (single) {
+            el.textContent = 'Single tile: UV-rotate scrolls it continuously, and the speed is set in Tomb Editor, not here.';
+            $('at-anim-lv-time').textContent = '';
+            return;
+        }
+        const N = TRLE.AnimGen.clampFrames($('at-anim-frames').value);
+        const fps = +$('at-anim-fps').value || 12;
+        const secs = N / fps;
+        const t = s => (s >= 10 ? Math.round(s) : s.toFixed(1)) + ' s';
+        let txt = `${N} frames at ${fps} fps: <strong>${t(secs)} per loop</strong>. This fps is written into the export manifest.`;
+        if (secs < 2) {
+            txt += ` To slow it down, drop the fps (it slows the churn too), add frames (one atlas tile each), `
+                 + `or set <strong>Repeat</strong> on the frames in Tomb Editor, which holds each one for several ticks `
+                 + `and costs no extra atlas space.`;
+        }
+        el.innerHTML = txt;
+
+        // And the swell, beside the sliders that set it.
+        const lvEl = $('at-anim-lv-time');
+        if (!lvEl) return;
+        const lv = anLvRead();
+        if (!lv) { lvEl.textContent = ''; return; }
+        const span = Math.abs(lv.high - lv.low);
+        lvEl.innerHTML = `One full swell every <strong>${t(secs / lv.cycles)}</strong>`
+            + (lv.cycles > 1 ? ` (${lv.cycles} cycles over the ${t(secs)} loop).` : '.')
+            + ` <strong>Cycles</strong> cannot go below 1: a whole number of them over the loop is what makes the last frame meet the first.`
+            + (span > 50
+                ? ` For a slower-looking swell, narrow <strong>Low</strong> and <strong>High</strong>: it travels less ground in the same time, and costs nothing.`
+                : ` It travels ${span}% of the tile, so it reads slower than a full sweep at the same fps.`);
     }
 
     /* Resolution note under Scale/Detail (C). Pattern scale is in lattice cells
@@ -5554,6 +9276,7 @@ window.TRLE = window.TRLE || {};
         $('at-anim-stretch-val').textContent  = $('at-anim-stretch').value;
         $('at-anim-fps-val').textContent      = $('at-anim-fps').value;
         anResNote();
+        anDurationNote();
     }
 
     /* Push a preset's params into the controls. */
@@ -5572,10 +9295,14 @@ window.TRLE = window.TRLE || {};
         const fc = anFlowToControls(q.flowX || 0, q.flowY || 0);
         $('at-anim-flowdir').value  = fc.dir;
         $('at-anim-flowspeed').value = fc.speed;
+        if (q.generator === 'particles') anParticleWrite(q);
+        // Always written, so leaving a glitch preset for lava resets the stage.
+        anGlitchWrite(q.glitch || null);
         $('at-anim-desc').textContent = p.description || '';
         $('at-anim-emissive-note').style.display = p.emissive ? '' : 'none';
         anUpdateMatNote(key);
         anColorFromPreset(key);   // colour follows the chosen preset's default gradient
+        anSyncGenerator();
         anSyncLabels();
     }
 
@@ -5605,11 +9332,57 @@ window.TRLE = window.TRLE || {};
         // Legacy groups predate supersampling and have no stored factor → off,
         // so re-opening one and hitting Update reproduces its existing pixels.
         $('at-anim-crisp').checked  = (params.supersample || 1) > 1;
+        // A stored recipe carries its own generator; an absent one is the noise
+        // field, which is what makes every pre-particle project reload unchanged.
+        if (params.generator === 'particles') anParticleWrite(params);
+        anGlitchWrite(params.glitch || null);
+        anSyncGenerator();
         anSyncLabels();
     }
 
     function anFramesVisibility() {
-        $('at-anim-frames-wrap').style.display = ($('at-anim-output').value === 'single') ? 'none' : '';
+        const single = $('at-anim-output').value === 'single';
+        ['at-anim-frames-wrap', 'at-anim-perrow-wrap', 'at-anim-shape-wrap'].forEach(id => { $(id).style.display = single ? 'none' : ''; });
+        anPerRowSync();
+    }
+
+    /* The shape an animation's frames take in the atlas: one block `perRow`
+       wide, on a fresh row, like a transition set (the author, 2026-09-24:
+       they used to land as a run in reading order, spilling round the end of
+       whatever row they started on). The width is the user's; until they touch
+       it, it follows the frame count, as square as the count allows. */
+    function animDefaultPerRow(n, maxW) {
+        if (n <= 1) return 1;
+        const root = Math.sqrt(n);
+        let w = null;
+        // The first divisor at or above the square root gives full rows...
+        for (let d = Math.ceil(root - 1e-9); d <= n; d++) if (n % d === 0) { w = d; break; }
+        // ...unless that is far from square (a prime count): then a ragged last row.
+        if (w == null || w > 2 * root) w = Math.ceil(root);
+        return Math.max(1, Math.min(w, maxW));
+    }
+    function anPerRowMax() {
+        const n = TRLE.AnimGen.clampFrames($('at-anim-frames').value);
+        return Math.max(1, Math.min(n, state.cols || n));
+    }
+    /* The width the Update / Add will use, clamped to what fits. */
+    function anPerRow() {
+        const max = anPerRowMax();
+        return Math.max(1, Math.min(max, parseInt($('at-anim-perrow').value, 10) || 1));
+    }
+    function anPerRowSync() {
+        const inp = $('at-anim-perrow');
+        if (!inp) return;
+        const n = TRLE.AnimGen.clampFrames($('at-anim-frames').value), max = anPerRowMax();
+        inp.max = max;
+        if (an.perRowAuto) inp.value = animDefaultPerRow(n, max);
+        const w = anPerRow(), h = Math.ceil(n / w), rem = n % w;
+        $('at-anim-shape-label').textContent = `${w} × ${h} in the atlas` + (rem ? `, ${rem} in the last row` : '');
+        // Cells shrink so the sketch stays within about 160 × 72 px at any shape.
+        const g = $('at-anim-shape-grid'), cell = Math.max(2, Math.min(7, Math.floor(72 / h) - 2, Math.floor(160 / w) - 2));
+        g.style.gridTemplateColumns = `repeat(${w}, ${cell}px)`;
+        g.style.setProperty('--cell', cell + 'px');
+        if (g.childElementCount !== n) g.innerHTML = '<i></i>'.repeat(n);
     }
 
     /* Switch the modal's Shape / Colour tab. */
@@ -5905,8 +9678,35 @@ window.TRLE = window.TRLE || {};
     function anBakeMemberGlow(el) {
         const g = el.anim && el.anim.glow;
         if (!g || !g.enabled) { el.emissive = null; return; }
-        el.emissive = TRLE.Engine.emissiveFromDiffuse(
-            el.canvas, anGlowOpts(g, el.anim.index || 0, el.anim.total || 1, el.canvas.width));
+        const k = el.anim.index || 0, N = el.anim.total || 1;
+        if (animStillSource(el.anim.still)) {
+            el.emissive = animStillEmissive(el.canvas, el.animRaw, g, k, N, el.anim.still.drive);
+            return;
+        }
+        el.emissive = TRLE.Engine.emissiveFromDiffuse(el.canvas, anGlowOpts(g, k, N, el.canvas.width));
+    }
+
+    /* The glow of an emissive-only frame. The MASK is the static texture's own
+       (the Glow tab's brightness or colour pick, with the pulse if it is on),
+       so the runes glow and the stone around them does not. `drive: 'anim'`
+       then multiplies it by the animation frame's brightness (times its alpha,
+       so a transparent particle field drives nothing between the particles),
+       which runs the moving field across the glowing parts. Shared by the bake
+       and the modal preview, so the two cannot disagree. */
+    function animStillEmissive(still, raw, g, k, N, drive) {
+        const em = TRLE.Engine.emissiveFromDiffuse(still, anGlowOpts(g, k, N, still.width));
+        if (drive !== 'anim' || !raw || !em) return em;
+        const S = em.width;
+        const r = raw.width === S && raw.height === S ? raw : resizeCanvas(raw, S, S);
+        const ectx = em.getContext('2d');
+        const E = ectx.getImageData(0, 0, S, S), e = E.data;
+        const d = r.getContext('2d').getImageData(0, 0, S, S).data;
+        for (let i = 0; i < e.length; i += 4) {
+            const l = (0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2]) * d[i + 3] / (255 * 255);
+            e[i] = Math.round(e[i] * l); e[i + 1] = Math.round(e[i + 1] * l); e[i + 2] = Math.round(e[i + 2] * l);
+        }
+        ectx.putImageData(E, 0, 0);
+        return em;
     }
 
     /* Re-bake the preview glow strip (an.glowFrames) from the current frames +
@@ -5915,12 +9715,362 @@ window.TRLE = window.TRLE || {};
         const g = anReadGlow();
         if (!g.enabled || !an.frames.length) { an.glowFrames = null; return; }
         const N = an.frames.length, dim = an.frames[0].width;
+        const st = anStillRead();
+        if (st && an.rawFrames) {
+            an.glowFrames = an.frames.map((f, k) => animStillEmissive(f, an.rawFrames[k], g, k, N, st.drive));
+            return;
+        }
         an.glowFrames = an.frames.map((f, k) => TRLE.Engine.emissiveFromDiffuse(f, anGlowOpts(g, k, N, dim)));
     }
 
     function anScheduleGlowRegen() {
         if (an.glowTimer) clearTimeout(an.glowTimer);
         an.glowTimer = setTimeout(anRegenGlow, 90);
+    }
+
+    /* ---- Overlay tab -------------------------------------------------
+       The recipe is an ovParams bag plus a source tile and a z-order, stored on
+       el.anim.overlay. Ids are `at-anim-ov-*`, NOT `at-ov-*`: the Overlay
+       Texture modal owns that prefix and getElementById returns the first
+       match, which is the silent-collision failure this codebase has hit four
+       times (at-fade-hardness, at-tr-hardness, at-hg-invert, at-heal-hint). */
+    function anOvPopulateTiles() { return anSourcePopulate($('at-anim-ov-tile')); }
+
+    /* Fill a picker with what an animation may be DERIVED from: the overlay's
+       texture and the emissive-only static diffuse share the rule. */
+    function anSourcePopulate(sel) {
+        const prev = sel.value;
+        sel.innerHTML = '';
+        // Plain tiles and transitions (round three). A transition that leans on
+        // a frame of the animation being edited would be a cycle, so it is
+        // left out rather than offered and then broken at render time.
+        const num = tileNumbers();
+        state.elements.forEach(e => {
+            if (!e.canvas || (e.kind !== 'tile' && e.kind !== 'transition')) return;
+            if (e.kind === 'transition' && an.editGroup && elDependsOnGroup(e.id, an.editGroup)) return;
+            const o = document.createElement('option');
+            o.value = e.id;
+            o.textContent = e.kind === 'transition' ? `Tile ${num.get(e.id)} · transition` : `Tile ${num.get(e.id)}`;
+            sel.appendChild(o);
+        });
+        if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
+        return sel.options.length;
+    }
+
+    function anOvSyncVisibility() {
+        const on = $('at-anim-ov-enable').checked;
+        $('at-anim-ov-body').style.display = on ? '' : 'none';
+        const m = $('at-anim-ov-mode').value, depth = m === 'depth';
+        // Depth has its own Fill picker and its own Edge hardness, and it reads
+        // the static texture rather than a colour, so it shares NONE of the
+        // selection groups. Showing them would be four controls that feed nothing.
+        const sel = m !== 'all' && !depth;
+        $('at-anim-ov-grp-color').style.display  = m === 'color'  ? '' : 'none';
+        $('at-anim-ov-grp-hue').style.display    = m === 'hue'    ? '' : 'none';
+        $('at-anim-ov-grp-bright').style.display = m === 'bright' ? '' : 'none';
+        $('at-anim-ov-grp-depth').style.display  = depth ? '' : 'none';
+        $('at-anim-ov-grp-sel').style.display    = sel ? '' : 'none';
+        $('at-anim-ov-grp-invert').style.display = sel ? '' : 'none';
+        $('at-anim-ov-grp-sample').style.display = sel ? '' : 'none';
+        if (depth) anOvDepthHint();
+        const hint = $('at-anim-ov-sample-hint');
+        hint.style.display = sel ? '' : 'none';
+        hint.innerHTML = $('at-anim-ov-sample').value === 'base'
+            ? 'Reading the <strong>animation</strong>: the texture lands only where the moving image matches, so the coverage changes frame by frame. This is how a splash follows the water.'
+            : 'Reading the <strong>texture</strong>: cuts it out of its own background, a rim or a grate on a flat colour.';
+        const behind = $('at-anim-ov-z').value === 'behind';
+        $('at-anim-ov-z-hint').innerHTML = behind
+            ? 'The texture sits <strong>underneath</strong>. Only worth it when the animation has transparency, rain over a window, drips down a wall.'
+            : 'The texture sits <strong>on top</strong>. A well rim around the water, stepping stones on lava, a grate the liquid shows through.';
+        // UV-rotate scrolls the WHOLE texture, so a baked-in rim would slide
+        // around with the liquid. Disabled with a reason rather than hidden,
+        // the Set Material precedent.
+        anSingleGuard();
+        $('at-anim-ov-single-note').style.display = on ? '' : 'none';
+        // Organic displaces a CONTOUR, so it needs one to displace. In "All of
+        // it" mode with no level there is no contour, only the texture's own
+        // alpha, and the panel would be a dead control. Say so rather than
+        // leaving the sliders to do nothing.
+        const hasContour = sel || depth || animLevelOn(anLvRead());
+        const oh = $('at-anorg-hint');
+        if (oh) oh.innerHTML = hasContour
+            ? 'Contact shadow lands on whatever is <em>under</em> the texture, so a well rim darkens the water it sits in and stays clean itself.'
+            : '<strong>Nothing to roughen yet.</strong> This shapes the edge of <strong>Where it shows</strong> or the <strong>Moving level</strong> line, and both are off, so the texture is placed by its own transparency alone.';
+    }
+
+    /* UV-rotate scrolls the WHOLE texture, so anything baked in with the
+       animation (an overlay's rim, an emissive-only static diffuse) would slide
+       around with it. Either one disables Single seamless tile, with a reason
+       rather than hidden: the Set Material precedent. */
+    function anSingleGuard() {
+        const ov = $('at-anim-ov-enable').checked, st = anStillOn(), l2 = $('at-anim-l2-enable').checked;
+        const out = $('at-anim-output');
+        const opt = out.querySelector('option[value="single"]');
+        const block = ov || st || l2;
+        if (opt) {
+            opt.disabled = block;
+            opt.title = ov ? 'Not available with an overlay: UV-rotate scrolls the whole texture, including the overlay.'
+                : st ? 'Not available with a static diffuse: UV-rotate would scroll the static texture too, and only the glow is meant to move.'
+                : l2 ? 'Not available with a second layer: UV-rotate would scroll both layers together as one.'
+                : '';
+        }
+        if (block && out.value === 'single') { out.value = 'sequence'; anFramesVisibility(); }
+    }
+
+    /* ---- Emissive-only (Glow tab, round three) ------------------------- */
+    const anStillOn = () => $('at-anim-glow-enable').checked && $('at-anim-still-mode').value === 'still';
+
+    /* Controls -> the stored `still` recipe, or null. Null is the original
+       path: the diffuse is the animation and nothing about the output moves. */
+    function anStillRead() {
+        if (!anStillOn()) return null;
+        const tileId = parseInt($('at-anim-still-tile').value, 10);
+        if (!Number.isFinite(tileId) || !byId(tileId)) return null;
+        return { tileId, drive: $('at-anim-still-drive').value === 'anim' ? 'anim' : 'pulse' };
+    }
+
+    function anStillWrite(st) {
+        anSourcePopulate($('at-anim-still-tile'));
+        $('at-anim-still-mode').value = st ? 'still' : 'anim';
+        if (st && st.tileId != null && byId(st.tileId)) $('at-anim-still-tile').value = st.tileId;
+        tilePickerSync($('at-anim-still-tile'));   // a bare .value = fires no event
+        $('at-anim-still-drive').value = st && st.drive === 'anim' ? 'anim' : 'pulse';
+        anStillSync();
+    }
+
+    function anStillSync() {
+        const on = anStillOn();
+        $('at-anim-still-body').style.display = $('at-anim-still-mode').value === 'still' ? '' : 'none';
+        // An overlay composites INTO the diffuse, and here the diffuse is a
+        // fixed texture, so the two are exclusive. Disabled with a reason, and
+        // switched off rather than silently ignored.
+        const ov = $('at-anim-ov-enable');
+        if (on && ov.checked) { ov.checked = false; anOvSyncVisibility(); }
+        ov.disabled = on;
+        ov.parentElement.title = on ? 'Off while the Glow tab uses a static texture: the diffuse is that texture, so there is nothing to lay an overlay into.' : '';
+        anSingleGuard();
+        const e = $('at-anim-still-hint');
+        if (!e) return;
+        const pulse = $('at-anim-glow-pulse').checked;
+        e.innerHTML = $('at-anim-still-drive').value === 'anim'
+            ? 'Every frame shows the static texture. Its glowing parts (picked below) light up wherever the animation is bright, so the motion runs across them. Pick a dark, patchy preset for flicker, a bright one for a steady shimmer.'
+            : pulse
+                ? 'Every frame shows the static texture, and its glowing parts (picked below) pulse over the loop. The Shape tab does nothing in this mode.'
+                : '<strong>Pulse is off</strong>, so nothing moves: every frame would be identical. Tick <strong>Pulse</strong> below, or set <strong>Glow follows</strong> to the animation.';
+    }
+
+    /* What the depth mode is about to do, in the terms of the two textures in
+       front of the user rather than in terms of a height field. Also says when
+       the moving level has taken the Fill level slider over, because otherwise
+       that slider looks broken: it moves and nothing happens. */
+    function anOvDepthHint() {
+        const e = $('at-anim-ov-depth-hint');
+        if (!e) return;
+        const tile = byId(parseInt($('at-anim-ov-tile').value, 10));
+        const low = $('at-anim-ov-dfill').value === 'low';
+        const lv = anLvRead();
+        const where = low ? 'in the low ground' : 'on the raised parts';
+        const rest = low ? 'the animation takes the raised parts'
+                         : 'the animation floods the low ground, the mortar joints and the cracks';
+        e.innerHTML = `Reads the height of <strong>the texture</strong> (never the animation) and puts it ${where}, so ${rest}. `
+            + (lv
+                ? `<strong>Moving level</strong> is on, so it drives the fill level instead of the slider: the liquid rises and falls through the texture's own relief.`
+                : `Turn on <strong>Moving level</strong> to make the fill level rise and fall over the loop, water climbing in and out of the mortar.`);
+        const rec = $('at-anim-ov-depth-recipe');
+        if (rec) rec.style.display = tile && tile.hgParams ? '' : 'none';
+        // Fill level is inert while the level curve owns it. Disabled with a
+        // reason rather than left to move nothing.
+        const sl = $('at-anim-ov-dlevel');
+        if (sl) {
+            sl.disabled = !!lv;
+            sl.title = lv ? 'The Moving level panel is driving this. Set its Direction to Off to use the slider.' : '';
+        }
+        const dd = $('at-anim-ov-ddetail'), dc = $('at-anim-ov-dcontrast');
+        const authored = !!(tile && tile.hgParams);
+        [dd, dc].forEach(x => { if (x) { x.disabled = authored; x.title = authored ? 'Read from this texture\'s own height map. Edit it in Make Height Map.' : ''; } });
+        anOvDetailNote(authored);
+    }
+
+    /* Detail in PIXELS, because that is what decides whether it works.
+
+       Detail sets a blur radius, and anything narrower than that radius is
+       smoothed out of the height field before the band ever sees it. Mortar
+       joints on a 256px brick are 2-3 px wide (HEIGHT-MAP-AUDIT's joint-aware
+       measurement), so the Height Transition's own default of 45 — a 5.4 px
+       radius — erases them, and the water comes out as a wash over the whole
+       wall rather than in the joints. Rendered and looked at across Bricks,
+       Stonetiles, Sand and Grass at Detail 45/70/80/90/100: 90 traces brick
+       joints perfectly and turns sand and grass into speckle, 45 does the
+       reverse, and **80** is the only value that reads correctly on all four.
+       That is the default, and this note carries the trade-off rather than
+       leaving it to be discovered.
+
+       The radius is ABSOLUTE pixels, so a bigger tile keeps proportionally more
+       of its fine detail — the same relationship the height edge band has. */
+    function anOvDetailNote(authored) {
+        const e = $('at-anim-ov-detail-note');
+        if (!e) return;
+        if (authored) { e.textContent = ''; return; }
+        const detail = parseInt($('at-anim-ov-ddetail').value, 10);
+        const px = (1 - detail / 100) * 9 + 0.5;
+        const S = state.tileSize || 256;
+        e.innerHTML = `Smooths away anything narrower than about <strong>${px.toFixed(1)} px</strong> at ${S}×${S}. `
+            + (px > 3
+                ? 'Mortar joints are 2 to 3 px wide, so raise <strong>Detail</strong> to reach them. This setting suits broad hollows, sand and gravel.'
+                : 'Fine enough for mortar joints and cracks. Lower <strong>Detail</strong> for broad hollows in sand or grass, or this picks out their grain instead.');
+    }
+
+    function anOvSyncLabels() {
+        anOvDetailNote(!!(byId(parseInt($('at-anim-ov-tile').value, 10)) || {}).hgParams);
+        ['tolerance', 'hue', 'huewidth', 'threshold', 'softness', 'feather', 'opacity',
+         'dlevel', 'dhard', 'ddetail', 'dcontrast'].forEach(k => {
+            const v = $('at-anim-ov-' + k + '-val');
+            if (v) v.textContent = $('at-anim-ov-' + k).value;
+        });
+        ['low', 'high', 'cycles', 'soft'].forEach(k => {
+            const v = $('at-anim-lv-' + k + '-val');
+            if (v) v.textContent = $('at-anim-lv-' + k).value;
+        });
+        anDurationNote();
+    }
+
+    /* Controls -> the stored recipe, or null when the tab is off / has nothing
+       to point at. Null is what keeps the whole feature inert: every consumer
+       then takes the original path and the output is byte-identical. */
+    function anOvRead() {
+        if (!$('at-anim-ov-enable').checked || anStillOn()) return null;
+        const tileId = parseInt($('at-anim-ov-tile').value, 10);
+        if (!Number.isFinite(tileId)) return null;
+        const n = id => parseInt($('at-anim-ov-' + id).value, 10);
+        return {
+            tileId,
+            z: $('at-anim-ov-z').value,
+            params: {
+                mode:      $('at-anim-ov-mode').value,
+                sample:    $('at-anim-ov-sample').value,
+                target:    $('at-anim-ov-target').value,
+                tolerance: n('tolerance'),
+                hue:       n('hue'),
+                hueWidth:  n('huewidth'),
+                satMin:    30, valMin: 20,
+                threshold: n('threshold'),
+                softness:  n('softness'),
+                feather:   n('feather'),
+                invert:    $('at-anim-ov-selinvert').checked,
+                opacity:   n('opacity') / 100,
+                blend:     $('at-anim-ov-blend').value,
+                // The depth band. Carried on every recipe, read only in 'depth'
+                // mode, so switching modes back and forth keeps the settings.
+                dFill:     $('at-anim-ov-dfill').value,
+                dLevel:    n('dlevel'),
+                dHard:     n('dhard'),
+                dDetail:   n('ddetail'),
+                dContrast: n('dcontrast')
+            },
+            // Both null when their panel is at rest, which is what keeps them
+            // inert: every consumer short-circuits on null and the output is
+            // byte-identical to a pre-phase-3 build.
+            org:   readOrgPanel('at-anorg', anOrg.seed),
+            level: anLvRead()
+        };
+    }
+
+    /* The moving level, or null when the direction picker says Off. */
+    function anLvRead() {
+        if ($('at-anim-lv-dir').value === 'off') return null;
+        const n = id => parseInt($('at-anim-lv-' + id).value, 10);
+        return { dir: $('at-anim-lv-dir').value, curve: $('at-anim-lv-curve').value,
+                 low: n('low'), high: n('high'), cycles: n('cycles'), soft: n('soft') };
+    }
+
+    /* Direction hint + the seam warning. A straight line cannot repeat across
+       the edge it travels towards; "Spreads out" displaces a toroidal distance
+       field and repeats fine, so the note names it rather than just warning. */
+    function anLvSync() {
+        const dir = $('at-anim-lv-dir').value;
+        const hints = {
+            off:   'Nothing moves: the texture covers the same area in every frame.',
+            up:    'The animation floods up over the texture and drains back down. Lava climbing out of a grate.',
+            down:  'The animation pours down over the texture and pulls back up.',
+            right: 'The animation washes in from the left and back out.',
+            left:  'The animation washes in from the right and back out.',
+            grow:  'The texture\'s own outline swells and shrinks, so the liquid around it spreads and pulls back. This one still repeats on every edge.'
+        };
+        $('at-anim-lv-dir-hint').textContent = hints[dir] || '';
+        $('at-anim-lv-seam-note').style.display =
+            (dir !== 'off' && dir !== 'grow') ? '' : 'none';
+        anDurationNote();
+        anOvSyncVisibility();   // the organic hint depends on whether a level is on
+    }
+
+    /* Recipe -> controls. Called on open for both a new animation and an edit;
+       a null recipe resets, so a second animation cannot silently inherit the
+       first one's overlay (the ovResetControls lesson). */
+    function anOvWrite(ovl) {
+        const set = (id, v) => { const e = $('at-anim-ov-' + id); if (e != null && v != null) e.value = v; };
+        $('at-anim-ov-enable').checked = !!ovl;
+        const p = (ovl && ovl.params) || {};
+        set('z', (ovl && ovl.z) || 'front');
+        set('mode', p.mode || 'all');
+        set('sample', p.sample || 'overlay');
+        set('target', p.target || '#ffffff');
+        set('tolerance', p.tolerance == null ? 25 : p.tolerance);
+        set('hue', p.hue == null ? 30 : p.hue);
+        set('huewidth', p.hueWidth == null ? 30 : p.hueWidth);
+        set('threshold', p.threshold == null ? 80 : p.threshold);
+        set('softness', p.softness == null ? 30 : p.softness);
+        set('feather', p.feather || 0);
+        set('opacity', Math.round((p.opacity == null ? 1 : p.opacity) * 100));
+        set('blend', p.blend || 'normal');
+        set('dfill', p.dFill || 'high');
+        set('dlevel', p.dLevel == null ? 50 : p.dLevel);
+        set('dhard', p.dHard == null ? 65 : p.dHard);
+        set('ddetail', p.dDetail == null ? 80 : p.dDetail);
+        set('dcontrast', p.dContrast == null ? 50 : p.dContrast);
+        $('at-anim-ov-selinvert').checked = !!p.invert;
+        if (ovl && ovl.tileId != null && byId(ovl.tileId)) $('at-anim-ov-tile').value = ovl.tileId;
+        tilePickerSync($('at-anim-ov-tile'));   // a bare .value = fires no event
+        anLvWrite(ovl && ovl.level);
+        anOrgWrite(ovl && ovl.org);
+        anOvSyncLabels();
+        anOvSyncVisibility();
+    }
+
+    /* Recipe -> the level controls, resetting to Off when there is none. */
+    function anLvWrite(lv) {
+        const set = (id, v) => { $('at-anim-lv-' + id).value = v; };
+        set('dir', (lv && lv.dir) || 'off');
+        set('curve', (lv && lv.curve) || 'smooth');
+        set('low', lv && lv.low != null ? lv.low : 0);
+        set('high', lv && lv.high != null ? lv.high : 70);
+        set('cycles', lv && lv.cycles != null ? lv.cycles : 1);
+        set('soft', lv && lv.soft != null ? lv.soft : 3);
+        anLvSync();
+    }
+
+    /* Recipe -> the shared organic panel. readOrgPanel has no counterpart (the
+       other four callers never restore one), so this is the one place that
+       writes it back; the seed goes onto the handle so Update reproduces the
+       same field rather than rerolling it. */
+    function anOrgWrite(org) {
+        const set = (id, v) => { const e = $('at-anorg-' + id); if (e) e.value = v; };
+        const pct = (v, d) => Math.round((v == null ? d : v) * 100);
+        set('style', (org && org.style) || 'blobs');
+        set('wobble', pct(org && org.wobble, 0));
+        set('scatter', pct(org && org.scatter, 0));
+        set('feather', pct(org && org.feather, 0));
+        set('shadow', pct(org && org.shadow, 0));
+        set('shcolor', (org && org.shadowColor) || '#000000');
+        set('shmode', (org && org.shadowMode) || 'multiply');
+        set('shtarget', (org && org.shadowTarget) || 'diffuse');
+        set('scale', (org && org.scale) || 3);
+        anOrg.seed = (org && org.seed) || anOrg.seed || 1;
+        ['wobble', 'scatter', 'feather', 'shadow', 'scale'].forEach(k => {
+            const lab = $('at-anorg-' + k + '-val');
+            if (lab) lab.textContent = $('at-anorg-' + k).value;
+        });
+        const sh = $('at-anorg-style-hint');
+        if (sh) sh.textContent = orgStyle({ style: $('at-anorg-style').value }).hint;
     }
 
     /* Build a params bag from the controls. `full` uses the real tile size;
@@ -5947,30 +10097,183 @@ window.TRLE = window.TRLE || {};
             equalize: +$('at-anim-col-spread').value / 100
         };
         Object.assign(overrides, anFlowFromControls());
+        // Always set, even to null: the preset's own `glitch` would otherwise
+        // survive the merge in AnimPresets_resolve after the sliders were zeroed.
+        overrides.glitch = anGlitchParams();
         // Colour comes from the Colour tab (gradient stops + adjustments).
         if (an.color && an.color.stops) {
             overrides.palette = an.color.stops;
             overrides.colorAdjust = an.color.adjust;
         }
+        /* A particle preset replaces the whole noise control set rather than
+           adding to it. The shared keys above (size, frames, seed, supersample,
+           palette, colorAdjust) still apply; `equalize` and the animNoise field
+           params do not, and are dropped so a saved recipe carries only what its
+           generator reads. */
+        if (anIsParticlePreset(key)) {
+            ['style', 'spatialPeriod', 'timePeriod', 'octaves', 'gain', 'warp',
+             'contrast', 'stretch', 'equalize', 'flowX', 'flowY', 'glitch'].forEach(k => delete overrides[k]);
+            Object.assign(overrides, anParticleParams());
+        }
         const params = TRLE.AnimPresets_resolve(key, overrides);
+        if (!params.glitch || anIsParticlePreset(key)) delete params.glitch;
         return { key, params, single, frames };
+    }
+
+    /* Both layers as one build: the controls describe whichever layer is being
+       edited, the other comes from its parked snapshot, refitted to this
+       build's size, frame count and supersample (preview and Add differ in
+       size). Returns anBuildParams' shape for LAYER 1 plus `layer2` (null when
+       off) and `gradient1`, layer 1's gradient name, since an.color belongs to
+       whichever layer is active. */
+    function anBuildLayers(full) {
+        const cur = anBuildParams(full);
+        const g = an.color ? an.color.gradient : null;
+        if (!$('at-anim-l2-enable').checked) return Object.assign(cur, { layer2: null, gradient1: g });
+        const fit = sn => Object.assign({}, sn.params,
+            { size: cur.params.size, supersample: cur.params.supersample, frames: cur.params.frames });
+        const active = an.layer.active, other = an.layer.snap[active === 1 ? 2 : 1];
+        const L1 = active === 1 ? { key: cur.key, params: cur.params, gradient: g }
+            : { key: other.key, params: fit(other), gradient: other.gradient };
+        const L2 = active === 2 ? { key: cur.key, params: cur.params, gradient: g }
+            : (other ? { key: other.key, params: fit(other), gradient: other.gradient } : null);
+        return {
+            key: L1.key, params: L1.params, single: cur.single, frames: cur.frames, gradient1: L1.gradient,
+            layer2: L2 ? { preset: L2.key, params: L2.params, gradient: L2.gradient == null ? null : L2.gradient,
+                           z: ['behind', 'top'].includes($('at-anim-l2-z').value) ? $('at-anim-l2-z').value : 'front',
+                           opacity: +$('at-anim-l2-opacity').value / 100 } : null
+        };
+    }
+
+    /* Park the controls' layer as a snapshot. */
+    function anLayerCapture() {
+        const cur = anBuildParams(false);
+        return { key: cur.key, params: cur.params, gradient: an.color ? an.color.gradient : null };
+    }
+
+    /* Load a parked layer into the Shape and Colour tabs. Output, frame count,
+       fps and Crisp are the GROUP's, so they are kept as they are. */
+    function anLayerLoad(sn) {
+        const single = $('at-anim-output').value === 'single';
+        const frames = +$('at-anim-frames').value, crisp = $('at-anim-crisp').checked;
+        anSetControls(sn.key, sn.params, single, frames, sn.params.seed, null);
+        $('at-anim-crisp').checked = crisp;
+        anRestoreColor(sn.key, sn.params, sn.gradient);
+    }
+
+    /* A fresh layer 2: steam, the round's own example (lava behind a grate
+       with steam drifting in front). */
+    function anLayerDefault() {
+        const key = 'steam';
+        const params = TRLE.AnimPresets_resolve(key, { seed: (+$('at-anim-seed').value || 0) + 1 });
+        return { key, params, gradient: TRLE.AnimPresets_gradient(key) };
+    }
+
+    function anLayerSwitch(to) {
+        if (to === an.layer.active) return;
+        an.layer.snap[an.layer.active] = anLayerCapture();
+        anLayerLoad(an.layer.snap[to] || anLayerDefault());
+        an.layer.active = to;
+        anLayerSync();
+        anRegenerate();
+    }
+
+    function anLayerSync() {
+        const on = $('at-anim-l2-enable').checked;
+        $('at-anim-l2-seg').style.display = on ? '' : 'none';
+        $('at-anim-l2-body').style.display = on ? '' : 'none';
+        [1, 2].forEach(n => {
+            const b = $('at-anim-l2-edit' + n), act = an.layer.active === n;
+            b.classList.toggle('active', act);
+            b.setAttribute('aria-pressed', act ? 'true' : 'false');
+        });
+        $('at-anim-l2-opacity-val').textContent = $('at-anim-l2-opacity').value;
+        const h = $('at-anim-l2-hint');
+        if (h) h.innerHTML = on
+            ? `<strong>Preset</strong>, <strong>Shape</strong> and <strong>Colour</strong> are editing <strong>layer ${an.layer.active}</strong>. `
+              + ($('at-anim-l2-z').value === 'top'
+                  ? 'Layer 2 goes over the <strong>Overlay</strong> tab\u2019s texture as well (steam in front of a grate), and stays out of the material maps, which describe the surface underneath. '
+                  : 'The <strong>Overlay</strong> tab\u2019s texture goes over both layers. ')
+              + 'Glow reads both. Layer 2 runs at the same frame count, so the loop still closes. '
+              + 'Give it a gradient with a transparent end, or it covers layer 1 completely.'
+            : '';
+        anSingleGuard();
+    }
+
+    /* Controls -> the stored layer-2 recipe (what anAdd keeps on the group). */
+    function anLayerWrite(l2) {
+        $('at-anim-l2-enable').checked = !!l2;
+        an.layer = { active: 1, snap: { 1: null, 2: l2 ? { key: l2.preset, params: l2.params, gradient: l2.gradient } : null } };
+        $('at-anim-l2-z').value = l2 && ['behind', 'top'].includes(l2.z) ? l2.z : 'front';
+        $('at-anim-l2-opacity').value = Math.round((l2 && l2.opacity != null ? l2.opacity : 1) * 100);
+        anLayerSync();
     }
 
     /* Generate the frame list for `info`. Single mode keeps just one seamless
        frame (generateFrames enforces a 2-frame minimum, so slice it). */
     function anGenerate(info) {
-        const all = TRLE.AnimGen.generateFrames(info.params);
-        return info.single ? [all[0]] : all;
+        return anGenerateLayers(info).frames;
+    }
+    function anGenerateLayers(info) {
+        return animGenerateLayers(info.params, info.layer2, info.single, !!anStillRead());
+    }
+
+    /* What adding at the real tile size will cost, extrapolated from the preview
+       we just rendered. Deliberately MEASURED rather than predicted: a
+       closed-form estimator was written for the particle generator and scored
+       against it, and under-predicted by 2x to 10x, because cost turns on how
+       much consecutive stamps overlap. Timing the render we had to do anyway is
+       self-calibrating and cannot go stale.
+
+       The exponent is empirical: particle cost grew 14 -> 20 -> 64 -> 193 -> 608 ms
+       across 64/128/256/512/1024, i.e. about S^1.6 rather than the S^2 a
+       per-pixel pass would give, because a streak's work scales with its LENGTH
+       and its stamp width, not with the tile's area. */
+    function anCostNote(previewMs, previewSize) {
+        const el = $('at-anim-cost-note');
+        if (!el) return;
+        const tile = state.tileSize || 256;
+        const N = an.frames.length || 1;
+        const est = previewMs * Math.pow(tile / Math.max(1, previewSize), 1.6);
+        if (est < 400) { el.textContent = ''; return; }
+        el.textContent = `Adding ${N} frame${N > 1 ? 's' : ''} at ${tile}×${tile} will take about `
+            + (est >= 1000 ? (est / 1000).toFixed(1) + ' s' : Math.round(est) + ' ms')
+            + ', the tab will hold still while it renders.';
+        el.style.color = est > 3000 ? 'var(--warning)' : 'var(--text-secondary)';
     }
 
     function anRegenerate() {
         if ($('at-overlay').style.display === 'none') return;
-        anResNote(); anCrispNote(); anPreviewNote();
-        const info = anBuildParams(false);
+        anResNote(); anCrispNote(); anPreviewNote(); anDurationNote(); anPerRowSync();
+        if (anIsParticle()) anParticleNote();
+        const info = anBuildLayers(false);
+        const t0 = performance.now();
+        let top = null;
         try {
-            an.frames = anGenerate(info);
+            const L = anGenerateLayers(info);
+            an.frames = L.frames; top = L.top;
         } catch (e) {
             console.error(e); showToast('Generation failed, see console', 'error'); return;
+        }
+        if (anIsParticle()) anCostNote(performance.now() - t0, info.params.size);
+        else $('at-anim-cost-note').textContent = '';
+        // The preview must show what Add will bake, so the overlay is composited
+        // into the preview frames through the same function the real path uses.
+        const ovl = anOvRead();
+        if (ovl && animOverlaySource(ovl) && an.frames.length) {
+            const P = an.frames[0].width, NF = an.frames.length;
+            const plan = animOverlayPlan(ovl, an.frames[0], P);
+            an.frames = an.frames.map((f, i) => composeAnimOverlay(f, ovl, P, plan, i, NF));
+        }
+        if (top) an.frames = an.frames.map((f, i) => animComposeLayer2(f, top[i % top.length], info.layer2));
+        // Emissive-only: show the static texture, keep the animation aside for
+        // the glow to follow. Same split animDrawMember makes on Add.
+        const still = animStillSource(anStillRead());
+        an.rawFrames = null;
+        if (still && an.frames.length) {
+            const P = an.frames[0].width, flat = resizeCanvas(still.canvas, P, P);
+            an.rawFrames = an.frames;
+            an.frames = an.frames.map(() => flat);
         }
         an.playIdx = 0;
         anRegenGlow();   // keep the preview glow strip in sync with the new frames
@@ -6057,30 +10360,43 @@ window.TRLE = window.TRLE || {};
     function makeAnimElement(src, S, meta) {
         const canvas = document.createElement('canvas');
         canvas.width = S; canvas.height = S;
-        canvas.getContext('2d').drawImage(src, 0, 0, S, S);
-        return {
+        const el = {
             id: state.nextId++, kind: 'anim', canvas, original: null,
             seamless: true, edited: false, material: meta.material, emissive: null,
             anim: { group: meta.group, index: meta.index, total: meta.total,
                     preset: meta.preset, single: meta.single, seed: meta.seed,
                     fps: meta.fps, gradient: meta.gradient, params: meta.params,
-                    glow: meta.glow || null }
+                    glow: meta.glow || null, overlay: meta.overlay || null, still: meta.still || null,
+                    layer2: meta.layer2 || null }
         };
+        // Same path refreshAnims takes, so Add and a later reload cannot disagree.
+        el.animTop = meta.top || null;
+        animDrawMember(el, src, meta.overlay, meta.plan);
+        return el;
     }
 
     function anAdd() {
         if (!state.tileSize) return;
-        const info = anBuildParams(true);
-        let frames;
+        const info = anBuildLayers(true);
+        let frames, tops = null;
         try {
-            frames = anGenerate(info);
+            const L = anGenerateLayers(info);
+            frames = L.frames; tops = L.top;
         } catch (e) {
             console.error(e); showToast('Generation failed, see console', 'error'); return;
         }
         const S = state.tileSize, total = frames.length;
-        const seed = +$('at-anim-seed').value || 0, fps = +$('at-anim-fps').value || 12;
-        const gradient = an.color ? an.color.gradient : null;
+        // Layer 1's, not the controls': with layer 2 being edited the Seed box
+        // and an.color describe layer 2.
+        const seed = info.params.seed || 0, fps = +$('at-anim-fps').value || 12;
+        const gradient = info.gradient1 == null ? null : info.gradient1;
+        const layer2 = info.layer2;
         const glow = anReadGlow();
+        const overlay = anOvRead();
+        const still = anStillRead();   // emissive-only: null unless the Glow tab asks for it
+        // After `overlay`, not before it: a const cannot be read in its own TDZ,
+        // and an exception here leaves anAdd half-run with a broken element list.
+        const addPlan = frames.length ? animOverlayPlan(overlay, frames[0], S) : null;
 
         // Emissive presets, or an explicit Glow, need the Emissive export map on.
         const wantsGlow = glow.enabled || (TRLE.AnimPresets[info.key] && TRLE.AnimPresets[info.key].emissive);
@@ -6099,9 +10415,13 @@ window.TRLE = window.TRLE || {};
             const group = an.editGroup;
             state.elements = state.elements.filter(e => !(e.kind === 'anim' && e.anim && e.anim.group === group));
             const newEls = frames.map((src, i) => makeAnimElement(src, S,
-                { group, index: i, total, preset: info.key, single: info.single, seed, fps, gradient, params: info.params, material, glow }));
+                { group, index: i, total, preset: info.key, single: info.single, seed, fps, gradient, params: info.params, material, glow, overlay, still, layer2, top: tops ? tops[i] : null, plan: addPlan }));
             newEls.forEach(anBakeMemberGlow);   // bake per-frame emissive from the recipe
             state.elements.splice(pos, 0, ...newEls);
+            /* The new frames are new elements, so without this they would take
+               the first empty slots after whatever precedes them in element
+               order, which scatters the animation over any holes on the way. */
+            pendingPlace = animEditPlacement(old.map(e => e.id), newEls.map(e => e.id), info.single ? 1 : anPerRow());
             closeModal();
             renderGrid();
             pushHistory('Edit animation');
@@ -6111,8 +10431,10 @@ window.TRLE = window.TRLE || {};
 
         const group = 'anim-' + state.nextId;       // stable token shared by the group
         const material = anDefaultMaterial(info.key);
+        // A block `Frames per row` wide on a fresh row (reconcileLayout's pendingRect).
+        if (!info.single && frames.length > 1) pendingRect = Math.min(anPerRow(), Math.max(1, state.cols));
         const newEls = frames.map((src, i) => makeAnimElement(src, S,
-            { group, index: i, total, preset: info.key, single: info.single, seed, fps, gradient, params: info.params, material, glow }));
+            { group, index: i, total, preset: info.key, single: info.single, seed, fps, gradient, params: info.params, material, glow, overlay, still, layer2, top: tops ? tops[i] : null, plan: addPlan }));
         newEls.forEach(anBakeMemberGlow);   // bake per-frame emissive from the recipe
         state.elements.push(...newEls);
         closeModal();
@@ -6121,8 +10443,496 @@ window.TRLE = window.TRLE || {};
         showToast(info.single ? 'Added animated tile' : `Added ${total}-frame looping animation 🎞️`, 'success');
     }
 
+    /* Slots for an edited animation's new frames (Map id -> slot). Same frame
+       count and the width untouched (or unchanged): every frame on its old
+       slot. Otherwise the new block `w` wide, anchored where the old one's top
+       left was if it fits there (over its own old slots and empty ones),
+       else on a fresh row below everything. */
+    function animEditPlacement(oldIds, newIds, w) {
+        const sh = an.editShape;
+        return editPlacement(sh, oldIds, newIds, w,
+            !!sh && newIds.length === oldIds.length && (!an.perRowTouched || w === sh.width));
+    }
+    /* The shared half, also used by Edit Pushable Markings: `keep` puts every new
+       tile on its predecessor's slot; otherwise the block goes to the old top
+       left if it fits, else a fresh row. `sh` is { slots, r0, c0 }. */
+    function editPlacement(sh, oldIds, newIds, w, keep) {
+        const cols = Math.max(1, state.cols);
+        if (!sh) return null;
+        if (keep) return new Map(newIds.map((id, i) => [id, sh.slots[i]]));
+        const old = new Set(oldIds);
+        const at = (r0, c0) => newIds.map((_, i) => (r0 + Math.floor(i / w)) * cols + c0 + (i % w));
+        const free = sl => sl >= state.layout.length || state.layout[sl] == null || old.has(state.layout[sl]);
+        let slots = sh.c0 + w <= cols ? at(sh.r0, sh.c0) : null;
+        if (!slots || !slots.every(free)) {
+            let last = -1;
+            state.layout.forEach((id, sl) => { if (id != null && !old.has(id)) last = sl; });
+            slots = at(Math.floor(last / cols) + 1, 0);
+        }
+        return new Map(newIds.map((id, i) => [id, slots[i]]));
+    }
+
     /* Open the modal to create a new animation, or — when `editGroup` is given —
        to edit an existing group in place. */
+    /* Restore a stored colour (gradient name + stops + adjustments) onto the
+       Colour tab. gradient === null means "custom" (edited stops); undefined
+       means a legacy anim with no stored gradient, so fall back to the preset's.
+       Deep-copies the stops so editing this session doesn't mutate the stored
+       params until the user clicks Update. Shared by edit mode and the layer
+       switch. */
+    function anRestoreColor(preset, params, gradient) {
+        const gname = gradient === undefined ? TRLE.AnimPresets_gradient(preset) : gradient;
+        const stops = params.palette
+            ? params.palette.map(s => ({ pos: s.pos, color: s.color.slice() }))
+            : TRLE.AnimGradients_stops(gname || TRLE.AnimPresets_gradient(preset));
+        an.color = { gradient: gname, stops, adjust: Object.assign(anColorIdentity(), params.colorAdjust || {}) };
+        an.selStop = null;
+        $('at-anim-col-spread').value = Math.round((params.equalize || 0) * 100);
+        anColorSyncControls();
+        anStopSyncControls();
+        anRenderStops();
+        anDrawRamp();
+    }
+
+    /* ============================================================
+       🎇 SPRITES (SPRITE-PLAN phase 2). Sprite sequences for WadTool, made
+       by TRLE.SpriteGen. Deliberately outside the atlas: nothing here reads
+       or writes state.elements, the project file or the atlas export, so it
+       works from a cold start (D5) and cannot change a saved project (D8).
+       ============================================================ */
+    const sp = { frames: [], params: null, playId: null, playIdx: 0, lastTs: 0, paused: false,
+                 regenTimer: null, nameTouched: false, built: false, lastMs: 0 };
+
+    /* The sliders, one row per parameter. `gen` / `shapes` / `seq` say when a
+       row shows; `label` may differ per shape (a star's spike is a flare's streak). */
+    const SP_SLIDERS = [
+        { group: 'Shape', gen: 'shape', key: 'size', min: 0.01, max: 1, step: 0.01, label: { star: 'Core size', flare: 'Core size', orb: 'Radius', ring: 'Radius' } },
+        { group: 'Shape', gen: 'shape', key: 'points', min: 2, max: 16, step: 1, label: 'Points', shapes: ['star'], fmt: v => String(v) },
+        { group: 'Shape', gen: 'shape', key: 'spikeLength', min: 0.1, max: 1.5, step: 0.01, label: { star: 'Spike length', flare: 'Streak length' }, shapes: ['star', 'flare'] },
+        { group: 'Shape', gen: 'shape', key: 'spikeWidth', min: 0, max: 1, step: 0.01, label: { star: 'Spike width', flare: 'Streak thickness' }, shapes: ['star', 'flare'] },
+        { group: 'Shape', gen: 'shape', key: 'irregular', min: 0, max: 1, step: 0.01, label: 'Irregular', shapes: ['star'] },
+        { group: 'Shape', gen: 'shape', key: 'cross', min: 0, max: 1, step: 0.01, label: 'Cross streak', shapes: ['flare'] },
+        { group: 'Shape', gen: 'shape', key: 'softness', min: 0, max: 1, step: 0.01, label: 'Softness', shapes: ['orb'] },
+        { group: 'Shape', gen: 'shape', key: 'ringWidth', min: 0.01, max: 0.4, step: 0.005, label: 'Ring width', shapes: ['ring'] },
+        { group: 'Shape', gen: 'shape', key: 'rotation', min: 0, max: 360, step: 1, label: 'Rotation', shapes: ['star', 'flare'], fmt: v => `${v}°` },
+        { group: 'Shape', gen: 'shape', key: 'spin', min: -3, max: 3, step: 1, label: 'Spin', seq: ['lifetime', 'loop'], shapes: ['star', 'flare'], fmt: v => `${v} turn${Math.abs(v) === 1 ? '' : 's'}` },
+        { group: 'Shape', gen: 'shape', key: 'glow', min: 0, max: 3, step: 0.05, label: 'Glow' },
+        { group: 'Shape', gen: 'shape', key: 'glowSize', min: 0.02, max: 1, step: 0.01, label: 'Glow size' },
+        // The noise body (SPRITE-PLAN phase 3).
+        { group: 'Noise body', gen: 'noise', key: 'noiseScale', min: 1, max: 12, step: 1, label: 'Pattern scale', fmt: v => String(v) },
+        { group: 'Noise body', gen: 'noise', key: 'octaves', min: 1, max: 8, step: 1, label: 'Detail', fmt: v => `${v} octave${v === 1 ? '' : 's'}` },
+        { group: 'Noise body', gen: 'noise', key: 'roughness', min: 0.2, max: 0.85, step: 0.01, label: 'Roughness' },
+        { group: 'Noise body', gen: 'noise', key: 'warp', min: 0, max: 3, step: 0.05, label: 'Swirl' },
+        { group: 'Noise body', gen: 'noise', key: 'contrast', min: 0.3, max: 4, step: 0.05, label: 'Contrast' },
+        { group: 'Noise body', gen: 'noise', key: 'detail', min: 0, max: 1, step: 0.01, label: 'Texture inside' },
+        { group: 'Noise body', gen: 'noise', key: 'ragged', min: 0, max: 1, step: 0.01, label: 'Ragged edge' },
+        { group: 'Noise body', gen: 'noise', key: 'feather', min: 0.02, max: 1, step: 0.01, label: 'Edge softness' },
+        { group: 'Noise body', gen: 'noise', key: 'rise', min: -4, max: 4, step: 1, label: 'Rise', seq: ['lifetime', 'loop'], fmt: v => String(v) },
+        { group: 'Noise body', gen: 'noise', key: 'evolve', min: 1, max: 6, step: 1, label: 'Churn', seq: ['lifetime', 'loop'], fmt: v => String(v) },
+        { group: 'Noise body', gen: 'noise', key: 'erodeStart', min: 0, max: 1, step: 0.01, label: 'Burn-away' },
+        { group: 'Noise body', gen: 'noise', key: 'erodeSoft', min: 0.005, max: 1, step: 0.005, label: 'Burn-away softness' },
+        // The particle burst (SPRITE-PLAN phase 4).
+        { group: 'Burst', gen: 'particles', key: 'count', min: 1, max: 400, step: 1, label: 'Count', fmt: v => String(v) },
+        { group: 'Burst', gen: 'particles', key: 'burstAngle', min: 0, max: 360, step: 1, label: 'Direction', fmt: v => `${v}°` },
+        { group: 'Burst', gen: 'particles', key: 'burstSpread', min: 0.01, max: 1, step: 0.01, label: 'Spread', fmt: v => v >= 0.99 ? 'full circle' : `${Math.round(v * 360)}°` },
+        { group: 'Burst', gen: 'particles', key: 'travel', min: 0, max: 2, step: 0.01, label: 'Travel' },
+        { group: 'Burst', gen: 'particles', key: 'travelSpread', min: 0, max: 1, step: 0.01, label: 'Travel variance' },
+        { group: 'Burst', gen: 'particles', key: 'dotSize', min: 0.002, max: 0.3, step: 0.001, label: 'Particle size' },
+        { group: 'Burst', gen: 'particles', key: 'dotSizeSpread', min: 0, max: 1, step: 0.01, label: 'Size variance' },
+        { group: 'Burst', gen: 'particles', key: 'streak', min: 0, max: 3, step: 0.05, label: 'Streak', fmt: v => v > 0 ? v.toFixed(2) : 'off (round)' },
+        { group: 'Burst', gen: 'particles', key: 'offsetX', min: -1.5, max: 1.5, step: 0.01, label: 'Offset X' },
+        { group: 'Burst', gen: 'particles', key: 'offsetY', min: -1.5, max: 1.5, step: 0.01, label: 'Offset Y' },
+        { group: 'Burst', gen: 'particles', key: 'gravity', min: -1, max: 1, step: 0.01, label: 'Gravity', fmt: v => v === 0 ? 'none' : (v > 0 ? `${v.toFixed(2)} down` : `${(-v).toFixed(2)} rises`) },
+        { group: 'Burst', gen: 'particles', key: 'brightJitter', min: 0, max: 1, step: 0.01, label: 'Brightness variance' },
+        { group: 'Finish', key: 'brightness', min: 0, max: 3, step: 0.05, label: 'Brightness' },
+        { group: 'Finish', key: 'blur', min: 0, max: 10, step: 0.1, label: 'Blur', fmt: v => v > 0 ? `${v.toFixed(1)}% of the sprite` : 'off' },
+        { group: 'Over its life', gen: ['shape', 'noise'], key: 'startScale', min: 0.05, max: 2, step: 0.01, label: 'Start size', seq: ['lifetime'] },
+        { group: 'Over its life', gen: ['shape', 'noise'], key: 'endScale', min: 0.05, max: 2, step: 0.01, label: 'End size', seq: ['lifetime'] },
+        { group: 'Over its life', key: 'fadeIn', min: 0, max: 1, step: 0.01, label: 'Fade in', seq: ['lifetime'], fmt: v => `${Math.round(v * 100)}%` },
+        { group: 'Over its life', key: 'fadeOut', min: 0, max: 1, step: 0.01, label: 'Fade out', seq: ['lifetime'], fmt: v => `${Math.round(v * 100)}%` },
+        { group: 'Over its life', gen: 'noise', key: 'erodeEnd', min: 0, max: 1, step: 0.01, label: 'Burn-away at death', seq: ['lifetime'] },
+        { group: 'Over its life', gen: 'particles', key: 'spawnSpread', min: 0, max: 0.9, step: 0.01, label: 'Spawn stagger', seq: ['lifetime'], fmt: v => v === 0 ? 'all at once' : `${Math.round(v * 100)}%` },
+        { group: 'Loop', key: 'pulse', min: 0, max: 1, step: 0.01, label: 'Twinkle', seq: ['loop'] },
+        { group: 'Loop', key: 'pulseCycles', min: 1, max: 8, step: 1, label: 'Twinkles per loop', seq: ['loop'], fmt: v => String(v) },
+        { group: 'Loop', gen: 'particles', key: 'burstCycles', min: 1, max: 8, step: 1, label: 'Respawns per loop', seq: ['loop'], fmt: v => String(v) },
+        { group: 'Variants', key: 'jitter', min: 0, max: 1, step: 0.01, label: 'Variation', seq: ['variants'] },
+    ];
+
+    function spBuild() {
+        if (sp.built) return;
+        sp.built = true;
+        const SG = TRLE.SpriteGen;
+        $('at-sp-slot').innerHTML = SG.SLOTS.map(s =>
+            `<option value="${s.key}">${s.name} (${s.id})${s.suggested ? ' · not in stock wad' : ''}</option>`).join('');
+        spFillLooks('shape');
+        const G = TRLE.AnimGradients || {};
+        $('at-sp-gradient').innerHTML = (TRLE.AnimGradientOrder || Object.keys(G))
+            .filter(k => G[k]).map(k => `<option value="${k}">${G[k].label}</option>`).join('');
+        let html = '', group = null;
+        for (const s of SP_SLIDERS) {
+            if (s.group !== group) {
+                if (group) html += '</div>';
+                group = s.group;
+                html += `<div class="at-sp-group" data-sp-group="${group}"><h4>${group}</h4>`;
+            }
+            html += `<div class="form-group" data-sp-row="${s.key}">
+                <label for="at-sp-p-${s.key}"><span data-sp-label="${s.key}"></span>: <span id="at-sp-v-${s.key}"></span></label>
+                <input type="range" id="at-sp-p-${s.key}" min="${s.min}" max="${s.max}" step="${s.step}" style="width:100%;">
+            </div>`;
+        }
+        $('at-sp-sliders').innerHTML = html + '</div>';
+        for (const s of SP_SLIDERS) $(`at-sp-p-${s.key}`).addEventListener('input', () => { spSyncLabels(); spQueue(); });
+
+        $('at-sp-slot').addEventListener('change', () => {
+            spApplySlot($('at-sp-slot').value);
+            spQueue(0);
+        });
+        $('at-sp-name').addEventListener('input', () => { sp.nameTouched = true; spSyncLabels(); });
+        $('at-sp-gen').addEventListener('change', () => {
+            // A new type starts from its first look, so the sliders it reveals
+            // hold values that were made for it.
+            const first = spFillLooks($('at-sp-gen').value);
+            $('at-sp-preset').value = first;
+            spSetControls(Object.assign(spReadParams(), SG.LOOKS[first].params));
+            spQueue(0);
+        });
+        $('at-sp-preset').addEventListener('change', () => {
+            const look = SG.LOOKS[$('at-sp-preset').value];
+            if (look) spSetControls(Object.assign(spReadParams(), look.params));
+            spQueue(0);
+        });
+        for (const id of ['at-sp-w', 'at-sp-h', 'at-sp-frames', 'at-sp-seq', 'at-sp-bg', 'at-sp-colour', 'at-sp-gradient', 'at-sp-shape', 'at-sp-body', 'at-sp-nstyle'])
+            $(id).addEventListener('change', () => { spSyncLabels(); spQueue(0); });
+        $('at-sp-crisp').addEventListener('change', () => { sp.crisp = $('at-sp-crisp').checked; spSyncLabels(); spQueue(0); });
+        $('at-sp-reroll').addEventListener('click', () => { sp.seed = (Math.random() * 1e9) >>> 0; spQueue(0); });
+        $('at-sp-fps').addEventListener('input', () => { $('at-sp-fps-val').textContent = $('at-sp-fps').value; });
+        $('at-sp-tint').addEventListener('input', () => spDrawCurrent());
+        $('at-sp-preview').addEventListener('click', () => { sp.paused = !sp.paused; });
+        $('at-sp-export').addEventListener('click', () => spExport());
+        $('at-sp-save').addEventListener('click', () => spSave());
+        $('at-sp-load').addEventListener('click', () => $('at-sp-file').click());
+        $('at-sp-file').addEventListener('change', async e => {
+            const f = e.target.files && e.target.files[0];
+            e.target.value = '';
+            if (f) await spLoadFile(f);
+        });
+    }
+
+    /* The Look list holds only the looks of one type. Returns the first key. */
+    function spFillLooks(gen) {
+        const looks = Object.entries(TRLE.SpriteGen.LOOKS).filter(([, l]) => (l.params.generator || 'shape') === gen);
+        $('at-sp-preset').innerHTML = looks.map(([k, l]) => `<option value="${k}">${l.label}</option>`).join('');
+        return looks.length ? looks[0][0] : '';
+    }
+
+    /* Everything the controls say, as a SpriteGen params bag. */
+    function spReadParams() {
+        const p = {
+            generator: $('at-sp-gen').value,
+            body: $('at-sp-body').value,
+            noiseStyle: +$('at-sp-nstyle').value,
+            slot: $('at-sp-slot').value,
+            width: +$('at-sp-w').value, height: +$('at-sp-h').value,
+            frames: +$('at-sp-frames').value,
+            sequence: $('at-sp-seq').value,
+            background: $('at-sp-bg').value,
+            colour: $('at-sp-colour').value,
+            gradient: $('at-sp-gradient').value,
+            shape: $('at-sp-shape').value,
+            seed: sp.seed >>> 0,
+            crisp: sp.crisp == null ? null : !!sp.crisp,
+        };
+        for (const s of SP_SLIDERS) p[s.key] = +$(`at-sp-p-${s.key}`).value;
+        return TRLE.SpriteGen.normalise(p);
+    }
+
+    /* The reverse: write a (normalised) params bag into the controls. */
+    function spSetControls(params) {
+        const p = TRLE.SpriteGen.normalise(params);
+        $('at-sp-slot').value = p.slot;
+        $('at-sp-w').value = p.width; $('at-sp-h').value = p.height;
+        $('at-sp-frames').value = p.frames;
+        $('at-sp-seq').value = p.sequence;
+        $('at-sp-bg').value = p.background;
+        $('at-sp-colour').value = p.colour;
+        if ([...$('at-sp-gradient').options].some(o => o.value === p.gradient)) $('at-sp-gradient').value = p.gradient;
+        $('at-sp-shape').value = p.shape;
+        if ($('at-sp-gen').value !== p.generator || !$('at-sp-preset').options.length) {
+            $('at-sp-gen').value = p.generator;
+            spFillLooks(p.generator);
+        }
+        $('at-sp-body').value = p.body;
+        $('at-sp-nstyle').value = String(p.noiseStyle);
+        for (const s of SP_SLIDERS) $(`at-sp-p-${s.key}`).value = p[s.key];
+        sp.seed = p.seed;
+        sp.crisp = p.crisp;
+        spSyncLabels();
+    }
+
+    /* Picking a slot sets what that slot expects (SPRITE-PLAN §1.2) and the
+       preview tint; the shape and its sliders are left alone. */
+    function spApplySlot(key) {
+        const SG = TRLE.SpriteGen, s = SG.slotByKey(key);
+        spSetControls(Object.assign(spReadParams(), SG.slotParams(key)));
+        $('at-sp-tint').value = s.tint;
+        if (!sp.nameTouched) $('at-sp-name').value = s.name.toLowerCase();
+        spSyncLabels();
+    }
+
+    function spFileBase() {
+        return ($('at-sp-name').value.trim() || 'sprites').replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 48) || 'sprites';
+    }
+    function spFrameName(base, i, N) {
+        return `${base}_${String(i).padStart(Math.max(2, String(N - 1).length), '0')}.png`;
+    }
+
+    /* Labels, visibility, notes and the budget: everything that is text. */
+    function spSyncLabels() {
+        const SG = TRLE.SpriteGen;
+        const p = spReadParams();
+        const slot = SG.slotByKey(p.slot);
+        for (const s of SP_SLIDERS) {
+            const show = (!s.gen || (Array.isArray(s.gen) ? s.gen.includes(p.generator) : s.gen === p.generator))
+                && (!s.shapes || s.shapes.includes(p.shape))
+                && (!s.seq || s.seq.includes(p.sequence));
+            const row = document.querySelector(`[data-sp-row="${s.key}"]`);
+            row.style.display = show ? '' : 'none';
+            document.querySelector(`[data-sp-label="${s.key}"]`).textContent =
+                typeof s.label === 'string' ? s.label : (s.label[p.shape] || Object.values(s.label)[0]);
+            const v = +$(`at-sp-p-${s.key}`).value;
+            $(`at-sp-v-${s.key}`).textContent = s.fmt ? s.fmt(v) : v.toFixed(2);
+        }
+        document.querySelectorAll('#at-sp-sliders .at-sp-group').forEach(g => {
+            g.style.display = [...g.querySelectorAll('[data-sp-row]')].some(r => r.style.display !== 'none') ? '' : 'none';
+        });
+        $('at-sp-frames').disabled = p.sequence === 'still';
+        if (p.sequence === 'still') $('at-sp-frames').value = 1;
+        $('at-sp-gradient-wrap').style.display = p.colour === 'gradient' ? '' : 'none';
+        $('at-sp-shape-wrap').style.display = p.generator === 'shape' ? '' : 'none';
+        $('at-sp-body-wrap').style.display = $('at-sp-nstyle-wrap').style.display = p.generator === 'noise' ? '' : 'none';
+        $('at-sp-tint-wrap').style.display = p.colour === 'grey' ? '' : 'none';
+        $('at-sp-slot-note').textContent = slot.note;
+
+        const note = $('at-sp-engine-note');
+        let txt = '', warn = false;
+        if (slot.stock && p.colour === 'grey') {
+            txt = 'Tomb Engine colours this slot\'s sprites itself, so they are made greyscale here. Preview tint shows roughly how that lands; it is not exported.';
+        } else if (slot.stock) {
+            txt = 'Tomb Engine colours this slot\'s sprites itself, so a colour baked in here gets tinted a second time in game. Greyscale is usually what you want for this slot.';
+            warn = true;
+        } else if (p.colour === 'grey') {
+            txt = 'Greyscale: give it colour from Lua with the particle\'s start and end colour.';
+        }
+        note.style.display = txt ? '' : 'none';
+        note.classList.toggle('notice-warning', warn);
+        note.classList.toggle('notice-info', !warn);
+        $('at-sp-engine-text').textContent = txt;
+
+        const auto = p.crisp == null;
+        const ss = SG.ssFor(p);
+        $('at-sp-crisp').checked = ss > 1;
+        $('at-sp-crisp-note').textContent = `(${ss > 1 ? `${ss}×${ss} samples per pixel` : 'off'}${auto ? ', auto: on at 64 px and below' : ''})`;
+
+        const b = SG.budget(p), base = spFileBase();
+        const bud = $('at-sp-budget');
+        bud.dataset.pixels = String(b.pixels);
+        const adds = b.frames === 1 ? `WadTool: add <code>${spFrameName(base, 0, 1)}</code>.`
+            : `WadTool: ${b.frames} adds, one at a time, in order: <code>${spFrameName(base, 0, b.frames)}</code> to <code>${spFrameName(base, b.frames - 1, b.frames)}</code>.`;
+        bud.innerHTML = `${b.frames} × ${b.width} × ${b.height} = <strong>${b.pixels.toLocaleString('en-US')} px</strong> in the level's sprite atlas. ${adds}`
+            + (b.classicOk ? '' : ' Over 256 px: too big for classic TR4 / TRNG levels, fine for Tomb Engine.');
+
+        const clear = p.background === 'clear';
+        $('at-sp-preview').classList.toggle('at-sp-clear', clear);
+        $('at-sp-strip').classList.toggle('at-sp-clear', clear);
+    }
+
+    function spQueue(delay = 110) {
+        if (sp.regenTimer) clearTimeout(sp.regenTimer);
+        sp.regenTimer = setTimeout(() => { sp.regenTimer = null; spRegenerate(); }, delay);
+    }
+
+    function spRegenerate() {
+        const p = spReadParams();
+        const t0 = performance.now();
+        let frames;
+        try { frames = TRLE.SpriteGen.generateFrames(p); }
+        catch (err) { $('at-sp-status').textContent = `Could not generate: ${err.message}`; return; }
+        sp.lastMs = performance.now() - t0;
+        sp.params = p;
+        sp.frames = frames;
+        if (sp.playIdx >= frames.length) sp.playIdx = 0;
+        $('at-sp-status').textContent = `${frames.length} frame${frames.length === 1 ? '' : 's'} generated in ${Math.round(sp.lastMs)} ms.`;
+        spRenderStrip();
+        spDrawCurrent();
+    }
+
+    /* Fit a frame into a square canvas, centred, nearest-neighbour when it is
+       blown up (a 9×36 spark shows its real pixels, as the anim preview does). */
+    function spDrawFit(ctx, D, f) {
+        const s = Math.min(D / f.width, D / f.height);
+        const w = Math.round(f.width * s), h = Math.round(f.height * s);
+        ctx.imageSmoothingEnabled = s < 1;
+        ctx.drawImage(f, Math.round((D - w) / 2), Math.round((D - h) / 2), w, h);
+    }
+
+    /* A greyscale sprite is multiplied by a colour in the engine; the preview
+       does the same with the tint, keeping the frame's own alpha. */
+    function spTinted(f) {
+        if (!sp.params || sp.params.colour !== 'grey') return f;
+        const tint = $('at-sp-tint').value;
+        if (tint.toLowerCase() === '#ffffff') return f;
+        const c = document.createElement('canvas');
+        c.width = f.width; c.height = f.height;
+        const g = c.getContext('2d');
+        g.drawImage(f, 0, 0);
+        g.globalCompositeOperation = 'multiply';
+        g.fillStyle = tint; g.fillRect(0, 0, c.width, c.height);
+        g.globalCompositeOperation = 'destination-in';
+        g.drawImage(f, 0, 0);
+        return c;
+    }
+
+    function spDrawCurrent() {
+        const cv = $('at-sp-preview'), ctx = cv.getContext('2d');
+        ctx.clearRect(0, 0, cv.width, cv.height);
+        const f = sp.frames[sp.playIdx % Math.max(1, sp.frames.length)];
+        if (f) spDrawFit(ctx, cv.width, spTinted(f));
+        document.querySelectorAll('#at-sp-strip canvas').forEach((c, i) => c.classList.toggle('current', i === sp.playIdx));
+    }
+
+    function spRenderStrip() {
+        const strip = $('at-sp-strip');
+        strip.textContent = '';
+        sp.frames.forEach((f, i) => {
+            const c = document.createElement('canvas');
+            c.width = c.height = 38;
+            c.title = `Frame ${i}`;
+            spDrawFit(c.getContext('2d'), 38, f);
+            c.addEventListener('click', () => { sp.playIdx = i; sp.paused = true; spDrawCurrent(); });
+            strip.appendChild(c);
+        });
+    }
+
+    function spStartPlayback() {
+        if (sp.playId) cancelAnimationFrame(sp.playId);
+        sp.lastTs = 0;
+        const step = ts => {
+            if (sp.frames.length > 1 && !sp.paused) {
+                const fps = +$('at-sp-fps').value || 15;
+                if (ts - sp.lastTs > 1000 / fps) {
+                    sp.lastTs = ts;
+                    sp.playIdx = (sp.playIdx + 1) % sp.frames.length;
+                    spDrawCurrent();
+                }
+            }
+            sp.playId = requestAnimationFrame(step);
+        };
+        sp.playId = requestAnimationFrame(step);
+    }
+
+    function spCleanup() {
+        if (sp.playId) { cancelAnimationFrame(sp.playId); sp.playId = null; }
+        if (sp.regenTimer) { clearTimeout(sp.regenTimer); sp.regenTimer = null; }
+        sp.frames = [];
+    }
+
+    function openSpriteModal() {
+        spBuild();
+        spCleanup();
+        if (!sp.params) {
+            // First open: a custom twinkle, the look in the author's reference sheet.
+            sp.seed = 1; sp.crisp = null;
+            spSetControls(Object.assign({}, TRLE.SpriteGen.DEFAULTS, TRLE.SpriteGen.LOOKS.twinkle.params));
+            $('at-sp-preset').value = 'twinkle';
+            spApplySlot('custom');
+        } else {
+            spSetControls(sp.params);
+        }
+        sp.paused = false; sp.playIdx = 0;
+        openModal('sprite');
+        spRegenerate();
+        spStartPlayback();
+    }
+
+    function spReadme(base, p) {
+        const SG = TRLE.SpriteGen, slot = SG.slotByKey(p.slot), N = sp.frames.length;
+        const play = { lifetime: 'once over each particle\'s life: frame 0 at birth, the last frame at death',
+                       loop: 'as a loop', variants: 'one frame picked at random per particle', still: 'as a single image' }[p.sequence];
+        const lines = [
+            `${base}: ${N} frame${N === 1 ? '' : 's'} at ${p.width} x ${p.height}, for ${slot.name} (${slot.id}).`,
+            '',
+            'In WadTool: open the sprite sequence ' + slot.name + ', remove the frames you are replacing,',
+            N === 1 ? `then add ${spFrameName(base, 0, 1)}.`
+                    : `then add these files ONE AT A TIME, in order: ${spFrameName(base, 0, N)}, ${spFrameName(base, 1, N)}, ... ${spFrameName(base, N - 1, N)}.`,
+            'Frame N is the Nth file you add.',
+            '',
+            `Made to play ${play}.`,
+            p.colour === 'grey'
+                ? (slot.stock ? 'Greyscale on purpose: Tomb Engine colours this slot\'s sprites itself.'
+                              : 'Greyscale: colour it from Lua with the particle\'s start and end colour.')
+                : 'Colour is baked in.',
+            p.background === 'black' ? 'Black background: meant for Additive blending, where black adds nothing.'
+                                     : 'Transparent background: meant for alpha blending.',
+            '',
+            `To change it later, open ${base}${SG.FILE_EXT} (or this ZIP) with Load in the Atlas Tool's Sprites window.`,
+        ];
+        return lines.join('\r\n') + '\r\n';
+    }
+
+    async function spExport() {
+        if (sp.regenTimer) { clearTimeout(sp.regenTimer); sp.regenTimer = null; spRegenerate(); }
+        if (!sp.frames.length) return;
+        const SG = TRLE.SpriteGen, p = sp.params, base = spFileBase(), N = sp.frames.length;
+        const btn = $('at-sp-export');
+        btn.disabled = true;
+        try {
+            const zip = new JSZip();
+            for (let i = 0; i < N; i++) zip.file(spFrameName(base, i, N), await TRLE.Engine.canvasToBlob(sp.frames[i]));
+            zip.file('README.txt', spReadme(base, p));
+            zip.file(base + SG.FILE_EXT, JSON.stringify(SG.toFile(base, p), null, 2));
+            downloadBlob(await zip.generateAsync({ type: 'blob' }), `${base}.zip`);
+            showToast(`Exported ${N} frame${N === 1 ? '' : 's'} as ${base}.zip`, 'success');
+        } catch (err) {
+            showToast(`Export failed: ${err.message}`, 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    function spSave() {
+        const SG = TRLE.SpriteGen, base = spFileBase();
+        const blob = new Blob([JSON.stringify(SG.toFile(base, spReadParams()), null, 2)], { type: 'application/json' });
+        downloadBlob(blob, base + SG.FILE_EXT);
+    }
+
+    /* A .atlassprites.json, or a ZIP this window exported (it carries one). */
+    async function spLoadFile(file) {
+        const SG = TRLE.SpriteGen;
+        try {
+            let text;
+            if (/\.zip$/i.test(file.name) || file.type === 'application/zip') {
+                const zip = await JSZip.loadAsync(file);
+                const entry = Object.values(zip.files).find(f => !f.dir && f.name.endsWith(SG.FILE_EXT));
+                if (!entry) throw new Error('this ZIP holds no ' + SG.FILE_EXT + ' file');
+                text = await entry.async('string');
+            } else {
+                text = await file.text();
+            }
+            spApplyFileText(text);
+        } catch (err) {
+            showToast(`Could not open ${file.name}: ${err.message}`, 'error');
+        }
+    }
+    function spApplyFileText(text) {
+        const got = TRLE.SpriteGen.fromFile(JSON.parse(text));
+        spSetControls(got.params);
+        $('at-sp-name').value = got.name;
+        sp.nameTouched = true;
+        spSyncLabels();
+        spRegenerate();
+        showToast(`Opened ${got.name}` + (got.count > 1 ? ` (the first of ${got.count} sequences)` : ''), 'success');
+    }
+
     function openAnimModal(editGroup) {
         if (!state.tileSize) { showToast('Slice or create an atlas first', 'info'); return; }
         anCleanup();
@@ -6134,32 +10944,40 @@ window.TRLE = window.TRLE || {};
             if (!members.length) { showToast('Animation not found', 'error'); return; }
             const m = members[0].anim;
             an.editGroup = editGroup;
+            /* Where the frames are now. A clean block keeps its width in the
+               Frames per row box; a legacy run (frames in reading order) shows
+               the default. Update keeps every frame on its slot unless the
+               frame count or the width changes (anAdd). */
+            {
+                const cols = Math.max(1, state.cols);
+                const slots = members.map(e => slotOf(e.id));
+                const r0 = Math.min(...slots.map(sl => Math.floor(sl / cols))), c0 = Math.min(...slots.map(sl => sl % cols));
+                const w = Math.max(...slots.map(sl => sl % cols)) - c0 + 1;
+                const block = slots.every((sl, i) => sl === (r0 + Math.floor(i / w)) * cols + c0 + (i % w));
+                an.editShape = { slots, r0, c0, width: block ? w : null };
+                an.perRowAuto = !block; an.perRowTouched = false;
+                if (block) $('at-anim-perrow').value = w;
+            }
             $('at-anim-title').textContent = 'Edit Animation';
             $('at-anim-add').textContent = 'Update';
             anSetControls(m.preset, m.params, m.single, m.total, m.seed, m.fps);
-            // Restore the stored colour (gradient name + stops + adjustments).
-            // gradient === null means "custom" (edited stops); undefined means a
-            // legacy anim with no stored gradient → fall back to the preset's.
-            // Deep-copy the stops so editing this session doesn't mutate the
-            // element's stored params until the user clicks Update.
-            const gname = m.gradient === undefined ? TRLE.AnimPresets_gradient(m.preset) : m.gradient;
-            const stops = m.params.palette
-                ? m.params.palette.map(s => ({ pos: s.pos, color: s.color.slice() }))
-                : TRLE.AnimGradients_stops(gname || TRLE.AnimPresets_gradient(m.preset));
-            an.color = { gradient: gname, stops, adjust: Object.assign(anColorIdentity(), m.params.colorAdjust || {}) };
-            an.selStop = null;
-            $('at-anim-col-spread').value = Math.round((m.params.equalize || 0) * 100);
-            anColorSyncControls();
-            anStopSyncControls();
-            anRenderStops();
-            anDrawRamp();
+            anRestoreColor(m.preset, m.params, m.gradient);
+            anLayerWrite(m.layer2 || null);
             anWriteGlow(m.glow);   // restore the group's stored glow recipe
+            anOvPopulateTiles();
+            anOvWrite(m.overlay || null);
+            anStillWrite(m.still || null);
         } else {
             an.editGroup = null;
+            an.editShape = null; an.perRowAuto = true; an.perRowTouched = false;
             $('at-anim-title').textContent = 'Animated Texture';
             if (!$('at-anim-preset').value) $('at-anim-preset').value = TRLE.AnimPresetOrder[0];
             anApplyPreset($('at-anim-preset').value);
+            anLayerWrite(null);  // one layer, editing layer 1
             anWriteGlow(null);   // default: glow off
+            anOvPopulateTiles();
+            anOvWrite(null);     // reset, or the next animation inherits this one's overlay
+            anStillWrite(null);  // likewise the emissive-only static texture
             // Crisp pays for itself at small tile sizes (measurably less
             // per-pixel snow, roughly twice the surviving colours at 32px) and
             // costs little there, so default it on for the low-res builders and
@@ -6170,6 +10988,7 @@ window.TRLE = window.TRLE || {};
         anCrispNote();
         anPreviewNote();
         anFramesVisibility();
+        anSyncGenerator();
         anSetTab('shape');
         openModal('anim');
         anRegenerate();
@@ -6178,6 +10997,7 @@ window.TRLE = window.TRLE || {};
     function setupAnimModal() {
         anPopulatePresets();
         anPopulateGradients();
+        anPopulateDirs();
         document.querySelectorAll('#at-modal-anim .at-anim-tab').forEach(b =>
             b.addEventListener('click', () => anSetTab(b.dataset.animTab)));
         // Colour tab
@@ -6229,13 +11049,26 @@ window.TRLE = window.TRLE || {};
             anColorMarkCustom(); anStopSyncControls(); anRenderStops(); anDrawRamp(); anScheduleRegen();
         });
         $('at-anim-preset').addEventListener('change', () => { anApplyPreset($('at-anim-preset').value); anRegenerate(); });
+        // Particle controls. Every one of them re-bakes the frames (there is no
+        // cheaper partial path the way the Glow tab has), so they all debounce.
+        anPSliders.forEach(([, id]) => {
+            $(id).addEventListener('input', () => {
+                anParticleSyncLabels(); anParticleNote(); anParticleDepthNote(); anParticleTwinkleNote(); anScheduleRegen();
+            });
+        });
+        $('at-anim-p-dir').addEventListener('change', () => { anParticleNote(); anRegenerate(); });
+        anGSliders.forEach(([k]) => anG(k).addEventListener('input', () => {
+            anGlitchSyncLabels(); anGlitchNote(); anScheduleRegen();
+        }));
         $('at-anim-output').addEventListener('change', () => { anFramesVisibility(); anRegenerate(); });
+        $('at-anim-perrow').addEventListener('input', () => { an.perRowAuto = false; an.perRowTouched = true; anPerRowSync(); });
+        $('at-anim-perrow').addEventListener('change', () => { $('at-anim-perrow').value = anPerRow(); anPerRowSync(); });
         $('at-anim-style').addEventListener('change', anRegenerate);
         ['at-anim-scale', 'at-anim-speed', 'at-anim-octaves', 'at-anim-gain', 'at-anim-warp', 'at-anim-contrast',
          'at-anim-flowspeed', 'at-anim-stretch'].forEach(id =>
             $(id).addEventListener('input', () => { anSyncLabels(); anScheduleRegen(); }));
         $('at-anim-flowdir').addEventListener('change', anRegenerate);
-        $('at-anim-frames').addEventListener('input', anScheduleRegen);
+        $('at-anim-frames').addEventListener('input', () => { anParticleNote(); anParticleTwinkleNote(); anGlitchNote(); anDurationNote(); anScheduleRegen(); });
         $('at-anim-frames').addEventListener('change', () => {
             $('at-anim-frames').value = TRLE.AnimGen.clampFrames($('at-anim-frames').value);
             anRegenerate();
@@ -6251,13 +11084,59 @@ window.TRLE = window.TRLE || {};
 
         // Glow tab — sliders/selects re-bake only the emissive strip (not frames).
         ['at-anim-glow-enable', 'at-anim-glow-pulse'].forEach(id =>
-            $(id).addEventListener('change', () => { anGlowSyncVisibility(); anScheduleGlowRegen(); }));
+            $(id).addEventListener('change', () => {
+                anGlowSyncVisibility();
+                // With a static diffuse selected, turning the glow on or off
+                // changes the DIFFUSE too, so that needs the frames rebuilt.
+                if ($('at-anim-still-mode').value === 'still') { anStillSync(); anScheduleRegen(); }
+                else anScheduleGlowRegen();
+            }));
+        ['at-anim-still-mode', 'at-anim-still-tile', 'at-anim-still-drive'].forEach(id =>
+            $(id).addEventListener('change', () => { anStillSync(); anScheduleRegen(); }));
+
+        // Second animated layer.
+        $('at-anim-l2-enable').addEventListener('change', () => {
+            // Ticked for the first time: layer 2 exists straight away (steam),
+            // so the preview shows two layers before anyone opens layer 2.
+            if ($('at-anim-l2-enable').checked && !an.layer.snap[2]) an.layer.snap[2] = anLayerDefault();
+            // Turning it off while layer 2 is in the tabs: park it and go back
+            // to layer 1, so the tabs never describe a layer that is not used.
+            if (!$('at-anim-l2-enable').checked && an.layer.active === 2) {
+                an.layer.snap[2] = anLayerCapture();
+                anLayerLoad(an.layer.snap[1]);
+                an.layer.active = 1;
+            }
+            anLayerSync(); anRegenerate();
+        });
+        $('at-anim-l2-edit1').addEventListener('click', () => anLayerSwitch(1));
+        $('at-anim-l2-edit2').addEventListener('click', () => anLayerSwitch(2));
+        $('at-anim-l2-z').addEventListener('change', () => { anLayerSync(); anScheduleRegen(); });
+        $('at-anim-l2-opacity').addEventListener('input', () => { anLayerSync(); anScheduleRegen(); });
         ['at-anim-glow-mode', 'at-anim-glow-colortype'].forEach(id =>
             $(id).addEventListener('change', () => { anGlowSyncVisibility(); anScheduleGlowRegen(); }));
         $('at-anim-glow-tint').addEventListener('input', anScheduleGlowRegen);
         ['at-anim-glow-threshold', 'at-anim-glow-hue', 'at-anim-glow-huewidth', 'at-anim-glow-strength',
          'at-anim-glow-softness', 'at-anim-glow-feather', 'at-anim-glow-pulse-cycles', 'at-anim-glow-pulse-depth'].forEach(id =>
             $(id).addEventListener('input', () => { anGlowSyncLabels(); anScheduleGlowRegen(); }));
+
+        // Overlay tab. Everything re-bakes the frames, so it all debounces.
+        ['at-anim-ov-enable', 'at-anim-ov-mode', 'at-anim-ov-sample', 'at-anim-ov-z',
+         'at-anim-ov-selinvert', 'at-anim-ov-blend', 'at-anim-ov-tile', 'at-anim-ov-dfill'].forEach(id =>
+            $(id).addEventListener('change', () => { anOvSyncVisibility(); anScheduleRegen(); }));
+        $('at-anim-ov-target').addEventListener('input', anScheduleRegen);
+        ['tolerance', 'hue', 'huewidth', 'threshold', 'softness', 'feather', 'opacity',
+         'dlevel', 'dhard', 'ddetail', 'dcontrast'].forEach(k =>
+            $('at-anim-ov-' + k).addEventListener('input', () => { anOvSyncLabels(); anScheduleRegen(); }));
+        // The moving level, and the shared organic panel as its FIFTH caller
+        // (Wang, Single Tiles, Borders & Corners, Fade, here). Built through the
+        // helper, never by copying markup.
+        ['dir', 'curve'].forEach(k =>
+            $('at-anim-lv-' + k).addEventListener('change', () => { anLvSync(); anScheduleRegen(); }));
+        ['low', 'high', 'cycles', 'soft'].forEach(k =>
+            $('at-anim-lv-' + k).addEventListener('input', () => { anOvSyncLabels(); anScheduleRegen(); }));
+        anOrg = wireOrgPanel('at-anorg', anScheduleRegen);
+        attachTilePicker($('at-anim-ov-tile'), { title: 'Overlay texture' });
+        attachTilePicker($('at-anim-still-tile'), { title: 'Static texture' });
 
         $('at-anim-add').addEventListener('click', anAdd);
     }
@@ -6292,19 +11171,19 @@ window.TRLE = window.TRLE || {};
     function transSetCells(layout, style) {
         if (typeof style === 'boolean') style = style ? 'sharp' : 'round';
         const sharp = style === 'sharp', seam = style === 'seamless';
-        const C = { NW: seam ? 'CornerBottomRight' : sharp ? 'SlopeBR' : 'DiagonalBottomRight',   // island (outer) corners
-                    NE: seam ? 'CornerBottomLeft'  : sharp ? 'SlopeBL' : 'DiagonalBottomLeft',
-                    SW: seam ? 'CornerTopRight'    : sharp ? 'SlopeTR' : 'DiagonalTopRight',
-                    SE: seam ? 'CornerTopLeft'     : sharp ? 'SlopeTL' : 'DiagonalTopLeft' };
-        const H = { NW: seam ? 'NotchBottomRight'  : sharp ? 'SlopeTL' : 'BottomRightFull',       // hole (inner) corners
-                    NE: seam ? 'NotchBottomLeft'   : sharp ? 'SlopeTR' : 'BottomLeftFull',
-                    SW: seam ? 'NotchTopRight'     : sharp ? 'SlopeBL' : 'TopRightFull',
-                    SE: seam ? 'NotchTopLeft'      : sharp ? 'SlopeBR' : 'TopLeftFull' };
+        const sm = m => seam ? seamlessModeOf(m) : m;
+        const C = { NW: sharp ? 'SlopeBR' : sm('DiagonalBottomRight'),   // island (outer) corners
+                    NE: sharp ? 'SlopeBL' : sm('DiagonalBottomLeft'),
+                    SW: sharp ? 'SlopeTR' : sm('DiagonalTopRight'),
+                    SE: sharp ? 'SlopeTL' : sm('DiagonalTopLeft') };
+        const H = { NW: sharp ? 'SlopeTL' : sm('BottomRightFull'),       // hole (inner) corners
+                    NE: sharp ? 'SlopeTR' : sm('BottomLeftFull'),
+                    SW: sharp ? 'SlopeBL' : sm('TopRightFull'),
+                    SE: sharp ? 'SlopeBR' : sm('TopLeftFull') };
         // Edge cells go through the corner builder too in 'seamless' — see the
         // Edge* entries in CORNER_BITS for why half-converting is worse than not
         // converting at all.
-        const E = { T: seam ? 'EdgeTop'    : 'TopFull',    B: seam ? 'EdgeBottom' : 'BottomFull',
-                    L: seam ? 'EdgeLeft'   : 'LeftFull',   R: seam ? 'EdgeRight'  : 'RightFull' };
+        const E = { T: sm('TopFull'), B: sm('BottomFull'), L: sm('LeftFull'), R: sm('RightFull') };
         // `blocks` = the rectangles that are actually one connected terrain patch.
         // complete5 PACKS two independent patches (island 3×3, hole 2×2) plus two
         // spare plain tiles into one 5-wide atlas block, so cells that merely sit
@@ -6602,8 +11481,8 @@ window.TRLE = window.TRLE || {};
         tr.baseId = baseId;
         tr.overlayId = overlayId;
         tr.overlayGeom = { rot: 0, flipH: false, flipV: false };
-        $('at-tr-base-no').textContent    = indexOf(baseId) + 1;
-        $('at-tr-overlay-no').textContent = indexOf(overlayId) + 1;
+        $('at-tr-base-no').textContent    = numberOf(baseId);
+        $('at-tr-overlay-no').textContent = numberOf(overlayId);
 
         // Same reason as the lit preview: a reused 96px canvas, and a base tile
         // may have alpha. trDrawOverlayThumb below already clears.
@@ -6632,7 +11511,16 @@ window.TRLE = window.TRLE || {};
         if (tr.maskMode === 'custom') return softenMask(tr.customMask, P);
         const pivot    = parseInt($('at-tr-pivot').value) / 100;
         const hardness = parseInt($('at-tr-edgehard').value) / 100;
-        return buildTopologyMask(P, tr.activeMode, pivot, hardness, trSingleOrgParams());
+        return buildTopologyMask(P, trSingleMode(tr.activeMode), pivot, hardness, trSingleOrgParams());
+    }
+
+    /* The mode a Single-tab direction button actually emits. The buttons keep their
+       legacy names (and the checkbox defaults off), so an unticked modal produces
+       exactly the tiles it always did; ticked, the corner and *Full buttons swap to
+       the corner-state family through the same table the Full Set uses. */
+    function trSingleMode(mode) {
+        const cb = $('at-tr-seamcorners');
+        return cb && cb.checked ? seamlessModeOf(mode) : mode;
     }
 
     function trSetMaskSource(mode) {
@@ -6783,6 +11671,7 @@ window.TRLE = window.TRLE || {};
             });
             dirs.appendChild(btn);
         });
+        $('at-tr-seamcorners').addEventListener('change', trPreview);
         $('at-tr-dirs-all').addEventListener('click', () =>
             dirs.querySelectorAll('.at-dir-btn').forEach(b => b.classList.add('active')));
         $('at-tr-dirs-none').addEventListener('click', () =>
@@ -6891,7 +11780,8 @@ window.TRLE = window.TRLE || {};
             const hardness = parseInt($('at-tr-edgehard').value) / 100;
             const sorg     = trSingleOrgParams();
 
-            modes.forEach(mode => {
+            modes.forEach(btnMode => {
+                const mode = trSingleMode(btnMode);
                 state.elements.push({
                     id: state.nextId++,
                     kind: 'transition',
@@ -6951,8 +11841,8 @@ window.TRLE = window.TRLE || {};
         exitPickMode();
         wang.baseId = baseId;
         wang.overlayId = overlayId;
-        $('at-wang-base-no').textContent    = indexOf(baseId) + 1;
-        $('at-wang-overlay-no').textContent = indexOf(overlayId) + 1;
+        $('at-wang-base-no').textContent    = numberOf(baseId);
+        $('at-wang-overlay-no').textContent = numberOf(overlayId);
         openModal('wang');
         wangPreview();
     }
@@ -7656,7 +12546,7 @@ window.TRLE = window.TRLE || {};
 
     const BSET_MODES = ['auto', 'rot', 'mirh', 'mirv', 'tile'];
     const BSET_MODE_META = {
-        auto: { badge: '⚙',  name: 'Generated from its own mask' },
+        auto: { badge: '⚙',  name: 'Built from its own mask' },
         rot:  { badge: '↻',  name: 'Rotated copy of the canonical slot' },
         mirh: { badge: '↔',  name: 'Horizontal mirror of the partner slot' },
         mirv: { badge: '↕',  name: 'Vertical mirror of the partner slot' },
@@ -7697,11 +12587,11 @@ window.TRLE = window.TRLE || {};
         const origami = baseId === overlayId;
         const titleSrc = $('at-bset-title-src'), origamiHint = $('at-bset-origami-hint');
         if (origami) {
-            if (titleSrc) titleSrc.textContent = `Tile ${indexOf(baseId) + 1} (origami, one texture)`;
+            if (titleSrc) titleSrc.textContent = `Tile ${numberOf(baseId)} (origami, one texture)`;
             if (origamiHint) origamiHint.style.display = '';
         } else {
             if (titleSrc) titleSrc.innerHTML =
-                `Tile <span id="at-bset-base-no">${indexOf(baseId) + 1}</span> + trim Tile <span id="at-bset-overlay-no">${indexOf(overlayId) + 1}</span>`;
+                `Tile <span id="at-bset-base-no">${numberOf(baseId)}</span> + trim Tile <span id="at-bset-overlay-no">${numberOf(overlayId)}</span>`;
             if (origamiHint) origamiHint.style.display = 'none';
         }
         openModal('bset');
@@ -7758,6 +12648,8 @@ window.TRLE = window.TRLE || {};
             cell.appendChild(badge);
             if (s.mode === 'tile') {
                 const sel = document.createElement('select');
+                // A unique id per slot, because the picker derives its ids from it.
+                sel.id = 'at-bset-slottile-' + key;
                 sel.style.cssText = 'width:100%;margin-top:2px;font-size:0.7rem;';
                 state.elements.forEach((e2, i2) => {
                     const o = document.createElement('option');
@@ -7769,6 +12661,7 @@ window.TRLE = window.TRLE || {};
                 sel.addEventListener('change', () => { s.srcId = parseInt(sel.value); bsetPreview(); });
                 sel.addEventListener('click', e => e.stopPropagation());
                 cell.appendChild(sel);
+                attachTilePicker(sel, { compact: true, title: `Slot ${key} texture` });
             }
             c.addEventListener('click', () => {
                 // 'C' (frame) and bits 0 (lines) have no trim — only auto/tile make sense.
@@ -7877,6 +12770,793 @@ window.TRLE = window.TRLE || {};
                 showToast(`Added ${n}-tile border set to the atlas`, 'success');
             });
         });
+    }
+
+    /* ============ PUSHABLE MARKINGS (PUSH-MARKINGS-PLAN phase 5) ============
+       The scrape marks a pushed block leaves, as a set built from ONE tile: the
+       track geometry is TRLE.PushMarks (js/pushmarks.js, its note is
+       docs/notes/pushmarks.md). Each generated element is a kind:'transition'
+       with base = overlay = the source tile and an `el.push` recipe
+       ({ v, bits, variant, p }), tagged with one block, re-rendered by
+       refreshTransitions like a border set.
+
+       Its MAPS are not a transition's. `deriveMaps` composites the parents' maps
+       through a mask, and a mark over its own texture is lerp(a, a, m) = a, so
+       the parents' maps cannot show a mark at all (plan 1.1). They are generated
+       from the marked diffuse with the source's material, plus `reliefPaint`
+       carving the mark in as a groove, with `base` = the unmarked tile so a pale
+       scrape stops reading as a ridge (phase 3: +42.8 without it).
+
+       The geometry costs 1.3 s a set at 1024 and refreshTransitions runs from
+       ~30 places, so each slot's 8-bit alpha is cached by its geometry (not its
+       colour, blend or depth, which recompose without a re-render). */
+    const PUSH_GEOM = ['seed', 'footprint', 'width', 'lines', 'lineWidth', 'strength', 'corner', 'cap', 'struggle', 'ring', 'kind', 'length', 'wobbleStrength', 'wobbleAmount', 'grain'];
+    const PUSH_BLENDS = { normal: 'source-over', multiply: 'multiply', screen: 'screen', overlay: 'overlay', additive: 'lighter' };
+    /* Surface presets: a starting point per floor, each value a control below.
+       Depth 0.6, not phase 3's 0.4: the carve scales with the mark's alpha and
+       the shipped marks are partly transparent (strength, bite). Measured on a
+       straight run at 256, height stroke - ring at 0.4 / 0.6 / 0.8: Stonetiles
+       -60 / -92 / -119, Bricks -64 / -85 / -94, Sand -65 / -98 / -131; Bricks'
+       normal ratio peaks at 0.4-0.6 (1.56) and falls after, AO saturates by 0.8. */
+    const PUSH_SURFACES = {
+        tiles:  { label: 'Scratched tiles', footprint: 'square', width: 0.8, lines: 9, lineWidth: 1.6, strength: 0.85,
+                  struggle: 0.35, corner: 'arc', cap: 'blunt', ring: false, color: [226, 214, 190], blend: 'normal', depth: 0.6,
+                  style: 'none', styleAmount: 0, grain: 0.3, wobbleAmount: 1 },
+        wood:   { label: 'Wood grooves', footprint: 'square', width: 0.7, lines: 6, lineWidth: 2.4, strength: 0.8,
+                  struggle: 0.15, corner: 'arc', cap: 'fade', ring: false, color: [58, 40, 26], blend: 'multiply', depth: 0.8,
+                  style: 'none', styleAmount: 0, grain: 0.35, wobbleAmount: 1 },
+        polish: { label: 'Scuffed polish', footprint: 'round', width: 0.85, lines: 14, lineWidth: 3.2, strength: 0.45,
+                  struggle: 0.1, corner: 'arc', cap: 'fade', ring: false, color: [255, 250, 240], blend: 'screen', depth: 0.3,
+                  style: 'none', styleAmount: 0, grain: 0.15, wobbleAmount: 1 },
+        // Phase 8: the floor itself moves; the scratches are faint.
+        sand:   { label: 'Sand', footprint: 'square', width: 0.8, lines: 5, lineWidth: 2.2, strength: 0.3,
+                  struggle: 0.5, corner: 'arc', cap: 'fade', ring: false, color: [236, 214, 170], blend: 'screen', depth: 0.25,
+                  style: 'sand', styleAmount: 0.7, grain: 0.25, wobbleAmount: 1 },
+        snow:   { label: 'Snow', footprint: 'square', width: 0.75, lines: 4, lineWidth: 2.5, strength: 0.2,
+                  struggle: 0.3, corner: 'arc', cap: 'fade', ring: false, color: [205, 215, 230], blend: 'multiply', depth: 0.15,
+                  style: 'snow', styleAmount: 0.8, grain: 0.2, wobbleAmount: 1 },
+        /* Phase 9: drips, a second kind on the same set (TRLE.PushMarks renderDrips).
+           They stand OUT of the relief (pushMaps flips the depth's sign), and each
+           preset carries its liquid's material, so a drip is glossy where the wall is
+           not. The other controls a drip does not use are hidden, not reset. */
+        oil:    { kind: 'drips', label: 'Oil', width: 0.7, lines: 7, lineWidth: 3, strength: 0.92, struggle: 0.2, length: 0.6,
+                  color: [26, 22, 18], blend: 'normal', depth: 0.35, material: 'liquid:oil', style: 'none', styleAmount: 0 },
+        blood:  { kind: 'drips', label: 'Blood', width: 0.6, lines: 5, lineWidth: 3.4, strength: 0.9, struggle: 0.3, length: 0.7,
+                  color: [96, 8, 10], blend: 'normal', depth: 0.3, material: 'liquid:blood', style: 'none', styleAmount: 0 }
+    };
+    const pushKindOf = p => (p && p.kind === 'drips') ? 'drips' : 'tracks';
+    const pushCache = new Map();          // geometry key -> Uint8 alpha, oldest first
+    const pushMarksCache = new Map();     // geometry key + colour -> { marks, painted }
+    const PUSH_CACHE_BYTES = 96 << 20;
+    function pushCacheTrim(map, per) {
+        while (map.size > Math.max(8, Math.floor(PUSH_CACHE_BYTES / per))) map.delete(map.keys().next().value);
+    }
+    /* One slot's marks at size S: { a8, marks, mask?, painted }. `wantMask` builds
+       the relief mask too (the maps need it, the diffuse does not). */
+    function pushSlot(p, bits, variant, S, wantMask, markCanvas) {
+        const key = [S, bits, variant | 0, ...PUSH_GEOM.map(k => p[k])].join('|');
+        let a8 = pushCache.get(key);
+        if (a8) { pushCache.delete(key); pushCache.set(key, a8); }
+        else {
+            const o = { size: S };
+            // Only what the recipe has: a set saved before a field existed takes its default.
+            PUSH_GEOM.forEach(k => { if (p[k] != null) o[k] = p[k]; });
+            a8 = TRLE.PushMarks.renderSlot(bits, o, variant | 0).a8;
+            pushCache.set(key, a8);
+            pushCacheTrim(pushCache, S * S);
+        }
+        if (markCanvas) {
+            /* Marks from an atlas tile: not cached, because that tile can be edited
+               and nothing versions a canvas (a stale mark would be the bug). */
+            const m = (markCanvas.width === S && markCanvas.height === S) ? markCanvas : resizeCanvas(markCanvas, S, S);
+            const tex = m.getContext('2d').getImageData(0, 0, S, S).data;
+            const L = TRLE.PushMarks.layers(a8, S, p.color, false, tex);
+            return { a8, marks: L.marks, painted: L.painted, mask: wantMask && L.painted ? TRLE.PushMarks.maskOf(a8, S) : null };
+        }
+        const ck = key + '|' + p.color.join(',');
+        let L = pushMarksCache.get(ck);
+        if (L) { pushMarksCache.delete(ck); pushMarksCache.set(ck, L); }
+        else {
+            L = TRLE.PushMarks.layers(a8, S, p.color, false);
+            pushMarksCache.set(ck, L);
+            pushCacheTrim(pushMarksCache, S * S * 4);
+        }
+        return { a8, marks: L.marks, painted: L.painted, mask: wantMask && L.painted ? TRLE.PushMarks.maskOf(a8, S) : null };
+    }
+    /* The marks laid on `baseCanvas` at S: { canvas, slot, base }. `markCanvas`:
+       the atlas tile the marks are cut from (phase 6), else the flat colour. */
+    /* `hand` (phase 7): { px, blend, opacity }, the hand strokes' pixels for this
+       tile, laid over the marks the way Draw lays its layer. `mask` / `painted` are
+       what the relief and the mark material follow: the marks, plus the hand
+       strokes when `p.handCarve` is not false. Without hand strokes they are the
+       slot's own, so phase 5 and 6 are untouched. */
+    function pushCompose(baseCanvas, p, bits, variant, S, wantMask, markCanvas, hand) {
+        const base0 = (baseCanvas.width === S && baseCanvas.height === S) ? baseCanvas : resizeCanvas(baseCanvas, S, S);
+        /* A floor style (phase 8) changes the FLOOR, before any mark: so the marks sit
+           on it, and the relief's unmarked tile (`base`, which must equal the diffuse
+           off the mask) is the styled floor too. Its relief rides on reliefPaint. */
+        const sf = pushStyleField(p, bits, variant, S);
+        const base = sf ? TRLE.PushMarks.styleBase(base0, sf) : base0;
+        const slot = pushSlot(p, bits, variant, S, wantMask, markCanvas);
+        /* Mark texture (phase 11, beta feedback: "reuse noise... using the same
+           paths"): the geometry is UNCHANGED (still o.wobbleStrength / wobbleAmount /
+           struggle-shaped strokes, still the same a8 coverage), only the FILL differs.
+           `slot.marks`'s own alpha channel IS that coverage (layers() writes a8 into
+           it), so it doubles as the mask applySurfaceNoise already takes for Build
+           Pattern's mortar -- no new geometry, no new mask. Absent or 'strokes', this
+           is exactly phase 5's route: byte-identical. */
+        const canvas = (p.markTexture === 'noise')
+            ? (() => { const out = cloneCanvas(base);
+                       const NP = NOISE_PRESETS[p.noisePreset] || NOISE_PRESETS.scuffs;
+                       applySurfaceNoise(out, S, Object.assign({}, NP, { strength: (p.strength || 0) * 100, seed: p.seed }), slot.marks);
+                       return out; })()
+            : TRLE.PushMarks.compose(base, slot, PUSH_BLENDS[p.blend] || 'source-over');
+        let mask = slot.mask, painted = slot.painted, relBase = base;
+        const lay = cv => {
+            const g = cv.getContext('2d');
+            g.save();
+            g.globalAlpha = hand.opacity == null ? 1 : hand.opacity;
+            g.globalCompositeOperation = hand.blend || 'source-over';
+            g.drawImage(hand.px, 0, 0, S, S);
+            g.restore();
+        };
+        if (hand && hand.px) {
+            lay(canvas);
+            /* Not marks: the relief's "unmarked" tile must carry them too. reliefPaint
+               reads its grey from `base` outright and needs it equal to the diffuse
+               wherever the mask is 0, or strokes left out of the mask vanish from the
+               height map instead of reading as paint. */
+            if (p.handCarve === false) { relBase = cloneCanvas(base); lay(relBase); }
+            if (wantMask && p.handCarve !== false) {
+                const hp = hand.px.width === S ? hand.px : resizeCanvas(hand.px, S, S);
+                const ha = hp.getContext('2d').getImageData(0, 0, S, S).data, op = hand.opacity == null ? 1 : hand.opacity;
+                const um = document.createElement('canvas'); um.width = um.height = S;
+                const ug = um.getContext('2d'), id = ug.createImageData(S, S);
+                let n = 0;
+                for (let i = 0; i < S * S; i++) {
+                    const a = Math.max(slot.a8[i], Math.round(ha[i * 4 + 3] * op));
+                    if (a) n++;
+                    id.data[i * 4] = id.data[i * 4 + 1] = id.data[i * 4 + 2] = a; id.data[i * 4 + 3] = 255;
+                }
+                ug.putImageData(id, 0, 0);
+                if (n) { mask = um; painted = n; }
+            }
+        }
+        return { canvas, slot, base: relBase, mask, painted, field: wantMask && sf ? TRLE.PushMarks.styleRelief(sf, S) : null };
+    }
+    /* The recipe's floor-style field for one slot, or null (no style, or amount 0). */
+    function pushStyleField(p, bits, variant, S) {
+        if (!p.style || p.style === 'none' || !(p.styleAmount > 0)) return null;
+        const o = { size: S, style: p.style, styleAmount: p.styleAmount };
+        ['seed', 'width', 'corner', 'cap', 'footprint', 'struggle', 'lines', 'lineWidth', 'strength', 'ring', 'kind'].forEach(k => { o[k] = p[k]; });
+        return TRLE.PushMarks.styleField(bits, o, variant);
+    }
+    /* Rebuild a placed element's diffuse (refreshTransitions). Null when the
+       source tile is gone. */
+    function buildPushTile(el, S) {
+        const src = byId(el.base);
+        if (!src) return null;
+        const mk = pushMarkEl(el);
+        return pushCompose(src.canvas, el.push.p, el.push.bits, el.push.variant, S, false, mk && mk.canvas, pushElHand(el)).canvas;
+    }
+    /* ---- hand strokes (phase 7) ------------------------------------------------
+       Drawn in Draw's set mode on the whole 4 x 4 sheet of one copy round, so a
+       stroke runs across slots and the seams hold as it was drawn. Each tile keeps
+       `el.push.hand = { v, S, x, y, blend, opacity, strokes }`, the strokes whose
+       bounds touch its cell (sheet coordinates, Q3's points), and `el.pushHandPx`,
+       its S x S crop of the round's pixels. THE PIXELS ARE WHAT IS SHOWN; the
+       points are what editing continues from, and what the pixels are rebuilt from
+       only if they are missing (a replay is exact at the same TRLE.Stroke.VERSION,
+       which is why the stamp is kept). */
+    const pushSheetPos = (bits, S) => { const i = pushSheet().indexOf(bits); return [(i % 4) * S, Math.floor(i / 4) * S]; };
+    function pushElHand(el) {
+        const h = el.push && el.push.hand;
+        if (!h) return null;
+        if (!el.pushHandPx) el.pushHandPx = pushReplayCell(h);
+        return el.pushHandPx ? { px: el.pushHandPx, blend: h.blend, opacity: h.opacity } : null;
+    }
+    /* A tile's hand pixels rebuilt from its points: every stroke replayed on the
+       sheet as Draw laid it, then this cell cropped out. Draw also clips each
+       stroke to the paintable cells; a crop of a paintable cell never holds
+       clipped pixels and compositing is per pixel, so the crop needs no clip. */
+    function pushReplayCell(h) {
+        if (!h.strokes || !h.strokes.length) return null;
+        const S = h.S, W = h.strokes[0].opts.width, H = h.strokes[0].opts.height;
+        const sheet = document.createElement('canvas'); sheet.width = W; sheet.height = H;
+        const g = sheet.getContext('2d');
+        for (const st of h.strokes) {
+            drawRegisterTiles(st.brush);
+            TRLE.Stroke.composite(g, TRLE.Stroke.render(st.samples, st.brush, st.opts), st.brush);
+        }
+        return pushCropCell(sheet, h.x, h.y, S);
+    }
+    /* A cell of a sheet as its own canvas; null when nothing is painted there. */
+    function pushCropCell(sheet, x, y, S) {
+        const c = document.createElement('canvas'); c.width = c.height = S;
+        const g = c.getContext('2d');
+        g.drawImage(sheet, x, y, S, S, 0, 0, S, S);
+        const d = g.getImageData(0, 0, S, S).data;
+        for (let i = 3; i < d.length; i += 4) if (d[i]) return c;
+        return null;
+    }
+    /* The tile a push element's marks are cut from: its `overlay`, when the recipe
+       says so and that tile is not the source. Else null (the flat colour). */
+    function pushMarkEl(el) {
+        if (!el.push || el.push.p.src !== 'tile' || el.overlay === el.base) return null;
+        return byId(el.overlay) || null;
+    }
+    /* A recipe's mark material: null (none, the floor's), or { material } for a
+       preset ('type:key') or the mark tile's own ('source'). */
+    function pushMarkMaterial(p, markEl) {
+        const v = p.material || '';
+        if (!v) return null;
+        if (v === 'source') return markEl ? { material: markEl.material ? deepCopyMaterial(markEl.material) : null } : null;
+        const [type, key] = v.split(':');
+        return getPreset(type, key, 'realistic') ? { material: { type, key, aesthetic: 'realistic' } } : null;
+    }
+    /* The maps of a marked diffuse: the source's material, the groove carved into
+       height / normal / AO (reliefPaint, engine.js step 1b). An unmarked slot gets
+       no reliefPaint, so its maps are the source's own. */
+    function pushMaps(diffuse, srcEl, r, p, enabledMaps, S, markEl) {
+        // A drip stands out of the wall: the same relief route with the sign flipped.
+        const depth = pushKindOf(p) === 'drips' ? -p.depth : p.depth, carveOn = r.painted && depth !== 0;
+        const relief = carveOn || r.field
+            ? { reliefPaint: { mask: carveOn ? r.mask : null, depth, base: r.base, field: r.field || undefined } } : {};
+        const mark = r.painted ? pushMarkMaterial(p, markEl) : null;
+        let out;
+        if (!mark && !hasMatLayers(srcEl)) {
+            // Phase 5's route, kept verbatim: material None is byte-identical to it.
+            const E = TRLE.Engine, tex = E.createTextureFromImage(diffuse);
+            const preset = Object.assign({}, resolvePreset(srcEl),
+                Object.assign({ flipNormalY: state.flipNormalY, alphaFlatten: canvasHasAlpha(diffuse) }, heightPresetOverrides(srcEl)), relief);
+            const maps = E.generateMaps(tex, S, S, preset, enabledMaps);
+            out = {};
+            for (const mt of TRLE.MapOrder) {
+                if (maps[mt]) { out[mt] = E.fboToCanvas(maps[mt]); E.deleteFBO(maps[mt]); }
+            }
+            E.deleteTexture(tex);
+        } else {
+            /* Layers: the source's own (a multi-material source keeps its regions,
+               which phase 5 dropped), then the mark's material over the mark's
+               coverage. The groove and the source's height settings ride on every
+               layer (`extra`), so the relief does not change where the material does.
+               A multi-material source takes no height settings, as its own maps do
+               not (heightPresetOverrides(null), a known limit left alone). */
+            const layers = (hasMatLayers(srcEl) ? srcEl.matLayers : [{ material: srcEl.material, mask: null }])
+                .concat(mark ? [{ material: mark.material, mask: r.mask, feather: 0 }] : []);
+            const extra = Object.assign({}, hasMatLayers(srcEl) ? {} : heightPresetOverrides(srcEl), relief);
+            out = composeLayerMaps(diffuse, layers, enabledMaps, S, extra);
+        }
+        if (enabledMaps.emissive && srcEl.emissive) out.emissive = cloneCanvas(srcEl.emissive);
+        return out;
+    }
+
+    /* ---- the modal ---- */
+    /* `hand`: copy round -> { strokes, layer (the sheet's pixels), blend, opacity };
+       a round nobody drew on inherits round 0's (copies start identical, then
+       diverge as each is drawn on). `crops`: round -> Map(bits -> S x S | null). */
+    const push = { srcId: null, edit: null, slots: new Map(), focus: 15, variant: 0, seed: 1, timer: null, litTimer: null,
+                   hand: new Map(), crops: new Map(), round: 0, kind: 'tracks', wobbleTouched: false };
+    function pushCleanup() {
+        push.srcId = null; push.edit = null; push.hand = new Map(); push.crops = new Map(); push.round = 0; push.wobbleTouched = false;
+        clearTimeout(push.timer); clearTimeout(push.litTimer); push.timer = push.litTimer = null;
+    }
+    const pushSheet = () => TRLE.PushMarks.SHEET;
+    /* Every slot on except the empty one (bits 0), which is the source tile itself
+       and already in the atlas. One copy each. Drips use only the slots without an E
+       or W arm: the sheet's first column, a vertical run. The other twelve are hidden
+       and stay OFF (here, in All, and a drip set's Edit has none), which is what the
+       count, Add and Draw on the set read. */
+    const pushAllowed = bits => push.kind !== 'drips' || !(bits & (TRLE.PushMarks.BITS.E | TRLE.PushMarks.BITS.W));
+    function pushDefaultSlots() {
+        return new Map(pushSheet().map(b => [b, { on: b !== 0 && pushAllowed(b), clones: 1 }]));
+    }
+    function pushParams() {
+        return {
+            kind: push.kind, length: +$('at-push-length').value / 100,
+            surface: $('at-push-surface').value, seed: push.seed,
+            footprint: $('at-push-footprint').value,
+            width: +$('at-push-width').value / 100,
+            lines: +$('at-push-lines').value,
+            lineWidth: +$('at-push-linewidth').value / 10,
+            strength: +$('at-push-strength').value / 100,
+            struggle: +$('at-push-struggle').value / 100,
+            corner: $('at-push-corner').value,
+            cap: $('at-push-cap').value,
+            ring: $('at-push-ring').checked,
+            color: hexToRgb($('at-push-color').value),
+            src: $('at-push-marksrc').value,
+            markTile: $('at-push-marksrc').value === 'tile' ? (parseInt($('at-push-marktile').value, 10) || null) : null,
+            material: $('at-push-material').value,
+            blend: $('at-push-blend').value,
+            depth: +$('at-push-depth').value / 100,
+            handCarve: $('at-push-handcarve').checked,
+            style: $('at-push-style').value,
+            styleAmount: +$('at-push-styleamt').value / 100,
+            // Phase 11 (beta feedback: "too mathematical"): wobble split off Struggle,
+            // a per-line wobble-at-all fraction, grain on the line's own edge, and an
+            // option to fill the same coverage with Surface Noise instead of a stroke.
+            wobbleStrength: +$('at-push-wobblestrength').value / 100,
+            wobbleAmount: +$('at-push-wobbleamount').value / 100,
+            grain: +$('at-push-grain').value / 100,
+            markTexture: $('at-push-marktex').value,
+            noisePreset: $('at-push-noisepreset').value
+        };
+    }
+    const pushRoundOf = v => push.hand.has(v) ? v : 0;
+    /* The hand pixels for one slot of a copy round, or null. */
+    function pushHandFor(bits, v) {
+        const r = pushRoundOf(v), rec = push.hand.get(r);
+        if (!rec) return null;
+        if (!push.crops.has(r)) push.crops.set(r, new Map());
+        const m = push.crops.get(r);
+        if (!m.has(bits)) { const [x, y] = pushSheetPos(bits, state.tileSize); m.set(bits, pushCropCell(rec.layer, x, y, state.tileSize)); }
+        const px = m.get(bits);
+        return px ? { px, blend: rec.blend, opacity: rec.opacity } : null;
+    }
+    /* The copy-round picker: shown only when some slot has more than one copy. */
+    function pushRoundUI() {
+        const most = Math.max(1, ...pushSheet().map(b => push.slots.get(b).on ? push.slots.get(b).clones : 1));
+        const sel = $('at-push-round');
+        if (push.round >= most) push.round = 0;
+        sel.innerHTML = '';
+        for (let k = 0; k < most; k++) sel.add(new Option(k ? `Copy ${k + 1}` : 'Originals', k));
+        sel.value = push.round;
+        sel.style.display = most > 1 ? '' : 'none';
+    }
+    /* Draw on the whole sheet of the chosen copy round (Draw's set mode). */
+    function pushOpenDraw() {
+        const src = byId(push.srcId);
+        if (!src) return;
+        const S = state.tileSize, p = pushParams(), round = push.round, mk = pushModalMark();
+        if (4 * S > DRAW_MAX_PX) { showToast(`Drawing on the set works up to ${DRAW_MAX_PX / 4} px tiles`, 'info'); return; }
+        const cells = pushSheet().map(bits => {
+            const [x, y] = pushSheetPos(bits, S), s = push.slots.get(bits);
+            return { key: bits, x, y, editable: s.on && s.clones > round,
+                     canvas: pushCompose(src.canvas, p, bits, round, S, false, mk && mk.canvas).canvas };
+        });
+        const rec = push.hand.get(pushRoundOf(round));
+        const off = cells.filter(c => !c.editable).length;
+        openDrawOnSheet({ S, cells, layer: rec ? rec.layer : null, strokes: rec ? rec.strokes : [],
+            blend: rec ? rec.blend : 'source-over', opacity: rec ? rec.opacity : 1,
+            title: `Pushable Markings, ${round ? 'copy ' + (round + 1) : 'the set'}`,
+            note: `🎯 Drawing on the whole set as it tiles, so a stroke runs across slots.` +
+                  (off ? ` ${off} slot${off > 1 ? 's' : ''} not being added ${off > 1 ? 'are' : 'is'} dimmed.` : ''),
+            onApply: res => {
+                push.hand.set(round, { strokes: res.strokes, layer: cloneCanvas(res.layer), blend: res.blend, opacity: res.opacity });
+                push.crops.delete(round);
+            },
+            onExit: () => { openModal('push'); pushRender(); } });
+    }
+    /* The mark tile the modal is set to, or null (colour, or no tile to pick). */
+    function pushModalMark() {
+        if ($('at-push-marksrc').value !== 'tile') return null;
+        const el = byId(parseInt($('at-push-marktile').value, 10));
+        return el && el.id !== push.srcId ? el : null;
+    }
+    /* Show the colour or the tile picker, and offer "the mark tile's" material only
+       when there is a mark tile. */
+    function pushSourceUI() {
+        const tile = $('at-push-marksrc').value === 'tile';
+        const noise = $('at-push-marktex').value === 'noise';
+        // Noise fills from its own preset's tone, so the picked colour is unused.
+        $('at-push-color-wrap').style.display = (tile || noise) ? 'none' : '';
+        $('at-push-marktile-wrap').style.display = tile ? '' : 'none';
+        const src = $('at-push-material').querySelector('option[value="source"]');
+        src.disabled = !tile;
+        if (!tile && $('at-push-material').value === 'source') $('at-push-material').value = '';
+    }
+    /* Strokes vs Noise (phase 11): Noise reuses the SAME stroke-shaped coverage
+       (slot.marks' own alpha, in pushCompose) but fills it with Surface Noise
+       instead of a flat/tile colour, so Blend (a stroke-compositing mode) and
+       Colour do not apply; a Noise type replaces Blend in that row. */
+    function pushMarktexUI() {
+        const noise = $('at-push-marktex').value === 'noise';
+        $('at-push-blend-wrap').style.display = noise ? 'none' : '';
+        $('at-push-noisepreset-wrap').style.display = noise ? '' : 'none';
+        pushSourceUI();
+    }
+    /* Mark tiles: textures in the atlas except this set's source, other push tiles
+       (a set cut from a set would re-render in a loop of dependencies) and
+       animation frames (they change every frame). */
+    function pushFillMarkTiles(keep) {
+        const sel = $('at-push-marktile'), num = tileNumbers();
+        sel.innerHTML = '';
+        state.elements.filter(e => e.id !== push.srcId && !e.push && e.kind !== 'anim' && num.has(e.id))
+            .sort((a, b) => num.get(a.id) - num.get(b.id))
+            .forEach(e => sel.add(new Option(`Tile ${num.get(e.id)}`, e.id)));
+        if (keep != null && [...sel.options].some(o => +o.value === keep)) sel.value = String(keep);
+        tilePickerSync(sel);
+    }
+    const PUSH_RANGES = { width: 100, lines: 1, linewidth: 10, strength: 100, struggle: 100, depth: 100, styleamt: 100, length: 100, wobblestrength: 100, wobbleamount: 100, grain: 100 };
+    function pushLabels() {
+        $('at-push-width-val').textContent = $('at-push-width').value;
+        $('at-push-lines-val').textContent = $('at-push-lines').value;
+        $('at-push-linewidth-val').textContent = (+$('at-push-linewidth').value / 10).toFixed(1);
+        $('at-push-strength-val').textContent = $('at-push-strength').value;
+        $('at-push-struggle-val').textContent = $('at-push-struggle').value;
+        $('at-push-depth-val').textContent = $('at-push-depth').value;
+        $('at-push-styleamt-val').textContent = $('at-push-styleamt').value;
+        $('at-push-length-val').textContent = $('at-push-length').value;
+        $('at-push-wobblestrength-val').textContent = $('at-push-wobblestrength').value;
+        $('at-push-wobbleamount-val').textContent = $('at-push-wobbleamount').value;
+        $('at-push-grain-val').textContent = $('at-push-grain').value;
+        $('at-push-seed').value = push.seed;
+    }
+    /* Write a recipe (or a surface preset) into the controls. */
+    function pushWrite(p) {
+        const keyOf = { width: 'width', lines: 'lines', linewidth: 'lineWidth', strength: 'strength', struggle: 'struggle', depth: 'depth', styleamt: 'styleAmount', length: 'length' };
+        for (const [id, k] of Object.entries(keyOf)) if (p[k] != null) $('at-push-' + id).value = Math.round(p[k] * PUSH_RANGES[id]);
+        ['footprint', 'corner', 'cap', 'blend', 'style'].forEach(k => { if (p[k] != null) $('at-push-' + k).value = p[k]; });
+        if (p.src != null) $('at-push-marksrc').value = p.src;
+        $('at-push-handcarve').checked = p.handCarve !== false;
+        if (p.material != null) $('at-push-material').value = p.material;
+        if (p.markTile != null) { $('at-push-marktile').value = String(p.markTile); tilePickerSync($('at-push-marktile')); }
+        pushSourceUI();
+        if (p.ring != null) $('at-push-ring').checked = !!p.ring;
+        if (p.color) $('at-push-color').value = rgbToHex(p.color);
+        if (p.surface && PUSH_SURFACES[p.surface]) $('at-push-surface').value = p.surface;
+        /* Wobble strength (phase 11): a recipe that set it (a set saved with this
+           feature) shows it as its own value and stays detached from Struggle; one
+           that never set it (every preset, and any set saved before this phase)
+           MIRRORS Struggle until the user drags Wobble strength itself, so a fresh
+           Add and an old reopened set both render exactly as Struggle alone would
+           have (D8-style: the default reproduces today's output). */
+        if (p.wobbleStrength != null) { $('at-push-wobblestrength').value = Math.round(p.wobbleStrength * 100); push.wobbleTouched = true; }
+        else { push.wobbleTouched = false; $('at-push-wobblestrength').value = $('at-push-struggle').value; }
+        if (p.wobbleAmount != null) $('at-push-wobbleamount').value = Math.round(p.wobbleAmount * 100);
+        if (p.grain != null) $('at-push-grain').value = Math.round(p.grain * 100);
+        if (p.markTexture != null) $('at-push-marktex').value = p.markTexture;
+        if (p.noisePreset != null) $('at-push-noisepreset').value = p.noisePreset;
+        pushMarktexUI();
+        push.kind = pushKindOf(p);
+        pushKindUI();
+        pushLabels();
+    }
+    /* What the controls say and show for the kind: drips hide what only a pushed
+       block has (its shape, corners, dead ends, the floor style) and rename the rest. */
+    const PUSH_WORDS = {
+        tracks: { width: 'Track width', lines: 'Scratches', linewidth: 'Scratch width', struggle: 'Rigid ↔ Struggle', depth: 'Groove depth',
+                  how: 'grooved', depthHint: 'Carved into height, normal and AO whatever the colour; 0 is colour only.',
+                  sheetHint: 'Laid out as they tile: every track meets its neighbour. The empty slot is your tile unchanged, so it starts unticked.' },
+        drips:  { width: 'Spread', lines: 'Drips', linewidth: 'Drip width', struggle: 'Straight ↔ Wavy', depth: 'Thickness',
+                  how: 'raised', depthHint: 'Raised in height, normal and AO whatever the colour; 0 is colour only.',
+                  sheetHint: 'A column, top to bottom: your tile above the leak, the source, drips running through, drips stopping. Stack them the same way on the wall.' }
+    };
+    function pushKindUI() {
+        const drips = push.kind === 'drips', W = PUSH_WORDS[push.kind];
+        ['width', 'lines', 'linewidth', 'struggle', 'depth'].forEach(id => { $('at-push-' + id + '-name').textContent = W[id]; });
+        $('at-push-handcarve-how').textContent = W.how;
+        $('at-push-depth-hint').textContent = W.depthHint;
+        $('at-push-sheet-hint').textContent = W.sheetHint;
+        ['shape-wrap', 'style-row', 'corner-row', 'ring-row', 'hint-tracks', 'grain-row'].forEach(id => { $('at-push-' + id).style.display = drips ? 'none' : ''; });
+        ['length-row', 'hint-drips'].forEach(id => { $('at-push-' + id).style.display = drips ? '' : 'none'; });
+        $('at-push-sheet').classList.toggle('drips', drips);
+    }
+    /* The tiles Add makes, in atlas order: the switched-on slots in sheet order
+       (a 4 x 4 that tiles with itself when all 16 are on), then each further copy
+       round in the same order, so every round is its own sheet. */
+    function pushMembers() {
+        const on = pushSheet().filter(b => push.slots.get(b).on);
+        const out = on.map(bits => ({ bits, variant: 0 }));
+        const most = Math.max(1, ...on.map(b => push.slots.get(b).clones));
+        for (let v = 1; v < most; v++) on.forEach(bits => { if (push.slots.get(bits).clones > v) out.push({ bits, variant: v }); });
+        return out;
+    }
+    function pushCount() {
+        const n = pushMembers().length;
+        $('at-push-count').textContent = n;
+        $('at-push-addcount').textContent = n;
+        $('at-push-add').disabled = !n;
+    }
+
+    function openPushModal(srcId, editEl) {
+        exitPickMode();
+        const src = byId(srcId);
+        if (!src) { showToast('The source tile of this set is gone', 'error'); return; }
+        push.srcId = srcId; push.edit = null; push.variant = 0; push.round = 0;
+        push.kind = editEl ? pushKindOf(editEl.push.p) : 'tracks';
+        push.slots = pushDefaultSlots();
+        push.hand = new Map(); push.crops = new Map();
+        pushFillMarkTiles(editEl && editEl.push.p.markTile);
+        if (editEl) {
+            // The set is the block, in reading order; a broken block edits this tile's own recipe.
+            const members = (editEl.block
+                ? state.elements.filter(e => e.push && e.block && e.block.id === editEl.block.id)
+                : [editEl]).slice().sort((a, b) => slotOf(a.id) - slotOf(b.id));
+            push.slots.forEach(s => { s.on = false; s.clones = 1; });
+            members.forEach(e => {
+                const s = push.slots.get(e.push.bits);
+                if (!s.on) { s.on = true; s.clones = 0; }
+                s.clones = Math.max(s.clones, e.push.variant + 1);
+            });
+            push.edit = { ids: members.map(e => e.id), list: members.map(e => e.push.bits + ':' + e.push.variant) };
+            push.hand = pushHandFromMembers(members);
+            push.seed = editEl.push.p.seed;
+            pushWrite(editEl.push.p);
+        } else {
+            push.seed = 1;
+            // A new set starts from the preset, and from a colour with no material.
+            pushWrite(Object.assign({ surface: 'tiles', src: 'colour', material: '' }, PUSH_SURFACES.tiles));
+        }
+        push.focus = push.slots.get(15).on ? 15 : pushSheet().find(b => push.slots.get(b).on) ?? 15;
+        $('at-push-title').textContent = (editEl ? 'Edit Pushable Markings, Tile ' : 'Pushable Markings, Tile ') + numberOf(srcId);
+        $('at-push-add').innerHTML = editEl ? '✔ Update <span id="at-push-addcount">0</span> Tiles'
+                                            : '➕ Add <span id="at-push-addcount">0</span> Tiles';
+        openModal('push');
+        pushBuildSheet();
+        pushRender();
+    }
+
+    /* Each round's strokes and pixels, reassembled from the tiles that keep them:
+       the strokes are the union by id in drawing order (`k`), the pixels each
+       tile's crop put back on the sheet. */
+    function pushHandFromMembers(members) {
+        const S = state.tileSize, out = new Map();
+        for (const e of members) {
+            const h = e.push.hand;
+            if (!h) continue;
+            const r = e.push.variant;
+            if (!out.has(r)) {
+                const layer = document.createElement('canvas'); layer.width = layer.height = 4 * S;
+                out.set(r, { strokes: new Map(), layer, blend: h.blend, opacity: h.opacity });
+            }
+            const R = out.get(r);
+            (h.strokes || []).forEach(st => R.strokes.set(st.sid, st));
+            const px = pushElHand(e);
+            if (px) R.layer.getContext('2d').drawImage(px.px, h.x, h.y);
+        }
+        for (const R of out.values()) R.strokes = [...R.strokes.values()].sort((a, b) => a.k - b.k);
+        return out;
+    }
+
+    /* The slot sheet: built once per open; a render only redraws the canvases. */
+    function pushBuildSheet() {
+        const wrap = $('at-push-sheet');
+        wrap.innerHTML = '';
+        const D = TRLE.PushMarks.BITS;
+        const name = b => b ? ['N', 'E', 'S', 'W'].filter(k => b & D[k]).join('') : 'none';
+        for (const bits of pushSheet()) {
+            const s = push.slots.get(bits);
+            const cell = document.createElement('div');
+            cell.className = 'at-push-slot' + (pushAllowed(bits) ? '' : ' na');
+            cell.dataset.bits = bits;
+            const cv = document.createElement('canvas');
+            cv.width = cv.height = 128;
+            cv.title = `Arms: ${name(bits)}. Click to preview it lit.`;
+            cv.addEventListener('click', () => { push.focus = bits; push.variant = Math.min(push.round, s.clones - 1); pushMarkFocus(); pushRenderLitSoon(0); });
+            const row = document.createElement('div');
+            row.className = 'at-push-slot-row';
+            const lab = document.createElement('label');
+            const cb = document.createElement('input');
+            cb.type = 'checkbox'; cb.checked = s.on;
+            cb.setAttribute('aria-label', `Add slot ${name(bits)}`);
+            cb.addEventListener('change', () => { s.on = cb.checked; cell.classList.toggle('off', !s.on); pushCount(); pushRoundUI(); });
+            lab.append(cb, document.createTextNode(' Add'));
+            const sel = document.createElement('select');
+            sel.setAttribute('aria-label', `Copies of slot ${name(bits)}`);
+            sel.title = 'Copies: same edges, different scratches inside';
+            for (let k = 1; k <= 4; k++) sel.add(new Option('×' + k, k));
+            sel.value = s.clones;
+            sel.addEventListener('change', () => {
+                s.clones = +sel.value; pushCount(); pushRoundUI();
+                if (bits === push.focus) { push.variant = Math.min(push.variant, s.clones - 1); pushRenderLitSoon(0); }
+            });
+            row.append(lab, sel);
+            cell.append(cv, row);
+            cell.classList.toggle('off', !s.on);
+            wrap.appendChild(cell);
+        }
+        pushMarkFocus();
+        pushCount();
+        pushRoundUI();
+    }
+    function pushMarkFocus() {
+        $('at-push-sheet').querySelectorAll('.at-push-slot').forEach(c => c.classList.toggle('focus', +c.dataset.bits === push.focus));
+    }
+    function pushRenderSheet() {
+        const src = byId(push.srcId);
+        if (!src) return;
+        const P = 128, p = pushParams(), base = resizeCanvas(src.canvas, P, P);
+        const mk = pushModalMark(), mark = mk ? resizeCanvas(mk.canvas, P, P) : null;
+        $('at-push-sheet').querySelectorAll('.at-push-slot').forEach(cell => {
+            const cv = cell.querySelector('canvas'), b = +cell.dataset.bits;
+            if (!pushAllowed(b)) return;   // hidden in this kind
+            drawReplace(cv, pushCompose(base, p, b, push.round, P, false, mark, pushHandFor(b, push.round)).canvas);
+        });
+    }
+    /* The focused slot at the atlas's tile size, through the same maps the export
+       makes, and its copies underneath. */
+    function pushRenderLit() {
+        const src = byId(push.srcId);
+        if (!src) return;
+        const S = state.tileSize, p = pushParams(), show = $('at-push-show').value;
+        const s = push.slots.get(push.focus), v = Math.min(push.variant, s.clones - 1);
+        const mk = pushModalMark();
+        const r = pushCompose(src.canvas, p, push.focus, v, S, show !== 'diffuse', mk && mk.canvas, pushHandFor(push.focus, v));
+        let out = r.canvas, note = '';
+        if (show !== 'diffuse') {
+            const want = { normal: true, ao: true, specular: true, roughness: true, height: show === 'height' };
+            const maps = pushMaps(r.canvas, src, r, p, want, S, mk);
+            if (show === 'lit') {
+                out = litCanvas(r.canvas, maps);
+                if (!out) { out = r.canvas; note = 'Lit preview unavailable (AtlasTool/ten/ not loaded), showing the diffuse.'; }
+            } else out = maps[show];
+        }
+        const lit = $('at-push-lit');
+        if (lit.width !== S) { lit.width = S; lit.height = S; }
+        drawReplace(lit, out);
+        $('at-push-lit-note').textContent = note;
+        const strip = $('at-push-copies');
+        strip.innerHTML = '';
+        if (s.clones > 1) {
+            const P = 64, base = resizeCanvas(src.canvas, P, P), mark = mk ? resizeCanvas(mk.canvas, P, P) : null;
+            for (let k = 0; k < s.clones; k++) {
+                const c = document.createElement('canvas');
+                c.width = c.height = P;
+                c.className = k === v ? 'focus' : '';
+                c.title = `Copy ${k + 1}`;
+                drawReplace(c, pushCompose(base, p, push.focus, k, P, false, mark, pushHandFor(push.focus, k)).canvas);
+                c.addEventListener('click', () => { push.variant = k; pushRenderLitSoon(0); });
+                strip.appendChild(c);
+            }
+        }
+    }
+    function pushRenderLitSoon(ms) {
+        clearTimeout(push.litTimer);
+        push.litTimer = setTimeout(pushRenderLit, ms == null ? 160 : ms);
+    }
+    function pushRender() { pushRenderSheet(); pushRenderLitSoon(0); }
+    function pushRenderSoon() {
+        clearTimeout(push.timer);
+        push.timer = setTimeout(pushRender, 120);
+    }
+
+    function pushApply() {
+        const src = byId(push.srcId);
+        if (!src) return;
+        const S = state.tileSize, p = pushParams(), members = pushMembers();
+        if (!members.length) return;
+        const w = Math.min(4, members.length);
+        const recipe = m => ({ v: 1, bits: m.bits, variant: m.variant, p: JSON.parse(JSON.stringify(p)) });
+        // The mark tile is the element's OVERLAY: the refresh order, Go to Overlay and
+        // the delete closure then treat it as the parent it is.
+        const mk = pushModalMark(), overlay = mk ? mk.id : src.id;
+        if (p.src === 'tile' && !mk) { p.src = 'colour'; p.markTile = null; if (p.material === 'source') p.material = ''; }
+        /* Hand strokes: each tile keeps the strokes whose bounds reach its cell (in
+           drawing order, `k`) and its crop of the round's pixels. A copy round
+           nobody drew on takes the originals'. */
+        const handOf = m => {
+            const r = pushRoundOf(m.variant), rec = push.hand.get(r);
+            if (!rec) return { hand: null, px: null };
+            const [x, y] = pushSheetPos(m.bits, S), px = pushCropCell(rec.layer, x, y, S);
+            if (!px) return { hand: null, px: null };
+            const touches = st => st.opts.wrap || !st.bounds
+                || (st.bounds[0] < x + S && st.bounds[2] > x && st.bounds[1] < y + S && st.bounds[3] > y);
+            return { px, hand: { v: TRLE.Stroke.VERSION, S, x, y, blend: rec.blend, opacity: rec.opacity,
+                                 strokes: rec.strokes.map((st, k) => Object.assign({}, st, { k })).filter(touches) } };
+        };
+        const withHand = (rec, m) => { const h = handOf(m); if (h.hand) rec.hand = h.hand; return [rec, h.px]; };
+        const make = blk => members.map(m => {
+            const [rec, px] = withHand(recipe(m), m);
+            return { id: state.nextId++, kind: 'transition', canvas: blankCanvas(S),
+                     original: null, seamless: false, material: null,
+                     base: src.id, overlay, push: rec, pushHandPx: px, block: blk };
+        });
+        const label = 'pushable-markings set';
+        if (push.edit) {
+            const oldIds = push.edit.ids, old = oldIds.map(byId).filter(Boolean);
+            const same = members.map(m => m.bits + ':' + m.variant).join(',') === push.edit.list.join(',')
+                && old.length === oldIds.length;
+            if (same) {
+                // The same tiles: new recipes in place, so ids, slots and the block stay.
+                old.forEach((e, i) => { const [rec, px] = withHand(recipe(members[i]), members[i]); e.push = rec; e.pushHandPx = px; e.overlay = overlay; });
+            } else {
+                const cols = Math.max(1, state.cols), slots = oldIds.map(slotOf);
+                const sh = { slots, r0: Math.min(...slots.map(sl => Math.floor(sl / cols))), c0: Math.min(...slots.map(sl => sl % cols)) };
+                const gone = new Set(oldIds);
+                state.elements = state.elements.filter(e => !gone.has(e.id));
+                const blk = newBlock(w, label); blk.n = members.length;
+                const els = make(blk);
+                state.elements.push(...els);
+                pendingPlace = editPlacement(sh, oldIds, els.map(e => e.id), w, false);
+            }
+            closeModal();
+            renderGrid();
+            refreshTransitions();
+            pushHistory('Edit pushable markings');
+            showToast(`Pushable markings updated (${members.length} tiles)`, 'success');
+            return;
+        }
+        confirmResizeCols(w, () => {
+            const blk = newBlock(w, label); blk.n = members.length;
+            state.elements.push(...make(blk));
+            closeModal();
+            renderGrid();
+            refreshTransitions();   // paint into the now-attached canvases
+            pushHistory(`Pushable markings (${members.length})`);
+            showToast(`Added ${members.length} pushable-marking tiles to the atlas`, 'success');
+        });
+    }
+
+    function setupPushModal() {
+        const surf = $('at-push-surface');
+        for (const [kind, label] of [['tracks', 'Pushed block'], ['drips', 'Drips']]) {
+            const g = document.createElement('optgroup'); g.label = label;
+            for (const [k, s] of Object.entries(PUSH_SURFACES)) if (pushKindOf(s) === kind) g.appendChild(new Option(s.label, k));
+            surf.appendChild(g);
+        }
+        // Noise type (phase 11): the SAME NOISE_PRESETS the Surface Noise modal offers.
+        const npsel = $('at-push-noisepreset');
+        for (const [k, np] of Object.entries(NOISE_PRESETS)) npsel.add(new Option(np.label, k));
+        surf.addEventListener('change', () => {
+            const s = PUSH_SURFACES[surf.value], was = push.kind;
+            /* Changing kind resets what does not carry over: the slots (drips use one
+               column) and the material (a track preset has none; a drip preset its liquid's). */
+            pushWrite(Object.assign({ surface: surf.value }, s, pushKindOf(s) !== was ? { material: s.material || '' } : {}));
+            if (push.kind !== was) {
+                push.slots = pushDefaultSlots(); push.hand = new Map(); push.crops = new Map(); push.round = 0;
+                push.focus = pushSheet().find(b => push.slots.get(b).on) ?? 15;
+                pushBuildSheet();
+            }
+            pushRender();
+        });
+        ['width', 'lines', 'linewidth', 'strength', 'length', 'wobbleamount', 'grain'].forEach(id =>
+            $('at-push-' + id).addEventListener('input', () => { pushLabels(); pushRenderSoon(); }));
+        /* Struggle also mirrors into Wobble strength until the user drags Wobble
+           strength itself (phase 11: they are decoupled, but a fresh preset or an
+           untouched drag of Struggle alone must still look the way it always did). */
+        $('at-push-struggle').addEventListener('input', () => {
+            if (!push.wobbleTouched) $('at-push-wobblestrength').value = $('at-push-struggle').value;
+            pushLabels(); pushRenderSoon();
+        });
+        $('at-push-wobblestrength').addEventListener('input', () => { push.wobbleTouched = true; pushLabels(); pushRenderSoon(); });
+        // Colour, blend and depth recompose from the cached geometry: no re-render.
+        $('at-push-depth').addEventListener('input', () => { pushLabels(); pushRenderLitSoon(); });
+        $('at-push-color').addEventListener('input', pushRenderSoon);
+        ['footprint', 'corner', 'cap', 'blend', 'ring', 'noisepreset'].forEach(id => $('at-push-' + id).addEventListener('change', pushRender));
+        $('at-push-marktex').addEventListener('change', () => { pushMarktexUI(); pushRender(); });
+        $('at-push-show').addEventListener('change', () => pushRenderLitSoon(0));
+        $('at-push-marksrc').addEventListener('change', () => { pushSourceUI(); pushRender(); });
+        $('at-push-marktile').addEventListener('change', pushRender);
+        attachTilePicker($('at-push-marktile'), { title: 'Mark texture' });
+        // The material only reaches the maps, so only the lit preview redraws.
+        const msel = $('at-push-material');
+        for (const [type, label, bag] of [['solid', 'Solid', TRLE.SolidPresets], ['liquid', 'Liquid', TRLE.LiquidPresets]]) {
+            const g = document.createElement('optgroup'); g.label = label;
+            for (const [key, pr] of Object.entries(bag)) g.appendChild(new Option(pr.label, type + ':' + key));
+            msel.appendChild(g);
+        }
+        msel.addEventListener('change', () => pushRenderLitSoon(0));
+        $('at-push-seed').addEventListener('change', function () {
+            push.seed = Math.max(1, parseInt(this.value, 10) || 1) >>> 0; pushLabels(); pushRender();
+        });
+        $('at-push-reroll').addEventListener('click', () => { push.seed = 1 + ((Math.random() * 1e9) >>> 0); pushLabels(); pushRender(); });
+        const all = on => {
+            push.slots.forEach((s, b) => { s.on = on && pushAllowed(b); });
+            $('at-push-sheet').querySelectorAll('.at-push-slot').forEach(c => {
+                const v = push.slots.get(+c.dataset.bits).on;
+                c.classList.toggle('off', !v); c.querySelector('input').checked = v;
+            });
+            pushCount();
+        };
+        $('at-push-all').addEventListener('click', () => all(true));
+        $('at-push-none').addEventListener('click', () => all(false));
+        $('at-push-add').addEventListener('click', pushApply);
+        $('at-push-draw').addEventListener('click', pushOpenDraw);
+        $('at-push-round').addEventListener('change', function () {
+            push.round = +this.value;
+            const s = push.slots.get(push.focus);
+            push.variant = Math.min(push.round, s.clones - 1);
+            pushRender();
+        });
+        $('at-push-handcarve').addEventListener('change', () => pushRenderLitSoon(0));
+        // A style picked at amount 0 would do nothing: start it at 60%.
+        $('at-push-style').addEventListener('change', function () {
+            if (this.value !== 'none' && +$('at-push-styleamt').value === 0) $('at-push-styleamt').value = 60;
+            pushLabels(); pushRender();
+        });
+        $('at-push-styleamt').addEventListener('input', () => { pushLabels(); pushRenderSoon(); });
     }
 
     /* ============ ORGANIC TRANSITION MODAL (Phase 13) ============
@@ -8047,8 +13727,8 @@ window.TRLE = window.TRLE || {};
         org.hint = document.createElement('canvas');
         org.hint.width = 256; org.hint.height = 256;
         org.hint.getContext('2d').clearRect(0, 0, 256, 256);
-        $('at-org-base-no').textContent    = indexOf(baseId) + 1;
-        $('at-org-overlay-no').textContent = indexOf(overlayId) + 1;
+        $('at-org-base-no').textContent    = numberOf(baseId);
+        $('at-org-overlay-no').textContent = numberOf(overlayId);
         const segs = parseInt($('at-org-segs').value) || 2;
         orgSeamInit(segs);
         $('at-org-threshold').value = 12; $('at-org-threshold-val').textContent = '12';
@@ -8710,6 +14390,27 @@ window.TRLE = window.TRLE || {};
         E.deleteFBO(fbo);
     }
 
+    /* matRenderLit's materialPreview blit for any diffuse and map canvases, as a
+       new canvas; null when ten/ is absent (the shader is optional). Used by the
+       Pushable Markings preview and the test probe `litPreview`. */
+    function litCanvas(diffuse, maps, lightDir) {
+        if (!TRLE.Shaders.materialPreview) return null;
+        const E = TRLE.Engine, S = diffuse.width, texs = [];
+        const tex = cv => { const t = E.createTextureFromImage(cv); texs.push(t); return t; };
+        const d = tex(diffuse), m = k => maps[k] ? tex(maps[k]) : d, has = k => maps[k] ? 1.0 : 0.0;
+        const fbo = E.createFBO(S, S);
+        E.blit('materialPreview', {
+            u_diffuse: d, u_normal: m('normal'), u_ao: m('ao'), u_specular: m('specular'),
+            u_roughness: m('roughness'), u_emissive: m('emissive'),
+            u_hasNormal: has('normal'), u_hasAO: has('ao'), u_hasSpecular: has('specular'),
+            u_hasRoughness: has('roughness'), u_hasEmissive: has('emissive'),
+            u_lightDir: lightDir || [-0.35, 0.4, 0.85]      // the Material modal's default light
+        }, fbo);
+        const out = E.fboToCanvas(fbo);
+        E.deleteFBO(fbo); texs.forEach(t => E.deleteTexture(t));
+        return out;
+    }
+
     /* ============ 3D PREVIEW (Babylon.js via TRLE.Preview3D) ============
        Thin wrapper around the shared TRLE.Preview3D module (js/preview3d.js),
        which lazy-loads Babylon on first use and renders a height-displaced PBR
@@ -8837,7 +14538,7 @@ window.TRLE = window.TRLE || {};
         mat.batchIds = null;
         mat.dirty = false;
         const el = byId(id);
-        $('at-mat-title').textContent = `🎨 Set Material, Tile ${indexOf(id) + 1}`;
+        $('at-mat-title').textContent = `🎨 Set Material, Tile ${numberOf(id)}`;
         /* Hide any banner a previous batch left behind; openMatModalBatch puts it
            back. This modal used to signal a batch through its TITLE alone, which is
            the only one of the six batchable modals that did not follow the
@@ -9258,7 +14959,8 @@ window.TRLE = window.TRLE || {};
 
     /* ============ HEAL / FILL MODAL (Phase 6) ============ */
     const HEAL_HINTS = {
-        patch:     'Fills from the pixels immediately around the spot, matching local tone & texture. Best all-rounder, handles high-contrast areas where global sampling drags in the wrong shade.',
+        brush:     'Copies real texture from a matching spot elsewhere on the tile, then blends its colour into the surroundings so there is no seam. Works like the healing brush in Photoshop, Photopea and Affinity. Best all-rounder at every texture size.',
+        patch:     'Grows the fill in from the pixels at the edge of the spot, so lines running into it carry on through. Use it on a one-off design (the centre of a mural) where there is no matching spot to copy. Can streak on large spots and big textures.',
         diffusion: 'Smoothly interpolates surrounding colours into the painted area. Best for small blemishes, scratches or logos on smoothish surfaces.',
         texture:   'Replaces the painted area with texture re-synthesised from the whole tile. Best for uniformly busy / organic surfaces.'
     };
@@ -9426,11 +15128,237 @@ window.TRLE = window.TRLE || {};
         return work;
     }
 
+    /* ---- Healing brush (BACKLOG-2026-09-PLAN phase 3, the default since 2026-09-24) ----
+       What Photoshop's / Photopea's spot healing does, and the answer to both reports
+       ("heal like Photoshop" and "Smooth feels flat on big textures"):
+
+           result = SOURCE texture copied from elsewhere in the tile
+                  + a smooth MEMBRANE carrying the colour difference found along
+                    the hole's border into the hole.
+
+       The copy supplies the detail, which diffusion by definition cannot (it scored
+       0.01-0.05 of the surrounding detail at every size). The membrane makes the copy
+       meet the surrounding tone without a seam, which a bare clone cannot. The
+       neighbour-aware method above copies ONE PIXEL at a time from a fixed 12 px
+       window, so past the first ring it copies its own fill and drags the border in
+       as streaks; measured detail 1.6-3.1x the surroundings at 1024.
+
+       Four things are load-bearing:
+       - The source is chosen per connected spot by matching a RING of known pixels
+         around it, MEAN-REMOVED (the membrane fixes tone, so the match should be on
+         structure), plus a penalty on the tone jump so a light spot is not healed
+         from a dark region. Everything wraps, because tiles tile.
+       - Everything scales with the SPOT, not in pixels: ring width 12% of its
+         diameter, search radius max(3 diameters, a quarter tile), coarse step 1/8 of
+         a diameter. That is what makes 64 and 1024 behave alike.
+       - The source is SEARCHED AT <=256 and only refined at full size. The modal
+         previews at 256 and saves at full size, and an independent full search at
+         1024 picks a different (equally plausible) source, so the saved tile would
+         not be the one previewed. Scaling the coarse offset and refining within one
+         coarse pixel keeps them the same source.
+       - The membrane is a push-pull in FLOAT on the CPU. The difference is signed,
+         so an 8-bit texture through inpaintDiffusion would clip it. */
+    const HEAL_SEARCH_RES = 256;
+    function healBrushPrepare(srcCanvas, maskCanvasRaw, S) {
+        const d = resizeCanvas(srcCanvas, S, S).getContext('2d').getImageData(0, 0, S, S).data;
+        const md = resizeCanvas(maskCanvasRaw, S, S).getContext('2d').getImageData(0, 0, S, S).data;
+        const N = S * S;
+        const soft = new Float32Array(N), hole = new Uint8Array(N);
+        for (let i = 0; i < N; i++) { soft[i] = md[i * 4] / 255; hole[i] = soft[i] > 0.02 ? 1 : 0; }
+        // 4-connected spots; each heals from its own source
+        const comp = new Int32Array(N).fill(-1), comps = [];
+        for (let i = 0; i < N; i++) {
+            if (!hole[i] || comp[i] >= 0) continue;
+            const px = [], st = [i]; comp[i] = comps.length;
+            let x0 = S, y0 = S, x1 = 0, y1 = 0, cx = 0, cy = 0;
+            while (st.length) {
+                const j = st.pop(); px.push(j);
+                const x = j % S, y = (j / S) | 0;
+                cx += x; cy += y;
+                if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+                if (x > 0     && hole[j - 1] && comp[j - 1] < 0) { comp[j - 1] = comps.length; st.push(j - 1); }
+                if (x < S - 1 && hole[j + 1] && comp[j + 1] < 0) { comp[j + 1] = comps.length; st.push(j + 1); }
+                if (y > 0     && hole[j - S] && comp[j - S] < 0) { comp[j - S] = comps.length; st.push(j - S); }
+                if (y < S - 1 && hole[j + S] && comp[j + S] < 0) { comp[j + S] = comps.length; st.push(j + S); }
+            }
+            comps.push({ px, x0, y0, x1, y1, cx: cx / px.length, cy: cy / px.length,
+                         diam: Math.max(x1 - x0 + 1, y1 - y0 + 1) });
+        }
+        // chamfer distance to the nearest hole pixel, for the ring
+        const dist = new Float32Array(N).fill(1e9);
+        for (let i = 0; i < N; i++) if (hole[i]) dist[i] = 0;
+        for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+            const i = y * S + x; let v = dist[i];
+            if (x > 0) v = Math.min(v, dist[i - 1] + 1);
+            if (y > 0) { v = Math.min(v, dist[i - S] + 1);
+                if (x > 0) v = Math.min(v, dist[i - S - 1] + 1.414);
+                if (x < S - 1) v = Math.min(v, dist[i - S + 1] + 1.414); }
+            dist[i] = v;
+        }
+        for (let y = S - 1; y >= 0; y--) for (let x = S - 1; x >= 0; x--) {
+            const i = y * S + x; let v = dist[i];
+            if (x < S - 1) v = Math.min(v, dist[i + 1] + 1);
+            if (y < S - 1) { v = Math.min(v, dist[i + S] + 1);
+                if (x < S - 1) v = Math.min(v, dist[i + S + 1] + 1.414);
+                if (x > 0) v = Math.min(v, dist[i + S - 1] + 1.414); }
+            dist[i] = v;
+        }
+        for (const c of comps) {
+            c.ringW = Math.max(2, Math.round(c.diam * 0.12));
+            const ring = [];
+            for (let y = c.y0 - c.ringW; y <= c.y1 + c.ringW; y++) for (let x = c.x0 - c.ringW; x <= c.x1 + c.ringW; x++) {
+                if (x < 0 || y < 0 || x >= S || y >= S) continue;
+                const i = y * S + x;
+                if (!hole[i] && dist[i] <= c.ringW) ring.push(i);
+            }
+            c.ring = ring;
+        }
+        return { S, d, soft, hole, dist, comps };
+    }
+    /* Best source offset for one spot. `around` = [dx, dy, r]: search only within r
+       of that offset at step 1 (the refine pass); otherwise the full coarse search. */
+    function healBrushSearch(F, c, around) {
+        const { S, d, hole } = F, px = c.px;
+        const wrap = v => ((v % S) + S) % S;
+        const stride = Math.max(1, Math.floor(c.ring.length / 1500));
+        const rs = c.ring.filter((_, k) => k % stride === 0);
+        if (!rs.length) return null;
+        const rx = rs.map(i => i % S), ry = rs.map(i => (i / S) | 0);
+        const tMean = [0, 0, 0];
+        for (const i of rs) for (let k = 0; k < 3; k++) tMean[k] += d[i * 4 + k];
+        for (let k = 0; k < 3; k++) tMean[k] /= rs.length;
+        const holeStep = Math.max(1, px.length >> 6);
+        const vals = new Float32Array(rs.length * 3);
+        const minD = c.diam * 0.75;
+        const score = (dx, dy) => {
+            if (Math.hypot(dx, dy) < minD) return Infinity;       // never heal a spot from itself
+            for (let k = 0; k < px.length; k += holeStep) {
+                const j = px[k];
+                if (hole[wrap(((j / S) | 0) + dy) * S + wrap(j % S + dx)]) return Infinity;
+            }
+            const sm = [0, 0, 0];
+            for (let k = 0; k < rs.length; k++) {
+                const q = (wrap(ry[k] + dy) * S + wrap(rx[k] + dx)) * 4;
+                if (hole[q >> 2]) return Infinity;
+                for (let ch = 0; ch < 3; ch++) { vals[k * 3 + ch] = d[q + ch]; sm[ch] += d[q + ch]; }
+            }
+            for (let ch = 0; ch < 3; ch++) sm[ch] /= rs.length;
+            let e = 0;
+            for (let k = 0; k < rs.length; k++) {
+                const t = rs[k] * 4;
+                for (let ch = 0; ch < 3; ch++) {
+                    const v = (d[t + ch] - tMean[ch]) - (vals[k * 3 + ch] - sm[ch]);
+                    e += v * v;
+                }
+            }
+            const tone2 = (sm[0] - tMean[0]) ** 2 + (sm[1] - tMean[1]) ** 2 + (sm[2] - tMean[2]) ** 2;
+            return e / rs.length + 0.5 * tone2;
+        };
+        let best = Infinity, bdx = 0, bdy = 0;
+        const consider = (dx, dy) => { const e = score(dx, dy); if (e < best) { best = e; bdx = dx; bdy = dy; } };
+        if (around) {
+            const [ax, ay, r] = around;
+            for (let dy = ay - r; dy <= ay + r; dy++) for (let dx = ax - r; dx <= ax + r; dx++) consider(dx, dy);
+            if (best < Infinity) return [bdx, bdy];
+        }
+        const R = Math.min(S, Math.max(c.diam * 3, S * 0.25) | 0);
+        const st = Math.max(1, Math.round(c.diam / 8));
+        for (let dy = -R; dy <= R; dy += st) for (let dx = -R; dx <= R; dx += st) consider(dx, dy);
+        const cx = bdx, cy = bdy;
+        for (let dy = cy - st; dy <= cy + st; dy++) for (let dx = cx - st; dx <= cx + st; dx++) consider(dx, dy);
+        return best < Infinity ? [bdx, bdy] : null;
+    }
+    /* Push-pull membrane: known values (weight 1) are averaged down a pyramid and
+       pulled back up bilinearly into the unknowns. Smooth, O(n), float. */
+    function healMembrane(v, w, W, H) {
+        const levels = [{ W, H, v, w }];
+        while (levels[levels.length - 1].W > 1 || levels[levels.length - 1].H > 1) {
+            const L = levels[levels.length - 1];
+            const w2 = Math.max(1, (L.W + 1) >> 1), h2 = Math.max(1, (L.H + 1) >> 1);
+            const nv = new Float32Array(w2 * h2 * 3), nw = new Float32Array(w2 * h2);
+            for (let y = 0; y < L.H; y++) for (let x = 0; x < L.W; x++) {
+                const a = y * L.W + x, b = (y >> 1) * w2 + (x >> 1);
+                nw[b] += L.w[a];
+                for (let ch = 0; ch < 3; ch++) nv[b * 3 + ch] += L.v[a * 3 + ch];
+            }
+            for (let b = 0; b < w2 * h2; b++) if (nw[b] > 0) {
+                for (let ch = 0; ch < 3; ch++) nv[b * 3 + ch] /= nw[b];
+                nw[b] = Math.min(1, nw[b]);
+            }
+            levels.push({ W: w2, H: h2, v: nv, w: nw });
+        }
+        for (let l = levels.length - 2; l >= 0; l--) {
+            const L = levels[l], C = levels[l + 1];
+            for (let y = 0; y < L.H; y++) for (let x = 0; x < L.W; x++) {
+                const a = y * L.W + x, ww = L.w[a];
+                if (ww >= 1) continue;
+                const fx = Math.min(C.W - 1, Math.max(0, (x - 0.5) / 2)), fy = Math.min(C.H - 1, Math.max(0, (y - 0.5) / 2));
+                const ix = Math.floor(fx), iy = Math.floor(fy), ax = fx - ix, ay = fy - iy;
+                const ix2 = Math.min(C.W - 1, ix + 1), iy2 = Math.min(C.H - 1, iy + 1);
+                for (let ch = 0; ch < 3; ch++) {
+                    const s = (C.v[(iy * C.W + ix) * 3 + ch] * (1 - ax) + C.v[(iy * C.W + ix2) * 3 + ch] * ax) * (1 - ay)
+                            + (C.v[(iy2 * C.W + ix) * 3 + ch] * (1 - ax) + C.v[(iy2 * C.W + ix2) * 3 + ch] * ax) * ay;
+                    L.v[a * 3 + ch] = L.v[a * 3 + ch] * ww + s * (1 - ww);
+                }
+                L.w[a] = 1;
+            }
+        }
+        return v;
+    }
+    function healBrushFill(srcCanvas, maskCanvasRaw, S) {
+        const P = Math.min(S, HEAL_SEARCH_RES);
+        const coarse = healBrushPrepare(srcCanvas, maskCanvasRaw, P);
+        for (const c of coarse.comps) c.off = healBrushSearch(coarse, c, null);
+        const F = P === S ? coarse : healBrushPrepare(srcCanvas, maskCanvasRaw, S);
+        const k = S / P, wrap = v => ((v % S) + S) % S;
+        const { d, soft, hole, dist } = F;
+        const out = new Uint8ClampedArray(d);
+        for (const c of F.comps) {
+            let off = null;
+            if (F === coarse) off = c.off;
+            else {
+                // the coarse spot this one came from: nearest centroid
+                let near = null, nd = Infinity;
+                for (const q of coarse.comps) {
+                    const dd = Math.hypot(q.cx * k - c.cx, q.cy * k - c.cy);
+                    if (dd < nd) { nd = dd; near = q; }
+                }
+                off = healBrushSearch(F, c, near && near.off && nd < c.diam
+                    ? [Math.round(near.off[0] * k), Math.round(near.off[1] * k), Math.ceil(k)] : null);
+            }
+            if (!off) continue;                      // nothing clean to copy from: leave it
+            const [dx, dy] = off, rw = c.ringW;
+            const bx0 = c.x0 - rw, by0 = c.y0 - rw, W = c.x1 - c.x0 + 1 + 2 * rw, H = c.y1 - c.y0 + 1 + 2 * rw;
+            const dv = new Float32Array(W * H * 3), dw = new Float32Array(W * H);
+            for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+                const gx = bx0 + x, gy = by0 + y;
+                if (gx < 0 || gy < 0 || gx >= S || gy >= S) continue;
+                const i = gy * S + gx;
+                if (hole[i] || dist[i] > rw) continue;
+                const q = (wrap(gy + dy) * S + wrap(gx + dx)) * 4, o = y * W + x;
+                for (let ch = 0; ch < 3; ch++) dv[o * 3 + ch] = d[i * 4 + ch] - d[q + ch];
+                dw[o] = 1;
+            }
+            healMembrane(dv, dw, W, H);
+            for (const j of c.px) {
+                const x = j % S, y = (j / S) | 0, o = (y - by0) * W + (x - bx0);
+                const q = (wrap(y + dy) * S + wrap(x + dx)) * 4, m = soft[j];
+                for (let ch = 0; ch < 3; ch++)
+                    out[j * 4 + ch] = d[j * 4 + ch] * (1 - m) + (d[q + ch] + dv[o * 3 + ch]) * m;
+                out[j * 4 + 3] = d[j * 4 + 3] * (1 - m) + d[q + 3] * m;
+            }
+        }
+        const res = document.createElement('canvas'); res.width = S; res.height = S;
+        res.getContext('2d').putImageData(new ImageData(out, S, S), 0, 0);
+        return res;
+    }
+
     function healComputeFill(size) {
         const el = byId(heal.id);
         const S = size || state.tileSize;
         const E = TRLE.Engine;
         const method = $('at-heal-method').value;
+        if (method === 'brush') return healBrushFill(el.canvas, heal.maskCanvas, S);
         if (method === 'patch') {
             return healPatchFill(el.canvas, heal.maskCanvas, S);
         }
@@ -9467,7 +15395,7 @@ window.TRLE = window.TRLE || {};
     function openHealModal(id) {
         heal.id = id;
         heal.resultCanvas = null;
-        $('at-heal-tileno').textContent = indexOf(id) + 1;
+        $('at-heal-tileno').textContent = numberOf(id);
         const mc = heal.maskCanvas.getContext('2d');
         mc.fillStyle = '#000'; mc.fillRect(0, 0, 256, 256);
         if (healEditor) { healEditor.setErase(false); healEditor.resetHistory(); }
@@ -9488,7 +15416,7 @@ window.TRLE = window.TRLE || {};
     function setupCompare(frameId, rangeId, holdId) {
         const frame = $(frameId), range = $(rangeId), hold = $(holdId);
         if (!frame) return;
-        let held = false, restore = 50;
+        let held = false, restore = 0;
         const set = v => {
             frame.style.setProperty('--pos', v + '%');
             if (range) range.value = v;
@@ -9532,7 +15460,11 @@ window.TRLE = window.TRLE || {};
             hold.addEventListener('keydown', e => { if (e.key === ' ' || e.key === 'Enter') { start(); e.preventDefault(); } });
             hold.addEventListener('keyup', e => { if (e.key === ' ' || e.key === 'Enter') end(); });
         }
-        set(50);
+        /* Opens fully on "After": at the old 50%, the left half of the frame never
+           showed the live fill wherever the painted spot fell there, however the
+           tile was painted. The tester's exact report: half the modal's own claim
+           ("After: updates as you paint") was permanently hidden behind "Before". */
+        set(0);
     }
 
     function setupHealModal() {
@@ -9627,7 +15559,7 @@ window.TRLE = window.TRLE || {};
 
     function openFadeModal(id) {
         fade.id = id;
-        $('at-fade-tileno').textContent = indexOf(id) + 1;
+        $('at-fade-tileno').textContent = numberOf(id);
         const mc = fade.maskCanvas.getContext('2d');
         mc.fillStyle = '#000'; mc.fillRect(0, 0, fade.maskCanvas.width, fade.maskCanvas.height);
         if (fadeEditor) { fadeEditor.setErase(false); fadeEditor.resetHistory(); }
@@ -9817,7 +15749,7 @@ window.TRLE = window.TRLE || {};
 
     function openEmissiveModal(id) {
         emissive.id = id;
-        $('at-em-tileno').textContent = indexOf(id) + 1;
+        $('at-em-tileno').textContent = numberOf(id);
         emSyncState();
         const mc = emissive.maskCanvas.getContext('2d');
         mc.fillStyle = '#000'; mc.fillRect(0, 0, emissive.maskCanvas.width, emissive.maskCanvas.height);
@@ -10270,7 +16202,7 @@ window.TRLE = window.TRLE || {};
         const mc = hg.mask.getContext('2d');
         mc.clearRect(0, 0, S, S);
         if (el.hgParams && el.hgParams.mask) mc.drawImage(el.hgParams.mask, 0, 0, S, S);
-        $('at-hg-tileno').textContent = indexOf(id) + 1;
+        $('at-hg-tileno').textContent = numberOf(id);
         hgSyncState();
         // An existing recipe reloads as it was; a fresh one starts from the tile's
         // own material, so the modal opens showing the height it would already export.
@@ -10469,7 +16401,16 @@ window.TRLE = window.TRLE || {};
        `getState()` returns the host state, `isActive()` gates editing (e.g. base chosen &&
        not in preview), `render()` repaints. Shared by the Anchored Transition + Height
        Transition tools (Transition Grid keeps its own handler — it mixes in stamps). */
-    function attachBoundaryEditor(canvas, getState, isActive, render) {
+    /* opts.lineDrag = false (Curves): a press on the line adds a point and drags it,
+       the way every curves tool works, instead of shifting the whole boundary. */
+    function attachBoundaryEditor(canvas, getState, isActive, render, opts = {}) {
+        const lineDragOn = opts.lineDrag !== false;
+        // opts.newPointType: smoothness for points the user adds (Curves wants smooth).
+        const addPoint = (S, x, y) => {
+            const a = { x, y };
+            if (opts.newPointType) applyCurveType(a, S.axis, opts.newPointType);
+            S.anchors.push(a);
+        };
         const pos = ev => {
             const r = canvas.getBoundingClientRect();
             const nx = (ev.clientX - r.left) / r.width, ny = (ev.clientY - r.top) / r.height;
@@ -10498,12 +16439,12 @@ window.TRLE = window.TRLE || {};
             if (h < 0) {
                 // Off the anchors: pressing the line starts a whole-boundary drag,
                 // but a press that never moves still means "add an anchor here".
-                if (boundaryLineHit(canvas, S.anchors, S.axis, p.px, p.py)) {
+                if (lineDragOn && boundaryLineHit(canvas, S.anchors, S.axis, p.px, p.py)) {
                     lineDrag = { start: p, moved: false, origin: boundaryOrigin(S.anchors, S.axis) };
                     try { canvas.setPointerCapture(e.pointerId); } catch { /* noop */ }
                     return;
                 }
-                S.anchors.push({ x: p.x, y: p.y }); h = S.anchors.length - 1;   // add + grab
+                addPoint(S, p.x, p.y); h = S.anchors.length - 1;   // add + grab
             }
             S.dragIdx = h;
             try { canvas.setPointerCapture(e.pointerId); } catch { /* noop */ }
@@ -10528,7 +16469,7 @@ window.TRLE = window.TRLE || {};
                 // Idle hover: advertise that the line itself can be grabbed.
                 if (!isActive()) return;
                 const p = pos(e);
-                canvas.style.cursor = (hit(p.px, p.py) < 0 && boundaryLineHit(canvas, S.anchors, S.axis, p.px, p.py))
+                canvas.style.cursor = (lineDragOn && hit(p.px, p.py) < 0 && boundaryLineHit(canvas, S.anchors, S.axis, p.px, p.py))
                     ? lineCursor(S.axis) : '';
                 return;
             }
@@ -10541,7 +16482,7 @@ window.TRLE = window.TRLE || {};
             const S = getState();
             if (lineDrag) {
                 // A click on the line that never moved falls back to "add anchor".
-                if (!lineDrag.moved) S.anchors.push({ x: lineDrag.start.x, y: lineDrag.start.y });
+                if (!lineDrag.moved) addPoint(S, lineDrag.start.x, lineDrag.start.y);
                 lineDrag = null;
                 render();
                 return;
@@ -10635,6 +16576,111 @@ window.TRLE = window.TRLE || {};
     /* Build the grayscale mask (white = overlay shows) from the anchor chain.
        Horizontal axis: border is y(x), fill above (or below if swapped).
        Vertical axis: border is x(y), fill left (or right if swapped). */
+    /* 🌿 Organic edge on a drawn boundary (BACKLOG-2026-09-PLAN phase 4). The same
+       raster route as the animated overlay (signed distance -> periodic field ->
+       re-threshold), plus the ONE thing that overlay deliberately leaves out: the
+       sin(pi*nx)*sin(pi*ny) window. An animation frame meets no sibling tile; an
+       anchored transition does, at the points where its curve crosses the tile
+       edge, and the neighbour was built from the same anchor position. So the
+       displacement goes to zero at the border AND the result is blended back to the
+       plain mask as the window closes, which keeps the border pixels bit for bit
+       what they were without organic (a rebuilt ramp is not the canvas's own
+       antialiasing, so pert = 0 alone would not). The field reads the orientation
+       the curve runs in: noise fast ALONG the contour, or teeth point sideways. */
+    /* Signed distance to a mask's 50% contour over a W x H rectangle, positive
+       inside, NOT wrapping, plus the mask's own edge width (the animCovDistance
+       statistic). animCovDistance is square and TOROIDAL, which is right for an
+       animation frame that repeats and wrong here: a drawn boundary's opposite
+       edges meet unrelated tiles, and a grid wall is rarely square. Values are
+       +-0.5 on the two pixels either side of the contour, so it sits between them. */
+    function maskSignedDistance(cov, W, H) {
+        const m = cov.getContext('2d').getImageData(0, 0, W, H).data;
+        const N = W * H, INF = 1e9;
+        const inside = new Uint8Array(N);
+        let band = 0;
+        for (let p = 0; p < N; p++) { const v = m[p * 4] / 255; band += 1 - Math.abs(2 * v - 1); inside[p] = m[p * 4] > 127 ? 1 : 0; }
+        const chamfer = cls => {      // distance from each `cls` pixel to the nearest other-class pixel
+            const d = new Float32Array(N);
+            for (let p = 0; p < N; p++) d[p] = inside[p] === cls ? INF : 0;
+            for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+                const p = y * W + x; let v = d[p]; if (!v) continue;
+                if (x > 0) v = Math.min(v, d[p - 1] + 1);
+                if (y > 0) { v = Math.min(v, d[p - W] + 1);
+                    if (x > 0) v = Math.min(v, d[p - W - 1] + 1.414);
+                    if (x < W - 1) v = Math.min(v, d[p - W + 1] + 1.414); }
+                d[p] = v;
+            }
+            for (let y = H - 1; y >= 0; y--) for (let x = W - 1; x >= 0; x--) {
+                const p = y * W + x; let v = d[p]; if (!v) continue;
+                if (x < W - 1) v = Math.min(v, d[p + 1] + 1);
+                if (y < H - 1) { v = Math.min(v, d[p + W] + 1);
+                    if (x < W - 1) v = Math.min(v, d[p + W + 1] + 1.414);
+                    if (x > 0) v = Math.min(v, d[p + W - 1] + 1.414); }
+                d[p] = v;
+            }
+            return d;
+        };
+        const dIn = chamfer(1), dOut = chamfer(0);
+        const sgn = new Float32Array(N);
+        let contour = 0;
+        for (let p = 0; p < N; p++) {
+            sgn[p] = inside[p] ? Math.min(dIn[p], 1e6) - 0.5 : 0.5 - Math.min(dOut[p], 1e6);
+            if (Math.abs(sgn[p]) <= 1) contour++;
+        }
+        const width = contour ? Math.min(Math.min(W, H) / 8, Math.max(1, 2 * band / contour)) : 1;
+        return { sgn, width };
+    }
+
+    /* 🌿 Organic edge on a DRAWN boundary: the Anchored Transition (one tile) and
+       the Transition Grid (a cols x rows wall, sliced afterwards). BACKLOG-2026-09-
+       PLAN phases 4-5. The same route as the animated overlay (signed distance ->
+       periodic field -> re-threshold), plus the ONE thing that overlay deliberately
+       leaves out: the sin(pi*nx)*sin(pi*ny) window over the rectangle's border. A
+       drawn boundary meets a neighbouring tile where it crosses that border, and the
+       neighbour was built from the same anchor position. So the displacement goes
+       to zero there AND the result is blended back to the plain mask as the window
+       closes, which keeps the border pixels bit for bit what they were without
+       organic (a rebuilt ramp is not the canvas's own antialiasing, so pert = 0
+       alone moved them by 11/255). A grid's INTERIOR cell seams need nothing: the
+       wall is one mask, sliced after.
+
+       `cellPx` is one tile's size inside the rectangle, so a grid cell and an
+       anchored tile get the same feature size and amplitude: the field is built on
+       the square covering the wall with its lattice scaled by the cell count. The
+       field reads the orientation the curve runs in (noise fast ALONG the contour),
+       or teeth point sideways. */
+    function orgBoundaryDisplace(plain, W, H, org, vertical, cellPx) {
+        const L = Math.max(W, H);
+        const w = ANORG_W(cellPx);
+        const og = bsetOrgFields(L, w, L === cellPx ? org : { ...org, scale: (org.scale || 3) * L / cellPx });
+        if (!og) return plain;
+        const { sgn, width } = maskSignedDistance(plain, W, H);
+        const span = width * SMOOTHSTEP_SPAN, feather = org.feather || 0;
+        const pd = plain.getContext('2d').getImageData(0, 0, W, H).data;
+        const out = document.createElement('canvas'); out.width = W; out.height = H;
+        const ctx = out.getContext('2d');
+        const im = ctx.createImageData(W, H);
+        const dx = Math.max(1, W - 1), dy = Math.max(1, H - 1);
+        for (let y = 0, p = 0; y < H; y++) {
+            const wy = Math.sin(Math.PI * y / dy);
+            for (let x = 0; x < W; x++, p++) {
+                const win = Math.sin(Math.PI * x / dx) * wy;
+                const pert = og.at(x, y, vertical, null, false) * win;
+                const ww = feather ? span * (1 + feather * 2 * Math.min(1, Math.abs(pert) / Math.max(1, w))) : span;
+                const t = Math.max(0, Math.min(1, (sgn[p] + pert) / ww + 0.5));
+                const rebuilt = 255 * t * t * (3 - 2 * t);
+                const k = Math.min(1, Math.max(0, win) * 4);
+                const v = Math.round(pd[p * 4] + (rebuilt - pd[p * 4]) * k);
+                im.data[p * 4] = im.data[p * 4 + 1] = im.data[p * 4 + 2] = v;
+                im.data[p * 4 + 3] = 255;
+            }
+        }
+        ctx.putImageData(im, 0, 0);
+        return out;
+    }
+    let anchorOrg = { seed: 1 };
+    const anchorOrgParams = () => readOrgPanel('at-ancorg', anchorOrg.seed);
+
     function buildAnchorMask(P) {
         let c = document.createElement('canvas'); c.width = P; c.height = P;
         const ctx = c.getContext('2d');
@@ -10647,6 +16693,8 @@ window.TRLE = window.TRLE || {};
         }
         const organic = parseInt($('at-anchor-organic').value) / 100;
         if (organic > 0) c = warpMaskOrganic(c, P, P, organic, anchorTr.organicSeed || 1);
+        const org = anchorOrgParams();
+        if (org) c = orgBoundaryDisplace(c, P, P, org, anchorTr.axis === 'v', P);
         const hardness = parseInt($('at-anchor-hardness').value) / 100;
         const blurPx = (1 - hardness) * (P / 12);
         if (blurPx > 0.4) {
@@ -10667,7 +16715,11 @@ window.TRLE = window.TRLE || {};
         const base = resizeCanvas(byId(anchorTr.baseId).canvas, P, P);
         const overlay = resizeCanvas(geomTransform(byId(anchorTr.overlayId).canvas, anchorTr.overlayGeom), P, P);
         const method = $('at-anchor-method').value;
-        const comp = composeTransitionDiffuse(base, overlay, buildAnchorMask(P), P, method, method === 'poisson' ? 180 : undefined);
+        const mask = buildAnchorMask(P);
+        let comp = composeTransitionDiffuse(base, overlay, mask, P, method, method === 'poisson' ? 180 : undefined);
+        const org = anchorOrgParams();
+        if (org && org.shadow > 0 && shadowHitsDiffuse(org))
+            comp = applyContactShadow(comp, mask, P, org.shadow, shadowOpts(org));
         ctx.clearRect(0, 0, P, P);
         ctx.drawImage(comp, 0, 0);
 
@@ -10690,8 +16742,15 @@ window.TRLE = window.TRLE || {};
         anchorTr.overlayGeom = { rot: 0, flipH: false, flipV: false };
         anchorTr.organicSeed = 1;
         $('at-anchor-organic').value = 0; $('at-anchor-organic-val').textContent = '0';
-        $('at-anchor-base-no').textContent = indexOf(baseId) + 1;
-        $('at-anchor-overlay-no').textContent = indexOf(overlayId) + 1;
+        // The organic panel resets with the warp slider it sits under: this modal
+        // opens clean every time. Amount, Scatter and Contact shadow are what arm it.
+        for (const k of ['wobble', 'scatter', 'shadow']) {
+            const e = $('at-ancorg-' + k);
+            if (e) { e.value = 0; $('at-ancorg-' + k + '-val').textContent = '0'; }
+        }
+        anchorOrg.seed = 1;
+        $('at-anchor-base-no').textContent = numberOf(baseId);
+        $('at-anchor-overlay-no').textContent = numberOf(overlayId);
         $('at-anchor-hide').checked = false;
         anchorSeed($('at-anchor-preset').value);
         openModal('anchor');
@@ -10711,6 +16770,7 @@ window.TRLE = window.TRLE || {};
         $('at-anchor-hardness').addEventListener('input', function () { $('at-anchor-hardness-val').textContent = this.value; anchorRender(); });
         $('at-anchor-organic').addEventListener('input', function () { $('at-anchor-organic-val').textContent = this.value; anchorRender(); });
         $('at-anchor-organic-seed').addEventListener('click', () => { anchorTr.organicSeed = (Math.random() * 1e9) >>> 0; anchorRender(); });
+        anchorOrg = wireOrgPanel('at-ancorg', anchorRender);
 
         $('at-anchor-hide').addEventListener('change', anchorRender);
         $('at-anchor-ov-rot').addEventListener('click', () => { anchorTr.overlayGeom.rot = (anchorTr.overlayGeom.rot + 90) % 360; anchorRender(); });
@@ -10733,6 +16793,10 @@ window.TRLE = window.TRLE || {};
                 base: anchorTr.baseId, overlay: anchorTr.overlayId,
                 mode: 'custom', pivot: 0, hardness: 0, blendMethod: method,
                 customMask: cloneCanvas(mask),
+                // The contour is baked into customMask; the recipe rides along for
+                // contact shadow, which refreshTransitions / deriveMaps read off
+                // el.organic for any transition, custom mask or not.
+                organic: anchorOrgParams(),
                 overlayGeom: geomIsIdentity(anchorTr.overlayGeom) ? null : { ...anchorTr.overlayGeom }
             });
             closeModal();
@@ -10805,10 +16869,55 @@ window.TRLE = window.TRLE || {};
         E.blit('desaturate', { u_texture: tex, u_gamma: 0.8, u_alphaFlatten: 0.0 }, gray);
         const blurred = E.gaussianBlur(gray.texture, S, S, detailBlur);
         const hfbo = E.createFBO(S, S);
-        E.blit('simpleHeight', { u_texture: blurred.texture, u_strength: contrast, u_bias: 0.0, u_invert: 0.0 }, hfbo);
+        /* EVERY uniform, at every call site. `blit()` leaves uniforms set on the
+           program and `simpleHeight` is shared with the material path, so the two
+           this used to omit were inherited from whatever ran last: measured on
+           Bricks, the field's mean was 87/255 cold and 184/255 after a single
+           generateMaps, for the same texture at the same settings. The Height
+           Transition's mask therefore depended on whether you had generated maps
+           first, which nothing recorded and `heightTr.hkey` could not cache.
+           (`u_bias` was never a uniform of this shader at all.)
+
+           0/0 is the COLD value, deliberately: it is what this feature has always
+           produced on a fresh page and what its seven presets were tuned against,
+           so fixing the determinism does not restyle anyone's saved transition. */
+        E.blit('simpleHeight', { u_texture: blurred.texture, u_strength: contrast,
+                                 u_ref: 0.0, u_top: 0.0, u_invert: 0.0 }, hfbo);
         const canvas = E.fboToCanvas(hfbo);
         E.deleteFBO(gray); E.deleteFBO(blurred); E.deleteFBO(hfbo); E.deleteTexture(tex);
         return canvas;
+    }
+
+    /* "Both (whichever is higher)" (BACKLOG-2026-09-PLAN phase 7, opt-in, Base stays
+       the default): the per-pixel MAX of the two fields, so snow settles on whatever
+       stands proud, brick or the snow's own lumps.
+
+       EACH FIELD IS NORMALISED TO ITS OWN RANGE FIRST, and the feature is useless
+       without it. htGenHeightField is a contrast stretch of LUMINANCE, so a brighter
+       texture's field sits above a darker one's everywhere: on Bricks + Sand the raw
+       max was Sand at all 16384 of 16384 pixels, i.e. "Both" was silently "Overlay".
+       "Higher" has to mean "proud of its OWN surface". The 1st and 99th percentiles,
+       not min/max, so one speck cannot decide the scale (the height map's 98th-
+       percentile rule). Base and Overlay alone are untouched by any of this. */
+    function htNormField(c, S) {
+        const im = c.getContext('2d').getImageData(0, 0, S, S), d = im.data;
+        const hist = new Uint32Array(256);
+        for (let i = 0; i < d.length; i += 4) hist[d[i]]++;
+        const N = S * S, pick = q => { let acc = 0; for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= q * N) return v; } return 255; };
+        const lo = pick(0.01), hi = Math.max(lo + 1, pick(0.99));
+        for (let i = 0; i < d.length; i += 4) d[i] = Math.round(255 * Math.max(0, Math.min(1, (d[i] - lo) / (hi - lo))));
+        return d;
+    }
+    function htMaxField(a, b, S) {
+        const da = a.getContext('2d').getImageData(0, 0, S, S);
+        const na = htNormField(a, S), nb = htNormField(b, S);
+        const d = da.data;
+        for (let i = 0; i < d.length; i += 4) {
+            const v = Math.max(na[i], nb[i]);
+            d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255;
+        }
+        a.getContext('2d').putImageData(da, 0, 0);
+        return a;
     }
 
     /* Read the modal controls. detail→blur (high detail = sharp = less blur);
@@ -10817,7 +16926,7 @@ window.TRLE = window.TRLE || {};
         const detail = parseInt($('at-ht-detail').value);
         const hardness = parseInt($('at-ht-hardness').value);
         return {
-            source:   $('at-ht-source').value,           // 'base' | 'overlay'
+            source:   $('at-ht-source').value,           // 'base' | 'overlay' | 'both'
             fill:     $('at-ht-fill').value,             // 'low' | 'high'
             level:    parseInt($('at-ht-level').value) / 100,
             width:    (1 - hardness / 100) * 0.4 + 0.02,
@@ -10833,13 +16942,16 @@ window.TRLE = window.TRLE || {};
 
     /* Layer C — sample the response spline into a 256-entry LUT (input height byte →
        fill 0..1) by filling above the curve and reading the boundary row per column. */
-    function htCurveLUT() {
+    function htCurveLUT() { return curveLUT(heightTr.curve.anchors); }
+    /* Any boundary-editor curve (axis 'h', y down) as a 256-entry LUT, 0..1. Shared
+       by the Height Transition's response curve and Adjust Colours' Curves. */
+    function curveLUT(anchors) {
         const N = 256;
         const c = document.createElement('canvas'); c.width = N; c.height = N;
         const x = c.getContext('2d');
         x.fillStyle = '#000'; x.fillRect(0, 0, N, N);
         x.fillStyle = '#fff';
-        traceFillOutline(x, heightTr.curve.anchors, 'h', false, N, N); x.fill();
+        traceFillOutline(x, anchors, 'h', false, N, N); x.fill();
         const d = x.getImageData(0, 0, N, N).data, lut = new Float32Array(N);
         for (let col = 0; col < N; col++) {
             let row = N;
@@ -10867,13 +16979,17 @@ window.TRLE = window.TRLE || {};
     /* Build the grayscale transition mask (white = overlay shows) at size S. */
     function htBuildMask(p, S) {
         // The height field is cached per (source·detail·contrast); only regenerate when those change.
-        const srcId = p.source === 'overlay' ? heightTr.overlayId : heightTr.baseId;
-        const srcCanvas = p.source === 'overlay'
-            ? geomTransform(byId(heightTr.overlayId).canvas, heightTr.overlayGeom)
-            : byId(heightTr.baseId).canvas;
+        const both = p.source === 'both';
+        const srcId = both ? `${heightTr.baseId}+${heightTr.overlayId}`
+                    : p.source === 'overlay' ? heightTr.overlayId : heightTr.baseId;
+        const ovCanvas = () => geomTransform(byId(heightTr.overlayId).canvas, heightTr.overlayGeom);
+        const srcCanvas = both ? null : p.source === 'overlay' ? ovCanvas() : byId(heightTr.baseId).canvas;
         const key = `${srcId}|${p.source}|${p.blur.toFixed(2)}|${p.contrast.toFixed(2)}|${S}|${heightTr.overlayGeom.rot}${heightTr.overlayGeom.flipH}${heightTr.overlayGeom.flipV}`;
         if (heightTr.hkey !== key) {
-            heightTr.hcache = htGenHeightField(resizeCanvas(srcCanvas, S, S), p.blur, p.contrast);
+            heightTr.hcache = both
+                ? htMaxField(htGenHeightField(resizeCanvas(byId(heightTr.baseId).canvas, S, S), p.blur, p.contrast),
+                             htGenHeightField(resizeCanvas(ovCanvas(), S, S), p.blur, p.contrast), S)
+                : htGenHeightField(resizeCanvas(srcCanvas, S, S), p.blur, p.contrast);
             heightTr.hkey = key;
         }
         const d = heightTr.hcache.getContext('2d').getImageData(0, 0, S, S).data;
@@ -10943,8 +17059,8 @@ window.TRLE = window.TRLE || {};
         heightTr.hcache = null; heightTr.hkey = null; heightTr.organicSeed = 1;
         heightTr.curve = { anchors: [{ x: 0, y: 1 }, { x: 1, y: 0 }], axis: 'h', dragIdx: -1 };
         heightTr.drift = { anchors: [{ x: 0, y: 0.5 }, { x: 1, y: 0.5 }], axis: 'h', dragIdx: -1 };
-        $('at-ht-base-no').textContent = indexOf(baseId) + 1;
-        $('at-ht-overlay-no').textContent = indexOf(overlayId) + 1;
+        $('at-ht-base-no').textContent = numberOf(baseId);
+        $('at-ht-overlay-no').textContent = numberOf(overlayId);
         $('at-ht-showmask').checked = false;
         $('at-ht-curve-on').checked = false;
         $('at-ht-drift-mode').value = 'off'; $('at-ht-drift-axis').value = 'h';
@@ -10962,8 +17078,8 @@ window.TRLE = window.TRLE || {};
         heightTr.editId = el.id;
         heightTr.baseId = el.base; heightTr.overlayId = el.overlay;
         heightTr.hcache = null; heightTr.hkey = null;
-        $('at-ht-base-no').textContent = indexOf(el.base) + 1;
-        $('at-ht-overlay-no').textContent = indexOf(el.overlay) + 1;
+        $('at-ht-base-no').textContent = numberOf(el.base);
+        $('at-ht-overlay-no').textContent = numberOf(el.overlay);
         $('at-ht-showmask').checked = false;
         htLoadParams(el.htParams);
         $('at-ht-add').textContent = '💾 Save Changes';
@@ -11234,8 +17350,8 @@ window.TRLE = window.TRLE || {};
     function ovOpenCommon(baseId, overlayId) {
         ov.baseId = baseId;
         ov.overlayId = overlayId;
-        $('at-ov-base-no').textContent    = indexOf(baseId) + 1;
-        $('at-ov-overlay-no').textContent = indexOf(overlayId) + 1;
+        $('at-ov-base-no').textContent    = numberOf(baseId);
+        $('at-ov-overlay-no').textContent = numberOf(overlayId);
         if (ovEditor) { ovEditor.setErase(false); ovEditor.resetHistory(); }
         ovSetMode();
         openModal('overlay');
@@ -11354,6 +17470,8 @@ window.TRLE = window.TRLE || {};
     const tg = { baseId: null, overlayId: null, anchors: [], axis: 'h', swap: false, dragIdx: -1,
                  cols: 3, rows: 3, shapes: [], tool: 'boundary', stampIdx: -1 };
 
+    let tgOrg = { seed: 1 };
+    const tgOrgParams = () => readOrgPanel('at-tgorg', tgOrg.seed);
     function tgCleanup() { tg.baseId = null; tg.overlayId = null; tg.dragIdx = -1; tg.curve = null; tg.stampIdx = -1; }
 
     function tgSeed(name) {
@@ -11363,7 +17481,7 @@ window.TRLE = window.TRLE || {};
     }
 
     /* Continuous boundary mask over a W×H rectangle (the whole grid). */
-    function buildGridMask(W, H, anchors, axis, swap, hardness, blurUnit, shapes, noBoundary, organic) {
+    function buildGridMask(W, H, anchors, axis, swap, hardness, blurUnit, shapes, noBoundary, organic, orgEdge) {
         let c = document.createElement('canvas'); c.width = W; c.height = H;
         const ctx = c.getContext('2d');
         ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
@@ -11384,6 +17502,9 @@ window.TRLE = window.TRLE || {};
         }
         // Organic edge — warp the whole mask before slicing so cells stay seamless.
         if (organic && organic.amount > 0) c = warpMaskOrganic(c, W, H, organic.amount, organic.seed || 1);
+        // 🌿 Organic edge (the shared panel): over the WHOLE wall too, windowed at
+        // the wall's border only. blurUnit is one cell's size.
+        if (orgEdge) c = orgBoundaryDisplace(c, W, H, orgEdge, axis === 'v', blurUnit);
         const blurPx = (1 - hardness) * (blurUnit / 12);
         if (blurPx > 0.4) {
             const o = document.createElement('canvas'); o.width = W; o.height = H;
@@ -11409,11 +17530,14 @@ window.TRLE = window.TRLE || {};
         const overlay = resizeCanvas(byId(tg.overlayId).canvas, pc, pc);
         const noBoundary = $('at-tg-noboundary').checked;
         const organic = { amount: parseInt($('at-tg-organic').value) / 100, seed: tg.organicSeed || 1 };
-        const global = buildGridMask(W, H, tg.anchors, tg.axis, tg.swap, hardness, pc, tg.shapes, noBoundary, organic);
+        const orgEdge = tgOrgParams();
+        const global = buildGridMask(W, H, tg.anchors, tg.axis, tg.swap, hardness, pc, tg.shapes, noBoundary, organic, orgEdge);
         for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
             const cellMask = document.createElement('canvas'); cellMask.width = pc; cellMask.height = pc;
             cellMask.getContext('2d').drawImage(global, c * pc, r * pc, pc, pc, 0, 0, pc, pc);
-            const comp = composeTransitionDiffuse(base, overlay, cellMask, pc, method, method === 'poisson' ? 120 : undefined);
+            let comp = composeTransitionDiffuse(base, overlay, cellMask, pc, method, method === 'poisson' ? 120 : undefined);
+            if (orgEdge && orgEdge.shadow > 0 && shadowHitsDiffuse(orgEdge))
+                comp = applyContactShadow(comp, cellMask, pc, orgEdge.shadow, shadowOpts(orgEdge));
             ctx.drawImage(comp, c * pc, r * pc);
         }
         // cell grid lines
@@ -11461,10 +17585,15 @@ window.TRLE = window.TRLE || {};
         tg.baseId = baseId; tg.overlayId = overlayId; tg.dragIdx = -1; tg.curve = null;
         tg.shapes = []; tg.stampIdx = -1; tg.tool = 'boundary'; tg.organicSeed = 1;
         $('at-tg-organic').value = 0; $('at-tg-organic-val').textContent = '0';
+        for (const k of ['wobble', 'scatter', 'shadow']) {     // opens clean, like the warp slider
+            const e = $('at-tgorg-' + k);
+            if (e) { e.value = 0; $('at-tgorg-' + k + '-val').textContent = '0'; }
+        }
+        tgOrg.seed = 1;
         tg.cols = Math.max(1, Math.min(8, parseInt($('at-tg-cols').value) || 3));
         tg.rows = Math.max(1, Math.min(8, parseInt($('at-tg-rows').value) || 3));
-        $('at-tg-base-no').textContent = indexOf(baseId) + 1;
-        $('at-tg-overlay-no').textContent = indexOf(overlayId) + 1;
+        $('at-tg-base-no').textContent = numberOf(baseId);
+        $('at-tg-overlay-no').textContent = numberOf(overlayId);
         $('at-tg-hide').checked = false;
         $('at-tg-noboundary').checked = false;
         const boundaryRadio = document.querySelector('input[name="at-tg-tool"][value="boundary"]');
@@ -11492,6 +17621,7 @@ window.TRLE = window.TRLE || {};
         $('at-tg-hardness').addEventListener('input', function () { $('at-tg-hardness-val').textContent = this.value; tgRender(); });
         $('at-tg-organic').addEventListener('input', function () { $('at-tg-organic-val').textContent = this.value; tgRender(); });
         $('at-tg-organic-seed').addEventListener('click', () => { tg.organicSeed = (Math.random() * 1e9) >>> 0; tgRender(); });
+        tgOrg = wireOrgPanel('at-tgorg', tgRender);
         $('at-tg-hide').addEventListener('change', tgRender);
 
         // Stamp tool controls
@@ -11623,7 +17753,8 @@ window.TRLE = window.TRLE || {};
             const baseId = tg.baseId, overlayId = tg.overlayId;
             // Build the cell tiles now (tg.* is cleared on close), then optionally
             // reflow the atlas to `cols` so the grid lines up before adding them.
-            const global = buildGridMask(cols * S, rows * S, tg.anchors, tg.axis, tg.swap, hardness, S, tg.shapes, noBoundary, organic);
+            const orgEdge = tgOrgParams();
+            const global = buildGridMask(cols * S, rows * S, tg.anchors, tg.axis, tg.swap, hardness, S, tg.shapes, noBoundary, organic, orgEdge);
             const els = [];
             for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
                 const cellMask = document.createElement('canvas'); cellMask.width = S; cellMask.height = S;
@@ -11633,7 +17764,9 @@ window.TRLE = window.TRLE || {};
                     original: null, seamless: false, material: null,
                     base: baseId, overlay: overlayId,
                     mode: 'custom', pivot: 0, hardness: 0, blendMethod: method,
-                    customMask: cellMask
+                    customMask: cellMask,
+                    // contour baked into customMask; the recipe is for contact shadow
+                    organic: orgEdge ? { ...orgEdge } : null
                 });
             }
             confirmResizeCols(cols, () => {
@@ -11731,12 +17864,24 @@ window.TRLE = window.TRLE || {};
 
     /* Generic slider-grid builder for the colour tools.
        params: [key, label, min, max, def, suffix]. Calls onInput on every move. */
+    /* A plain string in `params` renders a group HEADING rather than a slider. Nine
+       levels sliders in one flat list read as a wall; three labelled groups of three
+       read as what they are. Backward compatible -- every existing caller passes
+       arrays only. */
     function buildSliderGrid(containerId, params, prefix, onInput) {
         const wrap = $(containerId);
         wrap.innerHTML = '';
-        params.forEach(([key, label, min, max, def, suffix]) => {
+        params.forEach(entry => {
+            if (typeof entry === 'string') {
+                const h = document.createElement('div');
+                h.className = 'at-slider-head';
+                h.textContent = entry;
+                wrap.appendChild(h);
+                return;
+            }
+            const [key, label, min, max, def, suffix, wide] = entry;
             const g = document.createElement('div');
-            g.className = 'form-group';
+            g.className = 'form-group' + (wide ? ' at-slider-wide' : '');
             g.innerHTML = `<label>${label}: <span id="at-${prefix}-${key}-val">${def}</span>${suffix || ''}</label>
  <input type="range" id="at-${prefix}-${key}" min="${min}" max="${max}" value="${def}" style="width:100%;">`;
             wrap.appendChild(g);
@@ -11749,7 +17894,9 @@ window.TRLE = window.TRLE || {};
     }
     /* Reset a slider grid to its defaults. */
     function resetSliderGrid(params, prefix) {
-        params.forEach(([key, , , , def]) => {
+        params.forEach(entry => {
+            if (typeof entry === 'string') return;
+            const [key, , , , def] = entry;
             $(`at-${prefix}-${key}`).value = def;
             $(`at-${prefix}-${key}-val`).textContent = def;
         });
@@ -11778,38 +17925,310 @@ window.TRLE = window.TRLE || {};
         ['tint',     'Tint',        -100, 100,   0, ''],
         ['vibrance', 'Vibrance',    -100, 100,   0, '']
     ];
-    const ca = { id: null, tex: null, batchIds: [] };
+    /* Per-channel LEVELS. Nine sliders, three per channel, built with the same
+       buildSliderGrid helper as everything else -- deliberately Levels rather than
+       Curves, because it is the control level builders already know from Photoshop,
+       Photopea and Affinity, and it needs no new UI primitive. A curve editor is a
+       draggable-point canvas widget and that widget is most of its cost; it is
+       recorded as deferred in Roadmap.md, not rejected.
+
+       This exists because every one of the eight Simple sliders is GLOBAL AND
+       SYMMETRIC -- Temperature pushes R up and B down together, Tint moves G -- so
+       there was no way to say "lift the blacks in blue only" or "bring the red
+       highlights down". Gamma is a percent, like the Simple tab's, so 100 is neutral.
+
+       LABELS: "Dark cutoff" / "Bright cutoff" rather than Photoshop's "black point" /
+       "white point" (renamed 2026-09-22 after the terms were reported as confusing).
+       The ids keep the black/white spelling because they are wired into saved demo
+       steps and validators; only the labels moved. "Shadow"/"Highlight" was rejected
+       as the alternative because it reads oddly per channel, a red shadow is not a
+       thing.
+
+       NOTE the ids: nothing here may collide with what buildMaskToolbar generates
+       for the paint mode (-value, -hardness, -brush, -tol, -rough, -scatter, -fill,
+       -invert, -clear, -undo, -redo, -paint, -erase, -toolhint, -wand-contig). In
+       particular there is deliberately NO per-channel invert: `${prefix}-invert` is
+       the toolbar's own button and that collision is the at-hg-invert bug exactly. */
+    const CA_LEVELS_PARAMS = [
+        'Red',
+        ['rblack', 'Dark cutoff',   0, 254,   0, ''],
+        ['rwhite', 'Bright cutoff', 1, 255, 255, ''],
+        ['rgamma', 'Gamma',        20, 300, 100, '%', true],
+        'Green',
+        ['gblack', 'Dark cutoff',   0, 254,   0, ''],
+        ['gwhite', 'Bright cutoff', 1, 255, 255, ''],
+        ['ggamma', 'Gamma',        20, 300, 100, '%', true],
+        'Blue',
+        ['bblack', 'Dark cutoff',   0, 254,   0, ''],
+        ['bwhite', 'Bright cutoff', 1, 255, 255, ''],
+        ['bgamma', 'Gamma',        20, 300, 100, '%', true]
+    ];
+    const CA_MODE_HINT = {
+        simple:  'One grade over the whole tile. Every control here is symmetric, so Temperature moves red and blue together.',
+        channel: 'Each channel gets its own range. Below its Dark cutoff that channel reads as 0, above its Bright cutoff it reads as full, and Gamma bends everything between without moving either end. Use it to pull a colour cast out of the dark end or the bright end without touching the rest.',
+        mask:    'Paint on the preview to mark a region, then grade only that, or pull its colour back toward the texture around it. One tile at a time.',
+        curves:  'One curve per channel, the way Photoshop, Photopea and Affinity do it. Left to right is the brightness going in, up is what comes out. An S-shape adds contrast, lifting the left end brightens the shadows, and the Red, Green and Blue curves pull a colour cast out of one end without touching the other.'
+    };
+    const CA_PAINT_HINT = {
+        grade: 'The sliders below apply inside the painted region only. Everything outside it comes out byte for byte unchanged. Hit Apply when it looks right.',
+        match: 'The region keeps its light and shade and takes the HUE of the texture around it. Good for a patch that came out the wrong colour, a green cast on one part of a wall, a stain an upscaler invented. Paint the patch rather than a box around it: one shift is applied everywhere you painted, so clean texture caught in the selection comes back over-corrected.'
+    };
+    const ca = { id: null, tex: null, batchIds: [], maskCanvas: null };
+    let caEditor = null;
     function caCleanup() {
         if (ca.tex) { TRLE.Engine.deleteTexture(ca.tex); ca.tex = null; }
         ca.id = null;
         ca.batchIds = [];
     }
-    function caUniforms() {
-        const v = k => parseInt($('at-ca-' + k).value);
-        return {
-            u_hue: v('hue'), u_sat: v('sat') / 100, u_bright: v('bright') / 100,
-            u_contrast: v('contrast') / 100, u_gamma: v('gamma') / 100,
-            u_temp: v('temp') / 100, u_tint: v('tint') / 100,
-            u_vibrance: v('vibrance') / 100, u_invert: 0
-        };
+    function caMode() { const e = $('at-ca-mode'); return e ? e.value : 'simple'; }
+    function caPaintMode() {
+        const r = document.querySelector('input[name="at-ca-paintmode"]:checked');
+        return r ? r.value : 'grade';
     }
-    function caApplyTo(srcCanvas, S) {
+
+    /* Alpha-weighted mean Lab INSIDE or OUTSIDE a paint mask, at the tile's own
+       resolution (was 64x64 until 2026-09-24; see computeColorStats).
+       `outside` is not a convenience flag, it is the whole point of the Match
+       sub-mode: the reference has to come from the texture AROUND the region. Read
+       it from inside and the blotch becomes its own reference and the operation is
+       a slow no-op. Same shape as the Recolor batch rule, measure before you write. */
+    function caMaskedLabMean(canvas, maskCanvas, outside, size) {
+        size = size || canvas.width;
+        const src = resizeCanvas(canvas, size, size).getContext('2d').getImageData(0, 0, size, size).data;
+        const mk = resizeCanvas(maskCanvas, size, size).getContext('2d').getImageData(0, 0, size, size).data;
+        const sum = [0, 0, 0];
+        let wsum = 0;
+        for (let i = 0; i < src.length; i += 4) {
+            const sel = mk[i + 3] / 255;
+            const w = (src[i + 3] / 255) * (outside ? 1 - sel : sel);
+            if (w <= 0.001) continue;
+            const lab = srgb8ToLab(src[i], src[i + 1], src[i + 2]);
+            for (let c = 0; c < 3; c++) sum[c] += w * lab[c];
+            wsum += w;
+        }
+        return wsum <= 0 ? null : sum.map(x => x / wsum);
+    }
+
+    /* Match the surroundings: shift the region's CHROMA toward the surrounding
+       chroma and leave its LIGHTNESS alone, so the grain, the mortar and every
+       shadow inside the patch survive while the colour cast goes.
+
+       No new GLSL. It reuses `colorTransfer` with the L axis neutralised: both means
+       carry 0 for L and u_scale is 1 on every axis, so the map is `lab - meanA +
+       meanB` with the L term cancelling. Keeping u_scale at 1 rather than matching
+       the surrounding SPREAD is deliberate, that spread is what the region's own
+       detail is made of. */
+    function caMatchSurroundings(srcCanvas, maskCanvas, S, strength) {
+        const inside = caMaskedLabMean(srcCanvas, maskCanvas, false);
+        const around = caMaskedLabMean(srcCanvas, maskCanvas, true);
+        if (!inside || !around) return cloneCanvas(srcCanvas);
         const E = TRLE.Engine;
         const tex = E.createTextureFromImage(srcCanvas);
         const fbo = E.createFBO(S, S);
-        E.blit('colorAdjust', Object.assign({ u_texture: tex }, caUniforms()), fbo);
+        E.blit('colorTransfer', {
+            u_texture: tex,
+            u_meanA: [0, inside[1], inside[2]],
+            u_meanB: [0, around[1], around[2]],
+            u_scale: [1, 1, 1],
+            u_strength: strength
+        }, fbo);
         const out = E.fboToCanvas(fbo);
         E.deleteFBO(fbo); E.deleteTexture(tex);
         return out;
     }
+
+    /* Composite `edit` over `base` through the paint mask's alpha. Soft mask edges
+       come out as a real blend, and everything outside the mask is untouched, which
+       is the assertion validate-colour-mask leans on. */
+    function caMaskComposite(base, edit, maskCanvas, S) {
+        const cut = document.createElement('canvas');
+        cut.width = S; cut.height = S;
+        const g = cut.getContext('2d');
+        g.drawImage(edit, 0, 0, S, S);
+        g.globalCompositeOperation = 'destination-in';
+        g.drawImage(maskCanvas, 0, 0, S, S);
+        const out = cloneCanvas(base);
+        out.getContext('2d').drawImage(cut, 0, 0, S, S);
+        return out;
+    }
+    /* Levels is a stage in the same shader rather than a second shader, so the mode
+       only decides WHICH stages are exposed. In simple mode u_levOn is 0 and the
+       stage is skipped outright, which is what keeps the default path byte-identical
+       to what it produced before this existed. */
+    function caUniforms() {
+        const v = k => parseInt($('at-ca-' + k).value);
+        const chan = caMode() === 'channel';
+        // Curves mode exposes no Simple sliders, so they are neutral here exactly as
+        // in channel mode. `plain` is "the Simple stages are off".
+        const plain = chan || caMode() === 'curves';
+        const lev = (suffix, scale) => chan
+            ? ['r', 'g', 'b'].map(c => v(c + suffix) / scale)
+            : [0, 0, 0];
+        return {
+            u_hue: plain ? 0 : v('hue'), u_sat: plain ? 1 : v('sat') / 100,
+            u_bright: plain ? 0 : v('bright') / 100, u_contrast: plain ? 1 : v('contrast') / 100,
+            u_gamma: plain ? 1 : v('gamma') / 100,
+            u_temp: plain ? 0 : v('temp') / 100, u_tint: plain ? 0 : v('tint') / 100,
+            u_vibrance: plain ? 0 : v('vibrance') / 100, u_invert: 0,
+            // Always passed: blit() leaves uniforms set on the program, so a mode that
+            // omitted it would inherit a previous Curves render's 1.
+            u_curveOn: 0,
+            u_levOn: chan ? 1 : 0,
+            u_levBlack: lev('black', 255),
+            u_levWhite: chan ? ['r', 'g', 'b'].map(c => v(c + 'white') / 255) : [1, 1, 1],
+            u_levGamma: chan ? ['r', 'g', 'b'].map(c => v(c + 'gamma') / 100) : [1, 1, 1]
+        };
+    }
+    /* ---- Curves (BACKLOG-2026-09-PLAN phase 6) ----
+       Four curves on the shared boundary editor, the Height Transition's response
+       curve being the precedent: RGB, then one each for red, green and blue. Each
+       channel's own curve applies first and the RGB curve on top of it, as in
+       Photoshop. They become ONE 256x1 LUT texture, one channel per colour. */
+    const CA_CURVE_CHANNELS = ['rgb', 'r', 'g', 'b'];
+    const CA_CURVE_INK = { rgb: '#e8e8e8', r: '#ff6b6b', g: '#6bd96b', b: '#6b9bff' };
+    /* Endpoints start SMOOTH (the shared editor's default type 0 draws straight
+       segments), so one added point gives an S rather than a kink. A two-point curve
+       is a straight line whatever its types, so "bent" is about positions only. */
+    const caCurveIdentity = () => {
+        const a = [{ x: 0, y: 1 }, { x: 1, y: 0 }];
+        a.forEach(p => applyCurveType(p, 'h', 2));
+        return { anchors: a, axis: 'h', dragIdx: -1 };
+    };
+    const caCurveBent = cv => !(cv.anchors.length === 2
+        && cv.anchors.every(a => (a.x === 0 && a.y === 1) || (a.x === 1 && a.y === 0)));
+    function caCurveCh() {
+        const r = document.querySelector('input[name="at-ca-curvech"]:checked');
+        return r ? r.value : 'rgb';
+    }
+    /* null when Curves is not the mode, or no curve has been bent: the stage is then
+       skipped, which is the byte-identity guarantee. */
+    function caCurveTable() {
+        if (caMode() !== 'curves' || !ca.curves) return null;
+        if (!CA_CURVE_CHANNELS.some(k => caCurveBent(ca.curves[k]))) return null;
+        /* An untouched curve is EXACT identity, not a rasterised diagonal: that can
+           land a step off, and bending Red would then nudge Green and Blue by 1/255. */
+        const lut = k => caCurveBent(ca.curves[k]) ? curveLUT(ca.curves[k].anchors)
+                                                   : Float32Array.from({ length: 256 }, (_, i) => i / 255);
+        const m = lut('rgb');
+        return ['r', 'g', 'b'].map(k => {
+            const L = lut(k), t = new Array(256);
+            for (let i = 0; i < 256; i++) t[i] = Math.round(255 * m[Math.round(L[i] * 255)]);
+            return t;
+        });
+    }
+    function caCurveTexture() {
+        const T = caCurveTable();
+        if (!T) return null;
+        const c = document.createElement('canvas'); c.width = 256; c.height = 1;
+        const g = c.getContext('2d'), im = g.createImageData(256, 1);
+        for (let i = 0; i < 256; i++) {
+            im.data[i * 4] = T[0][i]; im.data[i * 4 + 1] = T[1][i]; im.data[i * 4 + 2] = T[2][i];
+            im.data[i * 4 + 3] = 255;
+        }
+        g.putImageData(im, 0, 0);
+        // NEAREST + clamp: the shader looks up texel centres, so no filtering happens.
+        return TRLE.Engine.createTextureFromImage(c, { filter: 0x2600, wrap: 0x812F });
+    }
+    /* Every colorAdjust blit in this modal goes through here, so the curve texture
+       is built, bound and freed in one place. */
+    function caBlit(tex, fbo) {
+        const E = TRLE.Engine;
+        const u = Object.assign({ u_texture: tex }, caUniforms());
+        const ct = caCurveTexture();
+        /* u_curveTex is bound on EVERY call, to the source when there is no curve.
+           A sampler in a branch that never runs still counts: WebGL rejects the draw
+           as a feedback loop if its unit holds the render target's texture, and
+           createFBO binds its new texture on whichever unit a previous blit left
+           active. Measured: after one Curves blit, the next plain colorAdjust came out
+           solid black. */
+        if (ct) { u.u_curveOn = 1; u.u_curveTex = ct; } else u.u_curveTex = tex;
+        E.blit('colorAdjust', u, fbo);
+        if (ct) E.deleteTexture(ct);
+    }
+    function caCurveRender() {
+        const cv = $('at-ca-curve');
+        if (!cv || !ca.curves) return;
+        const W = cv.width, H = cv.height, ctx = cv.getContext('2d');
+        ctx.fillStyle = '#1a1a1a'; ctx.fillRect(0, 0, W, H);
+        ctx.strokeStyle = 'rgba(255,255,255,0.10)'; ctx.lineWidth = 1;
+        for (let i = 1; i < 4; i++) { ctx.beginPath(); ctx.moveTo(W * i / 4, 0); ctx.lineTo(W * i / 4, H); ctx.moveTo(0, H * i / 4); ctx.lineTo(W, H * i / 4); ctx.stroke(); }
+        ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.beginPath(); ctx.moveTo(0, H); ctx.lineTo(W, 0); ctx.stroke();
+        const cur = caCurveCh();
+        // The other bent curves, faintly, so a cast fixed in Red stays in view from RGB.
+        for (const k of CA_CURVE_CHANNELS) {
+            if (k === cur || !caCurveBent(ca.curves[k])) continue;
+            const L = curveLUT(ca.curves[k].anchors);
+            ctx.strokeStyle = CA_CURVE_INK[k]; ctx.globalAlpha = 0.35; ctx.beginPath();
+            for (let i = 0; i < 256; i++) { const x = i / 255 * W, y = (1 - L[i]) * H; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+            ctx.stroke(); ctx.globalAlpha = 1;
+        }
+        drawBoundaryHandles(ctx, ca.curves[cur].anchors, 'h', W, H, ca.curves[cur].dragIdx);
+    }
+    function caCurvesReset() {
+        ca.curves = { rgb: caCurveIdentity(), r: caCurveIdentity(), g: caCurveIdentity(), b: caCurveIdentity() };
+        const r = document.querySelector('input[name="at-ca-curvech"][value="rgb"]');
+        if (r) r.checked = true;
+        caCurveRender();
+    }
+
+    /* The whole-tile grade, before any mask is considered. */
+    function caGradeTo(srcCanvas, S) {
+        const E = TRLE.Engine;
+        const tex = E.createTextureFromImage(srcCanvas);
+        const fbo = E.createFBO(S, S);
+        caBlit(tex, fbo);
+        const out = E.fboToCanvas(fbo);
+        E.deleteFBO(fbo); E.deleteTexture(tex);
+        return out;
+    }
+    /* What Apply and the preview both produce, for whichever mode is selected. */
+    function caApplyTo(srcCanvas, S) {
+        if (caMode() !== 'mask') return caGradeTo(srcCanvas, S);
+        const edit = caPaintMode() === 'match'
+            ? caMatchSurroundings(srcCanvas, ca.maskCanvas, S, parseInt($('at-ca-matchstr').value) / 100)
+            : caGradeTo(srcCanvas, S);
+        return caMaskComposite(srcCanvas, edit, ca.maskCanvas, S);
+    }
     function caRender() {
         if (ca.id === null) return;
-        const E = TRLE.Engine, P = $('at-ca-preview').width;
+        const disp = $('at-ca-preview'), P = disp.width;
+        const el = byId(ca.id);
+        if (!el) return;
+        if (caMode() === 'mask') {
+            /* Paint ON the result, the way De-light does. There is no second canvas
+               to keep in step and you judge the grade on the pixels you are painting.
+               drawReplace, never a bare drawImage: this canvas is reused by every
+               tile and a cutout would show the previous one through its holes. */
+            const out = caApplyTo(el.canvas, state.tileSize);
+            drawReplace(disp, out, P, P);
+            const ctx = disp.getContext('2d');
+            caTintMask(ctx, P);
+            if (caEditor) caEditor.drawOverlay(ctx);
+            return;
+        }
+        const E = TRLE.Engine;
         const fbo = E.createFBO(P, P);
-        E.blit('colorAdjust', Object.assign({ u_texture: ca.tex }, caUniforms()), fbo);
+        caBlit(ca.tex, fbo);
         const out = E.fboToCanvas(fbo);
-        drawReplace($('at-ca-preview'), out, P, P);
+        drawReplace(disp, out, P, P);
         E.deleteFBO(fbo);
+    }
+    /* Orange wash over the selected region so it is visible even where the grade
+       itself barely moved the pixels. Drawn on the DISPLAY canvas only -- the mask
+       lives in ca.maskCanvas and nothing reads it back off here. */
+    function caTintMask(ctx, P) {
+        ctx.save();
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.globalAlpha = 0.22;
+        const t = document.createElement('canvas');
+        t.width = P; t.height = P;
+        const g = t.getContext('2d');
+        g.fillStyle = '#e8852a';
+        g.fillRect(0, 0, P, P);
+        g.globalCompositeOperation = 'destination-in';
+        g.drawImage(ca.maskCanvas, 0, 0, P, P);
+        ctx.drawImage(t, 0, 0);
+        ctx.restore();
     }
     /* `ids` is the whole selection when the right-click landed inside one. The
        preview shows ids[0] (the tile that was right-clicked, since selectedIds
@@ -11823,18 +18242,124 @@ window.TRLE = window.TRLE || {};
         ca.id = id;
         ca.batchIds = list.slice();
         ca.tex = TRLE.Engine.createTextureFromImage(el.canvas);
-        $('at-ca-tileno').textContent = indexOf(id) + 1;
-        setBatchNote('at-modal-coloradj', list.length, indexOf(id) + 1);
-        resetSliderGrid(CA_PARAMS, 'ca');
+        $('at-ca-tileno').textContent = numberOf(id);
+        setBatchNote('at-modal-coloradj', list.length, numberOf(id));
+        /* PAINT MODE CANNOT BATCH. A mask is coordinates on one specific texture, so
+           applying it across a selection is almost never meant. Follow the Set
+           Material precedent and DISABLE the option with a reason rather than hiding
+           it, so the control does not silently change shape with the selection. */
+        const many = list.length > 1;
+        const maskOpt = $('at-ca-mode').querySelector('option[value="mask"]');
+        maskOpt.disabled = many;
+        maskOpt.title = many
+            ? 'Painting a region works on one tile at a time, a mask is drawn on one specific texture'
+            : '';
+        maskOpt.textContent = many ? 'Paint a region (one tile at a time)' : 'Paint a region';
+        /* Always reopen on Simple with everything neutral. Without this the modal
+           comes back on whatever the last tile left behind, which is the bug
+           ovResetControls exists to prevent in Overlay. */
+        $('at-ca-mode').value = 'simple';
+        caResetControls();
+        caSyncMode();
         openModal('coloradj');
         caRender();
     }
+    /* Show the controls for the current mode and reset BOTH grids. Switching mode
+       is switching operation, so carrying values across would mean a hidden slider
+       silently contributing to the result. */
+    function caSyncMode() {
+        const mode = caMode(), chan = mode === 'channel', paint = mode === 'mask', curves = mode === 'curves';
+        const match = paint && caPaintMode() === 'match';
+        /* In mask mode the SIMPLE sliders are what the Grade sub-mode applies, so
+           they stay on screen; Match needs no grade at all, so they go. Channel
+           levels inside a mask is not offered -- three levels of nesting in one
+           modal is worse than the feature is worth. Recorded in Roadmap.md. */
+        $('at-ca-sliders').style.display = (chan || match || curves) ? 'none' : '';
+        $('at-ca-curves').style.display = curves ? '' : 'none';
+        if (curves) caCurveRender();
+        $('at-ca-levels').style.display = chan ? '' : 'none';
+        $('at-ca-maskwrap').style.display = paint ? '' : 'none';
+        $('at-ca-matchwrap').style.display = match ? '' : 'none';
+        $('at-ca-mode-hint').textContent = CA_MODE_HINT[mode] || '';
+        $('at-ca-mask-hint').textContent = paint ? (CA_PAINT_HINT[caPaintMode()] || '') : '';
+        $('at-ca-preview-label').textContent = paint ? 'Paint here' : 'Preview';
+        $('at-ca-preview').classList.toggle('at-mm-brushmode', paint);
+    }
+    /* Reset everything the modal carries. Called on OPEN and on a MODE change, so a
+       second tile cannot inherit the first one's settings (the bug ovResetControls
+       exists to prevent in Overlay).
+
+       Deliberately NOT called when the Grade/Match SUB-MODE changes. The mask means
+       the same thing in both, so wiping it there would throw away the painting the
+       moment someone changed their mind about what to do with it -- which is exactly
+       the "paint once, then decide" workflow this modal is arranged around. Reported
+       2026-09-22 as part of the paint-first rework. */
+    function caResetControls() {
+        resetSliderGrid(CA_PARAMS, 'ca');
+        resetSliderGrid(CA_LEVELS_PARAMS, 'ca');
+        const g = document.querySelector('input[name="at-ca-paintmode"][value="grade"]');
+        if (g) g.checked = true;
+        $('at-ca-matchstr').value = 100;
+        $('at-ca-matchstr-val').textContent = '100';
+        caCurvesReset();
+        caClearMask();
+    }
+    /* Wipe the region and the editor's undo stack together. The stack is keyed to
+       the pixels underneath it, so an undo taken before a MODE switch would restore
+       the wrong mask afterwards -- multi-material resets on every layer switch for
+       exactly this reason. */
+    function caClearMask() {
+        if (!ca.maskCanvas) return;
+        ca.maskCanvas.getContext('2d').clearRect(0, 0, ca.maskCanvas.width, ca.maskCanvas.height);
+        if (caEditor) caEditor.resetHistory();
+    }
     function setupColorAdjModal() {
         buildSliderGrid('at-ca-sliders', CA_PARAMS, 'ca', caRender);
-        $('at-ca-reset').addEventListener('click', () => { resetSliderGrid(CA_PARAMS, 'ca'); caRender(); });
+        buildSliderGrid('at-ca-levels', CA_LEVELS_PARAMS, 'ca', caRender);
+        caCurvesReset();
+        attachBoundaryEditor($('at-ca-curve'), () => ca.curves[caCurveCh()],
+            () => caMode() === 'curves' && $('at-modal-coloradj').style.display !== 'none',
+            () => { caCurveRender(); caRender(); }, { lineDrag: false, newPointType: 2 });
+        document.querySelectorAll('input[name="at-ca-curvech"]').forEach(r =>
+            r.addEventListener('change', caCurveRender));
+        $('at-ca-curve-reset').addEventListener('click', () => {
+            ca.curves[caCurveCh()] = caCurveIdentity();
+            caCurveRender(); caRender();
+        });
+        ca.maskCanvas = document.createElement('canvas');
+        ca.maskCanvas.width = 256; ca.maskCanvas.height = 256;
+        /* Prefix `at-camask`, NOT `at-ca`. buildMaskToolbar generates
+           ${prefix}-value/-hardness/-brush/-tol/-fill/-invert/-clear/-undo/-redo/
+           -paint/-erase/-toolhint, getElementById returns the FIRST match, and this
+           modal already owns a pile of at-ca-* ids. Same reason Fade's organic panel
+           is at-fadeorg. The failure is silent, never a crash. */
+        buildMaskToolbar($('at-ca-tools'), 'at-camask', { brushMax: 96 });
+        caEditor = createMaskEditor('at-camask', {
+            canvas: $('at-ca-preview'),
+            mode: 'alpha',
+            getMask: () => ca.maskCanvas,
+            getSource: () => { const el = byId(ca.id); return el ? el.canvas : null; },
+            active: () => ca.id !== null && caMode() === 'mask'
+                          && $('at-modal-coloradj').style.display !== 'none',
+            onChange: caRender
+        });
+        /* A MODE change is a different operation, so everything resets. A SUB-MODE
+           change is the same region seen two ways, so the mask and the sliders stay. */
+        $('at-ca-mode').addEventListener('change', () => { caResetControls(); caSyncMode(); caRender(); });
+        document.querySelectorAll('input[name="at-ca-paintmode"]').forEach(r =>
+            r.addEventListener('change', () => { caSyncMode(); caRender(); }));
+        $('at-ca-matchstr').addEventListener('input', function () {
+            $('at-ca-matchstr-val').textContent = this.value;
+            caRender();
+        });
+        $('at-ca-reset').addEventListener('click', () => { caResetControls(); caSyncMode(); caRender(); });
         $('at-ca-apply').addEventListener('click', () => {
             if (ca.id === null) return;
-            const targets = ca.batchIds.map(byId).filter(el => el && el.kind === 'tile');
+            /* Belt and braces: the option is disabled in a batch, but the mask is
+               still coordinates on ONE texture, so even if the mode were reached the
+               apply must not spray it across a selection. */
+            const ids = caMode() === 'mask' ? [ca.id] : ca.batchIds;
+            const targets = ids.map(byId).filter(el => el && el.kind === 'tile');
             if (!targets.length) return;
             targets.forEach(el => {
                 const out = caApplyTo(el.canvas, state.tileSize);
@@ -11850,6 +18375,1036 @@ window.TRLE = window.TRLE || {};
         });
     }
 
+    /* ============ 🖌 DRAW MODAL (PUSH-MARKINGS-PLAN phase 2a) ============
+       A photo editor's brush on one tile. The strokes land on a PAINT LAYER over
+       the tile, with its own opacity and blend mode, and nothing touches the tile
+       until Apply, which is one pushHistory. The brush itself is TRLE.Stroke
+       (js/stroke.js): read its header before changing how a stroke paints.
+
+       Three things worth knowing before editing this:
+       - Brush settings are TOOL settings and survive between opens, the way a
+         paint program keeps your brush. The layer, its undo and the view do not:
+         they belong to the tile.
+       - The display canvas is only ever drawn to, never read back (the eyedropper
+         reads the composed tile, `draw.comp`), so the brush ring can be drawn into
+         it. The mask editor cannot do that: its surfaces read their own display.
+       - Shortcuts are Photoshop's and are taken only while this modal is open and
+         focus is not in a text field. The global Ctrl+Z already stands down while
+         any modal is open, so undo here is the layer's, never the project's. */
+    const DRAW_PARAMS = [
+        ['size',      'Size',       1, 256,  12, ' px'],
+        ['hardness',  'Hardness',   0, 100, 100, '%'],
+        ['opacity',   'Opacity',    1, 100, 100, '%'],
+        ['flow',      'Flow',       1, 100, 100, '%'],
+        ['spacing',   'Spacing',    1, 200,  10, '%'],
+        ['smoothing', 'Smoothing',  0, 100,   0, '%'],
+        ['angle',     'Angle',   -180, 180,   0, '°'],
+        ['roundness', 'Roundness',  1, 100, 100, '%']
+    ];
+    const DRAW_UNDO_BYTES = 96 * 1024 * 1024;   // modal-local, like the mask editor's
+    const DRAW_SMOOTH_SCREEN_PX = 60;           // Smoothing 100% = a 60 screen-px leash
+    const draw = {
+        id: null, S: 0, layer: null, tmp: null, comp: null,
+        undo: [], redo: [], stroke: null, brush: null, lastPt: null, seed: 1,
+        tool: 'brush', zoom: 1, panX: 0, panY: 0, fitted: false,
+        cursor: null, pan: null, space: false, alt: false, raf: 0, renderMs: [],
+        regd: new Set(), matTouched: false
+    };
+    // hexToRgb / rgbToHex: the shared helpers beside the animated-texture colour ramps.
+    const drawVal = k => +$('at-draw-' + k).value;
+
+    /* ---- colour: the picker (phase 2a.2) ------------------------------------
+       The hidden #at-draw-fg / #at-draw-bg hold the truth, as hex. Everything
+       that changes a colour goes through drawSetHex, so the swatches, the picker
+       and its fields cannot disagree. The picker edits the ACTIVE swatch (the
+       foreground unless you click the background one), as in Photoshop.
+
+       Hue is kept as a float of its own: a grey has no hue, and recomputing it
+       from RGB would snap the hue strip to red every time saturation touched 0. */
+    const drawPk = { slot: 'fg', h: 0, s: 0, v: 0 };
+    let drawRecent = [];                 // tool state: survives between opens, like the brush
+    const DRAW_RECENT_MAX = 16;
+    const drawHex = slot => $('at-draw-' + slot).value;
+    function drawRgbToHsv(r, g, b) {
+        r /= 255; g /= 255; b /= 255;
+        const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+        let h = 0;
+        if (d > 0) { h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4; h *= 60; if (h < 0) h += 360; }
+        return [h, mx ? d / mx : 0, mx];
+    }
+    function drawHsvToRgb(h, s, v) {
+        const f = n => { const k = (n + h / 60) % 6; return v - v * s * Math.max(0, Math.min(k, 4 - k, 1)); };
+        return [f(5), f(3), f(1)].map(x => Math.round(x * 255));
+    }
+    /* Set one swatch. `hsv` is passed when the change came FROM the picker, so the
+       float hue / saturation are kept instead of being re-derived from 8-bit RGB. */
+    function drawSetHex(slot, hex, hsv) {
+        hex = hex.toLowerCase();
+        $('at-draw-' + slot).value = hex;
+        $('at-draw-' + slot + 'sw').style.background = hex;
+        if (slot === drawPk.slot) {
+            if (hsv) [drawPk.h, drawPk.s, drawPk.v] = hsv;
+            else {
+                const [h, s, v] = drawRgbToHsv(...hexToRgb(hex));
+                if (s > 0 && v > 0) drawPk.h = h;          // keep the hue of a grey
+                if (v > 0) drawPk.s = s;
+                drawPk.v = v;
+            }
+            drawPickerSync();
+        }
+    }
+    function drawSetColors(fg, bg) { drawSetHex('fg', fg); drawSetHex('bg', bg); }
+    function drawSetSlot(slot) {
+        drawPk.slot = slot;
+        $('at-draw-fgsw').classList.toggle('active', slot === 'fg');
+        $('at-draw-bgsw').classList.toggle('active', slot === 'bg');
+        drawSetHex(slot, drawHex(slot));
+    }
+    function drawPickerSync() {
+        const hex = drawHex(drawPk.slot), [r, g, b] = hexToRgb(hex);
+        const put = (id, v) => { const e = $(id); if (document.activeElement !== e) e.value = v; };
+        put('at-draw-hex', hex);
+        put('at-draw-r', r); put('at-draw-g', g); put('at-draw-b', b);
+        put('at-draw-h', Math.round(drawPk.h) % 360); put('at-draw-s', Math.round(drawPk.s * 100)); put('at-draw-v', Math.round(drawPk.v * 100));
+        drawPickerRender();
+    }
+    function drawPickerRender() {
+        const sv = $('at-draw-sv'), sc = sv.getContext('2d'), W = sv.width, H = sv.height;
+        const [hr, hg, hb] = drawHsvToRgb(drawPk.h, 1, 1);
+        sc.fillStyle = `rgb(${hr},${hg},${hb})`; sc.fillRect(0, 0, W, H);
+        let gr = sc.createLinearGradient(0, 0, W, 0); gr.addColorStop(0, '#fff'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+        sc.fillStyle = gr; sc.fillRect(0, 0, W, H);
+        gr = sc.createLinearGradient(0, 0, 0, H); gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(1, '#000');
+        sc.fillStyle = gr; sc.fillRect(0, 0, W, H);
+        const mx = drawPk.s * (W - 1), my = (1 - drawPk.v) * (H - 1);
+        sc.lineWidth = 2; sc.strokeStyle = drawPk.v > 0.5 ? '#000' : '#fff';
+        sc.beginPath(); sc.arc(mx, my, 5, 0, Math.PI * 2); sc.stroke();
+        const hu = $('at-draw-hue'), hc = hu.getContext('2d'), HW = hu.width, HH = hu.height;
+        const hg2 = hc.createLinearGradient(0, 0, HW, 0);
+        for (let i = 0; i <= 6; i++) { const [a, b2, c2] = drawHsvToRgb(i * 60, 1, 1); hg2.addColorStop(i / 6, `rgb(${a},${b2},${c2})`); }
+        hc.fillStyle = hg2; hc.fillRect(0, 0, HW, HH);
+        const hx = drawPk.h / 360 * (HW - 1);
+        hc.fillStyle = '#fff'; hc.fillRect(hx - 1.5, 0, 3, HH);
+        hc.strokeStyle = '#000'; hc.lineWidth = 1; hc.strokeRect(hx - 2, 0.5, 4, HH - 1);
+    }
+    /* Drag on the square (saturation across, value up) or the strip (hue). */
+    function drawBindPickerCanvas(cv, onPick) {
+        let down = false;
+        const at = e => { const r = cv.getBoundingClientRect(); return [Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)), Math.max(0, Math.min(1, (e.clientY - r.top) / r.height))]; };
+        cv.addEventListener('pointerdown', e => { down = true; try { cv.setPointerCapture(e.pointerId); } catch { /* noop */ } onPick(...at(e)); e.preventDefault(); });
+        cv.addEventListener('pointermove', e => { if (down) onPick(...at(e)); });
+        cv.addEventListener('pointerup', () => { down = false; });
+        cv.addEventListener('pointercancel', () => { down = false; });
+    }
+    const drawFromHsv = () => drawSetHex(drawPk.slot, rgbToHex(drawHsvToRgb(drawPk.h, drawPk.s, drawPk.v)), [drawPk.h, drawPk.s, drawPk.v]);
+    function drawRecentAdd(hex) {
+        drawRecent = [hex, ...drawRecent.filter(h => h !== hex)].slice(0, DRAW_RECENT_MAX);
+        drawRecentRender();
+    }
+    function drawRecentRender() {
+        $('at-draw-recent').innerHTML = drawRecent.map(h => `<button type="button" data-hex="${h}" title="${h}" style="background:${h}"></button>`).join('');
+    }
+
+    /* ---- Brush dynamics (phase 1c settings, phase 2a.2 panel) ----------------
+       Rows: [key, label, 'range', min, max, default, suffix, scale, dependsOn]
+             [key, label, 'select', options, dependsOn]   [key, label, 'check', default, dependsOn].
+       `scale` turns the slider into the TRLE.Stroke value (percent -> 0..1). A row
+       with `dependsOn` [key, value] shows only while that control has that value
+       (a Fade steps slider next to its control), so the panel stays short. */
+    const DRAW_CTRL_FADE = [['off', 'Off'], ['fade', 'Fade']];
+    const DRAW_DYN = {
+        shape: [
+            ['sizeJitter', 'Size jitter', 'range', 0, 100, 0, '%', 0.01],
+            ['sizeControl', 'Size control', 'select', DRAW_CTRL_FADE],
+            ['sizeFade', 'Size fade steps', 'range', 1, 300, 25, '', 1, ['sizeControl', 'fade']],
+            ['minDiameter', 'Minimum diameter', 'range', 0, 100, 0, '%', 0.01],
+            ['angleJitter', 'Angle jitter', 'range', 0, 100, 0, '%', 0.01],
+            ['angleControl', 'Angle control', 'select', [['off', 'Off'], ['direction', 'Direction'], ['initial', 'Initial direction']]],
+            ['roundnessJitter', 'Roundness jitter', 'range', 0, 100, 0, '%', 0.01],
+            ['roundnessControl', 'Roundness control', 'select', DRAW_CTRL_FADE],
+            ['roundnessFade', 'Roundness fade steps', 'range', 1, 300, 25, '', 1, ['roundnessControl', 'fade']],
+            ['minRoundness', 'Minimum roundness', 'range', 1, 100, 10, '%', 0.01],
+            ['flipX', 'Flip X jitter', 'check', false],
+            ['flipY', 'Flip Y jitter', 'check', false]
+        ],
+        scatter: [
+            ['scatter', 'Scatter', 'range', 0, 1000, 0, '%', 0.01],
+            ['scatterBoth', 'Both axes', 'check', false],
+            ['count', 'Count', 'range', 1, 16, 1, '', 1],
+            ['countJitter', 'Count jitter', 'range', 0, 100, 0, '%', 0.01]
+        ],
+        transfer: [
+            ['opacityJitter', 'Opacity jitter', 'range', 0, 100, 0, '%', 0.01],
+            ['opacityControl', 'Opacity control', 'select', DRAW_CTRL_FADE],
+            ['opacityFade', 'Opacity fade steps', 'range', 1, 300, 25, '', 1, ['opacityControl', 'fade']],
+            ['minOpacity', 'Minimum opacity', 'range', 0, 100, 0, '%', 0.01],
+            ['flowJitter', 'Flow jitter', 'range', 0, 100, 0, '%', 0.01],
+            ['flowControl', 'Flow control', 'select', DRAW_CTRL_FADE],
+            ['flowFade', 'Flow fade steps', 'range', 1, 300, 25, '', 1, ['flowControl', 'fade']],
+            ['minFlow', 'Minimum flow', 'range', 0, 100, 0, '%', 0.01]
+        ],
+        color: [
+            ['colorPerTip', 'Apply per tip', 'check', true],
+            ['fgbgJitter', 'Foreground / background jitter', 'range', 0, 100, 0, '%', 0.01],
+            ['fgbgControl', 'Foreground / background control', 'select', DRAW_CTRL_FADE],
+            ['fgbgFade', 'Foreground / background fade steps', 'range', 1, 300, 25, '', 1, ['fgbgControl', 'fade']],
+            ['hueJitter', 'Hue jitter', 'range', 0, 100, 0, '%', 0.01],
+            ['satJitter', 'Saturation jitter', 'range', 0, 100, 0, '%', 0.01],
+            ['brightJitter', 'Brightness jitter', 'range', 0, 100, 0, '%', 0.01],
+            ['purity', 'Purity', 'range', -100, 100, 0, '%', 0.01]
+        ],
+        /* Tier B (phase 1d, reached in 2c). A dotted key is a field of a nested
+           setting (`texture.scale` is brush.texture.scale); drawDynValues builds the
+           objects, and an empty pattern or an unticked dual brush sends null, which
+           is the engine's "off". A dependsOn value of '!' means "not empty". */
+        tip: [
+            ['tip', 'Tip', 'select', [['', 'Round (computed)'], ...TRLE.Stroke.TIPS.map(t => [t.id, t.label]), ['tile', 'Atlas tile']]],
+            ['tipTile', 'Tip tile (dark paints)', 'tile', ['tip', 'tile']]
+        ],
+        texture: [
+            ['texture.id', 'Pattern', 'select', [['', 'None'], ...TRLE.Stroke.PATTERNS.map(t => [t.id, t.label]), ['tile', 'Atlas tile']]],
+            ['texture.tile', 'Pattern tile', 'tile', ['texture.id', 'tile']],
+            ['texture.scale', 'Scale', 'range', 10, 1000, 100, '%', 0.01, ['texture.id', '!']],
+            ['texture.depth', 'Depth', 'range', 0, 100, 100, '%', 0.01, ['texture.id', '!']],
+            ['texture.mode', 'Mode', 'select', [['multiply', 'Multiply'], ['subtract', 'Subtract'], ['height', 'Height']], ['texture.id', '!']],
+            ['texture.invert', 'Invert', 'check', false, ['texture.id', '!']]
+        ],
+        dual: [
+            ['dual.on', 'Dual brush', 'check', false],
+            ['dual.tip', 'Dual tip', 'select', [['', 'Round (computed)'], ...TRLE.Stroke.TIPS.map(t => [t.id, t.label])], ['dual.on', 'true']],
+            ['dual.size', 'Dual size', 'range', 1, 512, 24, ' px', 1, ['dual.on', 'true']],
+            ['dual.spacing', 'Dual spacing', 'range', 1, 200, 25, '%', 0.01, ['dual.on', 'true']],
+            ['dual.scatter', 'Dual scatter', 'range', 0, 1000, 0, '%', 0.01, ['dual.on', 'true']],
+            ['dual.scatterBoth', 'Dual both axes', 'check', false, ['dual.on', 'true']],
+            ['dual.count', 'Dual count', 'range', 1, 16, 1, '', 1, ['dual.on', 'true']],
+            ['dual.hardness', 'Dual hardness', 'range', 0, 100, 100, '%', 0.01, ['dual.on', 'true']]
+        ],
+        stroke: [
+            ['taperIn', 'Taper in', 'range', 0, 512, 0, ' px', 1],
+            ['taperOut', 'Taper out', 'range', 0, 512, 0, ' px', 1],
+            ['taperMin', 'Taper minimum', 'range', 0, 100, 0, '%', 0.01],
+            ['speedThin', 'Thin with speed', 'range', 0, 100, 0, '%', 0.01],
+            ['wetEdges', 'Wet edges', 'range', 0, 100, 0, '%', 0.01],
+            ['buildUp', 'Build-up (paint keeps landing while you hold still)', 'check', false],
+            ['noise', 'Noise', 'range', 0, 100, 0, '%', 0.01],
+            ['wobble', 'Wobble', 'range', 0, 200, 0, '%', 0.01],
+            ['wobbleScale', 'Wobble length', 'range', 1, 20, 6, ' diameters', 1],
+            ['bite', 'Bite', 'range', 0, 100, 0, '%', 0.01]
+        ]
+    };
+    const drawDynRows = () => Object.values(DRAW_DYN).flat();
+    const drawDynId = k => 'at-draw-d-' + k.replace('.', '-');
+    // dependsOn: after the options (select) or the default (check); last on a range;
+    // straight after the type on a tile row (a picker of atlas tiles, phase 2c.2).
+    const drawRowDep = row => (row[2] === 'range' ? row[8] : row[2] === 'tile' ? row[3] : row[4]) || null;
+    function drawBuildDyn() {
+        for (const [tab, rows] of Object.entries(DRAW_DYN)) {
+            const panel = document.querySelector(`[data-draw-panel="${tab}"]`);
+            panel.innerHTML = '';
+            for (const row of rows) {
+                const [key, label, type, a, b, def, suffix] = row, dep = drawRowDep(row);
+                const id = drawDynId(key), g = document.createElement('div');
+                g.className = 'form-group';
+                if (dep) g.dataset.dep = dep.join('=');
+                if (type === 'range') {
+                    g.innerHTML = `<label>${label}: <span id="${id}-val">${def}</span>${suffix}</label><input type="range" id="${id}" min="${a}" max="${b}" value="${def}" style="width:100%;">`;
+                    g.querySelector('input').addEventListener('input', e => { $(id + '-val').textContent = e.target.value; });
+                } else if (type === 'select') {
+                    g.innerHTML = `<label for="${id}">${label}</label><select id="${id}">${a.map(([v, t]) => `<option value="${v}">${t}</option>`).join('')}</select>`;
+                    g.querySelector('select').addEventListener('change', drawDynDeps);
+                } else if (type === 'tile') {
+                    // Filled from the atlas on every open (drawFillTileSelects); a picker from day one.
+                    g.innerHTML = `<label for="${id}">${label}</label><select id="${id}"></select>`;
+                    panel.appendChild(g);
+                    attachTilePicker(g.querySelector('select'), { title: label });
+                    continue;
+                } else {
+                    g.innerHTML = `<label class="at-draw-check"><input type="checkbox" id="${id}"${a ? ' checked' : ''}> ${label}</label>`;
+                    g.querySelector('input').addEventListener('change', drawDynDeps);
+                }
+                panel.appendChild(g);
+            }
+        }
+        drawDynDeps();
+    }
+    function drawDynDeps() {
+        // style.display, not [hidden]: .form-group's own display rule beats the
+        // UA's [hidden] (the Preview atlas trap in docs/notes/grid.md).
+        document.querySelectorAll('#at-draw-dyn [data-dep]').forEach(g => {
+            const [k, v] = g.dataset.dep.split('=');
+            const e = $(drawDynId(k)), cur = e.type === 'checkbox' ? String(e.checked) : e.value;
+            const show = v === '!' ? cur !== '' : cur === v;
+            g.style.display = show ? '' : 'none';
+        });
+    }
+    function drawDynReset() {
+        for (const [key, , type, a, , def] of drawDynRows()) {
+            const e = $(drawDynId(key));
+            if (type === 'range') { e.value = def; $(drawDynId(key) + '-val').textContent = def; }
+            else if (type === 'select') e.value = a[0][0];
+            else if (type === 'tile') continue;          // which tile stays picked
+            else e.checked = !!a;
+        }
+        drawDynDeps();
+    }
+    /* The panel's values as TRLE.Stroke brush settings. */
+    function drawDynValues() {
+        const out = {}, nest = {};
+        for (const [key, , type, , , , , scale] of drawDynRows()) {
+            const e = $(drawDynId(key));
+            const v = type === 'range' ? +e.value * scale : (type === 'select' || type === 'tile') ? e.value : e.checked;
+            const dot = key.indexOf('.');
+            if (dot > 0) (nest[key.slice(0, dot)] = nest[key.slice(0, dot)] || {})[key.slice(dot + 1)] = v;
+            else out[key] = v;
+        }
+        // An atlas tile is named `tile:<id>` (2c.2), so a stroke kept as points names it.
+        out.tip = out.tip === 'tile' ? (out.tipTile ? 'tile:' + out.tipTile : null) : (out.tip || null);
+        delete out.tipTile;
+        if (nest.texture) {
+            if (nest.texture.id === 'tile') nest.texture.id = nest.texture.tile ? 'tile:' + nest.texture.tile : '';
+            delete nest.texture.tile;
+        }
+        out.texture = nest.texture && nest.texture.id ? nest.texture : null;
+        if (nest.dual && nest.dual.on) {
+            const d = Object.assign({}, nest.dual); delete d.on; d.tip = d.tip || null;
+            out.dual = d;
+        } else out.dual = null;
+        return out;
+    }
+    /* ---- brush presets (phase 2c.1): TRLE.Stroke.PRESETS in a dropdown that shows
+       each brush's own stroke (D10), on the generalised tile picker. Loading one
+       resets every brush control and applies the preset, scaled from its 256 px
+       tile to this one (scaleBrush); the user's colour, blend, opacity, smoothing,
+       catch-up and wrap are not brush settings of a preset and stay as they are.
+       The select keeps the last preset loaded, as Photoshop's does after you change
+       the size; "Custom" is where Draw starts. */
+    const DRAW_PRESET_CORE = [['size', 1], ['hardness', 0.01], ['flow', 0.01], ['spacing', 0.01], ['angle', 1], ['roundness', 0.01]];
+    const drawThumbs = new Map();
+    function drawPresetThumb(id) {
+        const o = { color: [225, 225, 225], background: '#202022' };
+        if (!id) return TRLE.Stroke.thumb(drawBrush(), o);          // Custom: the brush as it is now
+        if (!drawThumbs.has(id)) drawThumbs.set(id, TRLE.Stroke.thumb(TRLE.Stroke.preset(id), o));
+        return drawThumbs.get(id);
+    }
+    function drawLoadPreset(id) {
+        const P = TRLE.Stroke.preset(id);
+        if (!P) return;
+        const S = draw.S || state.tileSize;
+        const b = Object.assign({}, TRLE.Stroke.DEFAULTS, TRLE.Stroke.scaleBrush(P, S / 256));
+        for (const [k, scale] of DRAW_PRESET_CORE) {
+            const e = $('at-draw-' + k);
+            e.value = Math.max(+e.min, Math.min(+e.max, Math.round(b[k] / scale)));
+            $('at-draw-' + k + '-val').textContent = e.value;
+        }
+        drawDynReset();
+        for (const [key, , type, , , , , scale] of drawDynRows()) {
+            const dot = key.indexOf('.'), head = dot > 0 ? key.slice(0, dot) : key, tail = dot > 0 ? key.slice(dot + 1) : null;
+            let v;
+            if (key === 'dual.on') v = !!b.dual;
+            else if (tail) v = b[head] ? b[head][tail] : undefined;
+            else v = b[key];
+            if (v === undefined || v === null) continue;           // the reset default stands
+            const e = $(drawDynId(key));
+            if (type === 'range') { e.value = Math.round(v / scale); $(drawDynId(key) + '-val').textContent = e.value; }
+            else if (type === 'select') e.value = v;
+            else e.checked = !!v;
+        }
+        drawDynDeps();
+        drawSuggestMaterial();
+        drawSchedule();
+    }
+    /* Atlas tiles as tips and patterns (2c.2): the pickers list every source tile,
+       and a tile is registered with the engine the first time a brush names it in
+       this session. Once per open is enough: no tile changes while Draw is open. */
+    function drawFillTileSelects() {
+        const tiles = state.elements.filter(e => e.kind === 'tile');
+        for (const row of drawDynRows()) {
+            if (row[2] !== 'tile') continue;
+            const sel = $(drawDynId(row[0])), keep = sel.value;
+            sel.innerHTML = tiles.map(e => `<option value="${e.id}">Tile ${numberOf(e.id)}</option>`).join('');
+            if (tiles.some(e => String(e.id) === keep)) sel.value = keep;
+        }
+    }
+    function drawRegisterTiles(b) {
+        // Keyed by kind as well: one tile can be a tip AND a pattern, two registries.
+        const reg = (kind, id, fn) => {
+            if (!id || !id.startsWith('tile:') || draw.regd.has(kind + id)) return;
+            const el = byId(parseInt(id.slice(5), 10));
+            if (el) { fn(id, el.canvas); draw.regd.add(kind + id); }
+        };
+        reg('tip ', b.tip, TRLE.Stroke.registerTip);
+        reg('pattern ', b.texture && b.texture.id, TRLE.Stroke.registerPattern);
+        return b;
+    }
+    /* The layer's material (2c.3). A preset may suggest one (Liquid: Blood) while the
+       user has not picked one themselves in this session. */
+    const DRAW_MAT_SUGGEST = { liquid: 'liquid:blood' };
+    function drawSuggestMaterial() {
+        if (draw.matTouched) return;
+        $('at-draw-material').value = DRAW_MAT_SUGGEST[$('at-draw-preset').value] || '';
+    }
+    function drawSetTab(tab) {
+        document.querySelectorAll('[data-draw-tab]').forEach(b => {
+            const on = b.dataset.drawTab === tab;
+            b.classList.toggle('active', on); b.setAttribute('aria-selected', on ? 'true' : 'false');
+        });
+        document.querySelectorAll('[data-draw-panel]').forEach(p => { p.hidden = p.dataset.drawPanel !== tab; });
+    }
+    /* Closed, Brush dynamics is one summary line in the tuning column. Opened, it
+       docks into the third column and the modal widens to xxl, the Set Material
+       and Borders & Corners pattern (accDock), so the surface never moves down. */
+    function drawApplyZones() {
+        const open = $('at-draw-dyn').open, m = $('at-modal-draw');
+        m.classList.toggle('at-draw-dyn-open', open);
+        m.classList.toggle('at-modal-xxl', open);
+        m.classList.toggle('at-modal-xl', !open);
+    }
+    function drawDockDyn(animate, wantOpen) {
+        accDock($('at-draw-dyn'), $('at-draw-dynhome'), $('at-modal-draw').querySelector('.at-draw-dyncol'),
+                drawApplyZones, animate, wantOpen);
+    }
+
+    /* Leaving with paint on the layer asks, inside the modal. True when it took
+       the exit: it showed the question, or (asked already) Esc / Cancel again means
+       "keep drawing". The layer has paint exactly when there is something to undo,
+       since the first undo step is the empty layer and the byte cap keeps one. */
+    const drawDiscardShown = () => $('at-draw-discard').style.display !== 'none';
+    function drawShowDiscard(on) {
+        $('at-draw-discard').style.display = on ? '' : 'none';
+        if (on) $('at-draw-keep').focus();
+    }
+    function drawAskDiscard() {
+        if (!drawOpen()) return false;
+        if (drawDiscardShown()) { drawShowDiscard(false); return true; }
+        if (!draw.undo.length && !draw.stroke) return false;
+        if (draw.stroke) drawPointerUp();
+        drawShowDiscard(true);
+        return true;
+    }
+    function drawCleanup() {
+        if (draw.raf) cancelAnimationFrame(draw.raf);
+        drawShowDiscard(false);
+        if (draw.setMode) $('at-draw-material').closest('label').style.display = '';
+        Object.assign(draw, { id: null, cells: [], mask: null, multi: false,
+                              layer: null, tmp: null, comp: null, undo: [], redo: [], sUndo: [], sRedo: [],
+                              stroke: null, brush: null, lastPt: null, pan: null, raf: 0, fitted: false,
+                              setMode: null, strokes: null });
+    }
+    function drawBrush() {
+        const erase = draw.tool === 'eraser';
+        return drawRegisterTiles({
+            size: drawVal('size'), hardness: drawVal('hardness') / 100,
+            opacity: drawVal('opacity') / 100, flow: drawVal('flow') / 100,
+            spacing: drawVal('spacing') / 100,
+            smoothing: drawVal('smoothing') / 100 * DRAW_SMOOTH_SCREEN_PX / Math.max(0.01, draw.zoom),
+            angle: drawVal('angle'), roundness: drawVal('roundness') / 100,
+            color: hexToRgb(drawHex('fg')), bgColor: hexToRgb(drawHex('bg')),
+            blend: $('at-draw-blend').value, erase,
+            catchUpEnd: $('at-draw-catchup').checked,
+            // Thinning speed is a length per time (1e): scaled with the tile like a preset.
+            speedRef: TRLE.Stroke.DEFAULTS.speedRef * (draw.S || state.tileSize) / 256,
+            ...drawDynValues()
+        });
+    }
+    /* Phase 2b: one tile, or a SELECTION assembled as it sits in the grid, so one
+       stroke can run from a wood tile onto a stone one (plan D9). The surface is
+       the bounding rectangle of the selected slots. Only selected source tiles are
+       paintable: a transition, set or animation tile is re-rendered from its recipe
+       (paint would vanish at the next refresh, which is why every Adjust entry is
+       data-tileonly), and an unselected tile or an empty slot inside the rectangle
+       is simply not part of the job. Those show dimmed, and the layer is clipped to
+       the paintable mask, so paint never appears where Apply will not put it. */
+    const DRAW_MAX_PX = 4096;   // per side; a 16x16 selection of 256 px tiles
+    function openDrawModal(ids) {
+        const list = (Array.isArray(ids) ? ids : [ids]).filter(i => byId(i));
+        if (!list.length) return;
+        const S = state.tileSize;
+        syncLayout();
+        const cols = Math.max(1, state.cols);
+        const slots = list.map(i => state.layout.indexOf(i)).filter(i => i >= 0);
+        if (!slots.length) return;
+        const cs = slots.map(i => i % cols), rs = slots.map(i => Math.floor(i / cols));
+        const c0 = Math.min(...cs), c1 = Math.max(...cs), r0 = Math.min(...rs), r1 = Math.max(...rs);
+        const W = (c1 - c0 + 1) * S, H = (r1 - r0 + 1) * S;
+        if (W > DRAW_MAX_PX || H > DRAW_MAX_PX) {
+            const n = Math.floor(DRAW_MAX_PX / S);
+            showToast(`Draw works on up to ${n} × ${n} tiles at ${S} px. Select a smaller area.`, 'info', 4000);
+            return;
+        }
+        const chosen = new Set(list), cells = [];
+        for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
+            const id = state.layout[r * cols + c] ?? null, el = id != null ? byId(id) : null;
+            cells.push({ id, x: (c - c0) * S, y: (r - r0) * S,
+                         editable: !!el && chosen.has(id) && el.kind === 'tile' });
+        }
+        const editable = cells.filter(c => c.editable);
+        if (!editable.length) { showToast('Draw works on source tiles only', 'info'); return; }
+        const mk = () => { const c = document.createElement('canvas'); c.width = W; c.height = H; return c; };
+        const mask = mk(), mctx = mask.getContext('2d');
+        mctx.fillStyle = '#fff';
+        editable.forEach(c => mctx.fillRect(c.x, c.y, S, S));
+        Object.assign(draw, { id: editable[0].id, S, W, H, cells, mask, multi: cells.length > 1,
+                              layer: mk(), tmp: mk(), comp: mk(), undo: [], redo: [],
+                              stroke: null, lastPt: null, fitted: false, pan: null,
+                              regd: new Set(), matTouched: false });
+        drawFillTileSelects();
+        drawSuggestMaterial();
+        const nums = editable.map(c => numberOf(c.id));
+        $('at-draw-tileno').textContent = nums.length === 1 ? `Tile ${nums[0]}`
+            : nums.length <= 4 ? `Tiles ${nums.slice(0, -1).join(', ')} and ${nums[nums.length - 1]}` : `${nums.length} tiles`;
+        const locked = cells.filter(c => c.id != null && !c.editable).length;
+        setBatchNote('at-modal-draw', editable.length, null,
+            `🎯 Drawing across ${editable.length} tiles as they sit in the grid.` +
+            (locked ? ` ${locked} other tile${locked > 1 ? 's' : ''} in the area ${locked > 1 ? 'are' : 'is'} dimmed and will not change.` : ''));
+        $('at-draw-size').max = Math.max(64, S);
+        if (drawVal('size') > S) { $('at-draw-size').value = S; $('at-draw-size-val').textContent = S; }
+        drawSetTool('brush');
+        openModal('draw');
+        drawDockDyn(false);   // a toggle only fires on CHANGE; dock for the current state
+        drawSetSlot('fg');
+        drawSyncButtons();
+        // Fit once the view has its real size.
+        requestAnimationFrame(() => { drawFit(); drawRender(); });
+    }
+    /* Draw on a SHEET that is not atlas tiles (PUSH-MARKINGS-PLAN phase 7): Pushable
+       Markings opens its 4 x 4 slot sheet here. `o`: { S, cells: [{ key, x, y,
+       editable, canvas }], layer (the paint so far, a W x H canvas or null),
+       strokes (their points), blend, opacity, title, note, onApply(result),
+       onExit() }. Every stroke is RECORDED as points (Q3) with its bounds, kept in
+       step with undo, redo and Clear; Apply hands { strokes, layer, blend, opacity }
+       back instead of writing tiles, and every way out returns to the caller. */
+    function openDrawOnSheet(o) {
+        const S = o.S, cols = Math.max(...o.cells.map(c => c.x)) / S + 1, rows = Math.max(...o.cells.map(c => c.y)) / S + 1;
+        const W = cols * S, H = rows * S;
+        const mk = () => { const c = document.createElement('canvas'); c.width = W; c.height = H; return c; };
+        const mask = mk(), mctx = mask.getContext('2d');
+        mctx.fillStyle = '#fff';
+        o.cells.filter(c => c.editable).forEach(c => mctx.fillRect(c.x, c.y, S, S));
+        const layer = mk();
+        if (o.layer) layer.getContext('2d').drawImage(o.layer, 0, 0);
+        Object.assign(draw, { id: 'set', S, W, H, cells: o.cells, mask, multi: true,
+                              layer, tmp: mk(), comp: mk(), undo: [], redo: [], sUndo: [], sRedo: [],
+                              stroke: null, lastPt: null, fitted: false, pan: null,
+                              regd: new Set(), matTouched: true,
+                              setMode: { onApply: o.onApply, onExit: o.onExit },
+                              strokes: (o.strokes || []).slice() });
+        (o.strokes || []).forEach(st => drawRegisterTiles(st.brush));
+        drawFillTileSelects();
+        $('at-draw-tileno').textContent = o.title;
+        $('at-draw-material').closest('label').style.display = 'none';   // the set's own material applies
+        $('at-draw-lblend').value = o.blend || 'source-over';
+        $('at-draw-lopacity').value = Math.round((o.opacity == null ? 1 : o.opacity) * 100);
+        $('at-draw-lopacity-val').textContent = $('at-draw-lopacity').value;
+        setBatchNote('at-modal-draw', 2, null, o.note);
+        $('at-draw-size').max = Math.max(64, S);
+        if (drawVal('size') > S) { $('at-draw-size').value = S; $('at-draw-size-val').textContent = S; }
+        drawSetTool('brush');
+        const rf = state.modalReturnFocus;
+        openModal('draw');
+        state.modalReturnFocus = rf;   // closing the set's modal later returns focus to the grid
+        drawDockDyn(false);
+        drawSetSlot('fg');
+        drawSyncButtons();
+        requestAnimationFrame(() => { drawFit(); drawRender(); });
+    }
+    /* Leave set mode: back to the caller, with or without a result. */
+    function drawSetLeave(result) {
+        const sm = draw.setMode;
+        if (!sm) return false;
+        if (result) sm.onApply(result);
+        if (draw.raf) cancelAnimationFrame(draw.raf);
+        drawShowDiscard(false);
+        Object.assign(draw, { id: null, cells: [], mask: null, multi: false, layer: null, tmp: null, comp: null,
+                              undo: [], redo: [], sUndo: [], sRedo: [], stroke: null, setMode: null, strokes: null, raf: 0 });
+        $('at-draw-material').closest('label').style.display = '';
+        sm.onExit();
+        return true;
+    }
+    function drawSetTool(t) {
+        draw.tool = t;
+        ['brush', 'eraser', 'picker'].forEach(n => $('at-draw-tool-' + n).classList.toggle('active', n === t));
+        drawSchedule();
+    }
+    function drawSyncButtons() {
+        $('at-draw-undo').disabled = !draw.undo.length;
+        $('at-draw-redo').disabled = !draw.redo.length;
+        $('at-draw-zoom').textContent = Math.round(draw.zoom * 100) + '%';
+    }
+
+    /* ---- the view: zoom and pan. screen = pan + surface * zoom (CSS px). ---- */
+    function drawViewSize() {
+        const v = $('at-draw-view');
+        return { w: v.clientWidth, h: v.clientHeight };
+    }
+    function drawFit() {
+        const { w, h } = drawViewSize();
+        if (!w || !h || !draw.W) return;
+        draw.zoom = Math.min(w / draw.W, h / draw.H) * 0.94;
+        draw.panX = (w - draw.W * draw.zoom) / 2;
+        draw.panY = (h - draw.H * draw.zoom) / 2;
+        draw.fitted = true;
+        draw.userView = false;
+        drawSyncButtons(); drawSchedule();
+    }
+    function drawZoomAt(z, sx, sy) {
+        const { w, h } = drawViewSize();
+        if (sx == null) { sx = w / 2; sy = h / 2; }
+        z = Math.max(0.05, Math.min(32, z));
+        draw.userView = true;
+        draw.panX = sx - (sx - draw.panX) * (z / draw.zoom);
+        draw.panY = sy - (sy - draw.panY) * (z / draw.zoom);
+        draw.zoom = z;
+        drawSyncButtons(); drawSchedule();
+    }
+    function drawToSurface(e) {
+        const r = $('at-draw-canvas').getBoundingClientRect();
+        return [(e.clientX - r.left - draw.panX) / draw.zoom, (e.clientY - r.top - draw.panY) / draw.zoom];
+    }
+
+    /* ---- composing: tile + layer (+ the live stroke) ---------------------- */
+    function drawCompose() {
+        if (!draw.comp) return;
+        const W = draw.W, H = draw.H, tctx = draw.tmp.getContext('2d');
+        tctx.clearRect(0, 0, W, H);
+        tctx.drawImage(draw.layer, 0, 0);
+        if (draw.stroke) TRLE.Stroke.composite(tctx, draw.stroke.preview(), draw.brush);
+        // Paint shows only where Apply will put it.
+        tctx.globalCompositeOperation = 'destination-in';
+        tctx.drawImage(draw.mask, 0, 0);
+        tctx.globalCompositeOperation = 'source-over';
+        // Cleared first, every frame (the drawReplace rule): a cutout's holes must
+        // show nothing, not the last frame's paint.
+        const c = draw.comp.getContext('2d');
+        c.clearRect(0, 0, W, H);
+        for (const cell of draw.cells) {
+            const el = cell.id != null ? byId(cell.id) : null;
+            const src = cell.canvas || (el && el.canvas);   // a sheet's cells carry their own canvas
+            if (src) c.drawImage(src, cell.x, cell.y, draw.S, draw.S);
+        }
+        c.save();
+        c.globalAlpha = drawVal('lopacity') / 100;
+        c.globalCompositeOperation = $('at-draw-lblend').value || 'source-over';
+        c.drawImage(draw.tmp, 0, 0);
+        c.restore();
+    }
+    function drawSchedule() {
+        if (draw.raf || draw.id === null) return;
+        draw.raf = requestAnimationFrame(() => { draw.raf = 0; drawRender(); });
+    }
+    let drawChecker = null;
+    function drawRender() {
+        if (draw.id === null) return;
+        const t0 = performance.now();
+        const cv = $('at-draw-canvas'), { w, h } = drawViewSize();
+        const dpr = window.devicePixelRatio || 1;
+        const bw = Math.max(1, Math.round(w * dpr)), bh = Math.max(1, Math.round(h * dpr));
+        if (cv.width !== bw || cv.height !== bh) { cv.width = bw; cv.height = bh; }
+        /* Stroke Catch-up: a pointer held still sends no moves, so the paint is
+           eased toward it here, once a frame (TRLE.Stroke records each tick, so
+           the stroke still replays exactly). Frames keep coming until it arrives. */
+        const catching = !!draw.stroke && draw.stroke.tick(performance.now());
+        drawCompose();
+        const ctx = cv.getContext('2d');
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, w, h);
+        const W = draw.W, H = draw.H, S = draw.S, z = draw.zoom;
+        // Transparency shows as a checkerboard, as in every paint program.
+        if (!drawChecker) {
+            const p = document.createElement('canvas'); p.width = p.height = 16;
+            const pc = p.getContext('2d'); pc.fillStyle = '#3a3a3a'; pc.fillRect(0, 0, 16, 16);
+            pc.fillStyle = '#2a2a2a'; pc.fillRect(0, 0, 8, 8); pc.fillRect(8, 8, 8, 8);
+            drawChecker = ctx.createPattern(p, 'repeat');
+        }
+        ctx.fillStyle = drawChecker;
+        ctx.fillRect(draw.panX, draw.panY, W * z, H * z);
+        ctx.imageSmoothingEnabled = z < 1;
+        ctx.drawImage(draw.comp, draw.panX, draw.panY, W * z, H * z);
+        // Tiles that will not change: dimmed, with their slot outlined.
+        if (draw.multi) {
+            for (const cell of draw.cells) {
+                const x = draw.panX + cell.x * z, y = draw.panY + cell.y * z;
+                if (!cell.editable) { ctx.fillStyle = 'rgba(15,15,15,0.62)'; ctx.fillRect(x, y, S * z, S * z); }
+                ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 1;
+                ctx.strokeRect(Math.round(x) + 0.5, Math.round(y) + 0.5, S * z - 1, S * z - 1);
+            }
+        }
+        ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 1;
+        ctx.strokeRect(draw.panX - 0.5, draw.panY - 0.5, W * z + 1, H * z + 1);
+        // The smoothing leash: from where the paint is to the cursor, so the lag
+        // reads as intended rather than as the brush falling behind.
+        if (draw.stroke && draw.stroke.lag > 0.5 && draw.cursor) {
+            const [ax, ay] = draw.stroke.anchor, [cx, cy] = draw.cursor;
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(draw.panX + ax * z, draw.panY + ay * z); ctx.lineTo(draw.panX + cx * z, draw.panY + cy * z);
+            ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 3; ctx.stroke();
+            ctx.strokeStyle = 'rgba(232,133,42,0.95)'; ctx.lineWidth = 1; ctx.stroke();
+            ctx.beginPath(); ctx.arc(draw.panX + ax * z, draw.panY + ay * z, 2.5, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(232,133,42,0.95)'; ctx.fill();
+            ctx.restore();
+        }
+        // The brush ring, in screen space. Never read back, so safe to draw here.
+        if (draw.cursor && draw.tool !== 'picker' && !draw.alt && !draw.space && !draw.pan) {
+            const [cx, cy] = draw.cursor;
+            const rx = Math.max(1, drawVal('size') / 2 * z), ry = Math.max(1, rx * drawVal('roundness') / 100);
+            ctx.save();
+            ctx.translate(draw.panX + cx * z, draw.panY + cy * z);
+            ctx.rotate(drawVal('angle') * Math.PI / 180);
+            ctx.beginPath(); ctx.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2);
+            ctx.strokeStyle = 'rgba(0,0,0,0.7)'; ctx.lineWidth = 3; ctx.stroke();
+            ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 1; ctx.stroke();
+            ctx.restore();
+        }
+        draw.renderMs.push(performance.now() - t0);
+        if (draw.renderMs.length > 240) draw.renderMs.shift();
+        if (draw.stroke && (catching || draw.stroke.lag > 0.25)) drawSchedule();
+    }
+
+    /* ---- the layer's own undo ------------------------------------------- */
+    function drawSnapshot() {
+        draw.undo.push(draw.layer.getContext('2d').getImageData(0, 0, draw.W, draw.H));
+        // Set mode: the recorded strokes move with the pixels, entry for entry.
+        if (draw.setMode) { draw.sUndo.push(draw.strokes.slice()); draw.sRedo = []; }
+        let bytes = draw.undo.reduce((a, im) => a + im.data.length, 0);
+        while (draw.undo.length > 1 && bytes > DRAW_UNDO_BYTES) {
+            bytes -= draw.undo.shift().data.length;
+            if (draw.setMode) draw.sUndo.shift();
+        }
+        draw.redo = [];
+        drawSyncButtons();
+    }
+    function drawUndoRedo(fromStack, toStack, sFrom, sTo) {
+        if (!fromStack.length || draw.stroke) return;
+        const lctx = draw.layer.getContext('2d');
+        toStack.push(lctx.getImageData(0, 0, draw.W, draw.H));
+        lctx.putImageData(fromStack.pop(), 0, 0);
+        if (draw.setMode) { sTo.push(draw.strokes); draw.strokes = sFrom.pop(); }
+        drawSyncButtons(); drawSchedule();
+    }
+    const drawUndo = () => drawUndoRedo(draw.undo, draw.redo, draw.sUndo, draw.sRedo);
+    const drawRedo = () => drawUndoRedo(draw.redo, draw.undo, draw.sRedo, draw.sUndo);
+
+    function drawPick(pt) {
+        drawCompose();
+        const x = Math.floor(pt[0]), y = Math.floor(pt[1]);
+        if (x < 0 || y < 0 || x >= draw.W || y >= draw.H) return;
+        const d = draw.comp.getContext('2d').getImageData(x, y, 1, 1).data;
+        if (d[3] === 0) return;   // a hole has no colour to pick
+        drawSetHex('fg', rgbToHex([d[0], d[1], d[2]]));
+    }
+
+    /* ---- pointer --------------------------------------------------------- */
+    function drawPointerDown(e) {
+        if (draw.id === null) return;
+        if (drawDiscardShown()) drawShowDiscard(false);   // drawing on is an answer too
+        const cv = $('at-draw-canvas');
+        if (e.button === 1 || (e.button === 0 && draw.space)) {
+            draw.pan = { x: e.clientX, y: e.clientY, px: draw.panX, py: draw.panY };
+            $('at-draw-view').classList.add('at-draw-grabbing');
+            try { cv.setPointerCapture(e.pointerId); } catch { /* noop */ }
+            e.preventDefault(); return;
+        }
+        if (e.button !== 0) return;
+        const pt = drawToSurface(e);
+        if (draw.tool === 'picker' || e.altKey) { drawPick(pt); e.preventDefault(); drawSchedule(); return; }
+        drawSnapshot();
+        const brush = drawBrush();
+        const line = e.shiftKey && draw.lastPt;
+        if (line) brush.smoothing = 0;   // a straight line is straight
+        draw.brush = brush;
+        draw.strokeOpts = { width: draw.W, height: draw.H, seed: draw.seed++, wrap: $('at-draw-wrap').checked };
+        draw.stroke = TRLE.Stroke.begin(brush, draw.strokeOpts);
+        if (line) draw.stroke.add(draw.lastPt[0], draw.lastPt[1], e.timeStamp - 1);
+        draw.stroke.add(pt[0], pt[1], e.timeStamp);
+        draw.cursor = pt;
+        try { cv.setPointerCapture(e.pointerId); } catch { /* noop */ }
+        e.preventDefault();
+        drawSchedule();
+    }
+    function drawPointerMove(e) {
+        if (draw.id === null) return;
+        if (draw.pan) {
+            draw.userView = true;
+            draw.panX = draw.pan.px + (e.clientX - draw.pan.x);
+            draw.panY = draw.pan.py + (e.clientY - draw.pan.y);
+            drawSchedule(); return;
+        }
+        draw.cursor = drawToSurface(e);
+        if (draw.stroke) {
+            /* Every position the browser saw, not one per frame: a fast stroke
+               otherwise arrives as a polygon (plan phase 0 measured 64% of a quick
+               circle missed with one sample per event). */
+            const evs = (e.getCoalescedEvents && e.getCoalescedEvents().length) ? e.getCoalescedEvents() : [e];
+            for (const ev of evs) { const p = drawToSurface(ev); draw.stroke.add(p[0], p[1], ev.timeStamp); }
+        }
+        drawSchedule();
+    }
+    function drawPointerUp() {
+        if (draw.pan) { draw.pan = null; $('at-draw-view').classList.remove('at-draw-grabbing'); drawSchedule(); return; }
+        if (!draw.stroke) return;
+        const buf = draw.stroke.end();
+        const lctx = draw.layer.getContext('2d');
+        TRLE.Stroke.composite(lctx, buf, draw.brush);
+        lctx.globalCompositeOperation = 'destination-in';   // keep the layer inside the paintable tiles
+        lctx.drawImage(draw.mask, 0, 0);
+        lctx.globalCompositeOperation = 'source-over';
+        if (!draw.brush.erase) drawRecentAdd(rgbToHex(draw.brush.color));
+        const smp = draw.stroke.samples;
+        draw.lastStroke = { samples: smp, brush: draw.brush, opts: draw.strokeOpts };   // what points would keep (Q3)
+        if (draw.setMode) draw.strokes.push({ sid: drawSid(), samples: smp, brush: draw.brush, opts: draw.strokeOpts,
+                                              bounds: draw.stroke.bounds, v: TRLE.Stroke.VERSION });
+        draw.lastPt = smp.length ? smp[smp.length - 1].slice(0, 2) : draw.lastPt;
+        draw.stroke = null;
+        drawSyncButtons(); drawSchedule();
+    }
+
+    // A stroke's id, unique across sessions (a set is edited again after a reload).
+    let drawSidN = 0;
+    const drawSid = () => Date.now().toString(36) + '.' + (drawSidN++).toString(36);
+
+    /* ---- keys: Photoshop's, only while Draw is open -------------------------- */
+    const DRAW_TEXT_INPUT = /^(text|number|search|email|url|password|tel)$/;
+    function drawKeyTarget(e) {
+        const t = e.target;
+        if (!t || !t.tagName) return true;
+        if (t.tagName === 'TEXTAREA' || t.tagName === 'SELECT') return false;
+        if (t.tagName === 'INPUT' && DRAW_TEXT_INPUT.test(t.type)) return false;
+        return true;
+    }
+    const drawOpen = () => draw.id !== null && $('at-modal-draw').style.display !== 'none';
+    function drawSetSlider(k, v) {
+        const el = $('at-draw-' + k);
+        el.value = v;
+        $('at-draw-' + k + '-val').textContent = el.value;
+        drawSchedule();
+    }
+    function drawKeyDown(e) {
+        if (!drawOpen() || !drawKeyTarget(e)) return;
+        const mod = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
+        let used = true;
+        if (mod) {
+            if (k === 'z' && !e.shiftKey) drawUndo();
+            else if (k === 'y' || (k === 'z' && e.shiftKey)) drawRedo();
+            else if (k === '=' || k === '+') drawZoomAt(draw.zoom * 1.25);
+            else if (k === '-') drawZoomAt(draw.zoom / 1.25);
+            else if (k === '0') drawFit();
+            else if (k === '1') drawZoomAt(1);
+            else used = false;
+        } else if (e.key === ' ') {
+            if (!draw.space) { draw.space = true; $('at-draw-view').classList.add('at-draw-panning'); drawSchedule(); }
+        } else if (e.key === 'Alt') {
+            draw.alt = true; drawSchedule();
+        } else if (/^Digit[0-9]$/.test(e.code) && !e.altKey) {
+            // Photoshop: 1 = 10% ... 9 = 90%, 0 = 100%; with Shift, the flow.
+            const n = +e.code.slice(5), v = n === 0 ? 100 : n * 10;
+            drawSetSlider(e.shiftKey ? 'flow' : 'opacity', v);
+        } else if (e.code === 'BracketLeft' || e.code === 'BracketRight') {
+            const up = e.code === 'BracketRight';
+            if (e.shiftKey) drawSetSlider('hardness', Math.max(0, Math.min(100, drawVal('hardness') + (up ? 25 : -25))));
+            else {
+                const s = drawVal('size'), step = Math.max(1, Math.round(s * 0.1));
+                drawSetSlider('size', Math.max(1, Math.min(+$('at-draw-size').max, s + (up ? step : -step))));
+            }
+        } else if (k === 'b') drawSetTool('brush');
+        else if (k === 'e') drawSetTool('eraser');
+        else if (k === 'i') drawSetTool('picker');
+        else if (k === 'x') drawSwap();
+        else if (k === 'd') drawSetColors('#000000', '#ffffff');
+        else used = false;
+        if (used) { e.preventDefault(); e.stopPropagation(); }
+    }
+    function drawKeyUp(e) {
+        if (draw.id === null) return;
+        if (e.key === ' ') {
+            draw.space = false; $('at-draw-view').classList.remove('at-draw-panning');
+            // Stops a focused button from being clicked by the Space it just panned with.
+            if (drawKeyTarget(e)) e.preventDefault();
+            drawSchedule();
+        } else if (e.key === 'Alt') { draw.alt = false; e.preventDefault(); drawSchedule(); }
+    }
+    function drawSwap() {
+        drawSetColors(drawHex('bg'), drawHex('fg'));
+    }
+
+    /* 2c.3: what was painted on this tile becomes a multi-material layer (the Set
+       Material mechanism, el.matLayers: saved and undone already). Its mask is the
+       layer's coverage times the layer's opacity; a layer with the same material
+       takes the union instead of a new layer being added, so twenty strokes of
+       blood are one Blood layer. */
+    function drawMaterialMask(cell, lop) {
+        const S = draw.S;
+        const white = document.createElement('canvas'); white.width = white.height = S;
+        const w = white.getContext('2d');
+        w.drawImage(draw.layer, cell.x, cell.y, S, S, 0, 0, S, S);
+        w.globalCompositeOperation = 'source-in';
+        w.fillStyle = '#fff'; w.fillRect(0, 0, S, S);
+        const m = document.createElement('canvas'); m.width = m.height = S;
+        const g = m.getContext('2d');
+        g.fillStyle = '#000'; g.fillRect(0, 0, S, S);          // masks are opaque greyscale, read from R
+        g.globalAlpha = lop; g.drawImage(white, 0, 0);
+        return m;
+    }
+    function drawAddMatLayer(el, cell, value, lop) {
+        const [type, key] = value.split(':');
+        const preset = getPreset(type, key, 'realistic');
+        const mask = drawMaterialMask(cell, lop);
+        if (!hasMatLayers(el))
+            el.matLayers = [{ name: 'Base', color: MM_COLORS[0], feather: 0, material: deepCopyMaterial(el.material), mask: null }];
+        const same = el.matLayers.find((L, i) => i > 0 && L.material && !L.material.custom && L.material.type === type && L.material.key === key);
+        if (same && same.mask) {
+            const g = same.mask.getContext('2d');
+            g.globalCompositeOperation = 'lighten'; g.drawImage(mask, 0, 0); g.globalCompositeOperation = 'source-over';
+        } else {
+            el.matLayers.push({ name: 'Draw: ' + (preset && preset.label ? preset.label : key), color: MM_COLORS[el.matLayers.length % MM_COLORS.length],
+                                feather: 0, material: { type, key, aesthetic: 'realistic' }, mask });
+        }
+    }
+    function setupDrawModal() {
+        buildSliderGrid('at-draw-sliders', DRAW_PARAMS, 'draw', drawSchedule);
+        for (const sel of ['at-draw-blend', 'at-draw-lblend']) {
+            $(sel).innerHTML = TRLE.Stroke.BLEND_MODES.map(m => `<option value="${m.id}">${m.label}</option>`).join('');
+            $(sel).addEventListener('change', drawSchedule);
+        }
+        $('at-draw-lopacity').addEventListener('input', function () { $('at-draw-lopacity-val').textContent = this.value; drawSchedule(); });
+        ['brush', 'eraser', 'picker'].forEach(n => $('at-draw-tool-' + n).addEventListener('click', () => drawSetTool(n)));
+        $('at-draw-swap').addEventListener('click', drawSwap);
+        $('at-draw-defaults').addEventListener('click', () => drawSetColors('#000000', '#ffffff'));
+        // The picker. Validators and restores set the hidden inputs and fire an event.
+        for (const slot of ['fg', 'bg']) {
+            $('at-draw-' + slot).addEventListener('input', () => drawSetHex(slot, drawHex(slot)));
+            $('at-draw-' + slot).addEventListener('change', () => drawSetHex(slot, drawHex(slot)));
+            $('at-draw-' + slot + 'sw').addEventListener('click', () => drawSetSlot(slot));
+        }
+        drawBindPickerCanvas($('at-draw-sv'), (x, y) => { drawPk.s = x; drawPk.v = 1 - y; drawFromHsv(); });
+        drawBindPickerCanvas($('at-draw-hue'), x => { drawPk.h = Math.min(359.999, x * 360); drawFromHsv(); });
+        $('at-draw-hex').addEventListener('change', e => {
+            const m = /^#?([0-9a-f]{6})$/i.exec(e.target.value.trim());
+            if (m) drawSetHex(drawPk.slot, '#' + m[1]); else drawPickerSync();
+        });
+        for (const c of ['r', 'g', 'b']) $('at-draw-' + c).addEventListener('input', () => {
+            const v = ['r', 'g', 'b'].map(k => Math.max(0, Math.min(255, Math.round(+$('at-draw-' + k).value || 0))));
+            drawSetHex(drawPk.slot, rgbToHex(v));
+        });
+        for (const c of ['h', 's', 'v']) $('at-draw-' + c).addEventListener('input', () => {
+            drawPk.h = Math.max(0, Math.min(359.999, +$('at-draw-h').value || 0));
+            drawPk.s = Math.max(0, Math.min(1, (+$('at-draw-s').value || 0) / 100));
+            drawPk.v = Math.max(0, Math.min(1, (+$('at-draw-v').value || 0) / 100));
+            drawFromHsv();
+        });
+        $('at-draw-recent').addEventListener('click', e => {
+            const b = e.target.closest('button[data-hex]');
+            if (b) drawSetHex('fg', b.dataset.hex);
+        });
+        drawSetColors(drawHex('fg'), drawHex('bg'));
+        drawRecentRender();
+        // Brush dynamics: tabs, the panel, and the docking column.
+        drawBuildDyn();
+        document.querySelectorAll('[data-draw-tab]').forEach(b => b.addEventListener('click', () => drawSetTab(b.dataset.drawTab)));
+        $('at-draw-dynreset').addEventListener('click', drawDynReset);
+        // Brush presets: the select, grouped, on the tile picker in rows mode.
+        const psel = $('at-draw-preset'), groups = new Map();
+        for (const p of TRLE.Stroke.PRESETS) {
+            if (!groups.has(p.group)) { const g = document.createElement('optgroup'); g.label = p.group; groups.set(p.group, g); psel.appendChild(g); }
+            const o = document.createElement('option'); o.value = p.id; o.textContent = p.label; groups.get(p.group).appendChild(o);
+        }
+        attachTilePicker(psel, { rows: true, title: 'Brush', thumb: opt => drawPresetThumb(opt.value) });
+        psel.addEventListener('change', () => { if (psel.value) drawLoadPreset(psel.value); });
+        // The layer's material (2c.3): None, or any solid or liquid preset.
+        const msel = $('at-draw-material');
+        for (const [type, label, bag] of [['solid', 'Solid', TRLE.SolidPresets], ['liquid', 'Liquid', TRLE.LiquidPresets]]) {
+            const g = document.createElement('optgroup'); g.label = label;
+            for (const [key, p] of Object.entries(bag)) { const o = document.createElement('option'); o.value = type + ':' + key; o.textContent = p.label; g.appendChild(o); }
+            msel.appendChild(g);
+        }
+        msel.addEventListener('change', () => { draw.matTouched = true; });
+        $('at-draw-dyn').addEventListener('toggle', () => drawDockDyn(true));
+        accBindSummary($('at-draw-dyn'), drawDockDyn);
+        $('at-draw-zoomin').addEventListener('click', () => drawZoomAt(draw.zoom * 1.25));
+        $('at-draw-zoomout').addEventListener('click', () => drawZoomAt(draw.zoom / 1.25));
+        $('at-draw-fit').addEventListener('click', drawFit);
+        $('at-draw-actual').addEventListener('click', () => drawZoomAt(1));
+        $('at-draw-undo').addEventListener('click', drawUndo);
+        $('at-draw-redo').addEventListener('click', drawRedo);
+        $('at-draw-clear').addEventListener('click', () => {
+            if (draw.id === null) return;
+            drawSnapshot();
+            draw.layer.getContext('2d').clearRect(0, 0, draw.W, draw.H);
+            if (draw.setMode) draw.strokes = [];
+            drawSchedule();
+        });
+        const cv = $('at-draw-canvas');
+        cv.addEventListener('pointerdown', drawPointerDown);
+        cv.addEventListener('pointermove', drawPointerMove);
+        cv.addEventListener('pointerup', drawPointerUp);
+        cv.addEventListener('pointercancel', drawPointerUp);
+        cv.addEventListener('pointerleave', () => { if (!draw.stroke && !draw.pan) { draw.cursor = null; drawSchedule(); } });
+        cv.addEventListener('wheel', e => {
+            if (draw.id === null) return;
+            e.preventDefault();
+            const r = cv.getBoundingClientRect();
+            drawZoomAt(draw.zoom * Math.exp(-e.deltaY * 0.0015), e.clientX - r.left, e.clientY - r.top);
+        }, { passive: false });
+        document.addEventListener('keydown', drawKeyDown, true);
+        document.addEventListener('keyup', drawKeyUp, true);
+        // Keep the tile where it was when the modal (and so the view) resizes.
+        /* When the view changes size (the dynamics column docking, the window), refit
+           unless the user has zoomed or panned; then keep what was at the centre at
+           the centre, the way a paint program does. */
+        let lastView = null;
+        new ResizeObserver(() => {
+            if (draw.id === null) return;
+            const v = drawViewSize();
+            if (!draw.fitted || !draw.userView) drawFit();
+            else if (lastView) { draw.panX += (v.w - lastView.w) / 2; draw.panY += (v.h - lastView.h) / 2; }
+            lastView = v;
+            drawSchedule();
+        }).observe($('at-draw-view'));
+        /* Apply writes back only the tiles the layer actually painted, each from its
+           own square of the composed surface, in one history step. A tile nothing
+           touched keeps its pixels and its `edited` flag. */
+        $('at-draw-keep').addEventListener('click', () => drawShowDiscard(false));
+        $('at-draw-discard-ok').addEventListener('click', () => { if (!drawSetLeave(null)) closeModal(); });
+        $('at-draw-apply').addEventListener('click', () => {
+            if (draw.id === null) return;
+            if (draw.stroke) drawPointerUp();
+            if (draw.setMode) {
+                drawSetLeave({ strokes: draw.strokes.slice(), layer: draw.layer,
+                               blend: $('at-draw-lblend').value || 'source-over', opacity: drawVal('lopacity') / 100 });
+                return;
+            }
+            drawCompose();
+            const S = draw.S, lctx = draw.layer.getContext('2d');
+            const matV = $('at-draw-material').value, lop = +$('at-draw-lopacity').value / 100;
+            const skipped = [];
+            let n = 0;
+            for (const cell of draw.cells) {
+                const el = cell.editable ? byId(cell.id) : null;
+                if (!el || el.kind !== 'tile') continue;
+                const a = lctx.getImageData(cell.x, cell.y, S, S).data;
+                let painted = false;
+                for (let i = 3; i < a.length; i += 4) if (a[i]) { painted = true; break; }
+                if (!painted) continue;
+                const crop = document.createElement('canvas'); crop.width = crop.height = S;
+                crop.getContext('2d').drawImage(draw.comp, cell.x, cell.y, S, S, 0, 0, S, S);
+                drawReplace(el.canvas, crop);
+                el.edited = true;
+                if (matV) { if (el.hgParams) skipped.push(numberOf(el.id)); else drawAddMatLayer(el, cell, matV, lop); }
+                n++;
+            }
+            closeModal();
+            if (!n) { showToast('Nothing was painted', 'info'); return; }
+            refreshTransitions();
+            renderGrid();
+            pushHistory(n > 1 ? `Draw: ${n} tiles` : 'Draw');
+            /* Make Height Map's settings are not used by a multi-material tile's maps
+               (composeLayerMaps passes no element), so adding a layer would silently
+               drop them: those tiles keep their own material, and say why. */
+            const done = n > 1 ? `Drawing applied to ${n} tiles` : 'Drawing applied';
+            if (skipped.length) showToast(`${done}. Material not added to tile${skipped.length > 1 ? 's' : ''} ${skipped.join(', ')}: ${skipped.length > 1 ? 'they have' : 'it has'} Make Height Map settings, which a multi-material tile would drop.`, 'info', 8000);
+            else showToast(done, 'success');
+        });
+    }
+
     /* ============ RECOLOR FROM TEXTURE MODAL ============
        Reinhard mean/std colour transfer from a reference tile, with a
        strength + light grade on top. */
@@ -11861,19 +19416,84 @@ window.TRLE = window.TRLE || {};
     ];
     const rc = { baseId: null, refId: null, stats: null, batchIds: [] };
     function rcCleanup() { rc.baseId = null; rc.refId = null; rc.stats = null; rc.batchIds = []; }
-    /* Per-channel mean + std (0..1) of a canvas, sampled at a small size. */
+
+    /* sRGB -> CIELAB (D65). These constants are duplicated in the `colorTransfer`
+       shader and MUST stay in step with it: the stats are measured here on the CPU
+       and the mapping is applied there on the GPU, so a drift between the two shows
+       up as a transfer that lands slightly off the reference rather than as a crash.
+       Lab rather than RGB because the RGB channels are correlated, so per-channel
+       std matching does not land the aggregate statistics on the target and the
+       residue converts brightness into colour. Measured: |log2(out/ref)| chroma
+       error 0.534 in RGB against 0.070 in Lab. See COLOUR-TOOLS-PLAN.md §4. */
+    const LAB_D65 = [0.95047, 1.0, 1.08883];
+    function srgbToLab(r, g, b) {
+        const lin = v => v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+        return linToLab(lin(r), lin(g), lin(b));
+    }
+    /* The same conversion from 8-bit channels, through a 256-entry table. The table
+       holds the identical expression evaluated at the identical 256 inputs, so the
+       result is bit for bit srgbToLab(r/255, g/255, b/255); it only drops three
+       Math.pow per pixel, which is what makes FULL-RESOLUTION stats affordable
+       (BACKLOG-2026-09-PLAN phase 2). */
+    const SRGB8_LIN = (() => {
+        const t = new Float64Array(256);
+        for (let i = 0; i < 256; i++) { const v = i / 255; t[i] = v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }
+        return t;
+    })();
+    function srgb8ToLab(r, g, b) { return linToLab(SRGB8_LIN[r], SRGB8_LIN[g], SRGB8_LIN[b]); }
+    function linToLab(R, G, B) {
+        const x = (0.4124564 * R + 0.3575761 * G + 0.1804375 * B) / LAB_D65[0];
+        const y = (0.2126729 * R + 0.7151522 * G + 0.0721750 * B) / LAB_D65[1];
+        const z = (0.0193339 * R + 0.1191920 * G + 0.9503041 * B) / LAB_D65[2];
+        const f = t => t > 0.008856 ? Math.cbrt(t) : t / 0.128418 + 0.137931;
+        const fx = f(x), fy = f(y), fz = f(z);
+        return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
+    }
+
+    /* Per-axis mean + std in LAB of a canvas, at FULL RESOLUTION, WEIGHTED BY ALPHA.
+
+       Full resolution since 2026-09-24. It used to measure a 64x64 drawImage
+       downscale, which gets the means right (within 0.42 dE) but misreads the
+       spread by up to 30%, and the spread is the per-axis transfer scale: measured
+       over 72 texture pairs the finished recolour moved by a median 0.5-1 dE and at
+       worst 5.07 (at 512). `size` still resamples when given; nothing passes it.
+
+       The weighting is not a refinement, it is a correctness fix (2026-09-22). A
+       canvas stores 0 in the RGB of a fully transparent pixel, so an unweighted
+       measurement reads a cutout's holes as BLACK and folds them into the palette.
+       `Examples/MetalGrate.png` is 44.7% transparent, i.e. nearly half of what the
+       old code "measured" was phantom black that nobody can see. Recolouring from or
+       to a grate, a fence or foliage is completely ordinary, so this was wrong in a
+       normal case rather than an exotic one.
+
+       It matters more in Lab than it did in RGB: transparent black is the single
+       point (0, 0, 0), so it drags the mean and inflates the std along every axis at
+       once, where in gamma RGB it merely sat at the bottom of each channel. Measured
+       on MetalGrate as a source, the resulting transfer error was 2.68 against 0.97
+       for the old path -- the one pair where Lab lost, and it lost because of this.
+
+       A fully transparent tile has no colour to measure, so it falls back to
+       unweighted rather than dividing by zero. */
     function computeColorStats(canvas, size) {
-        const s = resizeCanvas(canvas, size, size);
-        const d = s.getContext('2d').getImageData(0, 0, size, size).data;
-        const n = size * size;
+        const W = size || canvas.width, H = size || canvas.height;
+        const s = (W === canvas.width && H === canvas.height && canvas.getContext) ? canvas : resizeCanvas(canvas, W, H);
+        const d = s.getContext('2d').getImageData(0, 0, W, H).data;
         const sum = [0, 0, 0], sumSq = [0, 0, 0];
+        let wsum = 0;
         for (let i = 0; i < d.length; i += 4) {
-            for (let c = 0; c < 3; c++) { const v = d[i + c] / 255; sum[c] += v; sumSq[c] += v * v; }
+            const w = d[i + 3] / 255;
+            if (w <= 0) continue;
+            const lab = srgb8ToLab(d[i], d[i + 1], d[i + 2]);
+            for (let c = 0; c < 3; c++) { sum[c] += w * lab[c]; sumSq[c] += w * lab[c] * lab[c]; }
+            wsum += w;
         }
-        const mean = sum.map(x => x / n);
-        const std = sumSq.map((sq, c) => Math.sqrt(Math.max(1e-6, sq / n - mean[c] * mean[c])));
+        if (wsum <= 0) return { mean: [0, 0, 0], std: [1, 1, 1] };
+        const mean = sum.map(x => x / wsum);
+        const std = sumSq.map((sq, c) => Math.sqrt(Math.max(1e-6, sq / wsum - mean[c] * mean[c])));
         return { mean, std };
     }
+    /* means/stds are LAB axes (L, a, b), not RGB channels — see computeColorStats.
+       The 0.2..3 clamp is per axis and is what the transfer was measured with. */
     function rcTransferUniforms(stats) {
         const A = stats.A, B = stats.B;
         const scale = [0, 1, 2].map(c => Math.max(0.2, Math.min(3, B.std[c] / A.std[c])));
@@ -11895,14 +19515,21 @@ window.TRLE = window.TRLE || {};
        tile that started somewhere else won't actually reach the reference. */
     function rcStatsFor(el) {
         if (rcMatchMode() === 'same' || el.id === rc.baseId) return rc.stats;
-        return { A: computeColorStats(el.canvas, 64), B: rc.stats.B };
+        return { A: computeColorStats(el.canvas), B: rc.stats.B };
     }
+    /* EVERY colorAdjust uniform, including the levels stage this modal never uses.
+       `blit()` leaves uniforms set on the program and colorAdjust is shared with
+       Adjust Colours, so anything omitted here is silently INHERITED from whatever
+       that modal set last -- a Recolor would start applying someone else's channel
+       levels. Same trap as simpleHeight's height-only uniforms; see CLAUDE.md. */
     function rcGradeUniforms() {
         return {
             u_hue: 0, u_sat: parseInt($('at-rc-sat').value) / 100,
             u_bright: parseInt($('at-rc-bright').value) / 100,
             u_contrast: parseInt($('at-rc-contrast').value) / 100,
-            u_gamma: 1, u_temp: 0, u_tint: 0, u_vibrance: 0, u_invert: 0
+            u_gamma: 1, u_temp: 0, u_tint: 0, u_vibrance: 0, u_invert: 0,
+            u_levOn: 0, u_levBlack: [0, 0, 0], u_levWhite: [1, 1, 1], u_levGamma: [1, 1, 1],
+            u_curveOn: 0
         };
     }
     /* Two-pass: colour transfer → light grade. Returns a canvas. */
@@ -11912,7 +19539,8 @@ window.TRLE = window.TRLE || {};
         const t1 = E.createFBO(S, S);
         E.blit('colorTransfer', Object.assign({ u_texture: tex }, rcTransferUniforms(stats || rc.stats)), t1);
         const t2 = E.createFBO(S, S);
-        E.blit('colorAdjust', Object.assign({ u_texture: t1.texture }, rcGradeUniforms()), t2);
+        // u_curveTex bound to the input, never left pointing at a stale unit: see caBlit.
+        E.blit('colorAdjust', Object.assign({ u_texture: t1.texture, u_curveTex: t1.texture }, rcGradeUniforms()), t2);
         const out = E.fboToCanvas(t2);
         E.deleteFBO(t1); E.deleteFBO(t2); E.deleteTexture(tex);
         return out;
@@ -11934,23 +19562,23 @@ window.TRLE = window.TRLE || {};
         exitPickMode();
         rc.baseId = baseId; rc.refId = refId;
         rc.batchIds = targets.length ? targets : [baseId];
-        rc.stats = { A: computeColorStats(byId(baseId).canvas, 64), B: computeColorStats(byId(refId).canvas, 64) };
-        $('at-rc-base-no').textContent = indexOf(baseId) + 1;
-        $('at-rc-ref-no').textContent = indexOf(refId) + 1;
+        rc.stats = { A: computeColorStats(byId(baseId).canvas), B: computeColorStats(byId(refId).canvas) };
+        $('at-rc-base-no').textContent = numberOf(baseId);
+        $('at-rc-ref-no').textContent = numberOf(refId);
         const rp = $('at-rc-ref');
         rp.getContext('2d').drawImage(byId(refId).canvas, 0, 0, rp.width, rp.height);
         resetSliderGrid(RC_PARAMS, 'rc');
         $('at-rc-batch-mode').style.display = rc.batchIds.length > 1 ? '' : 'none';
         $('at-rc-match').value = 'each';
         rcSyncMatchHint();
-        setBatchNote('at-modal-recolor', rc.batchIds.length, indexOf(baseId) + 1);
+        setBatchNote('at-modal-recolor', rc.batchIds.length, numberOf(baseId));
         openModal('recolor');
         rcRender();
     }
     function rcSyncMatchHint() {
         const hint = $('at-rc-match-hint');
         if (!hint) return;
-        const no = rc.baseId === null ? '' : indexOf(rc.baseId) + 1;
+        const no = rc.baseId === null ? '' : numberOf(rc.baseId);
         hint.textContent = rcMatchMode() === 'each'
             ? 'Each tile is measured on its own, so they all land on the reference’s tone, even if they started at different tones. Their differences from each other are evened out.'
             : `The shift measured from tile ${no} is applied to every tile, so deliberate variants keep their spread, but tiles that started elsewhere won’t fully reach the reference.`;
@@ -12029,7 +19657,7 @@ window.TRLE = window.TRLE || {};
         const inpaint = dlMode() === 'inpaint';
         $('at-dl-whole-controls').style.display = inpaint ? 'none' : '';
         $('at-dl-inpaint-controls').style.display = inpaint ? '' : 'none';
-        setBatchNote('at-modal-delight', dlBatchIds().length, indexOf(dl.id) + 1);
+        setBatchNote('at-modal-delight', dlBatchIds().length, numberOf(dl.id));
         dl.resultCanvas = null;
         dlRender();
     }
@@ -12040,7 +19668,7 @@ window.TRLE = window.TRLE || {};
         dl.id = id;
         dl.batchIds = list.slice();
         dl.resultCanvas = null;
-        $('at-dl-tileno').textContent = indexOf(id) + 1;
+        $('at-dl-tileno').textContent = numberOf(id);
         const mc = dl.maskCanvas.getContext('2d');
         mc.fillStyle = '#000'; mc.fillRect(0, 0, dl.maskCanvas.width, dl.maskCanvas.height);
         document.querySelector('input[name="at-dl-mode"][value="whole"]').checked = true;
@@ -12181,7 +19809,7 @@ window.TRLE = window.TRLE || {};
 
     function openVarModal(id) {
         varState.id = id;
-        $('at-var-tileno').textContent = indexOf(id) + 1;
+        $('at-var-tileno').textContent = numberOf(id);
         $('at-var-seed').value = varState.seed;
         openModal('var');
         varRegen();
@@ -12215,7 +19843,7 @@ window.TRLE = window.TRLE || {};
         const el = byId(id);
         if (!el || el.kind !== 'tile') return;
         origamiState.id = id;
-        $('at-origami-tileno').textContent = indexOf(id) + 1;
+        $('at-origami-tileno').textContent = numberOf(id);
         openModal('origami');
         origamiPreview();
     }
@@ -13101,11 +20729,12 @@ window.TRLE = window.TRLE || {};
         const sel = $('at-bp-bg');
         const prev = sel.value;
         sel.innerHTML = '';
-        state.elements.forEach((e, i) => {
+        const num = tileNumbers();
+        state.elements.forEach(e => {
             if (e.kind !== 'tile' || !e.canvas) return;
             const o = document.createElement('option');
             o.value = e.id;
-            o.textContent = `Tile ${i + 1}${e.id === selfId ? ' (this one)' : ''}`;
+            o.textContent = `Tile ${num.get(e.id)}${e.id === selfId ? ' (this one)' : ''}`;
             sel.appendChild(o);
         });
         const keep = [...sel.options].some(o => o.value === prev);
@@ -13114,7 +20743,7 @@ window.TRLE = window.TRLE || {};
 
     function openBuildModal(id) {
         buildState.id = id;
-        $('at-bp-tileno').textContent = indexOf(id) + 1;
+        $('at-bp-tileno').textContent = numberOf(id);
         bpPopulateBackings(id);
         openModal('build');
         bpSyncControls();
@@ -13190,6 +20819,7 @@ window.TRLE = window.TRLE || {};
             bpGenerate();
         });
         $('at-bp-bg').addEventListener('change', bpGenerate);
+        attachTilePicker($('at-bp-bg'), { title: 'Backing tile' });
         $('at-bp-fill').addEventListener('change', bpGenerate);
         $('at-bp-noisetype').addEventListener('change', bpGenerate);
         $('at-bp-orient').addEventListener('change', bpGenerate);
@@ -13679,7 +21309,7 @@ window.TRLE = window.TRLE || {};
         if (!el || el.kind !== 'tile') return;
         sgState.id = id;
         sgState.editId = null;
-        $('at-sg-tileno').textContent = indexOf(id) + 1;
+        $('at-sg-tileno').textContent = numberOf(id);
         $('at-sg-add').textContent = '➕ Add Stained Glass Tile';
         $('at-sg-seed').value = sgState.seed;
         openModal('stainedglass');
@@ -13694,7 +21324,7 @@ window.TRLE = window.TRLE || {};
         sgState.id = srcEl ? sp.srcId : el.id;         // source gone → tile itself feeds texture modes
         sgState.editId = el.id;
         sgLoadParams(sp);
-        $('at-sg-tileno').textContent = indexOf(el.id) + 1;
+        $('at-sg-tileno').textContent = numberOf(el.id);
         $('at-sg-add').textContent = '💾 Save Changes';
         openModal('stainedglass');
         sgSyncControls();
@@ -13885,8 +21515,8 @@ window.TRLE = window.TRLE || {};
             const e = byId(i);
             return e && e.canvas && e.canvas.width === e.canvas.height;
         });
-        $('at-sn-tileno').textContent = indexOf(id) + 1;
-        setBatchNote('at-modal-noise', noiseState.batchIds.length, indexOf(id) + 1);
+        $('at-sn-tileno').textContent = numberOf(id);
+        setBatchNote('at-modal-noise', noiseState.batchIds.length, numberOf(id));
         $('at-sn-newtile').checked = false;
         const bf = $('at-sn-before');
         bf.getContext('2d').clearRect(0, 0, bf.width, bf.height);
@@ -13978,7 +21608,17 @@ window.TRLE = window.TRLE || {};
         const S = state.tileSize;
         let result = {};
 
-        if (el.kind === 'transition' && el.bset) {
+        if (el.kind === 'transition' && el.push) {
+            /* Generated from the marked diffuse, never composited from the parents:
+               their maps are the source's on both sides, so a lerp cannot show a
+               mark. The groove is reliefPaint's (see pushMaps). */
+            const src = byId(el.base);
+            if (src) {
+                const mk = pushMarkEl(el);
+                const r = pushCompose(src.canvas, el.push.p, el.push.bits, el.push.variant, S, true, mk && mk.canvas, pushElHand(el));
+                result = pushMaps(r.canvas, src, r, el.push.p, enabledMaps, S, mk);
+            }
+        } else if (el.kind === 'transition' && el.bset) {
             const b = el.bset;
             if (b.slotMode === 'tile' && byId(b.srcId)) {
                 // Authored slot — its maps ARE the source tile's maps.
@@ -14057,8 +21697,23 @@ window.TRLE = window.TRLE || {};
             result = composeLayerMaps(el.canvas, el.matLayers, enabledMaps, S);
             if (enabledMaps.emissive && el.emissive) result.emissive = cloneCanvas(el.emissive);
         } else {
-            const tex  = TRLE.Engine.createTextureFromImage(el.canvas);
-            const preset = Object.assign({}, resolvePreset(el), Object.assign({ flipNormalY: state.flipNormalY, alphaFlatten: canvasHasAlpha(el.canvas) }, heightPresetOverrides(el)));
+            /* An overlaid animation generates its maps from the RAW frame, not
+               from `el.canvas`, which already has the overlay composited into it.
+
+               Two reasons, and the second is the one that bites. The overlay's
+               own maps are composited in below by coverage, so taking them from
+               the composed diffuse as well would describe the same pixels twice.
+               And the blend mode would leak into the maps: a `multiply` darkens
+               the overlay's pixels, the NORMAL KERNEL IS SPATIAL, and the changed
+               gradient at the overlay's edge bleeds a pixel or two into the
+               region where coverage is zero. Measured — the normal map's hash
+               moved between `normal` and `multiply` until this line existed,
+               which contradicts the rule the UI states: the maps follow where the
+               texture SHOWS, not how it is blended. */
+            const mapSrc = (el.kind === 'anim' && el.anim && el.anim.overlay && el.animRaw)
+                ? el.animRaw : el.canvas;
+            const tex  = TRLE.Engine.createTextureFromImage(mapSrc);
+            const preset = Object.assign({}, resolvePreset(el), Object.assign({ flipNormalY: state.flipNormalY, alphaFlatten: canvasHasAlpha(mapSrc) }, heightPresetOverrides(el)));
             const maps = TRLE.Engine.generateMaps(tex, S, S, preset, enabledMaps);
             for (const mt of TRLE.MapOrder) {
                 if (maps[mt]) {
@@ -14070,6 +21725,45 @@ window.TRLE = window.TRLE || {};
             // Authored emissive overrides the preset-derived one (which is black
             // unless a preset opts in). Lets a tile glow without a glowing preset.
             if (enabledMaps.emissive && el.emissive) result.emissive = cloneCanvas(el.emissive);
+        }
+        /* An animation with a static overlay: the frame's maps are generated from
+           its COMPOSED diffuse above (el.canvas already is that), then the
+           source tile's own maps are composited in over its coverage. Without
+           this the grate in a lava-through-a-grate tile would be described by
+           the lava's material — rough where it should be smooth metal.
+
+           The overlay tile's maps come back from the shared `cache`, so they are
+           generated ONCE for the whole group rather than once per frame. */
+        if (el.kind === 'anim' && el.anim && el.anim.overlay) {
+            const src = animOverlaySource(el.anim.overlay);
+            if (src) {
+                const om = deriveMaps(src, enabledMaps, cache);
+                // el.animRaw, not el.canvas: the latter already HAS the overlay
+                // composited into it, so a recipe that keys off the animation's
+                // own colours would be sampling its own output.
+                // The frame-independent half of the coverage is shared across
+                // the whole group through deriveMaps' own cache, so an organic
+                // contour costs its two chamfer passes once per export rather
+                // than once per frame. A string key cannot collide with the
+                // numeric element ids the rest of the cache uses.
+                const pk = 'anovplan|' + el.anim.group;
+                const plan = cache[pk] !== undefined
+                    ? cache[pk]
+                    : (cache[pk] = animOverlayPlan(el.anim.overlay, el.animRaw || el.canvas, S));
+                const mask = animOverlayMapMask(el.animRaw || el.canvas, el.anim.overlay, S,
+                                                plan, el.anim.index, el.anim.total);
+                if (mask) for (const mt of TRLE.MapOrder) {
+                    if (enabledMaps[mt] && result[mt] && om[mt])
+                        result[mt] = compositeTransition(result[mt], om[mt], mask, S);
+                }
+                // Contact occlusion belongs in AO for a PBR/TEN export, or the
+                // map generator reads the darkened diffuse back out as relief.
+                // Same rule and the same call the border sets use.
+                const sh = el.anim.overlay.org;
+                if (mask && sh && sh.shadow > 0 && shadowHitsAO(sh) &&
+                    enabledMaps.ao && result.ao)
+                    applyContactShadowAO(result.ao, mask, S, sh.shadow, shadowOpts(sh));
+            }
         }
         // Maps that came in from a PSD's layers beat anything we'd generate:
         // the user edited them in Photoshop on purpose. Same precedence rule as
@@ -14105,76 +21799,76 @@ window.TRLE = window.TRLE || {};
        exported PNG/TGA/PSD uses. Shared with the 👁 Preview atlas modal on
        purpose: a preview that computed its own layout could drift from the
        export and would then be worse than no preview at all. */
-    function stitchAtlas(getTile) {
-        const S = state.tileSize;
+    function stitchAtlas(getTile, cellPx) {
+        // `cellPx` scales each cell for DISPLAY (the in-place atlas view); the
+        // export never passes it, so the export's geometry is unchanged.
+        const S = cellPx || state.tileSize;
+        const cells = layoutCells();
         const cols = Math.max(1, state.cols);
-        const rows = Math.max(1, Math.ceil(state.elements.length / cols));
+        const rows = Math.max(1, state.rows);
         const atlas = document.createElement('canvas');
         atlas.width = cols * S;
         atlas.height = rows * S;
         const ctx = atlas.getContext('2d');
-        state.elements.forEach((el, i) => {
+        for (const { el, col, row } of cells) {
             const tile = getTile(el);
-            if (tile) ctx.drawImage(tile, (i % cols) * S, Math.floor(i / cols) * S);
-        });
+            if (!tile) continue;
+            if (cellPx) ctx.drawImage(tile, col * S, row * S, S, S);
+            else ctx.drawImage(tile, col * S, row * S);   // export: exactly the call it always was
+        }
         return atlas;
     }
 
-    /* ============ ATLAS PREVIEW (👁 next to Layout) ============
-       Answers "what am I actually shipping?" without running an export. Draws
-       the stitched diffuse at native size into a scrollable, checkerboarded
-       frame, with optional tile boundaries and 1-based numbers drawn as an
-       OVERLAY on a separate pass — never baked into the pixels, so what you see
-       under the guides is exactly the exported image. */
-    function atlasPreviewRender() {
-        if (!state.elements.length) return;
-        const S = state.tileSize;
-        const cols = Math.max(1, state.cols);
-        const rows = Math.ceil(state.elements.length / cols);
-        let atlas = stitchAtlas(el => el.canvas);
-        if ($('at-ap-magenta').checked) atlas = magentaKey(atlas);
+    /* ============ ATLAS VIEW (👁 Preview atlas, in place) ============
+       GRID-SLOT-PLAN phase 5 (D21). The button swaps the grid for the stitched
+       diffuse sheet, in the same place and at the grid's scale: no gaps, borders,
+       badges or labels, just what the export will contain. It is drawn by
+       stitchAtlas, the export's own geometry, so it cannot drift from it.
+       Empty slots show as they will export: black where the project's saved
+       choice fills holes black, otherwise transparent (the checkerboard shows
+       through). Magenta key and the sheet's size sit in the Layout row while the
+       view is on. It replaced a modal that showed the sheet at native size with
+       optional tile boundaries and numbers drawn over it. */
+    function atlasViewOn() { return $('at-grid-card').classList.contains('at-atlas-viewing'); }
 
-        const c = $('at-ap-canvas');
-        c.width = atlas.width; c.height = atlas.height;
-        const x = c.getContext('2d');
-        x.clearRect(0, 0, c.width, c.height);
-        x.drawImage(atlas, 0, 0);
-
-        // Guides scale with the atlas so they stay ~1px once it's fit to the modal.
-        const px = Math.max(1, Math.round(Math.max(atlas.width, atlas.height) / 900));
-        if ($('at-ap-grid').checked) {
-            x.strokeStyle = 'rgba(232,133,42,0.55)';
-            x.lineWidth = px;
-            x.beginPath();
-            for (let i = 1; i < cols; i++) { x.moveTo(i * S, 0); x.lineTo(i * S, rows * S); }
-            for (let j = 1; j < rows; j++) { x.moveTo(0, j * S); x.lineTo(cols * S, j * S); }
-            x.stroke();
+    function renderAtlasView() {
+        const wrap = $('at-atlas-view'), cv = $('at-av-canvas');
+        if (!wrap || !cv) return;
+        syncLayout();
+        const S = state.tileSize, cols = Math.max(1, state.cols), rows = Math.max(1, state.rows);
+        // The grid's own cell size at this width (tracks are 56..112 px with a
+        // 16 px gap), so the sheet lands where the grid was.
+        const W = $('at-grid-scroll').clientWidth || 800;
+        const cell = Math.max(56, Math.min(112, Math.floor((W - 16 * (cols - 1)) / cols)));
+        const px = Math.min(S, Math.max(1, Math.round(cell * (window.devicePixelRatio || 1))));
+        let sheet = stitchAtlas(el => el.canvas, px);
+        if (state.emptyFill === 'black') {
+            const x = sheet.getContext('2d');
+            x.fillStyle = '#000';
+            for (const h of holeSlots()) x.fillRect((h % cols) * px, Math.floor(h / cols) * px, px, px);
         }
-        if ($('at-ap-numbers').checked) {
-            const fs = Math.max(10, Math.round(S * 0.16));
-            x.font = `bold ${fs}px system-ui, sans-serif`;
-            x.textBaseline = 'top';
-            state.elements.forEach((el, i) => {
-                const tx = (i % cols) * S + fs * 0.3, ty = Math.floor(i / cols) * S + fs * 0.3;
-                const label = String(i + 1);
-                const w = x.measureText(label).width;
-                x.fillStyle = 'rgba(0,0,0,0.62)';
-                x.fillRect(tx - fs * 0.15, ty - fs * 0.08, w + fs * 0.3, fs * 1.16);
-                x.fillStyle = '#fff';
-                x.fillText(label, tx, ty);
-            });
-        }
-        const blanks = state.elements.filter(e => e.spacer).length;
-        $('at-ap-dims').textContent =
-            `${atlas.width} × ${atlas.height} px · ${cols} × ${rows} tiles · ${state.elements.length} used`
-            + (blanks ? ` · ${blanks} spacer${blanks > 1 ? 's' : ''}` : '')
-            + (rows * cols > state.elements.length ? ` · ${rows * cols - state.elements.length} empty` : '');
+        if ($('at-av-magenta').checked) sheet = magentaKey(sheet);
+        cv.width = sheet.width; cv.height = sheet.height;
+        const x = cv.getContext('2d');
+        x.clearRect(0, 0, cv.width, cv.height);
+        x.drawImage(sheet, 0, 0);
+        cv.style.width = (cols * cell) + 'px';
+        cv.style.height = (rows * cell) + 'px';
+        cv.style.imageRendering = cell > S ? 'pixelated' : 'auto';
+        const N = state.elements.length, holes = holeSlots().length;
+        $('at-av-dims').textContent = `${cols * S} × ${rows * S} px · ${cols} × ${rows} tiles · ${N} used`
+            + (holes ? ` · ${holes} empty slot${holes !== 1 ? 's' : ''} ${state.emptyFill === 'black' ? 'filled black' : state.emptyFill === 'compact' ? 'to compact' : 'transparent'} at export` : '');
     }
 
-    function openAtlasPreview() {
-        if (!state.elements.length) { showToast('Nothing in the atlas yet', 'info'); return; }
-        openModal('atlaspreview');
-        atlasPreviewRender();
+    function setAtlasView(on) {
+        if (on && !state.elements.length) { showToast('Nothing in the atlas yet', 'info'); return; }
+        const card = $('at-grid-card'), btn = $('at-preview-atlas');
+        card.classList.toggle('at-atlas-viewing', !!on);
+        $('at-atlas-view').hidden = !on;
+        $('at-av-tools').hidden = !on;
+        btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+        btn.textContent = on ? '▦ Back to tiles' : '👁️ Preview atlas';
+        if (on) renderAtlasView();
     }
 
     /* ============ ROOM VIEW HANDOFF ============
@@ -14203,9 +21897,10 @@ window.TRLE = window.TRLE || {};
         const cache = {};
         const pages = {};
         const cols = Math.max(1, state.cols);
-        const rows = Math.ceil(state.elements.length / cols);
+        const diffuseAtlas = stitchAtlas(el => el.canvas);
+        const rows = state.rows;
 
-        pages.diffuse = await TRLE.Engine.canvasToBlob(stitchAtlas(el => el.canvas));
+        pages.diffuse = await TRLE.Engine.canvasToBlob(diffuseAtlas);
 
         if (TRLE.MapOrder.some(mt => enabledMaps[mt])) {
             for (let i = 0; i < state.elements.length; i++) {
@@ -14227,7 +21922,12 @@ window.TRLE = window.TRLE || {};
                 name: exportBaseName(),
                 tileSize: state.tileSize,
                 cols, rows,
-                count: state.elements.length,
+                /* The Room View's palette addresses CELLS (tile i is cell i), so
+                   this counts up to the last occupied slot: empty slots inside
+                   the atlas keep later tiles on their own cells, trailing ones
+                   are left off. On an atlas with no holes this is the element
+                   count, as it always was. */
+                count: state.layout.reduce((m, id, s) => (id != null ? s + 1 : m), 0),
                 flipNormalY: !!state.flipNormalY,
                 /* The stamp is how the Room View knows its copy is stale. It
                    re-reads on focus only when this changes, so alt-tabbing back
@@ -14257,6 +21957,7 @@ window.TRLE = window.TRLE || {};
        slow work starts. */
     async function openRoomView() {
         if (!state.elements.length) { showToast('Slice an atlas first!', 'error'); return; }
+        if (emptiesPending(openRoomView)) return;
         const btn = $('at-room-view');
         const win = roomViewNav.open('RoomView.html');
         if (win === null) {
@@ -14305,10 +22006,11 @@ window.TRLE = window.TRLE || {};
         const rvBtn = $('at-room-view');
         if (rvBtn) rvBtn.addEventListener('click', openRoomView);
         const btn = $('at-preview-atlas');
-        if (btn) btn.addEventListener('click', openAtlasPreview);
-        ['at-ap-grid', 'at-ap-numbers', 'at-ap-magenta'].forEach(id => {
-            const e = $(id);
-            if (e) e.addEventListener('change', atlasPreviewRender);
+        if (btn) btn.addEventListener('click', () => setAtlasView(!atlasViewOn()));
+        $('at-av-magenta').addEventListener('change', renderAtlasView);
+        // Esc leaves the view, unless a modal is up (Esc belongs to the modal then).
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape' && atlasViewOn() && $('at-overlay').style.display === 'none') setAtlasView(false);
         });
     }
 
@@ -14476,6 +22178,7 @@ window.TRLE = window.TRLE || {};
 
     async function exportAtlas() {
         if (!state.elements.length) { showToast('Slice an atlas first!', 'error'); return; }
+        if (emptiesPending(exportAtlas)) return;
 
         const enabledMaps = {};
         document.querySelectorAll('#at-map-checks input[data-map]').forEach(cb => {
@@ -14493,7 +22196,8 @@ window.TRLE = window.TRLE || {};
         try {
             const S = state.tileSize;
             const cols = state.cols;
-            const rows = Math.ceil(state.elements.length / cols);
+            syncLayout();
+            const rows = state.rows;
             const cache = {};
 
             // Per-element maps
@@ -14542,14 +22246,15 @@ window.TRLE = window.TRLE || {};
             }
 
             // Manifest for reproducibility
-            const manifest = state.elements.map((el, i) => ({
-                index: i + 1,
+            const num = tileNumbers();
+            const manifest = layoutCells().map(({ el, n }) => ({
+                index: n,
                 kind: el.kind,
                 seamless: el.seamless,
                 material: el.kind === 'transition' ? 'inherited' : materialLabel(el),
                 ...(el.kind === 'transition' ? {
-                    base: indexOf(el.base) + 1,
-                    overlay: indexOf(el.overlay) + 1,
+                    base: num.get(el.base) || 0,
+                    overlay: num.get(el.overlay) || 0,
                     mode: el.mode, pivot: el.pivot, hardness: el.hardness
                 } : {}),
                 ...(el.kind === 'anim' ? {
@@ -14564,21 +22269,39 @@ window.TRLE = window.TRLE || {};
             // Per-group animation summary with 1-based tile ranges + setup hints
             // for Tomb Editor (consecutive frames = an animated range that loops).
             const groups = {};
-            state.elements.forEach((el, i) => {
+            layoutCells().forEach(({ el, n }) => {
                 if (el.kind !== 'anim' || !el.anim) return;
                 (groups[el.anim.group] = groups[el.anim.group] ||
-                    { preset: el.anim.preset, gradient: el.anim.gradient || 'custom', single: el.anim.single, fps: el.anim.fps, indices: [] }).indices.push(i + 1);
+                    { preset: el.anim.preset, gradient: el.anim.gradient || 'custom', single: el.anim.single, fps: el.anim.fps, indices: [] }).indices.push(n);
             });
             const animations = Object.entries(groups).map(([group, g]) => {
                 const idx = g.indices.sort((a, b) => a - b);
+                const n = idx.length, fps = g.fps || 12;
+                /* Repeat is the one lever that slows an animation for nothing.
+                   Verified against TombLib rather than assumed: AddTexture skips
+                   the GetTexInfo dedupe for animated frames, then
+                   TryToAddToExisting hits ParentTextureArea.IsPotentialParent,
+                   whose first test is _area.Contains(rect) with inclusive <= / >=
+                   over an area the first copy rounded OUTWARD. An identical
+                   repeated frame is therefore always contained, so it attaches as
+                   a CHILD and shares the parent's pixels. It costs one of the
+                   engine's 256 frame slots and one TexInfo, and no atlas space. */
+                const rpt = Math.floor(256 / Math.max(1, n));
                 return {
-                    group, preset: g.preset, gradient: g.gradient, fps: g.fps,
+                    group, preset: g.preset, gradient: g.gradient, fps,
                     type: g.single ? 'uv-rotate' : 'animated-range',
-                    frames: g.single ? 1 : idx.length,
+                    frames: g.single ? 1 : n,
                     tiles: g.single ? `${idx[0]}` : `${idx[0]}-${idx[idx.length - 1]}`,
+                    ...(g.single ? {} : { secondsPerLoop: +(n / fps).toFixed(2) }),
                     note: g.single
                         ? 'Single seamless tile, set UV-Rotate on this texture in Tomb Editor.'
-                        : 'Select these consecutive tiles as an animated texture range; frames loop seamlessly (last → first).'
+                        : `Select these consecutive tiles as an animated texture range; frames loop seamlessly (last → first). `
+                          + `At ${fps} fps the loop lasts ${(n / fps).toFixed(2)} s.`
+                          + (rpt > 1
+                              ? ` To slow it down without adding tiles, set Repeat on every frame: Repeat N holds each frame N ticks `
+                                + `and costs no extra atlas space, only frame slots. Tomb Engine allows 256 frames per sequence including `
+                                + `repeats, so this sequence can take Repeat up to ${rpt}.`
+                              : ' This sequence already fills Tomb Engine\'s 256 frame slots, so Repeat is not available on it.')
                 };
             });
 
@@ -14608,6 +22331,7 @@ window.TRLE = window.TRLE || {};
        `tile_r{row}_c{col}` keep a stable round-trip contract. */
     async function exportTilesIndividually() {
         if (!state.elements.length) { showToast('Nothing to export yet!', 'error'); return; }
+        if (emptiesPending(exportTilesIndividually)) return;
         const enabledMaps = {};
         document.querySelectorAll('#at-map-checks input[data-map]').forEach(cb => { enabledMaps[cb.dataset.map] = cb.checked; });
         const btn = $('at-export-tiles'), progress = $('at-progress'), fill = $('at-progress-fill');
@@ -14626,9 +22350,10 @@ window.TRLE = window.TRLE || {};
             const S = state.tileSize;
             const zip = new JSZip();
             const cache = {};
-            for (let i = 0; i < state.elements.length; i++) {
-                const el = state.elements[i];
-                const name = `tile_r${Math.floor(i / cols)}_c${i % cols}`;
+            const cells = layoutCells();
+            for (let i = 0; i < cells.length; i++) {
+                const { el, col, row } = cells[i];
+                const name = `tile_r${row}_c${col}`;
                 let diffuse = el.canvas;
                 if (useMagenta) diffuse = magentaKey(diffuse);
                 if (anyMap) deriveMaps(el, enabledMaps, cache);
@@ -14656,11 +22381,11 @@ window.TRLE = window.TRLE || {};
                         }
                     }
                 }
-                fill.style.width = ((i + 1) / state.elements.length * 95) + '%';
+                fill.style.width = ((i + 1) / cells.length * 95) + '%';
                 if (i % 2 === 0) await new Promise(r => setTimeout(r, 0));
             }
             zip.file(`${prefix}manifest.json`, JSON.stringify({
-                tileSize: state.tileSize, cols, rows: Math.ceil(state.elements.length / cols),
+                tileSize: state.tileSize, cols, rows: state.rows,
                 count: state.elements.length, naming: 'tile_r{row}_c{col}', format: fmt
             }, null, 2));
             await addProjectToZip(zip, prefix, exportBaseName());
@@ -14731,8 +22456,12 @@ window.TRLE = window.TRLE || {};
                 blendMethod: el.blendMethod ?? null, wangBits: el.wangBits ?? null
             };
             if (el.bset) e.bset = el.bset;   // border-set recipe (re-rendered on load)
+            if (el.push) e.push = el.push;   // pushable-marking recipe (re-rendered on load)
+            // Its hand strokes' pixels: what is shown, whatever TRLE.Stroke.VERSION reads them later.
+            if (el.pushHandPx) e.pushHand = await png(el.pushHandPx);
             if (el.organic) e.organic = el.organic;   // organic-edge recipe (re-rendered on load)
             if (el.block) e.block = el.block;         // grid-block membership (shape on resize)
+            if (el.group) e.group = el.group;         // user group (phase 8): moves as one piece
             if (el.spacer) e.spacer = true;           // auto-padding filler, strippable on reflow
             if (el.kind === 'tile') {
                 e.original = await png(el.original);
@@ -14775,6 +22504,11 @@ window.TRLE = window.TRLE || {};
         return {
             version: 1, name: exportBaseName(),
             tileSize: state.tileSize, cols: state.cols, nextId: state.nextId,
+            // Where each element sits (GRID-SLOT-PLAN §2). Additive: a file
+            // without them derives today's row-major placement on load.
+            rows: (syncLayout(), state.rows), layout: state.layout.slice(),
+            emptyFill: state.emptyFill || null,   // the saved empty-slot choice (phase 4)
+            lockCols: !!state.lockCols, lockRows: !!state.lockRows,   // push locks (phase 6)
             elements
         };
     }
@@ -14882,8 +22616,10 @@ window.TRLE = window.TRLE || {};
                 blendMethod: e.blendMethod ?? undefined,
                 wangBits: e.wangBits == null ? undefined : e.wangBits,
                 bset: e.bset || null,
+                push: e.push || null,
                 organic: e.organic || null,
                 block: e.block || null,
+                group: e.group || null,
                 spacer: !!e.spacer,
                 overlayGeom: e.overlayGeom || null,
                 anim: e.anim || null,
@@ -14894,6 +22630,7 @@ window.TRLE = window.TRLE || {};
                 original: null, canvas: null
             };
             if (e.customMask) { const im = await loadImageURL(e.customMask); if (im) el.customMask = imgToCanvas(im); }
+            if (e.pushHand) { const im = await loadImageURL(e.pushHand); if (im) el.pushHandPx = imgToCanvas(im); }
             if (e.hgParams && e.hgParams.mask) {
                 const im = await loadImageURL(e.hgParams.mask);
                 if (im) el.hgParams.mask = imgToCanvas(im);
@@ -14930,8 +22667,12 @@ window.TRLE = window.TRLE || {};
         // Past every block id in the file, or the next set added would collide
         // with a loaded one and validateBlocks would see them as one broken run.
         nextBlockId = Math.max(1, ...els.map(e => (e.block && e.block.id) || 0)) + 1;
+        nextGroupId = Math.max(1, ...els.map(e => (e.group && e.group.id) || 0)) + 1;
         state.nextId = proj.nextId || (Math.max(0, ...els.map(e => e.id)) + 1);
         state.elements = els;
+        adoptLayout(proj.rows, proj.layout);
+        state.emptyFill = ['compact', 'black', 'transparent'].includes(proj.emptyFill) ? proj.emptyFill : null;
+        state.lockCols = !!proj.lockCols; state.lockRows = !!proj.lockRows;
         state.selectedId = null; state.focusedId = null; state.selSet.clear(); state.selAnchor = null;
         // Restore the project name so a load → edit → save round-trips it (older
         // files predate the field and simply keep whatever name is in the box).
@@ -15146,7 +22887,13 @@ window.TRLE = window.TRLE || {};
         if (!proj || !Array.isArray(proj.elements) || !proj.elements.length) return;
 
         const cols = Math.max(1, proj.cols || proj.elements.length);
-        const row = proj.elements.slice(0, Math.min(cols, RESTORE_ROW_MAX));
+        const width = Math.min(cols, RESTORE_ROW_MAX);
+        // The first row of SLOTS when the session has a layout (an empty slot
+        // draws as an empty cell); older sessions have none and are row-major.
+        const byEid = new Map(proj.elements.map(e => [e.id, e]));
+        const row = Array.isArray(proj.layout)
+            ? proj.layout.slice(0, width).map(id => (id == null ? {} : byEid.get(id) || {}))
+            : proj.elements.slice(0, width);
         for (const e of row) {
             const c = document.createElement('canvas');
             c.width = c.height = RESTORE_THUMB;
@@ -15397,6 +23144,7 @@ window.TRLE = window.TRLE || {};
                 state.cols = imp.cols;
                 state.elements = [];
                 state.nextId = 1;
+                state.emptyFill = null;   // a new atlas asks about its own empty slots
                 state.selectedId = null; state.selSet.clear(); state.selAnchor = null;
                 state.focusedId = null;
                 exitPickMode();
@@ -15417,6 +23165,52 @@ window.TRLE = window.TRLE || {};
         });
     }
 
+    /* An image pasted into an empty slot becomes ONE tile there, resized to the
+       tile size; when that means resizing, say so first (the author's wording:
+       "this is getting resized to NxN, still wanna paste?"). */
+    function pasteImageIntoSlot(img, slot) {
+        const S = state.tileSize, w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+        const go = () => commitImageTiles([{ img, maps: null }], slot, 'Paste');
+        if (w === S && h === S) { go(); return; }
+        openConfirm('📋 Paste into this slot',
+            `This image is ${w}×${h}${w !== h ? ', not square' : ''}. It gets resized to ${S}×${S} to fit one tile. Still want to paste it?`,
+            'Paste', go, { danger: false, cancelLabel: 'Cancel' });
+    }
+
+    /* Where a paste lands: the focused empty slot, else the empty slot under
+       the pointer, else nowhere in particular (the import route). */
+    let hoverSlot = null;
+    function pasteTargetSlot() {
+        if (!state.tileSize || atlasViewOn() || $('at-grid-card').style.display === 'none') return null;
+        const ae = document.activeElement;
+        if (ae && ae.classList && ae.classList.contains('at-slot-empty') && $('at-grid').contains(ae)) return Number(ae.dataset.slot);
+        return hoverSlot != null && hoverSlot < state.layout.length && state.layout[hoverSlot] == null ? hoverSlot : null;
+    }
+
+    /* The empty-slot menu's Paste: the async clipboard API needs a permission
+       some browsers refuse outside a real paste, so on refusal it focuses the
+       slot and says to press Ctrl/Cmd+V, which always works. */
+    async function pasteFromClipboardInto(slot) {
+        try {
+            if (!navigator.clipboard || !navigator.clipboard.read) throw new Error('no clipboard read');
+            for (const it of await navigator.clipboard.read()) {
+                const type = it.types.find(t => /^image\//.test(t));
+                if (!type) continue;
+                const blob = await it.getType(type);
+                const url = URL.createObjectURL(blob);
+                const img = new Image();
+                await new Promise((ok, bad) => { img.onload = ok; img.onerror = bad; img.src = url; });
+                URL.revokeObjectURL(url);
+                pasteImageIntoSlot(img, slot);
+                return;
+            }
+            showToast('There is no image on the clipboard', 'info');
+        } catch (err) {
+            focusSlot(slot);
+            showToast('The browser kept the clipboard to itself here. The slot is selected: press Ctrl/Cmd+V to paste into it.', 'info', 5000);
+        }
+    }
+
     /* Paste an image from the clipboard straight into the atlas. Confirms first,
        then routes the image through the Import modal so the user picks how to
        slice it (with the same aspect-ratio warning). Ignored while typing in a
@@ -15431,10 +23225,12 @@ window.TRLE = window.TRLE || {};
             for (const it of items) { if (it.kind === 'file' && /^image\//.test(it.type)) { file = it.getAsFile(); break; } }
             if (!file) return;
             e.preventDefault();
+            const slot = pasteTargetSlot();
             const url = URL.createObjectURL(file);
             const img = new Image();
             img.onload = () => {
                 URL.revokeObjectURL(url);
+                if (slot != null && state.layout[slot] == null) { pasteImageIntoSlot(img, slot); return; }
                 const isFirst = !state.elements.length;
                 const size = state.tileSize || getTileSize() || 256;
                 const square = img.naturalWidth === img.naturalHeight;
@@ -15450,31 +23246,39 @@ window.TRLE = window.TRLE || {};
 
     function createBlankAtlas() {
         const S = getTileSize();
-        const cols = Math.max(1, Math.min(12, parseInt($('at-blank-cols').value) || 4));
+        const cols = Math.max(1, Math.min(Math.floor(MAX_ATLAS_PX / S), parseInt($('at-blank-cols').value) || 4));
         state.tileSize = S;
         state.cols = cols;
         state.elements = [];
         state.nextId = 1;
+        state.emptyFill = null;   // a new atlas asks about its own empty slots
         state.selectedId = null; state.selSet.clear(); state.selAnchor = null;
         state.focusedId = null;
+        // One row of empty slots to add into (there is no "+" cell any more).
+        state.rows = 1;
+        state.layout = new Array(cols).fill(null);
+        layoutAssigned();
         exitPickMode();
         $('at-grid-card').style.display = 'block';
         $('at-export-card').style.display = 'block';
         renderGrid();
         collapseUploadCard('blank atlas · click to start a different atlas');
         resetHistory('Blank atlas');
-        showToast('Blank atlas created, add tiles with “Add Image(s)”', 'info', 3500);
+        showToast('Blank atlas created: click an empty slot to add an image, or drop files on it', 'info', 3500);
     }
 
     /* Load image files into tiles (preserves selection order). */
     /* Commit loaded images as tiles (preserving order). */
     /* `assets` is [{ img, maps }] — maps is empty for everything but PSD. */
-    function commitImageTiles(assets) {
+    /* `slot`: the empty slot the tiles start at (then the empty slots after
+       it), or null to append after the last occupied slot. */
+    function commitImageTiles(assets, slot = null, verb = 'Add') {
+        if (slot != null) pendingSlot = slot;
         assets.forEach(a => state.elements.push(makeTileFromImage(a.img, a.maps)));
         renderGrid();
         const n = assets.length;
-        pushHistory(`Add ${n} image${n !== 1 ? 's' : ''}`);
-        showToast(`Added ${n} tile${n !== 1 ? 's' : ''}`, 'success');
+        pushHistory(`${verb} ${n} image${n !== 1 ? 's' : ''}`);
+        showToast(verb === 'Paste' ? 'Pasted into the slot' : `Added ${n} tile${n !== 1 ? 's' : ''}`, 'success');
     }
 
     /* Heuristic: does a single dropped image look like a whole atlas sheet rather
@@ -15487,7 +23291,7 @@ window.TRLE = window.TRLE || {};
         return null;
     }
 
-    function addImageTiles(files) {
+    function addImageTiles(files, slot = null) {
         // Accept anything that reports an image MIME type OR is a .tga/.psd
         // (whose type is often empty), so those aren't silently dropped here.
         const list = [...files].filter(f =>
@@ -15512,11 +23316,11 @@ window.TRLE = window.TRLE || {};
                         `This image is ${img.naturalWidth}×${img.naturalHeight}: ${why}. Adding it as one tile resizes the whole sheet down to ${S}². Pick tiles from it as an atlas instead?`,
                         '🗺️ Import from Atlas…',
                         () => openImportModal(img, S, !state.elements.length, assets[0].maps),
-                        { cancelLabel: 'Add as one tile', danger: false, onNo: () => commitImageTiles(assets) });
+                        { cancelLabel: 'Add as one tile', danger: false, onNo: () => commitImageTiles(assets, slot) });
                     return;
                 }
             }
-            commitImageTiles(assets);
+            commitImageTiles(assets, slot);
         };
         list.forEach((file, idx) => {
             readImageAsset(file)
@@ -15526,16 +23330,17 @@ window.TRLE = window.TRLE || {};
         });
     }
 
-    function triggerAddImages() {
+    function triggerAddImages(slot = null) {
         if (!state.tileSize) return;
         const inp = document.createElement('input');
         inp.type = 'file'; inp.accept = 'image/*,.tga,.psd,.psb'; inp.multiple = true;
-        inp.addEventListener('change', e => { if (e.target.files.length) addImageTiles(e.target.files); });
+        inp.addEventListener('change', e => { if (e.target.files.length) addImageTiles(e.target.files, slot); });
         inp.click();
     }
 
-    function addBlankTile() {
+    function addBlankTile(slot = null) {
         if (!state.tileSize) return;
+        if (slot != null) pendingSlot = slot;
         const S = state.tileSize;
         const canvas = document.createElement('canvas');
         canvas.width = S; canvas.height = S;
@@ -15579,6 +23384,7 @@ window.TRLE = window.TRLE || {};
             state.cols = cols;
             state.elements = [];
             state.nextId = 1;
+            state.emptyFill = null;   // a new atlas asks about its own empty slots
             state.selectedId = null; state.selSet.clear(); state.selAnchor = null;
             exitPickMode();
 
@@ -15653,9 +23459,11 @@ window.TRLE = window.TRLE || {};
             inp.click();
         });
         $('at-create-blank').addEventListener('click', createBlankAtlas);
-        $('at-add-images').addEventListener('click', triggerAddImages);
-        $('at-add-blank').addEventListener('click', addBlankTile);
+        $('at-add-images').addEventListener('click', () => triggerAddImages());
+        $('at-add-blank').addEventListener('click', () => addBlankTile());
         $('at-add-anim').addEventListener('click', () => openAnimModal());
+        $('at-add-sprite').addEventListener('click', () => openSpriteModal());
+        $('at-sprite-start').addEventListener('click', () => openSpriteModal());
         $('at-pick-cancel').addEventListener('click', exitPickMode);
         $('at-pick-same').addEventListener('click', () => {
             if (state.pickBaseId !== null && state.pickMode === 'borderset')
@@ -15702,6 +23510,9 @@ window.TRLE = window.TRLE || {};
             heightCb.addEventListener('change', () => syncHeightWarn(true));
             syncHeightWarn(false);   // reflect initial state (height defaults off)
         }
+        // Magenta color-key only swaps which wording the advisory shows; it never
+        // changes which tiles have transparency, so this never rescans.
+        if ($('at-export-magenta')) $('at-export-magenta').addEventListener('change', renderAlphaAdvice);
         $('at-save-project').addEventListener('click', saveProject);
         // Two entry points, one picker: the export bar's button for mid-session
         // loads, and the one on the start screen. Load Project used to live ONLY
@@ -15740,6 +23551,7 @@ window.TRLE = window.TRLE || {};
         setupRestoreOffer();
 
         setupGrid();
+        setupEmptyFill();
         setupCtxMenu();
         setupModals();
         setupSeamlessModal();
@@ -15755,6 +23567,7 @@ window.TRLE = window.TRLE || {};
         setupWangModal();
         setupAtlasPreview();
         setupBsetModal();
+        setupPushModal();
         setupFadeModal();
         setupEmissiveModal();
         setupHeightMapModal();
@@ -15765,6 +23578,7 @@ window.TRLE = window.TRLE || {};
         setupOrganicModal();
         setupAnimModal();
         setupColorAdjModal();
+        setupDrawModal();
         setupRecolorModal();
         setupDelightModal();
         setupImportModal();
@@ -15816,14 +23630,48 @@ window.TRLE = window.TRLE || {};
                     sgParams: el.sgParams ? JSON.parse(JSON.stringify(el.sgParams)) : null,
                     htParams: !!el.htParams,
                     ovParams: el.ovParams ? JSON.parse(JSON.stringify(el.ovParams)) : null,
+                    push: el.push ? JSON.parse(JSON.stringify(el.push)) : null,
+                    pushHandPx: !!el.pushHandPx,
+                    block: el.block ? { ...el.block } : null,
+                    group: el.group ? { ...el.group } : null,
+                    base: el.base ?? null,
+                    overlay: el.overlay ?? null,
                     // The mask is a canvas, so report whether there IS one rather
                     // than trying to send it over CDP.
                     hgParams: el.hgParams
                         ? Object.assign({}, el.hgParams, { mask: !!el.hgParams.mask })
-                        : null
+                        : null,
+                    /* The animation recipe, which a validator needs to prove that
+                       `generator` rides along in the saved params and that a
+                       particle recipe carries none of the noise field's keys. */
+                    anim: el.anim ? {
+                        group: el.anim.group, index: el.anim.index, total: el.anim.total,
+                        preset: el.anim.preset, single: !!el.anim.single, seed: el.anim.seed,
+                        gradient: el.anim.gradient || null,
+                        glow: el.anim.glow ? !!el.anim.glow.enabled : false,
+                        overlay: el.anim.overlay ? JSON.parse(JSON.stringify(el.anim.overlay)) : null,
+                        still: el.anim.still ? JSON.parse(JSON.stringify(el.anim.still)) : null,
+                        layer2: el.anim.layer2 ? JSON.parse(JSON.stringify(el.anim.layer2)) : null,
+                        params: el.anim.params ? Object.assign({}, el.anim.params, {
+                            // stops are bulky and not what any assertion is about
+                            palette: el.anim.params.palette ? el.anim.params.palette.length : 0
+                        }) : null
+                    } : null
                 };
             },
             count() { return state.elements.length; },
+            // Each element's transition mode (null for plain tiles), in atlas order,
+            // so a validator can check which mask family an Add actually emitted.
+            elModes() { return state.elements.map(e => e.mode || null); },
+            // Colour statistics exactly as Recolor measures them, plus the time it
+            // took, so validate-colour-maths can check them against an independent
+            // full-resolution reference (BACKLOG-2026-09-PLAN phase 2).
+            async colorStats(src, S) {
+                const c = toC(await loadImg(src), S);
+                const t0 = performance.now();
+                const st = computeColorStats(c);
+                return { ...st, ms: performance.now() - t0 };
+            },
             // Contrast advice (Roadmap.md Phase 4): the measured luminance std of
             // a tile, and the advisory line the material modal would show for it.
             lumStd(i) {
@@ -15837,10 +23685,56 @@ window.TRLE = window.TRLE || {};
             // test-only: the cutout detector that drives alphaFlatten, so
             // validate-alpha-maps can assert on the same predicate the pipeline uses.
             canvasHasAlpha,
+            // test-only: TRANSPARENCY-PLAN phase 2's export-card advisory.
+            // alphaAdviceState() reads what is on screen right now (no rescan);
+            // alphaAdviceFlush() clears the debounce and scans synchronously (no
+            // chunk yields) so a validator gets a deterministic result without
+            // waiting out ALPHA_ADVICE_DELAY or the idle-chunk budget.
+            alphaAdviceState() {
+                const box = $('at-alpha-advice');
+                if (!box) return null;
+                return { visible: box.style.display === 'flex',
+                         text: box.querySelector('.at-alpha-advice-text').innerText.trim() };
+            },
+            async alphaAdviceFlush() {
+                clearTimeout(alphaAdviceTimer);
+                const gen = ++alphaAdviceGen;
+                alphaAdviceIds = state.elements.filter(el => canvasHasAlpha(el.canvas)).map(el => el.id);
+                alphaAdviceCompletedGen = gen;
+                if (gen === alphaAdviceGen) renderAlphaAdvice();
+                return TRLE._cap.alphaAdviceState();
+            },
+            // test-only: waits for a real (unflushed) scheduleAlphaAdvice() scan,
+            // triggered by the last renderGrid(), to finish on its own -- the
+            // chunked path, not alphaAdviceFlush's synchronous bypass -- then
+            // returns each chunk's wall time so a validator can assert the
+            // budget held on a large atlas.
+            async alphaAdviceChunkTimes(timeoutMs) {
+                // A scan already scheduled by a prior renderGrid() has not
+                // bumped alphaAdviceGen yet (that happens when its debounce
+                // timer FIRES, not when it is scheduled), so "done" means a
+                // gen newer than this one has COMPLETED, not merely matched it.
+                const startGen = alphaAdviceGen;
+                const t0 = performance.now();
+                while (alphaAdviceCompletedGen <= startGen && performance.now() - t0 < (timeoutMs || 5000))
+                    await new Promise(r => setTimeout(r, 20));
+                return alphaAdviceChunkMs.slice();
+            },
             // test-only: hashes of a tile's live pixels vs its untouched
             // `original`, so a destructive edit can be shown to change one and
             // leave the other intact (which is what keeps Reset to Original honest).
             tileSig(i) { return capSig(state.elements[i] && state.elements[i].canvas); },
+            tileRegionSig(i, x, y, w, h) {
+                const el = state.elements[i]; if (!el) return null;
+                const c = document.createElement('canvas'); c.width = w; c.height = h;
+                c.getContext('2d').drawImage(el.canvas, x, y, w, h, 0, 0, w, h);
+                const d = c.getContext('2d').getImageData(0, 0, w, h).data;   // every byte, unlike capSig
+                let hh = 2166136261;
+                for (let k = 0; k < d.length; k++) { hh ^= d[k]; hh = Math.imul(hh, 16777619); }
+                return (hh >>> 0).toString(16);
+            },
+            slotOfIdx(i) { const el = state.elements[i]; return el ? slotOf(el.id) : null; },
+            refreshDerived() { refreshTransitions(); return true; },
             originalSig(i) { return capSig(state.elements[i] && state.elements[i].original); },
             /* test-only: the ALPHA channel alone. `tileSig` samples every 17th
                byte, which steps over most of it -- and alpha is the channel the
@@ -15935,7 +23829,7 @@ window.TRLE = window.TRLE || {};
                histogram. The display canvas cannot answer this -- it composites
                the tint over an opaque tile, so every pixel reads alpha 255 and a
                feathered brush is indistinguishable from a hard one. */
-            /* test-only: the paint mask of any of the seven surfaces, by name.
+            /* test-only: the paint mask of any of the nine surfaces, by name.
                Every new assertion in validate-mask-editor (Value levels, lasso
                fill, wand replace, stamp variety) needs the RAW mask -- reading
                them through a surface's GPU preview measures the texture's own
@@ -15943,6 +23837,97 @@ window.TRLE = window.TRLE || {};
             // test-only: the Stamp contour generator, so shape variety and
             // seeded determinism are measurable without a UI in the way.
             stampAlpha: buildStampAlpha,
+            /* test-only: the Draw modal's state. `view` is the canvas's client rect
+               plus zoom and pan, so a validator can aim real pointer events at a
+               surface pixel: client = rect + pan + surface * zoom. */
+            drawProbe() {
+                const r = $('at-draw-canvas').getBoundingClientRect();
+                return { open: drawOpen(), id: draw.id, S: draw.S, W: draw.W, H: draw.H, tool: draw.tool,
+                         cells: (draw.cells || []).map(c => ({ id: c.id, x: c.x, y: c.y, editable: c.editable })),
+                         zoom: draw.zoom, panX: draw.panX, panY: draw.panY, left: r.left, top: r.top,
+                         fg: $('at-draw-fg').value, bg: $('at-draw-bg').value,
+                         size: drawVal('size'), hardness: drawVal('hardness'), opacity: drawVal('opacity'), flow: drawVal('flow'),
+                         undo: draw.undo.length, redo: draw.redo.length, space: draw.space, alt: draw.alt,
+                         layerSig: draw.layer ? capSig(draw.layer) : null,
+                         renderMs: draw.renderMs.slice().sort((a, b) => a - b) };
+            },
+            drawBrushProbe() { return drawBrush(); },
+            drawDynTable() { return JSON.parse(JSON.stringify(DRAW_DYN)); },
+            drawPickerProbe() { return { slot: drawPk.slot, h: drawPk.h, s: drawPk.s, v: drawPk.v, recent: drawRecent.slice(),
+                fields: ['hex', 'r', 'g', 'b', 'h', 's', 'v'].map(k => $('at-draw-' + k).value) }; },
+            drawLayerPx(x, y) { return draw.layer ? [...draw.layer.getContext('2d').getImageData(x, y, 1, 1).data] : null; },
+            /* test-only (tools/capture-stroke-bake.mjs): the export path's bake for one
+               tile, run by the tool's own code rather than a copy of it. putTileCanvas
+               writes pixels the way Draw's Apply does; bakeMaps is deriveMaps exactly
+               as exportAtlas calls it, every map on; litPreview is matRenderLit's
+               materialPreview blit with any diffuse and maps (null when ten/ is absent). */
+            putTileCanvas(i, cv) { const el = state.elements[i]; if (!el) return false; drawReplace(el.canvas, cv); el.edited = true; return true; },
+            bakeMaps(i) {
+                const el = state.elements[i];
+                if (!el) return null;
+                const enabled = {}; TRLE.MapOrder.forEach(m => { enabled[m] = true; });
+                return { maps: deriveMaps(el, enabled, {}), material: materialLabel(el), kind: el.kind };
+            },
+            litPreview(diffuse, maps, lightDir) { return litCanvas(diffuse, maps, lightDir); },
+            /* test-only (push-markings phase 5): one pushable-marking slot over tile i,
+               through the modal's own compose and maps; canvases as data URLs. */
+            pushLook(i, p, bits, variant, markIdx) {
+                const src = state.elements[i], S = state.tileSize;
+                const q = Object.assign({ seed: 1 }, PUSH_SURFACES.tiles, p || {});
+                const mk = markIdx != null ? state.elements[markIdx] : null;
+                const r = pushCompose(src.canvas, q, bits, variant | 0, S, true, mk && mk.canvas);
+                const en = {}; TRLE.MapOrder.forEach(m => { en[m] = true; });
+                const m = pushMaps(r.canvas, src, r, q, en, S, mk), lit = litCanvas(r.canvas, m);
+                const u = c => c ? c.toDataURL() : null;
+                return { diffuse: u(r.canvas), lit: u(lit), height: u(m.height), normal: u(m.normal), ao: u(m.ao),
+                         roughness: u(m.roughness), specular: u(m.specular), mask: u(r.slot.mask), painted: r.slot.painted };
+            },
+            pushSurfaces() { return JSON.parse(JSON.stringify(PUSH_SURFACES)); },
+            /* test-only (phase 7): Draw's layer and recorded strokes in set mode; a
+               tile's hand pixels, and the same rebuilt from its points; the atlas
+               history position (Draw's undo must not move it). */
+            drawLayerURL() { return draw.layer ? draw.layer.toDataURL() : null; },
+            drawSetProbe() { return { set: !!draw.setMode, strokes: draw.strokes ? draw.strokes.length : null }; },
+            pushHandURL(i) { const el = state.elements[i]; return el && el.pushHandPx ? el.pushHandPx.toDataURL() : null; },
+            pushReplayURL(i) { const el = state.elements[i]; if (!el || !el.push || !el.push.hand) return null;
+                const c = pushReplayCell(el.push.hand); return c ? c.toDataURL() : null; },
+            pushSheetPos(bits) { return pushSheetPos(bits, state.tileSize); },
+            historyIndex() { return history.index; },
+            tileURL(i) { const el = state.elements[i]; return el ? el.canvas.toDataURL() : null; },
+            /* test-only (phase 6): a tile's material, and material layers from rects
+               (white on transparent, the multi-material mask's form; null = the base). */
+            setTileMaterial(i, m) { const el = state.elements[i]; if (!el) return false; el.material = m; return true; },
+            setMatLayersForTest(i, spec) {
+                const el = state.elements[i], S = state.tileSize; if (!el) return false;
+                el.matLayers = spec.map((L, k) => {
+                    let mask = null;
+                    if (L.rect) { mask = blankCanvas(S); const g = mask.getContext('2d'); g.clearRect(0, 0, S, S); g.fillStyle = '#fff'; g.fillRect(...L.rect); }
+                    return { name: 'L' + k, color: MM_COLORS[k % MM_COLORS.length], feather: 0, material: L.material, mask };
+                });
+                return true;
+            },
+            pushCacheSize() { return pushCache.size; },
+            /* test-only (2c): the last stroke replayed from its own samples, brush and
+               seed, laid on an empty layer exactly as pointer-up lays it; the number of
+               pixels that differ from the real layer (0 when the layer holds only it). */
+            drawReplayDiff() {
+                const L = draw.lastStroke;
+                if (!L || !draw.layer) return null;
+                const c = document.createElement('canvas'); c.width = draw.W; c.height = draw.H;
+                const g = c.getContext('2d');
+                TRLE.Stroke.composite(g, TRLE.Stroke.render(L.samples, L.brush, L.opts), L.brush);
+                g.globalCompositeOperation = 'destination-in'; g.drawImage(draw.mask, 0, 0);
+                const a = g.getImageData(0, 0, draw.W, draw.H).data, b = draw.layer.getContext('2d').getImageData(0, 0, draw.W, draw.H).data;
+                let n = 0; for (let i = 0; i < a.length; i += 4) if (a[i] !== b[i] || a[i + 1] !== b[i + 1] || a[i + 2] !== b[i + 2] || a[i + 3] !== b[i + 3]) n++;
+                return { diff: n, samples: L.samples.length, painted: (() => { let m = 0; for (let i = 3; i < b.length; i += 4) if (b[i]) m++; return m; })() };
+            },
+            drawLastBrush() { return draw.lastStroke ? JSON.parse(JSON.stringify(draw.lastStroke.brush)) : null; },
+            // test-only (2c.3): Make Height Map's recipe on a tile, as that modal leaves it.
+            setHgParams(i, p) { const el = state.elements[i]; if (!el) return false; el.hgParams = p; return true; },
+            matLayersOf(i) { const el = state.elements[i]; return el && Array.isArray(el.matLayers) ? el.matLayers.map(L => ({ name: L.name, material: L.material, hasMask: !!L.mask })) : null; },
+            drawCompPx(x, y) { if (!draw.comp) return null; drawCompose(); return [...draw.comp.getContext('2d').getImageData(x, y, 1, 1).data]; },
+            tilePx(i, x, y) { const el = state.elements[i]; return el ? [...el.canvas.getContext('2d').getImageData(x, y, 1, 1).data] : null; },
+            drawResetRenderTimes() { draw.renderMs = []; },
             maskCanvasFor(which) {
                 return ({ em: emissive.maskCanvas, hg: hg.mask, heal: heal.maskCanvas,
                           fade: fade.maskCanvas, dl: dl.maskCanvas, tr: tr.customMask,
@@ -16165,6 +24150,142 @@ window.TRLE = window.TRLE || {};
             },
             setCols(n) { setColumns(n); return { cols: state.cols, n: state.elements.length }; },
             validateBlocks() { return validateBlocks(); },
+            /* test-only: the slot layout (GRID-SLOT-PLAN phase 1). `rowMajor` is
+               true while it still equals today's placement. */
+            layoutState() {
+                syncLayout();
+                const ids = state.elements.map(e => e.id);
+                const cols = Math.max(1, state.cols);
+                const rowMajor = state.rows === (ids.length ? Math.ceil(ids.length / cols) : 0)
+                    && state.layout.length === cols * state.rows
+                    && state.layout.every((id, i) => id === (i < ids.length ? ids[i] : null));
+                // The phase 2 invariant: element order == reading order of occupied slots.
+                const occupied = state.layout.filter(id => id != null);
+                const orderMatches = occupied.length === ids.length && occupied.every((id, i) => id === ids[i]);
+                return { cols: state.cols, rows: state.rows, layout: state.layout.slice(),
+                         problems: checkLayout(), rowMajor, orderMatches };
+            },
+            /* test-only: put a layout in place WITHOUT changing element order, so a
+               validator can prove each positional reader follows the layout and not
+               the order. Holds until the order or membership next changes. */
+            setLayoutForTest(layout) {
+                syncLayout();
+                state.layout = layout.slice();
+                state.rows = Math.ceil(layout.length / Math.max(1, state.cols));
+                layoutAssigned();
+                renderGrid();
+                return checkLayout();
+            },
+            /* test-only: which element each stitched cell came from. Stitches with
+               an id-coded solid tile per element and reads each cell's centre. */
+            stitchCellIds() {
+                const S = state.tileSize;
+                const c = stitchAtlas(el => {
+                    const t = document.createElement('canvas'); t.width = t.height = S;
+                    const x = t.getContext('2d');
+                    x.fillStyle = `rgb(${el.id & 255},${(el.id >> 8) & 255},77)`; x.fillRect(0, 0, S, S);
+                    return t;
+                });
+                const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+                const cols = c.width / S, rows = c.height / S, out = [];
+                for (let r = 0; r < rows; r++) for (let q = 0; q < cols; q++) {
+                    const i = (((r * S + (S >> 1)) * c.width) + q * S + (S >> 1)) * 4;
+                    out.push(d[i + 3] === 0 ? null : d[i] + (d[i + 1] << 8));
+                }
+                return out;
+            },
+            /* test-only: FNV-1a over every RGBA byte of the stitched diffuse and of
+               each material-map atlas, for byte-identity checks across a change. */
+            atlasHashes() {
+                const enabled = {}; for (const mt of TRLE.MapOrder) enabled[mt] = true;
+                const cache = {};
+                for (const el of state.elements) deriveMaps(el, enabled, cache);
+                const hash = c => {
+                    const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+                    let h = 2166136261;
+                    for (let i = 0; i < d.length; i++) { h ^= d[i]; h = Math.imul(h, 16777619); }
+                    return `${c.width}x${c.height}:${(h >>> 0).toString(16)}`;
+                };
+                const out = { diffuse: hash(stitchAtlas(el => el.canvas)) };
+                for (const mt of TRLE.MapOrder) out[mt] = hash(stitchAtlas(el => (cache[el.id] && cache[el.id][mt]) || null));
+                return out;
+            },
+            /* test-only: wall time of one renderGrid, for GRID-SLOT-PLAN phase 3's
+               30 ms bar at 4,096 cells. */
+            renderGridMs(withLayout) {
+                const t = performance.now(); renderGrid();
+                if (withLayout) void $('at-grid').getBoundingClientRect().height;   // force style + layout
+                return performance.now() - t;
+            },
+            snapshotMs() { const t = performance.now(); snapshotState(); return performance.now() - t; },
+            /* test-only: record downloads (name, size) instead of saving them. */
+            captureDownloads() { const got = []; downloadHook = (b, name) => got.push({ name, size: b.size, blob: b }); this._downloads = got; return true; },
+            /* Sprites (SPRITE-PLAN phase 2). */
+            spriteOpen() { openSpriteModal(); return true; },
+            spriteParams() { return spReadParams(); },
+            spriteFrames() { return sp.frames; },
+            spriteFrameAt(i) { return TRLE.SpriteGen.frameAt(spReadParams(), i); },
+            spriteMs() { return sp.lastMs; },
+            spriteSet(params) { spSetControls(params); spRegenerate(); return spReadParams(); },
+            spriteSlot(key) { spApplySlot(key); spRegenerate(); return spReadParams(); },
+            spriteLoadText(text) { spApplyFileText(text); return spReadParams(); },
+            spriteHash() {
+                let h = 2166136261 >>> 0;
+                for (const f of sp.frames) {
+                    const d = f.getContext('2d').getImageData(0, 0, f.width, f.height).data;
+                    for (let i = 0; i < d.length; i++) { h ^= d[i]; h = Math.imul(h, 16777619) >>> 0; }
+                }
+                return `${sp.frames.length}:${h.toString(16)}`;
+            },
+            downloads() { return this._downloads || []; },
+            holes() { return holeSlots(); },
+            /* Drive a drop without a pointer: the same plan and commit the drag uses. */
+            dropAt(ids, zone, target) {
+                const plan = planDrop([].concat(ids), zone, target);
+                if (!plan.refused && !plan.noop) commitPlan(plan, 'Move tile', [].concat(ids)[0]);
+                return { refused: plan.refused || null, noop: !!plan.noop, layout: state.layout.slice(), cols: state.cols, rows: state.rows };
+            },
+            planDrop(ids, zone, target) { const p = planDrop([].concat(ids), zone, target); return { refused: p.refused || null, noop: !!p.noop, cells: p.cells || null, cols: p.cols, rows: p.rows }; },
+            setLocks(cols, rows) { state.lockCols = !!cols; state.lockRows = !!rows; renderGrid(); return true; },
+            /* test-only: every animation's frames as { group: [slot of frame 0, 1, ...] }. */
+            animSlots() {
+                syncLayout();
+                const out = {};
+                state.elements.filter(e => e.kind === 'anim' && e.anim).sort((a, b) => a.anim.index - b.anim.index)
+                    .forEach(e => { (out[e.anim.group] = out[e.anim.group] || [])[e.anim.index] = state.layout.indexOf(e.id); });
+                return out;
+            },
+            resetHistory(label) { resetHistory(label || 'Test baseline'); return true; },
+            renderGridCalls() { return renderGridCalls; },
+            /* The in-place atlas view (phase 5): turn it on or off; returns its state. */
+            atlasView(on) { if (on != null) setAtlasView(!!on); return atlasViewOn(); },
+            /* test-only: for every occupied slot, the id there and a hash of that
+               cell's pixels in the diffuse and in each map atlas, so a fill can be
+               shown to leave every other cell of every map untouched. */
+            cellMapHashes() {
+                const S = state.tileSize, enabled = {};
+                for (const mt of TRLE.MapOrder) enabled[mt] = true;
+                const cache = {};
+                for (const el of state.elements) deriveMaps(el, enabled, cache);
+                const sheets = { diffuse: stitchAtlas(el => el.canvas) };
+                for (const mt of TRLE.MapOrder) sheets[mt] = stitchAtlas(el => (cache[el.id] && cache[el.id][mt]) || null);
+                const out = [];
+                for (const { el, slot, col, row } of layoutCells()) {
+                    const cell = { slot, id: el.id };
+                    for (const [k, c] of Object.entries(sheets)) {
+                        const d = c.getContext('2d').getImageData(col * S, row * S, S, S).data;
+                        let h = 2166136261;
+                        for (let i = 0; i < d.length; i++) { h ^= d[i]; h = Math.imul(h, 16777619); }
+                        const m = ((S >> 1) * S + (S >> 1)) * 4;
+                        cell[k] = (h >>> 0).toString(16);
+                        cell[k + 'Px'] = [d[m], d[m + 1], d[m + 2], d[m + 3]];
+                    }
+                    out.push(cell);
+                }
+                return out;
+            },
+            async projectJSON() { return JSON.parse(JSON.stringify(await buildProjectJSON())); },
+            async loadProjectJSON(json) { return applyProject(json); },
             stitchSize() { const c = stitchAtlas(el => el.canvas); return { w: c.width, h: c.height }; },
             // test-only: fingerprint one mask, so "all sliders at 0 changes
             // nothing" can be asserted as byte-equality rather than eyeballed.
@@ -16360,14 +24481,32 @@ window.TRLE = window.TRLE || {};
                 return url(o);
             },
             // heal demo: stamp an artificial smudge, then inpaint it away
-            async healDemo(src, S, cx, cy, r) {
+            async healDemo(src, S, cx, cy, r, method) {
                 const A = toC(await loadImg(src), S);
                 const smudged = cloneCanvas(A), sc = smudged.getContext('2d');
                 sc.fillStyle = 'rgba(18,12,8,0.88)'; sc.beginPath(); sc.arc(cx * S, cy * S, r * S, 0, Math.PI * 2); sc.fill();
                 const mask = document.createElement('canvas'); mask.width = S; mask.height = S;
                 const mc = mask.getContext('2d'); mc.fillStyle = '#000'; mc.fillRect(0, 0, S, S);
                 mc.fillStyle = '#fff'; mc.beginPath(); mc.arc(cx * S, cy * S, r * S * 1.12, 0, Math.PI * 2); mc.fill();
-                return { before: url(smudged), after: url(healPatchFill(smudged, mask, S)) };
+                const fill = method === 'patch' ? healPatchFill : healBrushFill;
+                return { before: url(smudged), after: url(fill(smudged, mask, S)) };
+            },
+            /* The modal previews at HEAL_PREVIEW_MAX and saves at full size, both from
+               the SAME full-size tile and the same 256px paint mask. This reproduces
+               that pair exactly, so a validator can check the save is the preview. */
+            async healPreviewVsSave(src, S, cx, cy, r, method) {
+                const A = toC(await loadImg(src), S);
+                const smudged = cloneCanvas(A), sc = smudged.getContext('2d');
+                sc.fillStyle = 'rgba(18,12,8,0.88)'; sc.beginPath(); sc.arc(cx * S, cy * S, r * S, 0, Math.PI * 2); sc.fill();
+                const mask = document.createElement('canvas'); mask.width = 256; mask.height = 256;
+                const mc = mask.getContext('2d'); mc.fillStyle = '#000'; mc.fillRect(0, 0, 256, 256);
+                mc.fillStyle = '#fff'; mc.beginPath(); mc.arc(cx * 256, cy * 256, r * 256 * 1.12, 0, Math.PI * 2); mc.fill();
+                const fill = method === 'patch' ? healPatchFill : healBrushFill;
+                const P = Math.min(S, HEAL_PREVIEW_MAX);
+                const t0 = performance.now();
+                const full = fill(smudged, mask, S);
+                const ms = performance.now() - t0;
+                return { preview: url(fill(smudged, mask, P)), save: url(full), ms };
             },
             // animated-texture montage (cols×rows frames). animate=false draws the
             // same frame in every cell (static "before"); true draws the real
@@ -16382,6 +24521,78 @@ window.TRLE = window.TRLE || {};
                     x.drawImage(f, (i % cols) * S, ((i / cols) | 0) * S, S, S);
                 }
                 return url(o);
+            },
+            /* Learn-page asset: a montage of an animation with a static overlay
+               baked into every frame, optionally with an organic contour and a
+               moving level. Drives the REAL compositor (animOverlayPlan +
+               composeAnimOverlay), so a before/after pair cannot drift away
+               from what the tool does — the whole reason these assets are
+               generated rather than hand-captured.
+
+               `srcIndex` is an element index, so the caller sets the atlas up
+               with setupTilesFrom first and this stays free of file loading. */
+            animOverlayMontage(o) {
+                const S = o.size || 160, cols = o.cols || 3, rows = o.rows || 2;
+                const n = cols * rows;
+                // `frames` renders a longer loop and shows its first n frames:
+                // particle streak length is motion blur PER FRAME, so a 6-frame
+                // loop draws streaks nearly three times what the 16-frame default
+                // ships. `step` spaces the shown frames through it.
+                const NL = o.frames || n, step = o.step || 1;
+                const p1 = TRLE.AnimPresets_resolve(o.preset, { size: S, frames: NL, seed: o.seed || 0 });
+                // Round three: a second layer ({preset, z, opacity, seed}) and an
+                // emissive-only static diffuse ({srcIndex, drive}), through the
+                // same functions the real path uses.
+                const l2 = o.layer2 ? { params: TRLE.AnimPresets_resolve(o.layer2.preset, { seed: o.layer2.seed || 1 }),
+                                        z: o.layer2.z || 'front', opacity: o.layer2.opacity == null ? 1 : o.layer2.opacity } : null;
+                const L = animGenerateLayers(p1, l2, false, !!o.still);
+                const frames = L.frames;
+                let ovl = null;
+                if (o.overlay) {
+                    const src = state.elements[o.srcIndex || 0];
+                    if (!src) return null;
+                    ovl = { tileId: src.id, z: o.z || 'front',
+                            params: { mode: o.mode || 'all', sample: 'overlay', target: '#ffffff',
+                                      tolerance: 25, hue: 30, hueWidth: 30, satMin: 30, valMin: 20,
+                                      threshold: 80, softness: 30, feather: 0, invert: false,
+                                      opacity: 1, blend: 'normal',
+                                      dFill: o.dFill || 'high', dLevel: o.dLevel == null ? 50 : o.dLevel,
+                                      dHard: o.dHard == null ? 65 : o.dHard,
+                                      dDetail: o.dDetail == null ? 80 : o.dDetail,
+                                      dContrast: o.dContrast == null ? 50 : o.dContrast },
+                            org: o.org ? { style: o.orgStyle || 'blobs', wobble: o.org, drift: 0,
+                                           scatter: 0, feather: 0, shadow: 0, shadowColor: '#000000',
+                                           shadowMode: 'multiply', shadowTarget: 'diffuse',
+                                           scale: 3, seed: 7, driftSeed: 1 } : null,
+                            level: o.level ? { dir: o.level, curve: 'smooth', cycles: 1,
+                                               low: 0, high: 75, soft: 4 } : null };
+                }
+                const plan = ovl ? animOverlayPlan(ovl, frames[0], S) : null;
+                const out = document.createElement('canvas');
+                out.width = S * cols; out.height = S * rows;
+                const x = out.getContext('2d');
+                if (o.bg) { x.fillStyle = o.bg; x.fillRect(0, 0, out.width, out.height); }
+                const still = o.still ? state.elements[o.still.srcIndex || 0] : null;
+                const g = Object.assign({}, GLOW_DEFAULT, { enabled: true, pulse: true, pulseCycles: 1, pulseDepth: 90 }, o.glow || {});
+                for (let i = 0; i < n; i++) {
+                    const dx = (i % cols) * S, dy = ((i / cols) | 0) * S;
+                    if (still) {
+                        const flat = resizeCanvas(still.canvas, S, S);
+                        // emissiveOnly: the map that actually moves, on black,
+                        // because over a bright diffuse the change is swamped.
+                        if (!o.still.emissiveOnly) x.drawImage(flat, dx, dy, S, S);
+                        else { x.fillStyle = '#000'; x.fillRect(dx, dy, S, S); }
+                        x.globalCompositeOperation = 'lighter';
+                        x.drawImage(animStillEmissive(flat, frames[(i * step) % NL], g, (i * step) % NL, NL, o.still.drive || 'pulse'), dx, dy, S, S);
+                        x.globalCompositeOperation = 'source-over';
+                        continue;
+                    }
+                    const k = (i * step) % NL;
+                    let f = ovl ? composeAnimOverlay(frames[k], ovl, S, plan, k, NL) : frames[k];
+                    if (L.top) f = animComposeLayer2(f, L.top[k], l2);
+                    x.drawImage(f, dx, dy, S, S);
+                }
+                return url(out);
             },
             // Per-frame data URLs for an animated preset: the looping albedo
             // sequence, plus (if emOpts given) the matching emissive map of each
@@ -16488,13 +24699,57 @@ window.TRLE = window.TRLE || {};
             async recolor(baseSrc, refSrc, S, strength) {
                 const E = TRLE.Engine;
                 const A = toC(await loadImg(baseSrc), S), B = toC(await loadImg(refSrc), S);
-                const sa = computeColorStats(A, 64), sb = computeColorStats(B, 64);
+                const sa = computeColorStats(A), sb = computeColorStats(B);
                 const scale = [0, 1, 2].map(c => Math.max(0.2, Math.min(3, sb.std[c] / sa.std[c])));
                 const tex = E.createTextureFromImage(A);
                 const t1 = E.createFBO(S, S);
                 E.blit('colorTransfer', { u_texture: tex, u_meanA: sa.mean, u_meanB: sb.mean, u_scale: scale, u_strength: strength == null ? 0.9 : strength }, t1);
                 const out = E.fboToCanvas(t1);
                 E.deleteFBO(t1); E.deleteTexture(tex);
+                return url(out);
+            },
+            /* Drive the colorAdjust shader directly. `p` takes the SLIDER scales the
+               modal uses (hue in degrees, everything else the raw percent), so a
+               validator asserts against the numbers a user actually dials rather
+               than against internal 0..1 uniforms. */
+            async colorAdjust(src, S, p) {
+                p = p || {};
+                const E = TRLE.Engine;
+                const tex = E.createTextureFromImage(toC(await loadImg(src), S));
+                const fbo = E.createFBO(S, S);
+                const n = (k, d) => (p[k] === undefined ? d : p[k]);
+                /* `levels` takes the slider values too: { rblack, rwhite, rgamma, … }.
+                   Passing it at all turns the stage on, so a validator can assert the
+                   stage is skipped by simply not passing it. */
+                const L = p.levels, on = L ? 1 : 0;
+                /* `curve` = [[256 R], [256 G], [256 B]] output bytes, which turns the
+                   curves stage on with exactly that table. */
+                let curveTex = null;
+                if (p.curve) {
+                    const cc = document.createElement('canvas'); cc.width = 256; cc.height = 1;
+                    const cg = cc.getContext('2d'), ci = cg.createImageData(256, 1);
+                    for (let i = 0; i < 256; i++) { for (let k = 0; k < 3; k++) ci.data[i * 4 + k] = p.curve[k][i]; ci.data[i * 4 + 3] = 255; }
+                    cg.putImageData(ci, 0, 0);
+                    curveTex = E.createTextureFromImage(cc, { filter: 0x2600, wrap: 0x812F });
+                }
+                const tri = (suffix, d, scale) => ['r', 'g', 'b'].map(ch =>
+                    (L && L[ch + suffix] !== undefined ? L[ch + suffix] : d) / scale);
+                E.blit('colorAdjust', {
+                    u_texture: tex,
+                    u_hue: n('hue', 0), u_sat: n('sat', 100) / 100,
+                    u_bright: n('bright', 0) / 100, u_contrast: n('contrast', 100) / 100,
+                    u_gamma: n('gamma', 100) / 100, u_temp: n('temp', 0) / 100,
+                    u_tint: n('tint', 0) / 100, u_vibrance: n('vibrance', 0) / 100,
+                    u_invert: n('invert', 0),
+                    u_levOn: on, u_curveOn: curveTex ? 1 : 0,
+                    u_curveTex: curveTex || tex,   // always bound; see caBlit
+                    u_levBlack: tri('black', 0, 255),
+                    u_levWhite: tri('white', 255, 255),
+                    u_levGamma: tri('gamma', 100, 100)
+                }, fbo);
+                const out = E.fboToCanvas(fbo);
+                E.deleteFBO(fbo); E.deleteTexture(tex);
+                if (curveTex) E.deleteTexture(curveTex);
                 return url(out);
             },
             // Fade a tile's edges to transparent (vignette) — PNG keeps the alpha.
@@ -16507,7 +24762,7 @@ window.TRLE = window.TRLE || {};
             // screenshots: build a 2-tile atlas and open a modal
             async setupTwoTiles(aSrc, bSrc, S) {
                 const A = toC(await loadImg(aSrc), S), B = toC(await loadImg(bSrc), S);
-                state.tileSize = S; state.cols = 2; state.nextId = 3;
+                state.tileSize = S; state.cols = 2; state.nextId = 3; state.emptyFill = null;
                 state.elements = [tile(A, 1), tile(B, 2)];
                 $('at-grid-card').style.display = 'block';
                 renderGrid();
@@ -16517,8 +24772,10 @@ window.TRLE = window.TRLE || {};
             // main-thread cost only shows up once there are enough of them.
             // test-only: delete by 1-based grid position through the real removal
             // path (dependency closure included), skipping only the confirm dialog.
+            /* `pos` is the tile's 1-based place in the GRID (reading order), which
+               since phase 6 can differ from element (processing) order. */
             deleteTileAt(pos) {
-                const el = state.elements[pos - 1];
+                const el = byId(readingOrder()[pos - 1]);
                 if (!el) return -1;
                 const n = performDelete([el.id]);
                 renderGrid();
@@ -16583,7 +24840,7 @@ window.TRLE = window.TRLE || {};
                 return state.elements.length;
             },
             async setupTilesFrom(srcs, S) {
-                state.tileSize = S; state.cols = 4; state.elements = []; state.nextId = 1;
+                state.tileSize = S; state.cols = 4; state.elements = []; state.nextId = 1; state.emptyFill = null;
                 for (const u of srcs) {
                     const c = toC(await loadImg(u), S);
                     state.elements.push(tile(c, state.nextId++));
@@ -16592,18 +24849,274 @@ window.TRLE = window.TRLE || {};
                 renderGrid();
                 return state.elements.length;
             },
-            async setupManyTiles(src, S, n) {
+            async setupManyTiles(src, S, n, cols) {
                 const A = toC(await loadImg(src), S);
-                state.tileSize = S; state.cols = 4; state.nextId = n + 1;
+                state.tileSize = S; state.cols = cols || 4; state.nextId = n + 1; state.emptyFill = null;
                 state.elements = [];
                 for (let i = 0; i < n; i++) state.elements.push(tile(cloneCanvas(A), i + 1));
                 $('at-grid-card').style.display = 'block';
                 renderGrid();
                 return state.elements.length;
             },
+            /* test-only: reopen an animation group for editing, the way the
+               context menu's "Edit Animation" does. */
+            editAnim(group) { openAnimModal(group); return $('at-modal-anim').style.display !== 'none'; },
+            /* test-only: what deleting these ids would REMOVE, without removing it.
+               The closure is the thing that stops refreshAnims compositing
+               against a tile that is no longer there. */
+            deleteClosure(ids) { return [...collectDeleteClosure(ids)]; },
+            /* test-only: the animation-overlay mechanism, measured rather than
+               eyeballed. For member `i`:
+                 changed   px where the composed canvas differs from the raw frame
+                 leaked    px where the SOURCE TILE IS FULLY TRANSPARENT and the
+                           composed canvas still differs from the raw frame.
+               `leaked` must be 0: source-over through a cutout has to leave the
+               animation untouched in the holes. That is the assertion the whole
+               "do not use compositeTransition here" decision rests on — a lerp
+               toward a transparent pixel darkens the base instead, and a well rim
+               arrives inside a grey box. `changed` is the control: it has to be
+               large, or `leaked === 0` would pass on an overlay that did nothing. */
+            /* Second animated layer: the composite against its own inputs.
+               Frame k of layer 1 alone, layer 2 alone and the composite, scored
+               per pixel: `leaked` is a pixel changed where layer 2 is fully
+               transparent (must be 0 in front), `changed` the control that the
+               layer did anything, `holes` the control that layer 2 HAS empty
+               pixels. `frames` is how many the composite produced, and `sigs`
+               lets a caller compare two builds. */
+            animLayerProbe(p1, l2, k) {
+                const comp = animGenerateComposite(p1, l2, false);
+                const base = TRLE.AnimGen.generateFrames(p1);
+                const out = { frames: comp.length, sigs: comp.map(capSig), baseSigs: base.map(capSig) };
+                if (!l2) return out;
+                const top = TRLE.AnimGen.generateFrames(Object.assign({}, l2.params,
+                    { size: p1.size, frames: p1.frames, supersample: p1.supersample || 1 }));
+                const S = p1.size, i = k || 0;
+                const px = c => c.getContext('2d').getImageData(0, 0, S, S).data;
+                const C = px(comp[i]), B = px(base[i]), T = px(top[i]);
+                let leaked = 0, changed = 0, holes = 0;
+                for (let q = 0; q < C.length; q += 4) {
+                    const diff = C[q] !== B[q] || C[q + 1] !== B[q + 1] || C[q + 2] !== B[q + 2] || C[q + 3] !== B[q + 3];
+                    if (diff) changed++;
+                    if (T[q + 3] === 0) { holes++; if (diff) leaked++; }
+                }
+                return Object.assign(out, { leaked, changed, holes });
+            },
+            /* A top layer (z: 'top') against the same frame without it: how
+               many pixels it changed ON the overlay's opaque parts (it must
+               reach them; a 'front' layer sits under them and cannot). */
+            animTopProbe(i) {
+                const el = state.elements[i];
+                if (!el || el.kind !== 'anim' || !el.animRaw) return null;
+                const ovl = el.anim.overlay, S = el.canvas.width;
+                const noTop = ovl ? composeAnimOverlay(el.animRaw, ovl, S,
+                    animOverlayPlan(ovl, el.animRaw, S), el.anim.index, el.anim.total) : el.animRaw;
+                const src = ovl && animOverlaySource(ovl);
+                const px = c => c.getContext('2d').getImageData(0, 0, S, S).data;
+                const A = px(el.canvas), B = px(noTop), O = src ? px(resizeCanvas(src.canvas, S, S)) : null;
+                let onSolid = 0, solid = 0;
+                for (let q = 0; q < A.length; q += 4) {
+                    if (!O || O[q + 3] !== 255) continue;
+                    solid++;
+                    if (A[q] !== B[q] || A[q + 1] !== B[q + 1] || A[q + 2] !== B[q + 2]) onSolid++;
+                }
+                return { top: !!el.animTop, onSolid, solid };
+            },
+            /* Time one derived refresh (every transition plus every overlaid
+               animation group), which is what each edit path now pays. */
+            timeRefreshDerived(reps) {
+                const n = Math.max(1, reps | 0), t0 = performance.now();
+                for (let r = 0; r < n; r++) refreshTransitions();
+                return (performance.now() - t0) / n;
+            },
+            animOverlayProbe(i) {
+                const el = state.elements[i];
+                if (!el || el.kind !== 'anim' || !el.animRaw) return null;
+                const S = el.canvas.width;
+                const A = el.canvas.getContext('2d').getImageData(0, 0, S, S).data;
+                const B = el.animRaw.getContext('2d').getImageData(0, 0, S, S).data;
+                const ovl = el.anim && el.anim.overlay;
+                const src = ovl && byId(ovl.tileId);
+                const C = src ? resizeCanvas(src.canvas, S, S).getContext('2d').getImageData(0, 0, S, S).data : null;
+                let changed = 0, leaked = 0, holes = 0;
+                for (let k = 0; k < A.length; k += 4) {
+                    const diff = A[k] !== B[k] || A[k+1] !== B[k+1] || A[k+2] !== B[k+2] || A[k+3] !== B[k+3];
+                    if (diff) changed++;
+                    if (C && C[k + 3] === 0) { holes++; if (diff) leaked++; }
+                }
+                return { changed, leaked, holes, total: A.length / 4 };
+            },
+            /* ---- phase 3: the contour maths, driven without a modal ----
+
+               Both probes return NUMBERS the validator can assert exactly.
+               Scoring how a ragged edge LOOKS is the thing TESTING.md rules
+               out; what is checkable is that the distance field is toroidal and
+               that the level sequence closes the loop. */
+
+            /* A disc centred on the wrap CORNER, so all four of its quadrants
+               sit in different corners of the tile. Its signed distance field
+               must have exact 180-degree symmetry about (0,0) on the torus; a
+               chamfer run without the wrapped apron breaks that immediately. */
+            animDistProbe(size) {
+                const S = size || 64, R = S * 0.3;
+                const c = document.createElement('canvas'); c.width = c.height = S;
+                const ctx = c.getContext('2d'), im = ctx.createImageData(S, S);
+                for (let y = 0, p = 0; y < S; y++) for (let x = 0; x < S; x++, p++) {
+                    const dx = Math.min(x, S - x), dy = Math.min(y, S - y);
+                    const v = Math.hypot(dx, dy) < R ? 255 : 0;
+                    im.data[p * 4] = im.data[p * 4 + 1] = im.data[p * 4 + 2] = v;
+                    im.data[p * 4 + 3] = 255;
+                }
+                ctx.putImageData(im, 0, 0);
+                const d = animCovDistance(c, S, S * 0.4);
+                let symMax = 0;
+                for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+                    const a = d.sgn[y * S + x], b = d.sgn[((S - y) % S) * S + ((S - x) % S)];
+                    const e = Math.abs(a - b);
+                    if (e > symMax) symMax = e;
+                }
+                return { symMax, width: +d.width.toFixed(3), size: S };
+            },
+
+            /* The displaced contour on a horizontal band, which crosses BOTH
+               vertical seams. Returns the wrap column's mean step alongside the
+               worst interior one, so the validator can rank rather than threshold
+               — the discontinuity metric validate-borderset settled on, because a
+               periodic field's last and first columns are neighbours, not copies,
+               and demanding equality reports a false failure. `moved` is the
+               control: a rank that passes on a field which displaced nothing is
+               the same false pass animOverlayProbe caught on its first run. */
+            animOrgWrapProbe(org, size, blur) {
+                const S = size || 128;
+                const c = document.createElement('canvas'); c.width = c.height = S;
+                const ctx = c.getContext('2d');
+                if (blur) {
+                    // A blurred band, so the probe can also answer whether a SOFT
+                    // selection keeps its softness: the contour is rebuilt from a
+                    // distance field, and rebuilding it with a fixed 1px ramp
+                    // would silently make every organic overlay crisper than the
+                    // plain one and read as Edge softness having stopped working.
+                    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, S, S);
+                    ctx.filter = 'blur(' + blur + 'px)';
+                    ctx.fillStyle = '#fff'; ctx.fillRect(-S, S * 0.35, S * 3, S * 0.3);
+                    ctx.filter = 'none';
+                } else {
+                    const im = ctx.createImageData(S, S);
+                    for (let y = 0, p = 0; y < S; y++) for (let x = 0; x < S; x++, p++) {
+                        const v = (y > S * 0.35 && y < S * 0.65) ? 255 : 0;
+                        im.data[p * 4] = im.data[p * 4 + 1] = im.data[p * 4 + 2] = v;
+                        im.data[p * 4 + 3] = 255;
+                    }
+                    ctx.putImageData(im, 0, 0);
+                }
+                const og = animOrgField(S, org);
+                const out = animOrgDisplace(c, S, org, og);
+                const A = c.getContext('2d').getImageData(0, 0, S, S).data;
+                const B = out.getContext('2d').getImageData(0, 0, S, S).data;
+                let moved = 0;
+                for (let k = 0; k < A.length; k += 4) if (A[k] !== B[k]) moved++;
+                const colStep = j => {
+                    let acc = 0;
+                    for (let y = 0; y < S; y++)
+                        acc += Math.abs(B[(y * S + j) * 4] - B[(y * S + ((j + 1) % S)) * 4]);
+                    return acc / S;
+                };
+                const wrap = colStep(S - 1);
+                let worst = 0, rank = 1;
+                for (let j = 0; j < S - 1; j++) {
+                    const v = colStep(j);
+                    if (v > worst) worst = v;
+                    if (v > wrap) rank++;
+                }
+                const wIn  = animCovDistance(c, S, 4).width;
+                const wOut = animCovDistance(out, S, 4).width;
+                return { wrap: +wrap.toFixed(4), worst: +worst.toFixed(4), rank, cols: S, moved,
+                         widthIn: +wIn.toFixed(2), widthOut: +wOut.toFixed(2) };
+            },
+
+            /* Two loops' worth of level positions. The sequence must be periodic
+               with period N, which is what makes the last frame meet the first
+               with no snap — the same guarantee anGlowPulseFactor's integer
+               cycle count gives the glow. */
+            animLevelProbe(lv, N) {
+                const out = [];
+                for (let k = 0; k < N * 2; k++) out.push(+animLevelPos(lv, k, N).toFixed(6));
+                return out;
+            },
+            /* ---- phase D: the height-map coverage mode ----
+
+               The depth band is a pure function of the texture, so it TILES if
+               the texture does — the field's blur samples a REPEAT-wrapped
+               texture and the percentile behind simpleHeight is global, so both
+               commute with a roll. `roll` is that assertion: the field built
+               from a rolled tile, rolled back, must equal the field built from
+               the tile. Exact, not a threshold.
+
+               `covers` is the control, and it has to be: an exactly-zero roll
+               difference is also what a field of constant grey gives, and a
+               constant field would make the whole mode a no-op. */
+            animDepthProbe(o) {
+                const el = state.elements[o.srcIndex || 0];
+                if (!el) return null;
+                const S = o.size || 128;
+                const p = Object.assign({ dFill: 'high', dLevel: 50, dHard: 65, dDetail: 80, dContrast: 50 }, o.params || {});
+                const rollCanvas = (c, dx, dy) => {
+                    const out = document.createElement('canvas'); out.width = out.height = S;
+                    const x = out.getContext('2d');
+                    const src = resizeCanvas(c, S, S);
+                    for (let iy = -1; iy <= 1; iy++) for (let ix = -1; ix <= 1; ix++)
+                        x.drawImage(src, dx + ix * S, dy + iy * S);
+                    return out;
+                };
+                const dx = o.rollX == null ? 37 : o.rollX, dy = o.rollY == null ? 53 : o.rollY;
+                const a = animDepthField(el, S, p);
+                const b = animDepthField({ canvas: rollCanvas(el.canvas, dx, dy) }, S, p);
+                // roll `a` by the same shift and compare, in the field's own bytes
+                let maxD = 0;
+                for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+                    const sx = ((x - dx) % S + S) % S, sy = ((y - dy) % S + S) % S;
+                    const d = Math.abs(a[(sy * S + sx) * 4] - b[(y * S + x) * 4]);
+                    if (d > maxD) maxD = d;
+                }
+                // Coverage at a few fill levels, as a fraction. Raising the level
+                // with fill 'high' must cover LESS: that is the waterline rising.
+                const frac = lvl => {
+                    const c = animDepthCov(a, S, p, lvl);
+                    const d = c.getContext('2d').getImageData(0, 0, S, S).data;
+                    let t = 0; for (let i = 0; i < d.length; i += 4) t += d[i];
+                    return +(t / (255 * S * S)).toFixed(4);
+                };
+                let lo = 255, hi = 0, sum = 0, n = 0;
+                for (let i = 0; i < a.length; i += 4) { const v = a[i]; if (v < lo) lo = v; if (v > hi) hi = v; sum += v; n++; }
+                return { maxRollDiff: maxD, fieldSpread: hi - lo, fieldMin: lo, fieldMax: hi,
+                         fieldMean: +(sum / n).toFixed(1),
+                         covers: [frac(0.2), frac(0.5), frac(0.8)] };
+            },
+            /* The level-driven threshold, over two whole loops. In depth mode the
+               moving level drives the BAND rather than sweeping a line, and it
+               still has to close the loop: frame N must equal frame 0. */
+            animDepthLoopProbe(o) {
+                const el = state.elements[o.srcIndex || 0];
+                if (!el) return null;
+                const S = o.size || 96, N = o.frames || 8;
+                const p = Object.assign({ dFill: 'high', dLevel: 50, dHard: 65, dDetail: 80, dContrast: 50 }, o.params || {});
+                const ovl = { tileId: el.id, z: 'front', params: Object.assign({ mode: 'depth', opacity: 1 }, p),
+                              org: null, level: o.level || { dir: 'up', curve: 'smooth', cycles: 1, low: 0, high: 80, soft: 3 } };
+                const field = animDepthField(el, S, p);
+                const px = k => {
+                    const c = animDepthCov(field, S, p, animDepthLevel(ovl, k, N));
+                    return c.getContext('2d').getImageData(0, 0, S, S).data;
+                };
+                const diff = (A, B) => { let m = 0; for (let i = 0; i < A.length; i += 4) m = Math.max(m, Math.abs(A[i] - B[i])); return m; };
+                const f0 = px(0);
+                return { wrap: diff(f0, px(N)), moves: diff(f0, px(Math.floor(N / 2))) };
+            },
             // Element order — drives the drag-reorder checks without synthesising
             // HTML5 drag events (which headless Chrome won't dispatch usefully).
             ids() { return state.elements.map(e => e.id); },
+            /* The tiles as the grid shows them, in reading order. `ids()` is
+               element (processing) order, which a move no longer changes. */
+            readingOrder() { return readingOrder(); },
+            selectIds(ids) { setSelection(ids, false); renderGrid(); return state.selSet.size; },
             reorder(dragId, targetId) { reorderElements(dragId, targetId); return state.elements.map(e => e.id); },
             // Autosave drivers — the debounce and the boot prompt are closure-private.
             async autosaveNow() { clearTimeout(autosave.timer); await runAutosave(); return TRLE.Store.sessionMeta(); },
@@ -16616,16 +25129,163 @@ window.TRLE = window.TRLE || {};
                pick flow itself gets its own step rather than being re-enacted
                before every builder. Ids default to 1/2 for the older validators
                that call these with no arguments. */
+            // The Curves table Adjust Colours would upload right now (null when the
+            // stage is skipped), so a validator can check the shader applies it exactly.
+            caCurveTable() { return caCurveTable(); },
             openAnchor(a, b) { openAnchorModal(a || 1, b || 2); return true; },
+            // The anchored transition's mask for the modal's CURRENT state, one
+            // byte per pixel (red channel), so validate-anchor-organic can compare
+            // plain against organic pixel for pixel.
+            anchorMask(P) {
+                const c = buildAnchorMask(P || 128);
+                const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+                const out = new Array(c.width * c.height);
+                for (let i = 0; i < out.length; i++) out[i] = d[i * 4];
+                return out;
+            },
             openWang(a, b) { openWangModal(a || 1, b || 2); return true; },
             openBset(a, b) { openBsetModal(a || 1, b || 2); return true; },
             openHeightTrans(a, b) { openHeightModal(a || 1, b || 2); return true; },
+            /* The Height Transition's mask for the modal's current state (red channel
+               FNV hash), and with `fields` the height field(s) behind it, for
+               validate-height-both (BACKLOG-2026-09-PLAN phase 7). */
+            htProbe(P, fields) {
+                const p = htParams();
+                heightTr.hkey = null;
+                const m = htBuildMask(p, P).getContext('2d').getImageData(0, 0, P, P).data;
+                let h = 2166136261; for (let i = 0; i < m.length; i += 4) { h ^= m[i]; h = Math.imul(h, 16777619); }
+                const out = { source: p.source, hash: (h >>> 0).toString(16) };
+                if (fields) {
+                    const red = c => { const d = c.getContext('2d').getImageData(0, 0, P, P).data, a = new Array(P * P);
+                        for (let i = 0; i < a.length; i++) a[i] = d[i * 4]; return a; };
+                    out.field = red(heightTr.hcache);
+                    // For 'both', the per-source fields AS COMPARED, i.e. each normalised.
+                    const f = c => { if (p.source !== 'both') return red(c);
+                        const d = htNormField(c, P), a = new Array(P * P); for (let i = 0; i < a.length; i++) a[i] = d[i * 4]; return a; };
+                    out.base = f(htGenHeightField(resizeCanvas(byId(heightTr.baseId).canvas, P, P), p.blur, p.contrast));
+                    out.overlay = f(htGenHeightField(resizeCanvas(geomTransform(byId(heightTr.overlayId).canvas, heightTr.overlayGeom), P, P), p.blur, p.contrast));
+                }
+                return out;
+            },
             openTrans() { openTransModal(1, 2); return true; },
+            /* The REAL entry point, so a validator exercises openColorAdjModal's
+               reset rather than the bare openModal it sits on top of. Takes element
+               ids, like the context menu does. */
+            openColorAdj(ids) { openColorAdjModal(Array.isArray(ids) ? ids : [ids]); return true; },
+            /* Adjust Colours' paint mode, driven without a pointer. `rect` is in
+               MASK coordinates (the mask canvas is 256 square regardless of tile
+               size); omitting it leaves the mask empty, which is how a validator
+               asserts the inert case. Returns the tile as a PNG so pixels can be
+               compared byte for byte. */
+            caPaint(idx, opts) {
+                opts = opts || {};
+                const el = state.elements[idx];
+                if (!el) return null;
+                openColorAdjModal([el.id]);
+                $('at-ca-mode').value = 'mask';
+                caSyncMode();
+                if (opts.sub) {
+                    const r = document.querySelector(`input[name="at-ca-paintmode"][value="${opts.sub}"]`);
+                    if (r) { r.checked = true; caSyncMode(); }
+                }
+                if (opts.rect) this.caMaskRect(opts.rect, opts.shape);
+                Object.entries(opts.sliders || {}).forEach(([k, v]) => {
+                    const e = $('at-ca-' + k);
+                    if (e) { e.value = v; e.dispatchEvent(new Event('input')); }
+                });
+                caRender();
+                const out = caApplyTo(el.canvas, state.tileSize);
+                closeModal();
+                return url(out);
+            },
+            /* Fill a rect into the paint mask and redraw, leaving the modal OPEN.
+               The demo course uses it to put a region on screen so a slider sweep can
+               show the grade staying inside it; caPaint() builds on it. Coordinates
+               are mask space, which is 256 square whatever the tile size. */
+            caMaskRect(rect, shape) {
+                if (!ca.maskCanvas) return false;
+                const g = ca.maskCanvas.getContext('2d');
+                g.fillStyle = '#fff';
+                if (shape === 'ellipse') {
+                    g.beginPath();
+                    g.ellipse(rect[0] + rect[2] / 2, rect[1] + rect[3] / 2,
+                              rect[2] / 2, rect[3] / 2, 0, 0, Math.PI * 2);
+                    g.fill();
+                } else {
+                    g.fillRect(rect[0], rect[1], rect[2], rect[3]);
+                }
+                caRender();
+                return true;
+            },
+            /* Fraction of the paint mask that is selected, so a validator can assert
+               a region survived (or did not) without shipping the canvas over CDP. */
+            caMaskCoverage() {
+                if (!ca.maskCanvas) return 0;
+                const S = ca.maskCanvas.width;
+                const d = ca.maskCanvas.getContext('2d').getImageData(0, 0, S, S).data;
+                let k = 0;
+                for (let i = 3; i < d.length; i += 4) if (d[i] > 8) k++;
+                return k / (S * S);
+            },
+            /* What the modal's own preview canvas currently holds, so the
+               previous-tile-through-the-holes check has something to read. */
+            caPreviewURL() { return url($('at-ca-preview')); },
             openCtx(id) { openCtxMenuForCell(id); return true; },
+            /* Phase 4: does element i's canvas differ from its original, and
+               what does it cost at this size (the menu runs it on every open)? */
+            /* Every byte of element i's canvas (or its `original`), hashed: tileSig
+               samples every 17th byte, and phase 4 promises byte equality. */
+            pxHash(i, which) {
+                const el = state.elements[i];
+                const cv = el && (which === 'original' ? el.original : el.canvas);
+                if (!cv) return null;
+                const d = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+                let h = 2166136261;
+                for (let k = 0; k < d.length; k++) { h ^= d[k]; h = Math.imul(h, 16777619); }
+                return cv.width + 'x' + cv.height + ':' + (h >>> 0).toString(16);
+            },
+            pixelsDiffer(i) { const t0 = performance.now(); const d = tilePixelsDiffer(state.elements[i]); return { differs: d, ms: performance.now() - t0 }; },
+            /* The categorised menu (CONTEXT-MENU-PLAN): whether it is on, open a
+               category's submenu as a hover would, and what is open/highlighted. */
+            ctxOpenCat(cat) { ctxOpenSub(cat); return ctxv.open === cat; },
+            ctxState() {
+                const h = ctxv.hl, m = $('at-ctx');
+                const runs = sel => [...m.querySelectorAll(sel)].map(b => b.dataset.run);
+                return { open: ctxv.open, pane: ctxv.pane, timing: { ...CTX_TIMING },
+                         hl: h ? (h.dataset.action || (h.dataset.run && '@' + h.dataset.run) || 'cat:' + h.dataset.cat) : null,
+                         query: $('at-ctx-search').value, results: runs('.at-ctx-results > button'),
+                         resultLabels: [...m.querySelectorAll('.at-ctx-results > button')].map(b => b.textContent),
+                         recent: runs('.at-ctx-recent > button'), none: m.querySelector('.at-ctx-none').textContent,
+                         focus: document.activeElement && document.activeElement.id };
+            },
+            /* Phase 5: the preview panel. `imgSrc` stays set once assigned (never
+               cleared back), so a validator on a fresh page can prove nothing in
+               menu-img/ loads before the first preview shown just by reading it
+               null before, non-null after, without needing the Network domain. */
+            ctxPreviewState() {
+                const p = $('at-ctx-preview'), img = p.querySelector('.at-ctx-preview-img'), cv = p.querySelector('.at-ctx-preview-css');
+                const r = p.getBoundingClientRect();
+                return { shown: p.style.display !== 'none', warm: ctxv.previewWarm, timerArmed: !!ctxv.previewTimer,
+                         text: p.querySelector('.at-ctx-preview-text').textContent,
+                         learnHref: p.querySelector('.at-ctx-preview-learn').style.display === 'none' ? null : p.querySelector('.at-ctx-preview-learn').getAttribute('href'),
+                         // getComputedStyle, not the inline property: an earlier version
+                         // "showed" the media by clearing .style.display to '', which
+                         // falls back to the STYLESHEET's own display:none default for
+                         // both, not to visible — invisible in a real browser while
+                         // every check reading only the inline value said it was shown.
+                         mediaKind: getComputedStyle(cv).display !== 'none' ? 'css' : getComputedStyle(img).display !== 'none' ? 'img' : 'none',
+                         imgSrc: img.getAttribute('src') || null,
+                         rect: { left: r.left, top: r.top, right: r.right, bottom: r.bottom, w: r.width, h: r.height } };
+            },
+            /* Read or replace the stored recents (D9), for a test to start clean. */
+            ctxRecent(list) { if (Array.isArray(list)) ctxRecentSet(list); return ctxRecentGet().slice(); },
+            /* The empty-slot menu on slot `s` (the demo course, and tests). */
+            openSlotMenu(s) { openSlotMenuForSlot(s); return $('at-slot-ctx').style.display !== 'none'; },
             // test-only selection driver: select by index, read back the selection
             // and the remembered "last material" (all closure-private otherwise).
-            selectIdx(idxs) {
-                setSelection(idxs.map(i => state.elements[i] && state.elements[i].id).filter(v => v != null), false);
+            selectIdx(idxs) {   // grid positions (reading order), 0-based
+                const order = readingOrder();
+                setSelection(idxs.map(i => order[i]).filter(v => v != null), false);
                 renderGrid();
                 return state.selSet.size;
             },
@@ -16642,6 +25302,20 @@ window.TRLE = window.TRLE || {};
             // data-URL and would be far too big to hand back over CDP.
             async projectHead() { const p = await buildProjectJSON(); return { name: p.name, version: p.version, count: p.elements.length }; },
             openGrid(a, b) { openTransGridModal(a || 1, b || 2); return true; },
+            // The Transition Grid's whole-wall mask for the modal's CURRENT state at
+            // `P` px per cell (red channel), and how long it took, for
+            // validate-anchor-organic.
+            gridMask(P) {
+                const t0 = performance.now();
+                const c = buildGridMask(tg.cols * P, tg.rows * P, tg.anchors, tg.axis, tg.swap,
+                    parseInt($('at-tg-hardness').value) / 100, P, tg.shapes, $('at-tg-noboundary').checked,
+                    { amount: parseInt($('at-tg-organic').value) / 100, seed: tg.organicSeed || 1 }, tgOrgParams());
+                const ms = performance.now() - t0;
+                const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+                const px = new Array(c.width * c.height);
+                for (let i = 0; i < px.length; i++) px[i] = d[i * 4];
+                return { W: c.width, H: c.height, px, ms };
+            },
             openOrganic(a, b) { openOrganicModal(a || 1, b || 2); return true; },
             openTrans(baseId, overlayId) { openTransModal(baseId || 1, overlayId || 2); return true; },
             /* Recolor normally arrives through the two-click pick flow (right-click
@@ -16816,6 +25490,28 @@ window.TRLE = window.TRLE || {};
             applyTheme(theme);
             savePref('theme', theme);
         });
+
+        // Animations (GRID-SLOT-PLAN phase 7, D22): the user's choice beats the
+        // OS reduced-motion setting both ways; unset follows the OS. js/motion.js
+        // reads the same prefs key at load; this writes it and tells it.
+        const motionBtn = $('at-motion-toggle');
+        const syncMotion = () => {
+            const on = !(TRLE.Motion && TRLE.Motion.reduced());
+            motionBtn.textContent = on ? 'On' : 'Off';
+            motionBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+            motionBtn.setAttribute('aria-label', on ? 'Animations on' : 'Animations off');
+            motionBtn.title = on ? 'Animations on: tiles slide to show where a drop will land'
+                                 : 'Animations off: changes happen instantly';
+        };
+        if (motionBtn && TRLE.Motion) {
+            syncMotion();
+            motionBtn.addEventListener('click', () => {
+                const next = TRLE.Motion.reduced() ? 'on' : 'off';
+                TRLE.Motion.set(next);
+                savePref('motion', next);
+                syncMotion();
+            });
+        }
 
         // UI scale (root font-size, drives all rem-based sizing)
         let scale = typeof prefs.uiScale === 'number' ? prefs.uiScale : SCALE_BASE;

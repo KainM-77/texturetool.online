@@ -18,6 +18,8 @@
                (they were swept out of every user-facing string on 2026-09-17
                after user complaints; use a comma, a colon or parentheses).
                Code comments like this one are not user-facing and keep theirs.
+               And NO "X is not Y, it is Z" (banned 2026-09-28): say what a
+               thing is and does. audit-lesson-copy.mjs flags it.
      covers    what this step teaches: 'action:<data-action>' | 'modal:<id>'
                | 'ui:<thing>'. The validator's registry.
      requires  'pristine' | 'loaded' | 'sliced' — the EXACT sandbox state this
@@ -38,6 +40,13 @@
      act       async (api) => …   a scripted click or other one-shot action
      handoff   HTML; what to try yourself. Its presence is what makes the step
                end in free play rather than in another animation.
+     expectState  { '<control id>': value } — what the step CLAIMS it set up, in
+               the framed tool's own DOM. The runner ignores it; validate-demo
+               compares it after the step settles. Opt in wherever a `setup`
+               does real work, because "the ring landed on the panel" is also
+               true of a setup that silently did nothing, which is what a
+               `setup` looks like when it breaks. Booleans read `checked`,
+               anything else reads `value`.
 
    ---- Why the cadence rule exists --------------------------------------
    `sweep` does NOT dispatch one `input` per frame. Measured on the real tool
@@ -97,7 +106,11 @@ TRLE.DemoBlendSet = [
        modal says outright that it wants a texture with real relief. The other
        benched textures' joints are too shallow to show anything, so the stone
        floor's deep grout lines are here for that step and that step only. */
-    { src: 'Examples/ExampleAtlas.png', cell: [2, 0], cellSize: 256 }  // 5 - stone floor, deep joints
+    { src: 'Examples/ExampleAtlas.png', cell: [2, 0], cellSize: 256 }, // 5 - stone floor, deep joints
+    /* Overlay Texture's example. A grate with real alpha goes over the brick
+       with nothing to key, so the step shows stacking at its plainest; sand
+       over brick needed a colour key before it showed anything at all. */
+    'Examples/MetalGrate.png'                                          // 6 - metal grate, real alpha
 ];
 
 /* The materials bench, shared by lessons 6, 7 and 8. Shared deliberately: the
@@ -147,6 +160,35 @@ async function matAdvanced(api) {
     if (det && !det.open) { await api.click('#at-mat-adv summary'); await api.wait(700); }
 }
 
+/* Three of the animated lesson's steps open the modal on lava with the metal
+   grate already set as the overlay, and only differ in what they do next. Same
+   reasoning as matOpen above: one helper rather than three copies that drift.
+
+   The grate is `DemoDepthSet[3]`, addressed through api.tileId rather than by
+   matching the picker's "Tile 4" label, because the label is generated from the
+   element's POSITION and a bench change would silently pick a different
+   texture instead of failing. */
+async function animOverlayOpen(api, presetKey) {
+    await api.closeMenu(); await api.cap('closeModal');
+    await api.click('#at-add-anim'); await api.wait(1600);
+    await api.setValue('at-anim-preset', presetKey, 'change'); await api.wait(1200);
+    await api.click('#at-modal-anim .at-anim-tab[data-anim-tab="overlay"]'); await api.wait(500);
+    const grate = await api.tileId(3);
+    if (grate != null) await api.setValue('at-anim-ov-tile', grate, 'change');
+    const d = api.doc();
+    const cb = d && d.getElementById('at-anim-ov-enable');
+    if (cb && !cb.checked) { await api.click('#at-anim-ov-enable'); await api.wait(1400); }
+}
+
+/* Open an accordion that is closed, and leave one that is already open alone.
+   The summary's handler TOGGLES, so clicking blind closes the panel on any step
+   the user arrived at with it open — the matAdvanced lesson, applied here. */
+async function animOpenAcc(api, id) {
+    const d = api.doc();
+    const det = d && d.getElementById(id);
+    if (det && !det.open) { await api.click('#' + id + ' summary'); await api.wait(600); }
+}
+
 /* Lesson 9's bench. Four textures, one job each: brick with deep joints is the
    only one on the atlas with relief worth marching into, the skylight's white
    panes are the easy brightness case for emissive, the foliage is what Fade to
@@ -154,9 +196,10 @@ async function matAdvanced(api) {
    leaf cluster is the thing whose edges have to stop existing), and the grate has
    REAL alpha so the maps have holes to flatten inside.
 
-   Lesson 10 declares the same set, so the last two lessons cost no reload
-   between them, and the grate is exactly the transparent tile lesson 10's
-   alpha warning needs in order to fire. */
+   Lessons 10 and 11 declare the same set, so the last three lessons cost no
+   reload between them: the grate is the transparent tile lesson 11's alpha
+   warning needs in order to fire, AND the cut-out the animated lesson bakes
+   over its lava. */
 TRLE.DemoDepthSet = [
     { src: 'Examples/ExampleAtlas.png', cell: [1, 0], cellSize: 256 }, // 1 - brick, deep joints
     { src: 'Examples/ExampleAtlas.png', cell: [1, 3], cellSize: 256 }, // 2 - skylight, white panes
@@ -188,7 +231,7 @@ TRLE.DemoLessons = [
         id: 'start-grid',
         icon: '🏁',
         title: 'Start & the grid',
-        blurb: 'Load a sheet, cut it into tiles, and learn to move around the grid.',
+        blurb: 'Load a sheet, cut it into tiles, and learn how the grid works: slots, moves, empty slots and groups.',
         steps: [
             {
                 id: 'what-is-an-atlas',
@@ -197,7 +240,7 @@ TRLE.DemoLessons = [
                 requires: 'pristine',
                 say: `An <em>atlas</em> is one image holding a grid of tiles. Tomb Editor wants your
  textures packed this way in a grid, so the whole tool is built around it.<br><br>
- The start screen has three ways in: bring your own sheet, generate a blank
+ The start screen has three ways in: bring your own sheet, create a blank
  atlas, or reopen a project. <strong>Tile size</strong> is the one thing to set
  first, every map atlas (for example emissive textures or normals) in a set has
  to share it, otherwise Tomb Editor will throw an error during compiling the
@@ -237,18 +280,53 @@ TRLE.DemoLessons = [
             {
                 id: 'right-click',
                 title: 'Every tile has a menu',
-                covers: ['ui:context-menu', 'action:download'],
-                say: `<strong>Right-click</strong> any tile for everything you can do to it. The menu
- is grouped into columns, <strong>Transitions</strong>, <strong>Generate</strong>,
- <strong>Transform</strong>, <strong>Adjust</strong>, <strong>Material</strong>,
- <strong>File</strong>, so nothing is buried in a scrolling list.<br><br>
- Groups that don't apply are hidden, so an animation frame or a transition tile
- shows fewer columns than a plain tile.`,
+                covers: ['ui:context-menu', 'ui:ctx-search', 'action:download'],
+                say: `<strong>Right-click</strong> any tile for everything you can do to it. Type to
+ search, from anywhere, <strong>colour</strong> finds Adjust Colours without you touching
+ the mouse.<br><br>
+ With nothing typed, the menu opens on <strong>File</strong>, <strong>Transform</strong>,
+ <strong>Edit</strong>, <strong>Draw</strong>, <strong>Transitions</strong>,
+ <strong>Create</strong> and <strong>Material</strong>. Hover one to open it; groups
+ that don't apply to this tile are hidden, so an animation frame or a transition tile
+ offers fewer of them.<br><br>
+ Up to three <strong>recent</strong> actions sit under the search box, so repeating
+ something you just did is one click. Rest on any action for 2 seconds and a small
+ preview shows what it does, with a <strong>Learn more</strong> link into the Learn page.`,
                 requires: 'sliced',
                 setup: async api => { await api.closeMenu(); },
                 act: async api => { await api.cap('openCtx', await api.tileId(1)); await api.wait(250); },
                 spotlight: '#at-ctx',
-                handoff: `Right-click a different tile and read down the columns. <strong>Esc</strong> closes it.`
+                handoff: `Right-click a different tile, then try typing <strong>seam</strong> to jump
+ straight to <strong>Make Seamless</strong>. <strong>Esc</strong> closes it.`
+            },
+            {
+                id: 'view-copy-duplicate',
+                title: 'View, Copy and Duplicate',
+                covers: ['action:view', 'modal:view', 'action:copy', 'action:copyorig',
+                         'action:duplicate', 'action:duporig', 'action:addanim'],
+                say: `<strong>File</strong> opens with the tile itself. <strong>View…</strong> shows
+ it at its own resolution plus a 2×2 tiled repeat, so you can check a seam without
+ leaving the atlas; anything over 512px is scaled down for the preview.<br><br>
+ <strong>Copy Image</strong> puts the tile on your clipboard as a PNG, ready to paste
+ into another program. Edit the tile first and it splits into
+ <strong>Copy Original</strong> and <strong>Copy Modified</strong>, so either version is
+ one click away.<br><br>
+ <strong>Duplicate</strong> drops a second copy right after the tile in the grid. It's a
+ plain, unlinked tile: editing one afterward never touches the other, even if the
+ original was part of a group or a transition. An edited tile offers
+ <strong>Duplicate Original</strong> and <strong>Duplicate Modified</strong> the same
+ way.<br><br>
+ <strong>Add Animated…</strong> sits at the bottom of the menu, opening the same
+ generator as the header button of the same name.`,
+                requires: 'sliced',
+                setup: async api => { await api.closeMenu(); await api.cap('closeModal'); },
+                act: async api => {
+                    await api.cap('openCtx', await api.tileId(2)); await api.wait(200);
+                    await api.click('#at-ctx button[data-action="view"]'); await api.wait(500);
+                },
+                spotlight: '#at-modal-view',
+                handoff: `Close the preview, then right-click a tile and try <strong>Duplicate</strong>:
+ a second copy lands right beside it, free to edit on its own.`
             },
             {
                 id: 'select-batch',
@@ -288,20 +366,105 @@ TRLE.DemoLessons = [
                 handoff: `That's tile 2 rolled by half. Right-click it → <strong>Offset ½</strong> again to put it back.`
             },
             {
+                id: 'move-tiles',
+                title: 'Drag to swap or insert',
+                covers: ['ui:drag-move', 'ui:motion-toggle'],
+                say: `<strong>Drag</strong> a tile onto another and the two swap. Drop it in the
+ <em>gap</em> between tiles and it goes in there: the gap beside a tile pushes the
+ row right, the gap above or below pushes the column down. A push stops at the
+ first empty slot, so the tiles past it keep their place, and so does every level
+ built on this sheet.<br><br>
+ While you drag, an orange dashed outline shows where each tile will land. With
+ <strong>Animations</strong> on (in the accessibility bar) the tiles also slide to
+ show the result before you let go. <strong>Ctrl/Cmd+Arrow</strong> moves a
+ focused tile one slot without the mouse.`,
+                requires: 'sliced',
+                setup: async api => { await api.closeMenu(); await api.cap('selectIdx', []); },
+                act: async api => {
+                    await api.cap('dropAt', [await api.tileId(0)], 'swap', 1); await api.wait(400);
+                },
+                spotlight: '#at-grid',
+                handoff: `The first two textures just swapped places. The numbers stay with the
+ slots: they count textures in reading order. Now drag a tile into the gap between
+ two others and watch the row make room.`
+            },
+            {
                 id: 'layout-blocks',
-                title: 'Columns, rows and blocks',
-                covers: ['ui:layout', 'ui:blocks', 'ui:preview-atlas'],
-                say: `<strong>Columns</strong> and <strong>Rows</strong> reflow the whole atlas. Tiles
- added by a set builder are outlined in orange: they form a <em>block</em> that
- only reads correctly at its own width, and changing the columns keeps each
- block's shape, padding its rows with black spacer tiles.<br><br>
- <strong>👁️ Preview atlas</strong> stitches everything into one image exactly as
- it exports, same order, same columns, same pixels.`,
+                title: 'Columns, rows and locks',
+                covers: ['ui:layout', 'ui:locks'],
+                say: `<strong>Columns</strong> and <strong>Rows</strong> add empty slots on the right
+ and at the bottom. Nothing already in the atlas moves, so a level built on this
+ sheet keeps every texture where it was.<br><br>
+ Lowering them never strands a texture. Lower <strong>Columns</strong> and anything
+ in the removed columns moves to new rows at the bottom. Lower
+ <strong>Rows</strong> and anything in the removed rows moves up into empty slots,
+ with columns added only if they run out.<br><br>
+ The 🔓 beside each one locks it. With <strong>Columns</strong> locked, a push that
+ runs off the end of a full row wraps into the next row instead of widening the
+ atlas.`,
                 requires: 'sliced',
                 setup: async api => { await api.closeMenu(); await api.cap('selectIdx', []); },
                 spotlight: '.at-layout-row',
                 sweep: { id: 'at-cols-input', from: 4, to: 6, ms: 1400 },
                 handoff: `Put <strong>Columns</strong> back to 4, or leave it, nothing here is precious.`
+            },
+            {
+                id: 'empty-slots',
+                title: 'Empty slots take textures',
+                covers: ['action:slot-image', 'action:slot-blank', 'action:slot-paste', 'action:slot-delrow', 'action:slot-delcol'],
+                say: `Empty slots are dashed, and each one is a place for a texture.
+ <strong>Click</strong> one to add an image there, drop files from your desktop on
+ it, or point at it and paste with <strong>Ctrl/Cmd+V</strong>. An image that is not
+ 256×256 gets resized to fit, and the tool asks first.<br><br>
+ Right-click one for this menu. <strong>Delete Empty Column</strong> is offered
+ because that whole column is empty; a row or column with a texture in it is not
+ deleted from here.`,
+                requires: 'sliced',
+                setup: async api => { await api.closeMenu(); await api.cap('selectIdx', []); await api.cap('setCols', 6); await api.wait(200); },
+                act: async api => { await api.cap('openSlotMenu', 4); await api.wait(250); },
+                spotlight: '#at-slot-ctx',
+                handoff: `Click an empty slot to open the file picker, or press <strong>Esc</strong>.`
+            },
+            {
+                id: 'empty-fill',
+                title: 'Gaps at export',
+                covers: ['modal:emptyfill'],
+                say: `An exported atlas has no such thing as an empty slot, so the gaps
+ <em>between</em> your textures have to become something. The first export asks, once
+ per project, and <strong>🔲 Empty slots…</strong> in the Layout row asks any time.<br><br>
+ <strong>🧲 Compact</strong> moves everything up to close the gaps; a group moves as
+ one piece, keeping its shape. <strong>⬛ Fill black</strong> and
+ <strong>🔳 Fill transparent</strong> put a tile in each gap and move nothing.
+ Filling renumbers the grid, and every map atlas stays lined up with it. Empty
+ slots after the last texture never need an answer.`,
+                requires: 'sliced',
+                setup: async api => { await api.closeMenu(); await api.cap('selectIdx', []); await api.cap('setCols', 6); await api.wait(200); },
+                act: async api => { await api.click('#at-empty-slots'); await api.wait(400); },
+                spotlight: '#at-modal-emptyfill',
+                handoff: `Pick one, or close it. Either way it is one undo step.`
+            },
+            {
+                id: 'groups',
+                title: 'Groups move as one piece',
+                covers: ['action:group', 'action:ungroup', 'ui:blocks'],
+                say: `Some tiles belong together. A transition set only reads right in its own
+ shape, and an animation's frames play in order, so both are <em>groups</em>,
+ outlined in orange. Drag any tile of a group and the whole group comes along,
+ keeping its shape and pushing loose tiles out of its way.<br><br>
+ You can make your own: select some tiles, then <strong>🔗 Group</strong> on the bulk
+ bar or in the right-click menu, or <strong>Ctrl/Cmd+G</strong>. Right-click →
+ <strong>✂️ Ungroup</strong> or <strong>Ctrl/Cmd+Shift+G</strong> undoes it.
+ Ungrouping an animation warns first, because moved apart its frames could lose
+ their seamlessness.`,
+                requires: 'sliced',
+                setup: async api => { await api.closeMenu(); await api.cap('setCols', 4); await api.cap('selectIdx', [0, 1, 4]); await api.wait(200); },
+                act: async api => {
+                    await api.cap('openCtx', await api.tileId(0)); await api.wait(250);
+                    await api.click('#at-ctx button[data-action="group"]'); await api.wait(400);
+                },
+                spotlight: '#at-grid',
+                handoff: `Tiles 1, 2 and 5 are one group now. Drag one of them and watch the
+ other two follow.`
             },
             {
                 id: 'undo-history',
@@ -380,16 +543,34 @@ TRLE.DemoLessons = [
  <strong>Multi-band edge blend</strong> is the one for a stubborn seam: it blends
  low and high frequencies separately, so it can hide a brightness step without
  smearing the detail.<br><br>
- <strong>Blend Radius</strong> is how far in from each edge it works, wide enough
- to hide the join, narrow enough to keep the texture.`,
+ <strong>Overlap X</strong> and <strong>Overlap Y</strong> are how far in from each
+ edge it works. That band is swapped for texture from the middle of the tile, which
+ already matches across the wrap. The sweep starts them at the minimum, where the
+ seam still shows as a frame, and brings them up to the default.<br><br>
+ <strong>Blend Radius</strong> is how softly that band meets the rest: low is a
+ scattered dither, higher is a smooth cross-fade. Watch it rise second.`,
                 setup: async api => {
                     await api.closeMenu();
                     await api.cap('openCtx', await api.tileId(0)); await api.wait(220);
                     await api.click('#at-ctx button[data-action="seamless"]'); await api.wait(900);
+                    /* Method and Blend Radius are remembered prefs, so a visit that
+                       changed them would otherwise start this step from there. */
+                    await api.setValue('at-sm-method', 'scattered', 'change');
+                    await api.setValue('at-sm-falloff', 10);
+                    const d = api.doc();
+                    const lock = d && d.getElementById('at-sm-lock-xy');
+                    if (lock && !lock.checked) await api.click('#at-sm-lock-xy');
+                    await api.setValue('at-sm-overlapx', 3);   // the lock carries Y along
+                    await api.wait(500);
                 },
-                spotlight: '#at-sm-method',
-                sweep: { id: 'at-sm-falloff', from: 10, to: 45, ms: 1600 },
-                preview: '#at-sm-preview',
+                act: async api => {
+                    api.status('Overlap 3% to 20%');
+                    await api.sweep({ id: 'at-sm-overlapx', from: 3, to: 20, ms: 1800 }, '#at-sm-preview');
+                    api.status('Blend Radius 10% to 30%');
+                    await api.sweep({ id: 'at-sm-falloff', from: 10, to: 30, ms: 1600 }, '#at-sm-preview');
+                },
+                expectState: { 'at-sm-method': 'scattered', 'at-sm-overlapx': '20', 'at-sm-overlapy': '20' },
+                spotlight: '#at-sm-overlap-row',
                 handoff: `Try <strong>Multi-band edge blend</strong> in the method list and watch the
  preview. <strong>Save</strong> writes it back; closing throws it away.`
             },
@@ -398,7 +579,7 @@ TRLE.DemoLessons = [
                 title: 'The paint tools, once',
                 covers: ['ui:mask-editor'],
                 requires: { tiles: TRLE.DemoCleanupSet },
-                say: `Eight places in the app let you paint a region, and they all use this same
+                say: `Nine places in the app let you paint a region, and they all use this same
  toolbar, so this is the one place worth learning it.<br><br>
  <strong>Brush</strong> and <strong>Stamp</strong> are freehand; <strong>Lasso</strong>
  takes clicks for corners or a drag to trace; <strong>Rect</strong> and
@@ -423,12 +604,14 @@ TRLE.DemoLessons = [
                 say: `Texture 2 is a mural with a hole where the pulley chain passed through. To reuse
  it as plain wall, paint over the hole and let the tool invent what belongs
  there.<br><br>
- The method matters here. <strong>Smooth (diffusion, flat fill)</strong> spreads surrounding
- colour inward, fine on a flat surface, but on this it leaves a grey smear.
- <strong>Neighbour-aware</strong> samples the area around the spot, so it matches
- the local tone rather than the tile average, which is what a dark hole on a light
- mural needs. <strong>Texture</strong> samples the whole tile, good for repeating
- detail.`,
+ The method matters here. <strong>Healing brush</strong>, the default, copies real
+ texture from a matching spot elsewhere on the tile and blends its colour into the
+ edge, the way the healing brush in Photoshop or Photopea does. That is right for
+ almost everything, but this hole sits in the one place on the mural that appears
+ nowhere else, so there is nothing to copy and it pastes a stray piece of pattern.
+ <strong>Neighbour-aware</strong> grows the fill in from the edge instead, so the lines
+ running into the hole carry on through it. <strong>Smooth (diffusion, flat fill)</strong>
+ spreads colour inward and leaves a grey smear here.`,
                 setup: async api => {
                     await api.closeMenu();
                     await api.cap('openCtx', await api.tileId(1)); await api.wait(220);
@@ -445,9 +628,13 @@ TRLE.DemoLessons = [
                 requires: { tiles: TRLE.DemoCleanupSet },
                 say: `Eight sliders over the whole texture: hue, saturation, brightness, contrast,
  gamma, temperature, tint and vibrance.<br><br>
- <strong>Temperature</strong> is the one worth knowing. Photo textures carry the
- colour of the light they were shot in, and nudging it warm or cool is what makes
- a wall from one photo sit beside a floor from another.<br><br>
+ Say you want to reuse your brick texture for a water area too. Swing
+ <strong>Hue</strong> round toward green and lift <strong>Saturation</strong> a
+ little, and the same wall reads as slimy, algae-covered brick, with every crack
+ and chip still where it was.<br><br>
+ <strong>Temperature</strong> is the other one worth knowing. Photo textures carry
+ the colour of the light they were shot in, and nudging it warm or cool is what
+ makes a wall from one photo sit beside a floor from another.<br><br>
  If you are not sure how a texture should look, pull it toward grey here and let the
  light bulbs in Tomb Editor put the colour back. Neutral pixels take whatever light you
  give them, a strongly tinted texture fights it.`,
@@ -456,10 +643,70 @@ TRLE.DemoLessons = [
                     await api.cap('openCtx', await api.tileId(5)); await api.wait(220);
                     await api.click('#at-ctx button[data-action="coloradj"]'); await api.wait(800);
                 },
+                act: async api => {
+                    api.status('Hue 0° to 65°');
+                    await api.sweep({ id: 'at-ca-hue', from: 0, to: 65, ms: 1600 }, '#at-ca-preview');
+                    api.status('Saturation 100% to 120%');
+                    await api.sweep({ id: 'at-ca-sat', from: 100, to: 120, ms: 1000 }, '#at-ca-preview');
+                },
+                expectState: { 'at-ca-hue': '65', 'at-ca-sat': '120' },
                 spotlight: '#at-ca-sliders',
-                sweep: { id: 'at-ca-temp', from: 0, to: -70, ms: 1500 },
-                preview: '#at-ca-preview',
                 handoff: `Drag any of them. <strong>Reset</strong> puts them all back to neutral.`
+            },
+            {
+                id: 'ca-channel',
+                title: 'Channel levels',
+                requires: { tiles: TRLE.DemoCleanupSet },
+                say: `The <strong>Mode</strong> dropdown has a second set of controls:
+ <strong>Channel levels</strong>, a dark cutoff, bright cutoff and gamma for red, green
+ and blue separately.<br><br>
+ Every slider on the Simple side moves the whole picture at once.
+ <strong>Temperature</strong> pushes red up and blue down together, so it cannot lift
+ just the blue in the shadows. That is what this mode is for: a cast that sits in one
+ part of the range rather than across the whole texture.<br><br>
+ <strong>Dark cutoff</strong> is where that channel reads as 0, <strong>Bright
+ cutoff</strong> where it reads as full, and <strong>Gamma</strong> bends everything
+ between them without moving either end.`,
+                setup: async api => {
+                    await api.closeMenu();
+                    await api.cap('openCtx', await api.tileId(5)); await api.wait(220);
+                    await api.click('#at-ctx button[data-action="coloradj"]'); await api.wait(800);
+                    await api.setValue('at-ca-mode', 'channel', 'change'); await api.wait(400);
+                },
+                spotlight: '#at-ca-levels',
+                sweep: { id: 'at-ca-bgamma', from: 100, to: 225, ms: 1600 },
+                preview: '#at-ca-preview',
+                handoff: `Blue gamma is lifting the midtones only, so the texture cools off
+ without its darkest and brightest pixels moving. Switching modes resets both sets of
+ sliders, so you are always starting from neutral.`
+            },
+            {
+                id: 'ca-paint',
+                title: 'Grading part of a texture',
+                requires: { tiles: TRLE.DemoCleanupSet },
+                say: `The third mode, <strong>Paint a region</strong>, marks part of the texture
+ and works on that alone. Paint straight onto the preview with the usual brush, lasso,
+ rectangle and wand.<br><br>
+ A region is already painted here. Watch <strong>Hue</strong> move: the marked patch
+ shifts and the rest of the wall does not, right down to the pixel.<br><br>
+ The other option, <strong>Match the surroundings</strong>, is the useful one for
+ remaster textures. It keeps the region's light and shade and gives it the colour of
+ the wall around it, which is how you kill a green or pink patch an upscaler invented
+ without flattening the grain.<br><br>
+ This one works on a single tile, since a painted region is drawn on one specific
+ texture. The mode is greyed out if you have several tiles selected.`,
+                setup: async api => {
+                    await api.closeMenu();
+                    await api.cap('openCtx', await api.tileId(5)); await api.wait(220);
+                    await api.click('#at-ctx button[data-action="coloradj"]'); await api.wait(800);
+                    await api.setValue('at-ca-mode', 'mask', 'change'); await api.wait(400);
+                    await api.cap('caMaskRect', [56, 60, 120, 110]); await api.wait(300);
+                },
+                spotlight: '#at-ca-tools',
+                sweep: { id: 'at-ca-hue', from: 0, to: 140, ms: 1600 },
+                preview: '#at-ca-preview',
+                handoff: `<strong>Clear</strong> starts the region again, <strong>Invert</strong>
+ flips it so you grade everything except what you painted.`
             },
             {
                 id: 'recolor',
@@ -538,12 +785,40 @@ TRLE.DemoLessons = [
  preset list. <strong>Make a new tile</strong> keeps the original alongside.`
             },
             {
+                id: 'draw',
+                title: 'Draw on it',
+                covers: ['action:draw', 'modal:draw'],
+                requires: { tiles: TRLE.DemoCleanupSet },
+                say: `Sometimes the fix is to paint something in by hand: a crack, a stain, a trail.
+ <strong>🖌 Draw…</strong> sits on its own in the menu and paints with a photo editor's
+ brush. Strokes go on a layer over the tile, and nothing changes until
+ <strong>💾 Apply</strong>.<br><br>
+ The two sand floors are selected, so Draw has opened on both of them, laid out as they
+ sit in the grid. One stroke runs across the join and is written into each tile.<br><br>
+ The <strong>Brush</strong> list draws every brush as a stroke. <strong>Liquid</strong>
+ is loaded, in a dark red: it pools where you slow down, which is what blood and oil do.
+ It also sets the layer's <strong>Material</strong> to <strong>🩸 Blood</strong>, so on
+ Apply the paint reads wet in the material maps, not just red in the texture.`,
+                setup: async api => {
+                    await api.closeMenu();
+                    await api.cap('selectIdx', [2, 3]);
+                    await api.cap('openCtx', await api.tileId(2)); await api.wait(220);
+                    await api.click('#at-ctx button[data-action="draw"]'); await api.wait(900);
+                    await api.setValue('at-draw-preset', 'liquid', 'change'); await api.wait(200);
+                    await api.setValue('at-draw-hex', '#6e0a0c', 'change'); await api.wait(200);
+                },
+                expectState: { 'at-draw-preset': 'liquid', 'at-draw-fg': '#6e0a0c', 'at-draw-material': 'liquid:blood' },
+                spotlight: '.at-draw-optbar',
+                handoff: `Drag across both tiles, slowing down near the end. <strong>Ctrl+Z</strong>
+ takes back a stroke; leaving with paint on the layer asks first.`
+            },
+            {
                 id: 'reset',
                 title: 'Undo all of it',
                 covers: ['action:reset'],
                 requires: { tiles: TRLE.DemoCleanupSet },
                 say: `Every tile keeps its untouched original, however many edits you stack on it.
- <strong>Reset to Original</strong> in the <strong>File</strong> column throws the
+ <strong>Reset to Original</strong> under <strong>File</strong> throws the
  lot away and hands back the texture you started with, and it works on a whole
  selection at once.<br><br>
  That is the safety net under this entire lesson: nothing you did to these six is
@@ -551,8 +826,9 @@ TRLE.DemoLessons = [
                 setup: async api => { await api.closeMenu(); await api.cap('selectIdx', []); },
                 act: async api => {
                     await api.cap('openCtx', await api.tileId(0)); await api.wait(280);
+                    await api.cap('ctxOpenCat', 'file'); await api.wait(120);
                 },
-                spotlight: '#at-ctx .at-ctx-col[data-col="file"]',
+                spotlight: '#at-ctx .at-ctx-sub[data-cat="file"]',
                 handoff: `<strong>Reset to Original</strong> is the second-to-last entry. Try it on
  texture 1, then pick another lesson above.`
             }
@@ -563,24 +839,25 @@ TRLE.DemoLessons = [
         id: 'generate',
         icon: '\u{1F3D7}\u{FE0F}',
         title: 'Make a new texture',
-        blurb: 'Bring one texture, leave with many: walls, floors, variants, frames, glass and animation.',
+        blurb: 'Bring one texture, leave with many: walls, floors, variants, frames and glass.',
         steps: [
             {
                 id: 'the-generators',
                 title: 'One texture in, a set out',
                 covers: ['ui:generate-column'],
                 requires: { tiles: TRLE.DemoGenerateSet },
-                say: `The <strong>Generate</strong> column builds new textures out of the ones you
+                say: `The <strong>Create</strong> category builds new textures out of the ones you
                       already have. A single brick photo becomes a whole wall, a wall becomes six
                       walls that do not repeat, a flat panel becomes a carved frame.<br><br>
-                      This is the column to reach for when you need a lot of texture and you have
+                      This is the category to reach for when you need a lot of texture and you have
                       one good one. These six are the sources for the rest of the lesson.`,
                 setup: async api => { await api.closeMenu(); await api.cap('selectIdx', []); },
                 act: async api => {
                     await api.cap('openCtx', await api.tileId(0)); await api.wait(280);
+                    await api.cap('ctxOpenCat', 'generate'); await api.wait(120);
                 },
-                spotlight: '#at-ctx .at-ctx-col[data-col="generate"]',
-                handoff: `Read down the column. Everything in it makes a <em>new</em> tile and leaves
+                spotlight: '#at-ctx .at-ctx-sub[data-cat="generate"]',
+                handoff: `Look down the list. Everything in it makes a <em>new</em> tile and leaves
                           the one you right-clicked alone.`
             },
             {
@@ -638,7 +915,7 @@ TRLE.DemoLessons = [
                 covers: ['action:variations', 'modal:var'],
                 requires: { tiles: TRLE.DemoGenerateSet },
                 say: `One texture repeated across a room reads as one texture repeated across a room.
-                      <strong>Generate Variations</strong> makes several tiles that are recognisably the
+                      <strong>Create Variations</strong> makes several tiles that are recognisably the
                       same material and visibly not the same tile.<br><br>
                       <strong>Hue jitter</strong>, <strong>Brightness jitter</strong>,
                       <strong>Saturation jitter</strong> and <strong>Contrast jitter</strong> drift the
@@ -654,7 +931,7 @@ TRLE.DemoLessons = [
                 spotlight: '#at-modal-var .at-modal-body',
                 sweep: { id: 'at-var-hue', from: 0, to: 40, ms: 1400 },
                 handoff: `Variations of a seamless tile stay seamless, every jitter preserves the wrap.
-                          Set a <strong>Count</strong> and click <strong>Generate</strong> to add them.`
+                          Set a <strong>Count</strong> and click <strong>Add Variations</strong> to add them.`
             },
             {
                 id: 'origami',
@@ -701,42 +978,19 @@ TRLE.DemoLessons = [
                           <strong>Add Stained Glass Tile</strong> puts it in the atlas.`
             },
             {
-                id: 'animated',
-                title: 'Animated textures',
-                covers: ['ui:add-anim', 'modal:anim'],
-                requires: { tiles: TRLE.DemoGenerateSet },
-                say: `Water, lava, clouds, smoke, portals. Generated as a looping sequence of frames
-                      that each tile on their own, so you can drop them into an animated range in
-                      Tomb Editor.<br><br>
-                      Start from a preset and tune from there. <strong>Pattern scale</strong> is the
-                      one to respect: the tool tells you how many pixels each feature gets, and below
-                      about six the animation turns to confetti at small tile sizes. At 32px the
-                      useful ceiling is around scale 4.`,
-                setup: async api => {
-                    await api.closeMenu(); await api.cap('closeModal');
-                    await api.click('#at-add-anim'); await api.wait(1600);
-                },
-                spotlight: '#at-anim-preset',
-                sweep: { id: 'at-anim-scale', from: 3, to: 9, ms: 1800 },
-                preview: '#at-anim-tiled',
-                handoff: `Change <strong>Preset</strong> and watch the live preview. The second canvas
-                          is a 2×2 tiling, which is where you check the seam. <strong>✨ Crisp</strong>
-                          renders larger and averages down, worth it at small tile sizes.`
-            },
-            {
                 id: 'what-you-get',
                 title: 'Three kinds of output',
                 covers: ['action:editstainedglass'],
                 requires: { tiles: TRLE.DemoGenerateSet },
-                say: `Generators do not all leave the same thing behind, and it matters when you want
+                say: `These tools do not all leave the same thing behind, and it matters when you want
                       to change your mind.<br><br>
                       <strong>Build Pattern</strong> and <strong>Origami Frame</strong> bake pixels. The
                       result is an ordinary tile with no memory of how it was made, so to change it you
                       build it again.<br><br>
                       <strong>Stained Glass</strong> keeps its recipe. Right-click the tile it made and
                       <strong>🪟 Edit Stained Glass</strong> reopens every slider where you left it.<br><br>
-                      <em>Animated textures</em> arrive as a group of frames that stay linked,
-                      so you can reopen the group and regenerate all of them at once.`,
+                      <em>Animated textures</em> keep a recipe too, but they arrive as a whole group
+                      of linked frames rather than one tile. They get a lesson of their own.`,
                 setup: async api => { await api.closeMenu(); await api.cap('closeModal'); await api.cap('selectIdx', []); },
                 spotlight: '#at-grid',
                 handoff: `Anything you added is at the end of the grid. Right-click one and see which
@@ -857,7 +1111,7 @@ TRLE.DemoLessons = [
                 setup: async api => { await api.closeMenu(); await api.cap('closeModal'); await api.cap('selectIdx', []); },
                 spotlight: '#at-grid',
                 handoff: `Right-click a transition tile and compare its menu with a plain tile's. Fewer
-                          columns, and a <strong>Go to</strong> group that plain tiles do not have.`
+                          entries, and a <strong>Go to</strong> group that plain tiles do not have.`
             },
             {
                 id: 'overlay',
@@ -867,38 +1121,37 @@ TRLE.DemoLessons = [
                 say: `Every tool so far in this lesson blends two terrains <em>into</em> each other.
                       <strong>🖼 Overlay Texture</strong> does the other thing: it lays one texture on
                       top of another and leaves the base alone underneath. It is in the same
-                      <strong>Transitions</strong> column for that reason, and it is the one you want
-                      for grime, decals, posters and moss rather than for a shoreline.<br><br>
+                      <strong>Transitions</strong> category for that reason, and it is the one you want
+                      for grates, decals, posters, grime and moss rather than for a shoreline.<br><br>
                       Right-click the base, then click the texture to put over it. Here that is tile
-                      2's sand over tile 3's brick.<br><br>
-                      The interesting control is <strong>Read colours from</strong>, because it is two
-                      genuinely different jobs. Reading from <em>the overlay</em> keys a decal off its
-                      own background, which is how you drop a painted sign onto a wall. Reading from
-                      <em>the base</em> puts the overlay only where the wall matches, which is grime in
-                      the mortar and moss on the dark stones. This step reads from the base, inverted,
-                      so the sand collects in the joints.<br><br>
-                      Watch the threshold sweep: the grime creeps out of the joints and onto the brick
-                      faces. Stop before it does.<br><br>
+                      6's metal grate over tile 3's brick. The grate already has transparency, so
+                      <strong>What shows through</strong> stays on <strong>Whole overlay</strong> and
+                      the brick shows through the holes with nothing to set up. The sweep fades the
+                      grate in with <strong>Opacity</strong>.<br><br>
+                      An overlay with no transparency of its own needs telling what to keep:
+                      <strong>Pick a colour</strong>, <strong>Hue range</strong>, <strong>Bright
+                      areas</strong> or <strong>Paint it</strong>. Those modes add <strong>Read colours
+                      from</strong>. Reading from <em>the overlay</em> keys a decal off its own
+                      background; reading from <em>the base</em> puts the overlay only where the wall
+                      matches, which is how grime ends up in the mortar joints.<br><br>
                       <strong>Blend</strong> is separate from coverage. <strong>Multiply</strong> for
                       dirt and stains, <strong>Screen</strong> for dust and light leaks. The generated
                       maps follow the <em>coverage</em> and ignore the blend, which is correct: a
                       multiply changes how a surface looks, not what it is made of.`,
                 setup: async api => {
                     await api.closeMenu();
-                    await api.cap('openOverlay', await api.tileId(2), await api.tileId(1));
+                    await api.cap('openOverlay', await api.tileId(2), await api.tileId(5));
                     await api.wait(1500);
-                    await api.setValue('at-ov-mode', 'bright', 'change'); await api.wait(700);
-                    await api.setValue('at-ov-sample', 'base', 'change'); await api.wait(500);
-                    const d = api.doc();
-                    const inv = d && d.getElementById('at-ov-selinvert');
-                    if (inv && !inv.checked) { await api.click('#at-ov-selinvert'); await api.wait(500); }
-                    await api.setValue('at-ov-blend', 'multiply', 'change'); await api.wait(700);
+                    await api.setValue('at-ov-mode', 'all', 'change'); await api.wait(500);
+                    await api.setValue('at-ov-blend', 'normal', 'change'); await api.wait(500);
                 },
+                expectState: { 'at-ov-mode': 'all', 'at-ov-blend': 'normal', 'at-ov-opacity': '100' },
                 spotlight: '#at-ov-preview',
-                sweep: { id: 'at-ov-threshold', from: 20, to: 75, ms: 2800 },
+                sweep: { id: 'at-ov-opacity', from: 0, to: 100, ms: 2000 },
                 preview: '#at-ov-preview',
-                handoff: `Switch <strong>Read colours from</strong> back to the overlay and watch the
-                          result stop making sense. That one dropdown is most of this tool.`
+                handoff: `Set <strong>Blend</strong> to <strong>Multiply</strong> and the bars darken the
+                          brick instead of covering it. Then try <strong>Bright areas</strong> under
+                          <strong>What shows through</strong> to see an overlay keyed by colour.`
             },
             {
                 id: 'edit-overlay',
@@ -911,8 +1164,8 @@ TRLE.DemoLessons = [
                       and changing the base or the overlay texture later re-renders it.<br><br>
                       That is the same arrangement every other tool in this lesson used, and it has the
                       same two consequences. Editing a source updates everything built from it. And the
-                      generated tile <em>inherits</em> the material from its sources rather than carrying
-                      its own, so material the brick and the sand first and the overlay arrives already
+                      new tile <em>inherits</em> the material from its sources rather than carrying
+                      its own, so material the brick and the grate first and the overlay arrives already
                       carrying both.<br><br>
                       Only paint mode stores actual pixels. Colour, hue and brightness coverage are
                       recomputed from the recipe, so the project file does not carry a mask it could
@@ -925,7 +1178,7 @@ TRLE.DemoLessons = [
                        silently have nothing to point at. */
                     let idx = await findOverlay(api);
                     if (idx < 0) {
-                        await api.cap('openOverlay', await api.tileId(2), await api.tileId(1));
+                        await api.cap('openOverlay', await api.tileId(2), await api.tileId(5));
                         await api.wait(1500);
                         await api.click('#at-ov-add');
                         await api.wait(1800);
@@ -964,8 +1217,9 @@ TRLE.DemoLessons = [
                 setup: async api => { await api.closeMenu(); await api.cap('closeModal'); await api.cap('selectIdx', []); },
                 act: async api => {
                     await api.cap('openCtx', await api.tileId(0)); await api.wait(280);
+                    await api.cap('ctxOpenCat', 'transitions'); await api.wait(120);
                 },
-                spotlight: '#at-ctx .at-ctx-col[data-col="transitions"]',
+                spotlight: '#at-ctx .at-ctx-sub[data-cat="transitions"]',
                 handoff: `Six builders. The rest of the lesson is one step each.`
             },
             {
@@ -1019,7 +1273,7 @@ TRLE.DemoLessons = [
                 covers: ['action:borderset', 'modal:bset'],
                 requires: { tiles: TRLE.DemoBlendSet },
                 say: `This one is not a blend between two terrains, which is why it sits under
-                      <strong>Generate</strong> rather than <strong>Transitions</strong>. It takes a fill
+                      <strong>Create</strong> rather than <strong>Transitions</strong>. It takes a fill
                       and a trim and builds the connectivity set a classic TRLE border uses: edges, outer
                       corners, inner corners and the plain fill.<br><br>
                       Here it is metal banding run around a brick wall, which is the kind of pairing that
@@ -1038,6 +1292,35 @@ TRLE.DemoLessons = [
                 sweep: { id: 'at-bset-width', from: 20, to: 42, ms: 1600 },
                 handoff: `The right-hand preview is a sample wall with the set assembled into an L-shaped
                           room, so you can see the trim turn through a concave corner.`
+            },
+            {
+                id: 'pushmarks',
+                title: 'Pushable Markings: the marks a block leaves',
+                covers: ['action:pushmarks', 'modal:push', 'action:editpushmarks'],
+                requires: { tiles: TRLE.DemoBlendSet },
+                say: `Giving players a hint about which objects can be pushed is useful, like the
+ pushable lamp in Alexandria. This creates a set of pushable markings from one floor
+ tile: sixteen tiles covering straight runs, corners, T junctions, a cross and dead
+ ends, so they join up wherever two of them meet.<br><br>
+ The marks carve into the height, normal and AO maps as grooves.
+ <strong>Floor style</strong> moves the floor itself along the track:
+ <strong>Sand ripples</strong>, a <strong>Snow channel</strong> with raised sides,
+ <strong>Liquify</strong> a smear.<br><br>
+ <strong>Oil</strong> or <strong>Blood</strong> under <strong>Drips</strong> in the same
+ <strong>Preset</strong> list makes a leak running down a wall, a column of tiles that
+ join top to bottom.`,
+                setup: async api => {
+                    await api.closeMenu(); await api.cap('closeModal');
+                    await api.cap('openCtx', await api.tileId(4)); await api.wait(220);
+                    await api.click('#at-ctx button[data-action="pushmarks"]'); await api.wait(900);
+                },
+                expectState: { 'at-push-surface': 'tiles' },
+                spotlight: '#at-push-sheet',
+                sweep: { id: 'at-push-struggle', from: 15, to: 90, ms: 1600 },
+                preview: '#at-push-sheet',
+                handoff: `Watch the tracks wobble and judder as <strong>Rigid ↔ Struggle</strong>
+ climbs. <strong>🎲 Randomize</strong> gives a new set, <strong>Add</strong> writes the
+ tiles, and right-clicking any of them afterwards reopens the same recipe to change it.`
             },
             {
                 id: 'anchored',
@@ -1117,7 +1400,7 @@ TRLE.DemoLessons = [
                       <strong>Fill level</strong> is touchier than it looks. On most textures everything
                       interesting happens inside a narrow band, with nothing below it and a flooded tile
                       above, so move it in small steps and watch rather than dragging it to a number.<br><br>
-                      It keeps its recipe, so <strong>🏔️ Edit Height Transition</strong> reopens every
+                      It keeps its recipe, so <strong>Edit Height Transition</strong> reopens every
                       slider where you left it.`,
                 setup: async api => {
                     await api.closeMenu(); await api.cap('closeModal');
@@ -1318,25 +1601,16 @@ TRLE.DemoLessons = [
             },
             {
                 id: 'the-other-three',
-                title: 'Height and emissive are materials too',
+                title: 'Height and emissive',
                 covers: ['ui:map-height-emissive'],
                 requires: { tiles: TRLE.DemoMaterialSet },
-                say: `Two more maps ride in the same set, and the course teaches them separately for a
-                      reason worth knowing.<br><br>
-                      <strong>Height</strong> is real depth: the engine walks into the surface so a
-                      recess is genuinely behind the wall, not shaded to look like it.
-                      <strong>Emissive</strong> is light the surface makes itself, so it glows in a dark
-                      room.<br><br>
-                      They are material maps like every other one here. Same pipeline, same export, and a
-                      preset sets their strengths along with the rest. The tool gives each of them its own
-                      editor because you paint or pick something for one specific texture, and because you
-                      very often want <em>only</em> one: a glowing sign needs no roughness work, and a
-                      parallax wall needs no emissive.<br><br>
-                      <strong>Transparency is not on this list, and it is not a map.</strong> It lives in
-                      your texture's own alpha, and there is nothing extra to author or export for it.
-                      What a cutout <em>does</em> change is how these maps behave inside the hole, which
-                      is taught next to the tool that makes holes.<br><br>
-                      Both maps, and cutouts, are lesson 9.<br><br>
+                say: `Two more maps ride in the same set. <strong>Height</strong> gives real depth:
+                      the engine shifts the surface as the camera moves, so a recess sits behind the
+                      wall. <strong>Emissive</strong> is light the surface makes itself, so it glows in a
+                      dark room.<br><br>
+                      A preset sets their strengths along with the rest. Each also has its own editor,
+                      in lesson 9, because you often want only one of them: a glowing sign needs no
+                      roughness work.<br><br>
                       The <strong>🧊 3D</strong> button beside the preview is for <em>height</em>
                       specifically: it displaces a real mesh, which is the one thing a flat preview
                       cannot fake. For the other maps stay on 2D, which lights the tile the way the
@@ -1348,8 +1622,8 @@ TRLE.DemoLessons = [
                     await api.setValue('at-mat-preset', 'brick', 'change'); await api.wait(700);
                 },
                 spotlight: '#at-mat-previews',
-                handoff: `The <strong>Height</strong> thumbnail is in that row already, generated from the
-                          preset, even though nobody has opened the height editor.`
+                handoff: `The <strong>Height</strong> thumbnail is already in that row, made from the
+                          preset without opening the height editor.`
             },
             {
                 id: 'from-the-diffuse',
@@ -1397,12 +1671,12 @@ TRLE.DemoLessons = [
                 title: 'Under every preset is this panel',
                 covers: ['ui:mat-advanced-editor'],
                 requires: { tiles: TRLE.DemoMaterialSet },
-                say: `A preset is not a mode. It is one row of numbers, and this panel is the row.
+                say: `A preset is one row of numbers, and this panel shows that row.
                       Open <strong>⚙️ Advanced editor</strong> and the modal widens, the sliders dock
                       into their own column beside the preview, and every value you can see came from
                       the preset you picked.<br><br>
-                      Move any one of them and the material becomes <em>custom</em>: still yours, still
-                      assignable, just no longer the preset. Nothing is committed until
+                      Move any one of them and the material becomes <em>custom</em>, which assigns like
+                      any other. Nothing is committed until
                       <strong>Assign Material</strong>, so this whole lesson is safe to poke at.<br><br>
                       Nineteen sliders in four groups, normal, AO, roughness and specular, plus height
                       and emissive at the bottom. Those last two work exactly like the rest, and they
@@ -1418,13 +1692,12 @@ TRLE.DemoLessons = [
                 title: 'Normal Strength: how hard to read the relief',
                 covers: ['ui:mat-normal-strength'],
                 requires: { tiles: TRLE.DemoMaterialSet },
-                say: `<strong>Normal Strength</strong> does not invent depth, it decides how strongly
-                      the light and dark already in the texture get turned into slopes. Brick ships at
+                say: `<strong>Normal Strength</strong> sets how strongly the light and dark already in
+                      the texture get turned into slopes. Brick ships at
                       <strong>32</strong> with <strong>Normal Blur</strong> at 2, because mortar joints
                       are real relief and there is plenty there to read.<br><br>
-                      Watch the top of the sweep. Past about 40 the surface stops reading as brick and
-                      starts reading as crinkled foil: every scratch in the clay is now a ridge, and
-                      the joints have stopped being the deepest thing in the tile.<br><br>
+                      Watch the top of the sweep. Past about 40 the surface reads as crinkled foil:
+                      every scratch in the clay is now a ridge, and the joints are lost among them.<br><br>
                       The stopping rule is the same one the Learn page gives: raise it until it reads
                       as depth, then stop.`,
                 setup: async api => { await matOpen(api, 0, 'brick'); await matAdvanced(api); },
@@ -1439,13 +1712,13 @@ TRLE.DemoLessons = [
                 title: 'The same slider on sand is wrong',
                 covers: ['ui:mat-normal-blur'],
                 requires: { tiles: TRLE.DemoMaterialSet },
-                say: `Sand has no joints. What it has is fine grain, and <strong>Normal Strength</strong>
-                      reads that grain as thousands of tiny slopes. Push it and the tile glitters, and
+                say: `Sand's relief is fine grain, and <strong>Normal Strength</strong> reads that
+                      grain as thousands of tiny slopes. Push it and the tile glitters, and
                       in game it shimmers as the light or the camera moves, because every grain is now
                       catching a highlight like a pebble. Sand ships at <strong>14</strong>.<br><br>
-                      The fix is not always less strength. <strong>Normal Blur</strong> smooths the
-                      texture <em>before</em> the slopes are read, so it takes out the grain and leaves
-                      the broader shape. Watch the second sweep: same strength, sparkle gone. Sand ships
+                      Often the better fix is <strong>Normal Blur</strong>. It smooths the texture
+                      <em>before</em> the slopes are read, so it takes out the grain and leaves the
+                      broader shape. Watch the second sweep: same strength, sparkle gone. Sand ships
                       Blur at 3, brick at 2.<br><br>
                       Rule of thumb: if it glitters, blur it. If it looks like foil, then cut strength.`,
                 setup: async api => {
@@ -1477,9 +1750,9 @@ TRLE.DemoLessons = [
                       balance: grain against broad shape. Wood wants fine detail high and large scale
                       low, so the grain stays sharp while the plank itself reads flat. A dune wants the
                       opposite.<br><br>
-                      <strong>Normal Angularity</strong> and <strong>Normal Tilt</strong> sharpen slopes
-                      into facets instead of soft rounded bumps, which is what cut stone and brick want
-                      and what sand and cloth do not. They are a pair in the strict sense:
+                      <strong>Normal Angularity</strong> and <strong>Normal Tilt</strong> sharpen soft
+                      rounded bumps into facets, which suits cut stone and brick and spoils sand and
+                      cloth. They are a pair in the strict sense:
                       <em>Tilt does nothing at all while Angularity is 0</em>, which is where
                       every preset leaves it. Angularity alone moves this preview by about 5 levels out
                       of 255, and Tilt on top of it moves another 34.<br><br>
@@ -1506,14 +1779,12 @@ TRLE.DemoLessons = [
                       the size of the gap you want shaded. Brick ships <strong>16</strong>, sand
                       <strong>12</strong>.<br><br>
                       Both ends of this sweep are wrong in different ways. Too small and a mortar joint
-                      gets a thin dark line drawn on it instead of a shadow sitting in it. Too large and
-                      the shadow climbs out of the joint and washes across the brick faces, which reads
-                      as a dirty wall rather than a deep one.<br><br>
-                      Match it to the feature, not to how dark you want it. Darkness is the next slider.<br><br>
-                      Watch the <strong>Ao</strong> thumbnail rather than the lit preview, which is what
-                      the ring is on. AO is a quiet map in a lit view: this sweep moves the preview by
-                      about 2 levels out of 255 and the AO map itself by about 37. The map is the honest
-                      instrument here.`,
+                      gets a thin dark line drawn along it. Too large and the shadow climbs out of the
+                      joint and washes across the brick faces, which reads as a dirty wall.<br><br>
+                      Match it to the size of the feature. Darkness is the next slider.<br><br>
+                      Watch the <strong>Ao</strong> thumbnail, where the ring is. AO is a quiet map in a
+                      lit view: this sweep moves the preview by about 2 levels out of 255 and the AO map
+                      itself by about 37, so the thumbnail is where you can see it.`,
                 setup: async api => { await matOpen(api, 0, 'brick'); await matAdvanced(api); },
                 spotlight: '#at-mat-previews [data-map="ao"]',
                 sweep: { id: 'at-mat-p-aoRadius', from: 1, to: 30, ms: 2800 },
@@ -1531,8 +1802,8 @@ TRLE.DemoLessons = [
                       darkens whatever is slightly darker already. Watch the tile go muddy. Sand ships
                       <strong>10</strong> against brick's <strong>22</strong>.<br><br>
                       This is the single most common way a material goes wrong, and it is worth knowing
-                      which way to reach. If a texture looks grimy, it is nearly always AO too strong
-                      rather than the normal map too strong, so back off Intensity first.<br><br>
+                      which way to reach. If a texture looks grimy, the cause is nearly always AO, so
+                      back off Intensity first.<br><br>
                       If the opposite is true and the crevices look shallow, Intensity will not help
                       much once it has saturated. <strong>AO Depth</strong> is the cap on how far AO is
                       allowed to darken at all, sitting at 0.5 by default so a crevice bottoms out at
@@ -1547,7 +1818,8 @@ TRLE.DemoLessons = [
                 sweep: { id: 'at-mat-p-aoIntensity', from: 1, to: 30, ms: 2800 },
                 preview: '#at-mat-lit',
                 handoff: `Leave it high, then pull <strong>AO Depth</strong> down and watch the map lift
-                          while the shape stays. Those two sliders are not two strengths.`
+                          while the shape stays. Intensity shapes the shadow, Depth caps how dark it
+                          gets.`
             },
             {
                 id: 'spec-rough',
@@ -1561,8 +1833,8 @@ TRLE.DemoLessons = [
                       The light is put head on for this step, deliberately. The highlight is a lobe
                       aimed back at your eye, so at the preview's usual angle it is off screen and
                       pushing specular from 30 to 220 changes the image by 0.6 levels out of 255. Head
-                      on it changes it by 47. That is not a preview quirk, it is how the engine behaves,
-                      and it is why a specular map can look broken until something lines up.<br><br>
+                      on it changes it by 47. The engine behaves the same way, which is why a specular
+                      map can look broken until something lines up.<br><br>
                       So: first sweep pushes specular up. Past about 200 the map is nearly white, and in
                       engine a white specular lays white over your texture and drains the colour out of
                       it. That is why even the metals top out around 180.<br><br>
@@ -1601,7 +1873,7 @@ TRLE.DemoLessons = [
                 say: `Switch <strong>Type</strong> to <strong>Liquid</strong> and the preset list changes
                       to water, lava, tar and the rest. Same pipeline, same sliders, different table.
                       The tier dropdown drops its solid-only options, because a liquid's character comes
-                      from the texture rather than from a stylistic cut.<br><br>
+                      from the texture.<br><br>
                       <strong>💧 Still Water</strong> is Roughness Base <strong>15</strong> and Specular
                       Base <strong>169</strong>: nearly a mirror, throwing back most of the light that
                       hits it. Watch roughness go to 120 and back, which is the whole distance between
@@ -1628,14 +1900,13 @@ TRLE.DemoLessons = [
                 say: `This is the part the preview cannot show you, because the tool has no room to
                       reflect.<br><br>
                       In Tomb Engine a texture can be flagged <em>reflective</em>, and on a reflective
-                      material your <strong>specular map is the reflection amount</strong>. Not the
-                      highlight, the actual blend between your texture and the environment. Still
+                      material your <strong>specular map is the reflection amount</strong>: the blend
+                      between your texture and the environment. Still
                       Water's 169 is about two thirds reflection. Tomb Editor invents a flat 128 when
                       you give a reflective material no specular map at all, so 128 is roughly the
                       middle of the road and anything above it is a deliberate mirror.<br><br>
-                      Two things people get wrong here. <strong>Roughness does not blur that
-                      reflection</strong>, it only shapes the highlight, so a rough water surface still
-                      mirrors sharply. And on a room surface the normal map only bends the reflection by
+                      Two things people get wrong here. Roughness only shapes the
+                      highlight, so a rough water surface still mirrors sharply. And on a room surface the normal map only bends the reflection by
                       about a tenth of its strength, so ripples show up in the highlight far more than
                       in the mirrored image.<br><br>
                       In Tomb Editor: the texture panel, <strong>Materials</strong>, then
@@ -1785,6 +2056,7 @@ TRLE.DemoLessons = [
                     await api.cap('selectIdx', [0, 1, 2]);
                     await api.wait(300);
                     await api.cap('openCtx', await api.tileId(0));
+                    await api.cap('ctxOpenCat', 'material');
                     await api.wait(400);
                 },
                 spotlight: '#at-ctx button[data-action="material"]',
@@ -1825,6 +2097,7 @@ TRLE.DemoLessons = [
                     }
                     await api.closeMenu();
                     await api.cap('openCtx', await api.tileId(3));
+                    await api.cap('ctxOpenCat', 'material');
                     await api.wait(400);
                 },
                 spotlight: '#at-ctx button[data-action="lastmaterial"]',
@@ -1924,8 +2197,8 @@ TRLE.DemoLessons = [
                       of something you pick or paint, which is a different activity from choosing a
                       material for a surface. And people want them on their own, constantly: a glowing
                       sign needs no roughness work, a parallax wall needs no emissive.<br><br>
-                      <strong>Transparency is the odd one out and it is not a map.</strong> It is your
-                      texture's own alpha, nothing is generated for it and nothing extra is exported.
+                      <strong>Transparency is the odd one out: it lives in your texture's own
+                      alpha.</strong> Nothing is generated for it and nothing extra is exported.
                       It is in this lesson because the tool that authors it,
                       <strong>🫥 Fade to Transparent</strong>, lives here, and because a cutout changes
                       what the other maps do inside the hole.<br><br>
@@ -1934,8 +2207,8 @@ TRLE.DemoLessons = [
                 setup: async api => { await api.closeMenu(); },
                 spotlight: { grid: 0 },
                 handoff: `Right-click any of them. <strong>🏔️ Make Height Map</strong> and
-                          <strong>✨ Make Emissive</strong> are in the <strong>Material</strong> column,
-                          <strong>🫥 Fade to Transparent</strong> is in <strong>Adjust</strong> with the
+                          <strong>✨ Make Emissive</strong> are under <strong>Material</strong>,
+                          <strong>🫥 Fade to Transparent</strong> is under <strong>Edit</strong> with the
                           other tools that change the picture itself.`
             },
             {
@@ -2127,35 +2400,42 @@ TRLE.DemoLessons = [
                 title: 'Fade to transparent: edges that stop existing',
                 covers: ['action:fade', 'modal:fade'],
                 requires: { tiles: TRLE.DemoDepthSet },
-                say: `<strong>🫥 Fade to Transparent</strong> takes alpha out of a texture rather than
-                      colour. It is how you make a decal that sits on a wall without a visible rectangle
-                      around it: grime, dust, a poster, a scorch mark, a patch of damp.<br><br>
-                      Three shapes. <strong>Edges (vignette)</strong> fades all four sides inward, which
-                      is the decal case and the one sweeping here. <strong>Direction / slope</strong>
-                      fades along one axis, for something that trails off downward like a water stain.
-                      <strong>Custom (paint)</strong> hands you the brush.<br><br>
+                say: `<strong>🫥 Fade to Transparent</strong> fades part of a texture to alpha 0, so
+                      it can sit over another surface without a visible rectangle around it: foliage,
+                      grime, dust, a poster, a scorch mark.<br><br>
+                      Three shapes. <strong>Direction / slope</strong> fades along one direction, and it
+                      is what this foliage wants. Leaves grow out of something, so here they stay solid
+                      in the bottom-left corner and fade out diagonally toward the top-right, the way a
+                      bush sits against a wall and floor. That is <strong>◹ Slope TR</strong>.
+                      <strong>Edges (vignette)</strong> fades all four sides inward, for a decal that
+                      floats in the middle of a wall. <strong>Custom (paint)</strong> hands you the
+                      brush.<br><br>
                       <strong>Fade amount</strong> and <strong>Shape edge hardness</strong> are easy to
-                      confuse. Amount is how far in from the edge the fade reaches; hardness is how
-                      abruptly it happens, 0 being a wide soft gradient and high being close to a cut.
-                      Hard at a large amount is just a shrunken rectangle, which is rarely what you
-                      wanted. (The brush toolbar in <strong>Custom (paint)</strong> has its own
-                      <strong>Edge softness</strong>; that one feathers the stroke, not the shape.)<br><br>
+                      confuse. Amount is how far the fade reaches into the tile, which is what the sweep
+                      moves; hardness is how abruptly it happens, 0 being a wide soft gradient and high
+                      being close to a cut. (The brush toolbar in <strong>Custom (paint)</strong> has its
+                      own <strong>Edge softness</strong>, which feathers the stroke.)<br><br>
                       <strong>🌿 Organic edge</strong> breaks the outline up with the same styles the
                       transition tools use: blobs, spikes, drips, clumps, fray. A mathematically
-                      straight vignette is what gives a foliage decal away, and this is the fix.<br><br>
+                      straight fade line is what gives foliage away, and this is the fix.<br><br>
                       This changes the texture's own alpha, so everything downstream follows: the maps
                       flatten inside it, which is the next step.`,
                 setup: async api => {
                     await api.closeMenu();
                     await api.cap('openCtx', await api.tileId(2)); await api.wait(240);
                     await api.click('#at-ctx button[data-action="fade"]'); await api.wait(1400);
+                    await api.setValue('at-fade-shape', 'dir', 'change'); await api.wait(300);
+                    await api.setValue('at-fade-dir', 'SlopeTR', 'change');
+                    await api.setValue('at-fade-edgehard', 40);
+                    await api.wait(400);
                 },
+                expectState: { 'at-fade-shape': 'dir', 'at-fade-dir': 'SlopeTR', 'at-fade-edgehard': '40' },
                 spotlight: '#at-fade-preview',
-                sweep: { id: 'at-fade-amount', from: 5, to: 70, ms: 2600 },
+                sweep: { id: 'at-fade-amount', from: 5, to: 45, ms: 2600 },
                 preview: '#at-fade-preview',
-                handoff: `Try <strong>Direction / slope</strong> on the same leaves, then open
-                          <strong>🌿 Organic edge</strong> and push <strong>Amount</strong> up. A
-                          straight vignette on foliage is the giveaway; a ragged one is not.`
+                handoff: `Open <strong>🌿 Organic edge</strong> and push <strong>Amount</strong> up, so the
+                          diagonal breaks up into leaves. Then try <strong>Edges (vignette)</strong> for
+                          the floating-decal version.`
             },
             {
                 id: 'transparency',
@@ -2167,27 +2447,28 @@ TRLE.DemoLessons = [
                       What a cutout changes is the <em>other</em> maps, and that is worth seeing
                       once.<br><br>
                       Tile 4 is a grate with real holes in it. Open its material and look at the
-                      thumbnails: every map is fully opaque, and the areas under the holes are flat mid
-                      grey rather than dark.<br><br>
+                      thumbnails: every map generated for it is fully opaque, and the areas under the
+                      holes are white rather than dark.<br><br>
                       Both halves of that are deliberate. A map is <em>data</em>, not a picture, so a
                       hole in it would mean nothing to the engine. And a transparent pixel arrives as
                       pure black, which is the deepest value there is, so left alone every hole would
                       become the deepest pit in the height map and every cutout edge a cliff. The tool
-                      detects alpha and flattens those regions to neutral. There is nothing to switch
-                      on.<br><br>
-                      <strong>Alpha or magenta is your choice, and Tomb Editor takes both.</strong>
-                      Magenta is the older convention because the classic level formats had no alpha
-                      channel, only one reserved palette slot meaning "invisible", so the texture had to
-                      name a colour. Tomb Editor still converts it, and <strong>Magenta to alpha</strong>
-                      in Level Settings is on by default for every texture you add. Which means magenta
-                      needs no setup, and also that a pure magenta pixel you actually wanted will be
-                      punched out. The match is exact, so a resaved magenta will not key. Export from
-                      here as PNG or TGA with alpha, or tick the magenta key on the export card.<br><br>
+                      detects alpha and flattens those regions to white instead, the wall's own surface,
+                      so they carry no relief. There is nothing to switch on.<br><br>
+                      Performance suggestion, for Tomb Editor's <strong>Blending mode</strong>. Left on
+                      <strong>Normal</strong>, a texture like this grate is drawn blended (Alpha Blend;
+                      there is no separate entry for it): sorted every frame, no depth writes.
+                      <strong>Alpha Test</strong> is cheap and suits holes like these, fences, grates,
+                      plants, without much loss: anything more than half solid just draws fully solid.
+                      <strong>Additive</strong> is cheap too, and suits glow and haze instead of holes.
+                      Working with magenta rather than alpha? Tick <strong>Magenta color-key</strong> on
+                      export, and Normal already gives Alpha Test, since Tomb Editor's <strong>Magenta to
+                      alpha</strong> (on by default) turns the keyed pixels clear.<br><br>
                       One real warning, and the export card repeats it: <em>be careful pairing Height
-                      with a cutout</em>. Parallax shifts the texture coordinate, and near a hole that
-                      drags pixels across the alpha boundary, so you get a milky fringe or a view
-                      straight through to the skybox. Normal and AO are safe. If a fence looks wrong in
-                      game, drop Height first and keep the rest.`,
+                      with a cutout</em>. Parallax shifts the texture coordinate before the holes are
+                      cut, so a cutout's edges move with the relief and can be eaten away or show
+                      through. Normal and AO are safe. If a fence looks wrong in game, drop Height first
+                      and keep the rest.`,
                 setup: async api => {
                     await matOpen(api, 3, 'metal');
                 },
@@ -2195,6 +2476,383 @@ TRLE.DemoLessons = [
                 handoff: `Compare the Height thumbnail against the tile: the bars carry relief and the
                           gaps are flat. Now look at Normal, which does the same thing.`
             },
+        ]
+    },
+
+    /* ============ LESSON 10 — animated textures ============
+       Split out of lesson 3 on 2026-09-22. It was ONE step there, written when
+       there was one generator and no overlay; there are now two generators, a
+       Colour tab, a Glow tab, an Overlay tab with a moving level and an organic
+       contour, and an export story (a second variant costs a second full set of
+       tiles) that no other lesson has a place for.
+
+       ELEVEN steps as of 2026-09-23, up from eight, from user testing. The
+       reported sticking point was "waves that go in and out", which is the
+       interaction of Direction, Motion, Low/High, Cycles, Frames and fps — four
+       controls and two global settings that were all compressed into one step
+       whose sweep moved High alone. So `anim-level` is now two: what the level
+       DOES, then how far it goes and how long it takes, which is where the loop
+       duration finally gets said out loud. The other two new steps are the
+       particle depth and defocus sliders (the classic-versus-HD note from the
+       same round) and the height-map coverage mode.
+
+       Position matters: it sits after Depth & glow and before Export, because
+       the Glow tab is the emissive idea from lesson 9 applied per frame, the
+       overlay steps need the cutout idea from the same lesson, and the last
+       step hands straight over to the export lesson. It also declares
+       DemoDepthSet, so walking 9 -> 10 -> 11 costs no reload and the grate the
+       overlay steps need is already on the bench. */
+    {
+        id: 'animated',
+        icon: '\u{1F39E}\u{FE0F}',
+        title: 'Animated textures',
+        blurb: 'Water, lava, rain and sparks as looping frames, and how to bake a static texture into every one of them.',
+        steps: [
+            {
+                id: 'anim-what',
+                title: 'An animation is N tiles',
+                covers: ['ui:add-anim', 'modal:anim', 'ui:anim-perrow'],
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `Tomb Engine animates a texture by <em>swapping which part of the atlas a face
+                      reads</em>, frame by frame. So an animation is a set of ordinary tiles, and
+                      the engine steps through them. They land as one
+                      block on a fresh row: <strong>Frames per row</strong>, beside
+                      <strong>Frames</strong>, sets its width (16 frames default to 4 × 4), and the
+                      sketch next to it shows the shape.<br><br>
+                      That is the whole mental model, and everything else follows from it. Each
+                      frame has to tile on its own, the last frame has to meet the first, and the
+                      material maps ship as matching atlases with the same layout so a normal map
+                      lines up frame for frame.<br><br>
+                      <strong>Pattern scale</strong> is the one control to respect early: the line
+                      under it says how many pixels each feature gets, and under about six the
+                      animation turns to confetti on a small tile. At 32px the useful ceiling is
+                      around 4.`,
+                setup: async api => {
+                    await api.closeMenu(); await api.cap('closeModal');
+                    await api.click('#at-add-anim'); await api.wait(1600);
+                    await api.setValue('at-anim-preset', 'lava', 'change'); await api.wait(1200);
+                },
+                spotlight: '#at-anim-preset',
+                sweep: { id: 'at-anim-scale', from: 3, to: 9, ms: 1800 },
+                preview: '#at-anim-tiled',
+                handoff: `Change <strong>Preset</strong> and watch both canvases. The second one is a
+                          2x2 tiling, which is where you check the seam. <strong>Output</strong> can
+                          also emit a <em>Single seamless tile</em> for UV-rotate instead of a
+                          sequence: one tile that scrolls.`
+            },
+            {
+                id: 'anim-colour',
+                title: 'Structure and colour are separate',
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `The <strong>Shape &amp; motion</strong> tab makes a moving greyscale field. The
+                      <strong>Colour</strong> tab decides what that field looks like. They are
+                      independent, which is more useful than it sounds: put a lava palette on cloud
+                      structure and you have something nobody has a preset for.<br><br>
+                      The gradient bar is editable. Click it to add a stop, drag to move one, click a
+                      stop to set its colour and its <em>alpha</em>, which is how you get smoke and
+                      dust that you can see through. The sliders under it re-grade the whole ramp.`,
+                setup: async api => {
+                    await api.closeMenu(); await api.cap('closeModal');
+                    await api.click('#at-add-anim'); await api.wait(1600);
+                    await api.setValue('at-anim-preset', 'clouds', 'change'); await api.wait(1200);
+                    await api.click('#at-modal-anim .at-anim-tab[data-anim-tab="colour"]'); await api.wait(500);
+                    await api.setValue('at-anim-gradient', 'lava_hot', 'change'); await api.wait(900);
+                },
+                expectState: { 'at-anim-preset': 'clouds', 'at-anim-gradient': 'lava_hot' },
+                spotlight: '#at-anim-ramp-wrap',
+                sweep: { id: 'at-anim-col-hue', from: 0, to: 140, ms: 2000 },
+                preview: '#at-anim-preview',
+                handoff: `Cloud structure, lava palette. Try <strong>Posterize</strong> for banded
+                          retro water, and drop a stop's <strong>Alpha</strong> to zero to punch a
+                          hole through the animation.`
+            },
+            {
+                id: 'anim-glow',
+                title: 'Glow that moves with it',
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `Lesson 9 painted an emissive map onto a still texture. Here it is derived from
+                      <em>each frame</em>, so the glow travels with the motion: a lava range lights
+                      along its shifting cracks rather than glowing through a fixed stencil.<br><br>
+                      <strong>Pulse</strong> throbs the whole thing on a sine over the loop. It takes
+                      a whole number of <strong>cycles</strong> for the same reason the animation does,
+                      so the last frame still meets the first. Useful when the surface barely moves
+                      but you want it alive: a beacon, breathing lava, a power core.`,
+                setup: async api => {
+                    await api.closeMenu(); await api.cap('closeModal');
+                    await api.click('#at-add-anim'); await api.wait(1600);
+                    await api.setValue('at-anim-preset', 'lava', 'change'); await api.wait(1200);
+                    await api.click('#at-modal-anim .at-anim-tab[data-anim-tab="glow"]'); await api.wait(500);
+                    const d = api.doc();
+                    const cb = d && d.getElementById('at-anim-glow-enable');
+                    if (cb && !cb.checked) { await api.click('#at-anim-glow-enable'); await api.wait(900); }
+                },
+                expectState: { 'at-anim-glow-enable': true, 'at-anim-preset': 'lava' },
+                spotlight: '#at-anim-glow-strength',
+                sweep: { id: 'at-anim-glow-strength', from: 40, to: 180, ms: 1800 },
+                preview: '#at-anim-glow-strip',
+                handoff: `Tick <strong>Pulse</strong> and set <strong>cycles</strong> to 2. The
+                          <strong>Emissive</strong> export map switches itself on, because a glow you
+                          cannot export is not a glow.`
+            },
+            {
+                id: 'anim-particles',
+                title: 'The second generator: particles',
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `A noise field churns. It cannot draw a straight streak, count its own raindrops
+                      or fall at an angle, so rain is not a preset of it, it is a different
+                      generator.<br><br>
+                      Pick anything from the <strong>Particles</strong> group and the
+                      <strong>Shape</strong> tab swaps over: <strong>Amount</strong>,
+                      <strong>Direction</strong> on a ladder of fixed slants, <strong>Speed</strong>,
+                      <strong>Streak length</strong>, <strong>Thickness</strong> and
+                      <strong>Tail fade</strong>, plus sway and gusts.<br><br>
+                      Speed reads out in <em>tiles per frame</em>, which is the number that decides
+                      whether it falls or strobes past. The line under the sliders warns you before
+                      it does either.`,
+                setup: async api => {
+                    await api.closeMenu(); await api.cap('closeModal');
+                    await api.click('#at-add-anim'); await api.wait(1600);
+                    await api.setValue('at-anim-preset', 'rain_drizzle', 'change'); await api.wait(1400);
+                },
+                expectState: { 'at-anim-preset': 'rain_drizzle' },
+                spotlight: '#at-anim-particle-controls',
+                sweep: { id: 'at-anim-p-count', from: 60, to: 600, ms: 2000 },
+                preview: '#at-anim-preview',
+                handoff: `Push <strong>Speed</strong> up until the advisory line complains, then read
+                          what it says: a fast particle with a short trail jumps between frames
+                          instead of falling. <strong>Sway</strong> is what makes snow look like snow.`
+            },
+            {
+                id: 'anim-particle-depth',
+                title: 'Near and far, and why it looks real',
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `Every particle is already given a depth. <strong>Depth spread</strong> has
+                      always used it to sort them into that many speed bands, so the near ones fall
+                      faster than the far ones. Two more sliders read the same number.<br><br>
+                      <strong>Size by depth</strong> makes far particles smaller and dimmer.
+                      <strong>Depth blur</strong> softens the far bands and leaves the nearest one
+                      sharp, which is what a camera does and what the eye reads as distance. Both
+                      are off by default, so the eight original presets come out byte for byte as
+                      they always did.<br><br>
+                      This is the difference between a streak of one flat colour and rain on glass.
+                      At 128px or smaller a blurred particle is a smudge, so this is aimed at 256
+                      and up. Try the <strong>Rain on glass (deep)</strong>, <strong>Rain, soft slant</strong> and
+                      <strong>Snow, deep</strong> presets, which ship with both turned on.`,
+                setup: async api => {
+                    await api.closeMenu(); await api.cap('closeModal');
+                    await api.click('#at-add-anim'); await api.wait(1600);
+                    await api.setValue('at-anim-preset', 'rain_glass', 'change'); await api.wait(1600);
+                    await api.reveal('#at-anim-p-dscale');
+                },
+                expectState: { 'at-anim-preset': 'rain_glass' },
+                spotlight: '#at-anim-p-depth-hint',
+                sweep: { id: 'at-anim-p-defocus', from: 0, to: 12, ms: 2200 },
+                preview: '#at-anim-preview',
+                handoff: `<strong>Rain on glass (deep)</strong> has <strong>Speed</strong> at 0, which is
+                          legal and deliberate: beads that hold still on the glass rather than rain
+                          falling past it. Raise <strong>Depth spread</strong> to get more distinct
+                          planes, since that slider is also what sets how many there are.`
+            },
+            {
+                id: 'anim-overlay',
+                title: 'Bake a texture into every frame',
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `The engine only swaps UVs. There is no second sampler and no blend stage, so
+                      there is no way to lay a grate over lava at runtime: whatever sits on top has
+                      to be baked into every frame before export.<br><br>
+                      That is what the <strong>Overlay</strong> tab does. Pick a texture from the
+                      atlas, say whether it sits in front of the animation or behind it, and it is
+                      composited into all sixteen frames. The texture stays <em>live</em>: recolour
+                      it later and every frame follows.<br><br>
+                      <strong>Where it shows</strong> is the colour / hue / brightness picker from
+                      Make Emissive. <strong>All of it</strong> uses the texture's own transparency,
+                      which is what the metal grate on the bench already has, so the lava shows
+                      through its holes untouched.`,
+                setup: async api => { await animOverlayOpen(api, 'lava'); await api.reveal('#at-anim-ov-body'); },
+                expectState: { 'at-anim-ov-enable': true, 'at-anim-preset': 'lava' },
+                spotlight: '#at-anim-ov-body',
+                sweep: { id: 'at-anim-ov-opacity', from: 100, to: 40, ms: 1800 },
+                preview: '#at-anim-preview',
+                handoff: `Switch <strong>Where it sits</strong> to <em>Behind it</em> and pick a
+                          particle preset instead: that is rain on a window, with the window as the
+                          overlay. <strong>Single seamless tile</strong> goes grey while an overlay is
+                          set, because UV-rotate would scroll the grate along with the lava.`
+            },
+            {
+                id: 'anim-level',
+                title: 'Lava climbing out of the grate',
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `<strong>Moving level</strong> sweeps a line across the tile over the loop and
+                      hides the overlay behind it. Above the line the grate draws normally; below it
+                      the grate is gone and you are looking at raw lava. Over sixteen frames that
+                      reads as the liquid welling up through the grate and draining back.<br><br>
+                      Both motions close the loop by construction, so there is no snap on the wrap
+                      frame whatever cycle count you pick.<br><br>
+                      One honest limit, and the tool says it in the panel: a straight line cannot
+                      repeat across the edge it travels towards. Stack two copies and liquid at the
+                      bottom of one meets dry texture at the top of the next. Fine for a single tile,
+                      a grate, a pool, a well. <strong>Spreads out from the shape</strong> swells the
+                      overlay's own outline instead and repeats on every edge.`,
+                setup: async api => {
+                    await animOverlayOpen(api, 'lava');
+                    await animOpenAcc(api, 'at-anim-lv-acc');
+                    await api.setValue('at-anim-lv-dir', 'up', 'change'); await api.wait(1200);
+                    await api.reveal('#at-anim-lv-acc');
+                },
+                expectState: { 'at-anim-ov-enable': true, 'at-anim-lv-dir': 'up' },
+                spotlight: '#at-anim-lv-dir',
+                sweep: { id: 'at-anim-lv-high', from: 20, to: 90, ms: 2000 },
+                preview: '#at-anim-preview',
+                handoff: `The level works in every mode, so it also cuts a painted or colour-keyed
+                          overlay. Next: how far it travels, and how long it takes.`
+            },
+            {
+                id: 'anim-level-time',
+                title: 'How far it goes, and how long it takes',
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `This is the step that answers "it moves too fast", and the answer is
+                      arithmetic rather than taste.<br><br>
+                      A loop lasts <em>frames ÷ fps</em> seconds. The line under
+                      <strong>Preview speed</strong> now says so: 16 frames at 12 fps is 1.3
+                      seconds, which is the default and is quick. <strong>Cycles</strong> divides
+                      that again, so 2 cycles over the same loop is a swell every 0.7 seconds.
+                      Cycles cannot go below 1, because a whole number of them over the loop is
+                      what makes the last frame meet the first.<br><br>
+                      So there are four levers. Lower the <strong>fps</strong>, which slows the
+                      churn with it. Add <strong>Frames</strong>, up to 128, which decouples the
+                      two and costs one atlas tile each. Set <strong>Repeat</strong> on the frames
+                      in Tomb Editor, which holds each one for several ticks and costs no atlas
+                      space at all, only frame slots out of the engine's 256. Or narrow
+                      <strong>Low</strong> and <strong>High</strong>: a swell from 40% to 60% covers
+                      20% of the tile where the default 0 to 70 covers 70%, in exactly the same
+                      time, so it reads as slower and costs nothing at all.`,
+                setup: async api => {
+                    await animOverlayOpen(api, 'lava');
+                    await animOpenAcc(api, 'at-anim-lv-acc');
+                    await api.setValue('at-anim-lv-dir', 'up', 'change'); await api.wait(1200);
+                    await api.setValue('at-anim-lv-low', 35, 'input');
+                    await api.setValue('at-anim-lv-high', 65, 'input'); await api.wait(1400);
+                    await api.reveal('#at-anim-lv-time');
+                },
+                expectState: { 'at-anim-lv-dir': 'up', 'at-anim-lv-low': '35', 'at-anim-lv-high': '65' },
+                spotlight: '#at-anim-lv-time',
+                sweep: { id: 'at-anim-lv-cycles', from: 1, to: 4, ms: 1800 },
+                preview: '#at-anim-preview',
+                handoff: `Watch the readout while you drag <strong>Preview speed</strong>: that fps
+                          is not preview-only, it is written into the export manifest and is what
+                          you set on the range in Tomb Editor.`
+            },
+            {
+                id: 'anim-depth-mode',
+                title: 'Water in the mortar',
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `The last coverage mode reads the texture's own <em>height</em>, and it is the
+                      one that makes a wall look wet rather than painted.<br><br>
+                      <strong>Where the surface is deep or raised</strong> builds a height field
+                      from the texture, exactly the way the height-map transition does, and shows
+                      the texture on one side of a threshold. On <strong>the raised parts</strong>
+                      the bricks stay dry and the liquid finds the mortar joints and the cracks.
+                      <strong>Detail</strong> is the control that decides whether that works: it is
+                      a blur radius in pixels, and a joint narrower than it gets smoothed away
+                      before the threshold ever sees it. The line under the sliders gives you the
+                      radius in pixels for your tile size.<br><br>
+                      It reads the texture and never the animation, so there is no
+                      <strong>Read colours from</strong> here.<br><br>
+                      Now put the two together. Turn on <strong>Moving level</strong> and it stops
+                      sweeping a straight line and drives the threshold instead, so the liquid
+                      rises and falls through the texture's own relief. That is lava welling up out
+                      of the mortar of a brick wall, and it needs no control the tool did not
+                      already have.`,
+                setup: async api => {
+                    await api.closeMenu(); await api.cap('closeModal');
+                    await api.click('#at-add-anim'); await api.wait(1600);
+                    await api.setValue('at-anim-preset', 'lava', 'change'); await api.wait(1200);
+                    await api.click('#at-modal-anim .at-anim-tab[data-anim-tab="overlay"]'); await api.wait(500);
+                    // The BRICK, not the grate: this mode is about a texture with
+                    // joints in it. Addressed by tileId, never by the picker's label.
+                    const brick = await api.tileId(0);
+                    if (brick != null) await api.setValue('at-anim-ov-tile', brick, 'change');
+                    const d = api.doc();
+                    const cb = d && d.getElementById('at-anim-ov-enable');
+                    if (cb && !cb.checked) { await api.click('#at-anim-ov-enable'); await api.wait(1400); }
+                    await api.setValue('at-anim-ov-mode', 'depth', 'change'); await api.wait(1600);
+                    await api.reveal('#at-anim-ov-grp-depth');
+                },
+                expectState: { 'at-anim-ov-enable': true, 'at-anim-ov-mode': 'depth',
+                               'at-anim-ov-ddetail': '80' },
+                spotlight: '#at-anim-ov-grp-depth',
+                sweep: { id: 'at-anim-ov-dlevel', from: 20, to: 75, ms: 2200 },
+                preview: '#at-anim-preview',
+                handoff: `If the texture already has a height map from <strong>Make Height Map</strong>,
+                          this uses that one instead of deriving a second, and says so.
+                          <strong>In the low ground</strong> flips it: the texture settles into the
+                          hollows and the animation takes the high ground.`
+            },
+            {
+                id: 'anim-organic',
+                title: 'A water line that looks like water',
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `A computed edge is a clean curve, and liquid does not have one.
+                      <strong>Organic edge</strong> roughens whichever contour the overlay has, the
+                      edge of <strong>Where it shows</strong> and the level line, into something
+                      ragged.<br><br>
+                      It is the same panel the transition sets use, so the five styles mean the same
+                      thing here: <em>Blobs</em> for a general wobble, <em>Drips</em> for long
+                      fingers reaching past the line, <em>Fray</em> for a fine fringe.<br><br>
+                      <strong>Contact shadow</strong> darkens whatever sits <em>under</em> the
+                      texture, so a rim shades the water it stands in and stays clean itself. If you
+                      are exporting relief maps, send it to the <strong>AO map</strong>: the map
+                      generator reads darkening in the diffuse back out as geometry, and a painted
+                      shadow becomes a trench.`,
+                setup: async api => {
+                    await animOverlayOpen(api, 'lava');
+                    await animOpenAcc(api, 'at-anim-lv-acc');
+                    await api.setValue('at-anim-lv-dir', 'up', 'change'); await api.wait(900);
+                    await animOpenAcc(api, 'at-anorg-acc');
+                    await api.setValue('at-anorg-style', 'drips', 'change'); await api.wait(1200);
+                    await api.reveal('#at-anorg-acc');
+                },
+                expectState: { 'at-anim-ov-enable': true, 'at-anim-lv-dir': 'up',
+                               'at-anorg-style': 'drips' },
+                spotlight: '#at-anorg-acc',
+                sweep: { id: 'at-anorg-wobble', from: 0, to: 80, ms: 2200 },
+                preview: '#at-anim-preview',
+                handoff: `Watch the level line grow fingers as <strong>Amount</strong> rises.
+                          <strong>Feature size</strong> changes how often they happen,
+                          <strong>Scatter</strong> breaks them up, and <strong>Reroll</strong> gives
+                          you a different set of them.`
+            },
+            {
+                id: 'anim-what-you-get',
+                title: 'What lands in the atlas',
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `Adding them puts sixteen ordinary tiles in the atlas with a purple
+                      <strong>A</strong> badge, kept consecutive and in order. Delete one and the
+                      whole group goes, because half an animation is not a thing.<br><br>
+                      Right-click any frame for <strong>Edit Animation</strong> and every tab comes
+                      back where you left it, overlay and all, so you can regenerate the group in
+                      place instead of rebuilding it.<br><br>
+                      The export manifest lists each animation's tile range, gradient and fps, which
+                      is what you need to set it up as an animated range in Tomb Editor. Every
+                      material map ships as a matching atlas with the same layout.<br><br>
+                      Worth knowing before you plan a level: because the engine only swaps UVs, a
+                      <em>second</em> version of an animation, lava, and the same lava with stepping
+                      stones on it, costs a second full set of tiles. There is no cheap variant.`,
+                setup: async api => {
+                    await api.closeMenu(); await api.cap('closeModal');
+                    await api.click('#at-add-anim'); await api.wait(1600);
+                    await api.setValue('at-anim-preset', 'caustic_water', 'change'); await api.wait(1200);
+                },
+                act: async api => {
+                    await api.click('#at-anim-add'); await api.wait(2200);
+                },
+                spotlight: { modal: 'anim' },
+                spotlightAfter: '#at-grid',
+                handoff: `The frames are at the end of the grid. Right-click one to see
+                          <strong>Edit Animation</strong>, and note that the seamless and transition
+                          entries are hidden on a frame: its pixels are regenerated from the recipe,
+                          so editing them by hand would be thrown away.`
+            }
         ]
     },
 
@@ -2264,10 +2922,15 @@ TRLE.DemoLessons = [
                       and mirror textures. That is a lot to spend on a whole atlas, so apply height to
                       individual textures and judge each one.<br><br>
                       The second warning counts your transparent tiles, and this bench has one: the
-                      grate. Their holes are kept flat in the height map, but parallax on an
-                      alpha-tested texture is still fragile, because the coordinate offset drags pixels
-                      across the cutout edge. Check fences and foliage in game, and drop height for
-                      those.<br><br>
+                      grate. Their holes are kept flat in the height map, but parallax shifts the
+                      texture before the holes are cut, so a cutout's edges move with the relief and
+                      can be eaten away or show through. Check fences and foliage in game, and drop
+                      height for those.<br><br>
+                      A blue tip further down names the same grate for a different reason: it has
+                      transparency at all, Height ticked or not, and points at Tomb Editor's
+                      <strong>Blending mode</strong>. <strong>Alpha Test</strong> is the cheap choice
+                      for a cutout like this one, which is the thing worth carrying into Tomb
+                      Editor.<br><br>
                       <strong>Fade height edges to white</strong> appears with Height and should stay
                       ticked. White is the wall plane, so a white border stops the parallax march at the
                       texture's edge instead of letting it read into whatever is packed next door. That
@@ -2288,15 +2951,18 @@ TRLE.DemoLessons = [
                 covers: ['ui:export-format'],
                 requires: { tiles: TRLE.DemoDepthSet },
                 say: `<strong>Format.</strong> PNG for everything normally. TGA if your pipeline wants
-                      it. PSD writes one layered file per tile, with the maps as named layers, for
-                      editing elsewhere and bringing back.<br><br>
+                      it. PSD packs the diffuse and every enabled map into one layered file for the
+                      whole atlas, with the maps as named layers, for editing elsewhere and bringing
+                      back.<br><br>
                       <strong>Export layout.</strong> Flat ZIP puts everything in one folder.
                       <strong>TombEngine</strong> arranges it into a <em>Textures/</em> folder so it
                       drops into a level project without rearranging.<br><br>
-                      <strong>Magenta color-key</strong> flattens transparent pixels to magenta, which
-                      is Tomb Editor's invisible colour. Tick it if you are working the classic way with
-                      a colour key rather than real alpha. Leave it off if your pipeline handles alpha,
-                      because it is destructive to the exported image.<br><br>
+                      <strong>Magenta color-key</strong> turns clear pixels magenta instead of
+                      exporting real alpha, the old colour-key workflow. Tomb Editor's <strong>Magenta
+                      to alpha</strong> turns it back, and Normal blending then already gives Alpha
+                      Test, the cheap option this lesson keeps coming back to. Leave it off if your
+                      pipeline handles alpha; ticking it is destructive to the exported image, so only
+                      do it if you mean to.<br><br>
                       <strong>Include the project file</strong> puts the <em>.atlasproj.json</em> inside
                       the ZIP, so the export can be reopened and edited later. It embeds the tile
                       images, so it costs a few megabytes and is almost always worth it.`,
@@ -2308,25 +2974,25 @@ TRLE.DemoLessons = [
             {
                 id: 'atlas-preview',
                 title: 'See the sheet before you ship it',
-                covers: ['modal:atlaspreview'],
+                covers: ['ui:atlas-view'],
                 requires: { tiles: TRLE.DemoDepthSet },
-                say: `<strong>👁️ Preview atlas</strong> stitches the whole thing exactly as it will
-                      export: same tile order, same column count, same pixel size. It is the last chance
-                      to notice that two tiles are in the wrong order or that a transition set got split
-                      across a row.<br><br>
-                      <strong>Tile boundaries</strong> and <strong>Tile numbers</strong> are drawn on
-                      top and are not in the export. <strong>Magenta key</strong> previews what that
-                      checkbox does to your transparent areas, which is easier to judge here than after
-                      the fact.<br><br>
-                      Transparency shows as a checkerboard. If you see checkerboard where you expected
-                      solid pixels, that is a tile with alpha you did not know about, and it is worth
-                      finding out before the atlas is in a level.`,
+                say: `<strong>👁️ Preview atlas</strong> swaps the tiles for the sheet exactly as it
+                      will export: same slots, same columns, no gaps, badges or labels, nothing drawn
+                      on top. It is the last chance to notice two tiles in the wrong place.<br><br>
+                      <strong>Magenta key</strong> appears beside it while the sheet is showing and
+                      previews what that export option does to your transparent areas, which is easier
+                      to judge here than after the fact.<br><br>
+                      Transparency shows as a checkerboard, and so does an empty slot past your last
+                      texture. If you see checkerboard where you expected solid pixels, find out which
+                      one it is, a tile with alpha you did not know about, or a gap in the layout,
+                      before the atlas is in a level. <strong>▦ Back to tiles</strong>, or Esc, returns
+                      to the grid.`,
                 setup: async api => {
                     await api.closeMenu();
-                    await api.click('#at-preview-atlas');
-                    await api.wait(1200);
+                    await api.cap('atlasView', true);
+                    await api.wait(600);
                 },
-                spotlight: '#at-ap-canvas',
+                spotlight: '#at-atlas-view',
                 handoff: `Tick <strong>Magenta key</strong> and watch the grate's holes. That is what
                           Tomb Editor would treat as invisible.`
             },
@@ -2350,7 +3016,8 @@ TRLE.DemoLessons = [
                       everywhere: one multiplies the finished pixel, the other is added to it.<br><br>
                       The course stops at this button, the same way it stops at Export. It opens a
                       window, which is yours to do when you want it.`,
-                setup: async api => { await api.closeMenu(); },
+                // The previous step leaves the sheet showing in place of the tiles.
+                setup: async api => { await api.closeMenu(); await api.cap('atlasView', false); },
                 spotlight: '#at-room-view',
                 handoff: `Open it, drop a flame in the room and tick <strong>Carry it in a circle</strong>.
                           Watching your normal map under a moving light is the fastest way to tell
@@ -2428,6 +3095,7 @@ TRLE.DemoLessons = [
                 setup: async api => {
                     await api.closeMenu();
                     await api.cap('openCtx', await api.tileId(0));
+                    await api.cap('ctxOpenCat', 'file');
                     await api.wait(400);
                 },
                 spotlight: '#at-ctx button[data-action="replace"]',
@@ -2497,10 +3165,30 @@ TRLE.DemoPlanned = {
        `modal:mat`, and their two menu actions (`action:material`,
        `action:lastmaterial`) are now covered by lesson 8's steps.
 
-       As of 2026-09-19 this table is EMPTY: all ten lessons are built and every
+       As of 2026-09-19 this table is EMPTY: every lesson is built and every
        modal and menu action is either taught or excluded. That is the state it
        should be kept in. A new feature goes here the moment it is written, named
        against the lesson that will teach it, and comes out when that step lands. */
+
+    /* Animated textures were ONE step inside lesson 3 until 2026-09-22, written
+       when the modal had one generator and three tabs. They are lesson 10 now
+       (`id: 'animated'`), covering both generators, the Colour and Glow tabs,
+       the Overlay tab with its moving level and organic contour, and the export
+       consequence: the engine only swaps UVs, so a second variant of an
+       animation costs a second full set of tiles.
+
+       Worth keeping in mind for the NEXT feature that lands inside an existing
+       modal. Everything phases 1 to 3 added lives inside `modal:anim`, so the
+       coverage walk below was satisfied the whole time it was untaught — it
+       enumerates `#at-modal-*` ids and `[data-action]`s, and a new control
+       inside a modal it already knows about is invisible to it. That is the
+       case this registry is weaker at than a missing modal, and the only
+       instrument for it is writing the gap down here. */
+
+    /* 🎇 Sprites (SPRITE-PLAN, 2026-09-28). Built in phases 2 to 6; the lesson
+       that teaches it is SPRITE-PLAN phase 7, and this entry comes out then. */
+    sprites: ['modal:sprite', 'action:addsprite'],
+
 };
 
 TRLE.DemoExclusions = {

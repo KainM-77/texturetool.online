@@ -71,7 +71,7 @@ Most of the Room View was written from **measurement**, not from the engine, and
 ## What is left outside, and why
 
 Drawing this boundary meant scanning for it, and the scan found four times what
-`../PREVIEW-FIDELITY.md` §6 had recorded: eight files, not two. They were dealt with rather
+`../docs/PREVIEW-FIDELITY.md` §6 had recorded: eight files, not two. They were dealt with rather
 than merely noted, and what remains outside this directory is:
 
 - **`../js/shaders.js`** — one PROSE citation (`Materials.hlsli:159`) explaining why white is
@@ -81,7 +81,7 @@ than merely noted, and what remains outside this directory is:
   engine's march at its grazing limit. It **cannot** move here, because `heightEdgeBandFor`
   uses it to size the white border on an **exported** height map, so the export path needs it
   and the export path must stay MIT. What is kept is a number describing observed output, and
-  `../HEIGHT-MAP-AUDIT.md` arrives at the same 35.8 px by measuring rendered bleed.
+  `../docs/HEIGHT-MAP-AUDIT.md` arrives at the same 35.8 px by measuring rendered bleed.
 - **five files under `../tools/`** — development tooling, never distributed, `_pom.mjs` and
   the probes and validators that use it.
 

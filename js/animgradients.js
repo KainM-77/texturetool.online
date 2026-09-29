@@ -41,7 +41,23 @@ TRLE.AnimGradients = {
     neon_pink:  { label: 'Neon Pink',  stops: [[0,[20,0,20]], [0.5,[200,20,160]], [1,[255,180,240]]] },
     steam_white:{ label: 'Steam',      stops: [[0,[210,215,222,0]], [0.4,[228,232,238,120]], [0.75,[244,247,250,215]], [1,[255,255,255,255]]] },
     electric:   { label: 'Electric',   stops: [[0,[4,6,26]], [0.45,[24,70,180]], [0.72,[90,170,255]], [0.9,[190,230,255]], [1,[255,255,255]]] },
-    mono_grey:  { label: 'Mono (B→W)', stops: [[0,[0,0,0]], [1,[255,255,255]]] }
+    mono_grey:  { label: 'Mono (B→W)', stops: [[0,[0,0,0]], [1,[255,255,255]]] },
+
+    /* ---- particle gradients ----------------------------------------------
+       Stop 0 carries ALPHA 0 on every one of these, which is what leaves the
+       gaps between the drops transparent so the tile can sit over a window or
+       a wall. A particle field is mostly zero, so stop 0 is most of the tile. */
+    rain_clear:  { label: 'Rain (clear)',  stops: [[0,[150,180,205,0]], [0.35,[170,195,215,70]], [0.75,[205,225,240,170]], [1,[240,250,255,235]]] },
+    rain_storm:  { label: 'Rain (storm)',  stops: [[0,[120,135,155,0]], [0.4,[140,158,178,90]], [0.8,[180,198,215,180]], [1,[225,238,248,245]]] },
+    snow_white:  { label: 'Snow',          stops: [[0,[230,238,248,0]], [0.3,[238,244,252,90]], [0.7,[248,251,255,200]], [1,[255,255,255,255]]] },
+    ash_grey:    { label: 'Ash / Cinders', stops: [[0,[60,56,52,0]], [0.4,[96,90,84,90]], [0.8,[140,132,122,175]], [1,[180,172,160,225]]] },
+    spark_hot:   { label: 'Sparks',        stops: [[0,[40,10,2,0]], [0.3,[160,50,6,110]], [0.65,[255,140,30,210]], [1,[255,240,190,255]]] },
+    bubble_pale: { label: 'Bubbles',       stops: [[0,[190,225,240,0]], [0.45,[205,232,245,70]], [0.85,[230,245,252,150]], [1,[255,255,255,215]]] },
+
+    /* ---- glitch gradients: hard jumps between saturated bands, so a block
+       re-rolled to a new value reads as a different colour, not a shade ---- */
+    glitch_neon: { label: 'Glitch Neon',   stops: [[0,[4,3,10]], [0.45,[30,12,62]], [0.6,[255,0,140]], [0.76,[0,225,255]], [0.9,[170,255,80]], [1,[255,255,255]]] },
+    glitch_vhs:  { label: 'Glitch VHS',    stops: [[0,[10,18,22]], [0.22,[20,90,100]], [0.42,[210,40,120]], [0.6,[245,200,60]], [0.8,[90,200,230]], [1,[240,236,225]]] }
 };
 
 /* Order for the gradient picker. */
@@ -49,7 +65,9 @@ TRLE.AnimGradientOrder = [
     'caustic_blue', 'water_deep', 'swamp_green', 'oil_dark', 'lava_hot', 'molten',
     'ember_fire', 'toxic_green', 'cloud_white', 'smoke_grey', 'dust_tan',
     'magic_violet', 'portal_cyan', 'ice_blue', 'blood_red', 'mercury',
-    'aurora', 'rainbow', 'sepia', 'neon_pink', 'steam_white', 'electric', 'mono_grey'
+    'aurora', 'rainbow', 'sepia', 'neon_pink', 'steam_white', 'electric', 'mono_grey',
+    'rain_clear', 'rain_storm', 'snow_white', 'ash_grey', 'spark_hot', 'bubble_pale',
+    'glitch_neon', 'glitch_vhs'
 ];
 
 /* Normalised stops ({pos,color}) for a gradient name (falls back to mono). */

@@ -62,7 +62,7 @@ off a textured export the same way. Both are plain MIT.
 ### What the scan found, and what is left outside
 
 Drawing the boundary on 2026-09-20 meant scanning for it, and the scan found **four
-times** what [AtlasTool/PREVIEW-FIDELITY.md](AtlasTool/PREVIEW-FIDELITY.md) §6 had
+times** what [AtlasTool/docs/PREVIEW-FIDELITY.md](AtlasTool/docs/PREVIEW-FIDELITY.md) §6 had
 recorded: eight files, not two. That gap is the argument for enumerating an
 exception rather than describing it. All of it predated the boundary and none of it
 was Room View's.
@@ -85,7 +85,7 @@ What remains outside the directory:
 `heightEdgeBandFor` uses it to size the white border on an **exported** height map,
 so the export path needs it and the export path must stay MIT. What is kept is a
 single number describing observed output rather than a piece of the engine's code,
-and [AtlasTool/HEIGHT-MAP-AUDIT.md](AtlasTool/HEIGHT-MAP-AUDIT.md) reaches the same
+and [AtlasTool/docs/HEIGHT-MAP-AUDIT.md](AtlasTool/docs/HEIGHT-MAP-AUDIT.md) reaches the same
 35.8 px by measuring rendered bleed rather than by reading anything.
 
 `tools/validate-licensing.mjs` holds every one of these in an explicit allow-list,

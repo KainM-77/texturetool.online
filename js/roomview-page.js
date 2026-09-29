@@ -861,7 +861,7 @@
     /* Repo-wide rule, and here it has teeth beyond politeness: run-validators
        kills a validator at 300 s, and the demo course already paid for learning
        that. Play collapses to its end state, which is dusk. */
-    const dayReduced = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const dayReduced = () => !!(window.TRLE && TRLE.Motion && TRLE.Motion.reduced());   // OS setting or the tool's switch
 
     function setDayPlaying(on) {
         $('rv-dayplay').textContent = on ? '■ Stop' : '▶ Play';

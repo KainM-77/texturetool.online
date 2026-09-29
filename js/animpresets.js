@@ -187,6 +187,150 @@ TRLE.AnimPresets = {
         params: { style: 1, spatialPeriod: 4, timePeriod: 4, octaves: 5, gain: 0.5, warp: 1.1, contrast: 1.6 },
         material: { type: 'liquid', key: 'magic_liquid' }, emissive: true
     },
+    /* ---- Batch D: PARTICLES -------------------------------------------
+       A different generator (js/animparticles.js), selected by
+       `params.generator`. fBm cannot make a straight streak, an honest
+       particle count or a slant, and those three are what rain is. Every
+       `dirX`/`dirY` here is a pair of small INTEGERS so the velocity stays
+       whole tiles per loop and the sequence closes exactly; see the header
+       of animparticles.js. These all want a transparent gradient, because a
+       particle field is mostly empty and the gaps have to show what is
+       behind them. */
+    rain_drizzle: {
+        label: 'Rain, drizzle', icon: '🌦️', gradient: 'rain_clear',
+        description: 'Fine light rain drifting down. Sparse thin streaks over transparency, for windows and wet stone.',
+        params: { generator: 'particles', count: 65, dirX: 1, dirY: 4, speed: 1, speedSpread: 1,
+                  length: 0.9, width: 0.9, taper: 0.7, brightJitter: 0.6 },
+        material: null
+    },
+    rain_downpour: {
+        label: 'Rain, downpour', icon: '🌧️', gradient: 'rain_storm',
+        description: 'Heavy driving rain. Dense fast streaks with a strong slant. Turn Gusts up for rain that comes in waves.',
+        params: { generator: 'particles', count: 190, dirX: 1, dirY: 3, speed: 1, speedSpread: 2,
+                  length: 1.15, width: 1.2, taper: 0.55, brightJitter: 0.5,
+                  gustCycles: 2, gustDepth: 0.35 },
+        material: null
+    },
+    rain_window: {
+        label: 'Rain on glass', icon: '🪟', gradient: 'rain_clear',
+        description: 'Slow heavy drops creeping down a pane, with a few running fast. Made to lay over a window texture.',
+        params: { generator: 'particles', count: 70, dirX: 0, dirY: 1, speed: 1, speedSpread: 3,
+                  length: 2.4, width: 2.0, taper: 0.8, brightJitter: 0.7 },
+        material: null
+    },
+    snow_fall: {
+        label: 'Snow', icon: '❄️', gradient: 'snow_white',
+        description: 'Flakes drifting down and swaying sideways as they fall. Round, not streaked.',
+        params: { generator: 'particles', count: 190, dirX: 0, dirY: 1, speed: 1, speedSpread: 2,
+                  length: 0, width: 2.0, taper: 0, brightJitter: 0.55,
+                  sway: 0.05, swayCycles: 2 },
+        material: null
+    },
+    ash_fall: {
+        label: 'Ash / Cinders', icon: '🌋', gradient: 'ash_grey',
+        description: 'Fine ash settling through the air, slower and dirtier than snow. Ruined cities, volcano levels.',
+        params: { generator: 'particles', count: 170, dirX: 1, dirY: 4, speed: 1, speedSpread: 1,
+                  length: 0.35, width: 1.5, taper: 0.4, brightJitter: 0.7,
+                  sway: 0.035, swayCycles: 3 },
+        material: null
+    },
+    sparks_rising: {
+        label: 'Sparks', icon: '✨', gradient: 'spark_hot',
+        description: 'Embers climbing off a fire and fading out. Rises rather than falls. Glows.',
+        params: { generator: 'particles', count: 85, dirX: 0, dirY: -1, speed: 2, speedSpread: 3,
+                  length: 0.9, width: 1.2, taper: 0.85, brightJitter: 0.75,
+                  sway: 0.045, swayCycles: 2 },
+        material: null, emissive: true
+    },
+    /* Round three (2026-09-24). A NEW preset rather than a retune of
+       sparks_rising, by the author's decision: additive, so every tile made
+       with Sparks stays what it was. Slower and shorter than Sparks so each
+       flash reads as a point of light rather than a streak blinking. Flashes 2
+       gives each spark 2-3 flashes per loop, inside the N/2 strobe limit at the
+       default 16 frames. */
+    sparks_twinkle: {
+        label: 'Sparks, twinkling', icon: '🎇', gradient: 'spark_hot',
+        description: 'Sparks drifting up and flickering on and off, each on its own beat. Glitter off a forge or a magic effect. Glows.',
+        params: { generator: 'particles', count: 110, dirX: 0, dirY: -1, speed: 1, speedSpread: 3,
+                  length: 0.5, width: 1.3, taper: 0.7, brightJitter: 0.5,
+                  sway: 0.04, swayCycles: 2, twinkle: 0.85, twinkleCycles: 2 },
+        material: null, emissive: true
+    },
+    bubbles_rising: {
+        label: 'Bubbles', icon: '🫧', gradient: 'bubble_pale',
+        description: 'Bubbles wobbling up through water. Round and slow, for underwater walls and vents.',
+        params: { generator: 'particles', count: 70, dirX: 0, dirY: -1, speed: 1, speedSpread: 2,
+                  length: 0, width: 3.4, taper: 0, brightJitter: 0.4,
+                  sway: 0.04, swayCycles: 3 },
+        material: null
+    },
+    drips_wall: {
+        label: 'Drips', icon: '💧', gradient: 'rain_clear',
+        description: 'Occasional drops running down a wet wall. Very sparse, slow, long trails.',
+        params: { generator: 'particles', count: 35, dirX: 0, dirY: 1, speed: 1, speedSpread: 2,
+                  length: 3.2, width: 1.5, taper: 0.9, brightJitter: 0.6 },
+        material: null
+    },
+
+    /* ---- Batch E: DEPTH (2026-09-23) ----------------------------------
+       Three presets for 256 px and up, which is where "the particles all look
+       the same" was reported from. They are the only ones that set depthScale
+       and defocus; the eight above are deliberately untouched, because the
+       classic-resolution builders they were tuned for are happy with them and a
+       retune would move every tile already made with one.
+
+       All three lean on Depth spread, which sorts particles into that many
+       speed bands: the band is also the size, the brightness and the blur, so
+       one control buys the whole parallax. ------------------------------- */
+    rain_glass: {
+        label: 'Rain on glass (deep)', icon: '🌧️', gradient: 'rain_clear',
+        description: 'Beads holding on the pane while a few run, at four depths, the far ones out of focus. For 256px and up, over a window or a wall.',
+        params: { generator: 'particles', count: 150, dirX: 0, dirY: 1, speed: 0, speedSpread: 3,
+                  length: 1.6, width: 4.5, taper: 0.5, brightJitter: 0.8,
+                  depthScale: 0.8, defocus: 5 },
+        material: null
+    },
+    rain_soft: {
+        label: 'Rain, soft slant', icon: '🌦️', gradient: 'rain_clear',
+        description: 'A slanting sheet with real depth: near drops sharp and bright, far ones small and blurred. The photographic one.',
+        /* (1,3) not (1,4), spread 3 not 4, length 0.95 not 1.3: the first
+           attempt was 1.03 tiles per FRAME and the advisory caught it, exactly
+           as it caught ash_fall when the particle presets first shipped. The
+           depth bands cost one plane and the slant is barely shallower. */
+        params: { generator: 'particles', count: 150, dirX: 1, dirY: 3, speed: 1, speedSpread: 3,
+                  length: 0.95, width: 2.6, taper: 0.6, brightJitter: 0.7,
+                  depthScale: 0.75, defocus: 6 },
+        material: null
+    },
+    snow_deep: {
+        label: 'Snow, deep', icon: '🌨️', gradient: 'snow_white',
+        description: 'Flakes at four distances, swaying, the far ones soft and dim. Reads as weather rather than as dots.',
+        params: { generator: 'particles', count: 170, dirX: 0, dirY: 1, speed: 1, speedSpread: 4,
+                  length: 0.25, width: 3.4, taper: 0.2, brightJitter: 0.5,
+                  sway: 0.06, swayCycles: 2, depthScale: 0.85, defocus: 7 },
+        material: null
+    },
+
+    /* ---- Batch F: GLITCH (2026-09-24) --------------------------------
+       The noise field plus the glitch stage (js/animglitch.js), selected by a
+       `glitch` object. Hard blocks, torn rows and split channels on a torus, so
+       the tile still repeats. The second one sets noiseMix 0, so it has no
+       Perlin in it at all: a collage of flat, striped and graded blocks. ---- */
+    glitch_corrupt: {
+        label: 'Glitch / Corrupted', icon: '📼', gradient: 'glitch_neon',
+        description: 'Corrupted signal: blocks torn out and dragged across the frame, colour channels split, scanlines. Bursts of damage between calmer frames. Still tiles.',
+        params: { style: 0, spatialPeriod: 4, timePeriod: 1, octaves: 5, gain: 0.5, warp: 0.6, contrast: 1.4,
+                  glitch: { amount: 0.5, blocks: 6, bursts: 4, calm: 0.25, split: 0.02, tear: 0.5, scan: 0.35, noiseMix: 0.75 } },
+        material: null, emissive: true
+    },
+    glitch_collage: {
+        label: 'Glitch Collage', icon: '🧩', gradient: 'glitch_vhs',
+        description: 'A cut-up collage of flat, striped and graded blocks that reshuffles every burst. No noise underneath. Datamosh walls, broken screens.',
+        params: { style: 0, spatialPeriod: 4, timePeriod: 1, octaves: 4, gain: 0.5, warp: 0, contrast: 1,
+                  glitch: { amount: 0.7, blocks: 5, bursts: 8, calm: 0.1, split: 0.012, tear: 0.3, scan: 0, noiseMix: 0 } },
+        material: null, emissive: true
+    },
+
     aurora_sky: {
         label: 'Aurora Sky', icon: '🌌', gradient: 'aurora',
         description: 'Slow shimmering curtains of aurora light drifting across the sky — ceilings, skyboxes and magical vistas. Glows.',
@@ -202,7 +346,11 @@ TRLE.AnimPresetOrder = [
     'clouds', 'smoke', 'dust', 'magic_energy', 'portal',
     'fire', 'waterfall', 'river_current', 'rising_smoke', 'blowing_sand', 'lava_flow',
     'blood_pool', 'frozen_ice', 'quicksilver', 'boiling_water', 'whirlpool', 'honey_flow',
-    'steam', 'poison_gas', 'electric_plasma', 'aurora_sky'
+    'steam', 'poison_gas', 'electric_plasma', 'aurora_sky',
+    'rain_drizzle', 'rain_downpour', 'rain_window', 'snow_fall', 'ash_fall',
+    'sparks_rising', 'sparks_twinkle', 'bubbles_rising', 'drips_wall',
+    'rain_glass', 'rain_soft', 'snow_deep',
+    'glitch_corrupt', 'glitch_collage'
 ];
 
 /* Merge a preset's params with overrides (size/frames/seed/style/…) into a bag

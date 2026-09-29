@@ -342,8 +342,16 @@
        the preview column. The squeeze is fixed in style.css, but the ring should
        never have been able to draw outside its target's visible area, so it
        intersects with every clipping ancestor on the way up. */
+    /* Overflow clips only what it is the containing block for, and a
+       position:fixed element's containing block is the viewport: no ancestor
+       above it clips it or anything inside it. The walk stops there. The
+       context menu depends on it (CONTEXT-MENU-PLAN): its submenus are fixed
+       CHILDREN of the root, which scrolls (overflow-y: auto), and clipping them
+       to the root's box left every step that points into a submenu with no
+       spotlight at all. */
     function visibleRect(el, win) {
         let r = el.getBoundingClientRect();
+        if (win.getComputedStyle(el).position === 'fixed') return r;
         let p = el.parentElement;
         while (p) {
             const cs = win.getComputedStyle(p);
@@ -354,6 +362,7 @@
                 r = { left, top, right, bottom,
                       width: Math.max(0, right - left), height: Math.max(0, bottom - top) };
             }
+            if (cs.position === 'fixed') break;
             p = p.parentElement;
         }
         return r;
@@ -428,7 +437,16 @@
             }
             const menu = d.getElementById('at-ctx');
             if (menu && menu.style.display !== 'none' && menu.checkVisibility && menu.checkVisibility()) {
-                return box(menu);
+                /* The menu is a root column plus one open submenu beside it
+                   (CONTEXT-MENU-PLAN), and the submenu is outside the root's box,
+                   so the surface is the union of the two, or a step pointing into
+                   a submenu would dim the very entries it is about. */
+                const root = box(menu);
+                const sub = [...menu.querySelectorAll('.at-ctx-sub')].find(s => s.style.display !== 'none' && s.checkVisibility());
+                if (!sub) return root;
+                const b = box(sub);
+                const x = Math.min(root.x, b.x), y = Math.min(root.y, b.y);
+                return { x, y, w: Math.max(root.x + root.w, b.x + b.w) - x, h: Math.max(root.y + root.h, b.y + b.h) - y, el: menu };
             }
             return null;
         } catch { return null; }

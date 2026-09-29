@@ -763,6 +763,60 @@ TRLE.Engine = (function() {
             u_alphaFlatten: flatten ? 1.0 : 0.0
         }, grayFBO);
 
+        /* Step 1b: carved relief (PUSH-MARKINGS-PLAN phase 3). A mark pushed into a
+           surface is a GROOVE whatever its colour, but everything below reads relief
+           from luminance, so a pale scrape on dark stone came out a ridge (+118 in the
+           plan's 1.1). `reliefPaint: { mask, depth, base }`: under the mask the grey
+           is the UNMARKED tile's (`base`, so the mark's own colour stops counting; it
+           must equal the diffuse wherever the mask is 0),
+           then `depth` is carved in. It feeds height, normal and AO only; roughness
+           and specular keep reading `grayFBO`, because a groove is shape, not finish.
+           No new GLSL: transitionComposite mixes, heightPaint carves. Absent, zero or
+           maskless, this block does nothing and every map is byte-identical. */
+        /* `reliefPaint.field` (phase 8): a SIGNED relief on top of the carve, for the
+           push-mark styles (sand ripples, a snow channel with raised sides):
+           { up, down, lift }, two grey masks of |h| and one amplitude, laid with the
+           same heightPaint blit, one pass each way. Absent or at lift 0, nothing
+           changes (the carve-only path is still one blit). */
+        const rp = preset.reliefPaint;
+        let reliefFBO = grayFBO, reliefMask = null, unmarkedGray = null, fieldUp = null, fieldDown = null;
+        // `src` with `lift` laid in under `mask` (one heightPaint blit).
+        const paintIn = (src, mask, lift) => {
+            const out = createFBO(width, height);
+            blit('heightPaint', { u_texture: src.texture, u_mask: mask, u_lift: lift }, out);
+            return out;
+        };
+        const hasCarve = !!(rp && rp.mask && Math.abs(rp.depth || 0) > 0.001);
+        const fld = rp && rp.field && rp.field.lift > 0.0005 && (rp.field.up || rp.field.down) ? rp.field : null;
+        /* The whole relief onto `src`: the carve, then the field. `s` = +1 carves down
+           and raises `up`; -1 is the inverted sense (an inverted height map). */
+        const relief = (src, s) => {
+            let cur = src;
+            const step = (mask, lift) => { const nx = paintIn(cur, mask, lift); if (cur !== src) deleteFBO(cur); cur = nx; };
+            if (hasCarve) step(reliefMask, -s * rp.depth);
+            if (fieldUp) step(fieldUp, s * fld.lift);
+            if (fieldDown) step(fieldDown, -s * fld.lift);
+            return cur;
+        };
+        if (hasCarve || fld) {
+            if (hasCarve) reliefMask = createTextureFromImage(rp.mask, { wrap: gl.CLAMP_TO_EDGE });
+            if (fld && fld.up) fieldUp = createTextureFromImage(fld.up, { wrap: gl.CLAMP_TO_EDGE });
+            if (fld && fld.down) fieldDown = createTextureFromImage(fld.down, { wrap: gl.CLAMP_TO_EDGE });
+            /* The relief grey is the UNMARKED tile's outright, not a mix toward it
+               under the mask: a mark at alpha a mixed back only a of it, so its
+               colour leaked in at about a(1 - a) and the soft edges of a pale mark
+               still rose (phase 5, measured on the shipped push marks). Exact as long
+               as `base` equals the diffuse wherever the mask is 0, which holds for
+               marks composited over it (PushMarks.compose). */
+            if (rp.base) {
+                const bTex = createTextureFromImage(rp.base);
+                unmarkedGray = createFBO(width, height);
+                blit('desaturate', { u_texture: bTex, u_gamma: 0.8, u_alphaFlatten: flatten ? 1.0 : 0.0 }, unmarkedGray);
+                deleteTexture(bTex);
+            }
+            reliefFBO = relief(unmarkedGray || grayFBO, 1);
+        }
+
         /* Step 2: what the relief is READ FROM, then blur it.
 
            Normally that is the tile's own luminance. `preset.heightSource` swaps in
@@ -772,7 +826,7 @@ TRLE.Engine = (function() {
            rather than adding one, and the selection (1 where matched) is turned the
            right way up by simpleHeight's EXISTING u_invert, XOR'd with the user's
            own "which side sinks" choice. Zero new GLSL, zero new uniforms. */
-        let heightBase = grayFBO, heightSelFBO = null;
+        let heightBase = reliefFBO, heightSelFBO = null;
         let heightInvert = !!preset.heightInvert;
         const hSrc = preset.heightSource;
         if (enabledMaps.height && hSrc && typeof hSrc.mode === 'number') {
@@ -793,6 +847,14 @@ TRLE.Engine = (function() {
             // The selection reads as "this is the thing", and the thing carves IN
             // by default -- so the default for a selection is the inverted sense.
             heightInvert = !heightInvert;
+        }
+        /* The groove has to survive the height map's own inversion: simpleHeight
+           flips the value AFTER this, so an inverted map (or a selection) gets its
+           relief carved with the opposite sign, from its own base. */
+        let heightReliefFBO = null;
+        if ((hasCarve || fld) && (heightInvert || heightSelFBO)) {
+            heightReliefFBO = relief(heightSelFBO || unmarkedGray || grayFBO, heightInvert ? -1 : 1);
+            heightBase = heightReliefFBO;
         }
         const heightBlurred = gaussianBlur(heightBase.texture, width, height, preset.heightBlur);
 
@@ -870,7 +932,7 @@ TRLE.Engine = (function() {
         }
 
         // Step 4: Create blurred height for normals/AO (use preset blur)
-        const normalBlurred = gaussianBlur(grayFBO.texture, width, height, preset.normalBlur);
+        const normalBlurred = gaussianBlur(reliefFBO.texture, width, height, preset.normalBlur);
 
         // Step 5: Normal map from height
         if (enabledMaps.normal) {
@@ -884,8 +946,8 @@ TRLE.Engine = (function() {
                 const baseBlur     = preset.normalBlur ?? 0;
                 const fineRadius   = Math.max(0, baseBlur * 0.34);
                 const coarseRadius = baseBlur * 3 + 5;
-                const fineBlurred   = gaussianBlur(grayFBO.texture, width, height, fineRadius);
-                const coarseBlurred = gaussianBlur(grayFBO.texture, width, height, coarseRadius);
+                const fineBlurred   = gaussianBlur(reliefFBO.texture, width, height, fineRadius);
+                const coarseBlurred = gaussianBlur(reliefFBO.texture, width, height, coarseRadius);
 
                 const normalFBO = createFBO(width, height);
                 blit('normalFromHeightMulti', {
@@ -942,7 +1004,7 @@ TRLE.Engine = (function() {
             const aoHeightFBO = createFBO(width, height);
             // Same as above: no plane shift, and both uniforms set explicitly.
             blit('simpleHeight', {
-                u_texture: grayFBO.texture,
+                u_texture: reliefFBO.texture,
                 u_strength: 1.0,
                 u_ref: 0.0,
                 u_top: 0.0,
@@ -1024,6 +1086,12 @@ TRLE.Engine = (function() {
         // Cleanup temporary FBOs
         deleteFBO(grayFBO);
         if (heightSelFBO) deleteFBO(heightSelFBO);   // the colour/hue height source
+        if (reliefFBO !== grayFBO) deleteFBO(reliefFBO);   // phase 3's carved relief
+        if (unmarkedGray) deleteFBO(unmarkedGray);
+        if (heightReliefFBO) deleteFBO(heightReliefFBO);
+        if (reliefMask) deleteTexture(reliefMask);
+        if (fieldUp) deleteTexture(fieldUp);
+        if (fieldDown) deleteTexture(fieldDown);
         deleteFBO(heightBlurred);
         deleteFBO(normalBlurred);
 

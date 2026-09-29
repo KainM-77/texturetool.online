@@ -58,13 +58,13 @@ TRLE.DemoRunner = (function () {
         const doc = () => frameEl.contentDocument;
         const cap = () => { const w = win(); return w && w.TRLE && w.TRLE._cap; };
 
+        /* TRLE.Motion answers for the OS setting AND the tool's Animations
+           switch (js/motion.js). Ask the FRAME too: the switch lives in the
+           tool, and a JS tween out here inherits nothing from its CSS. */
         const reduced = () => {
-            const m = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)');
-            // Check the FRAME too: the tool's global CSS block zeroes its own
-            // transitions, but a JS tween out here is untouched by that.
-            const f = win() && win().matchMedia
-                ? win().matchMedia('(prefers-reduced-motion: reduce)') : null;
-            return !!((m && m.matches) || (f && f.matches));
+            const here = window.TRLE && TRLE.Motion && TRLE.Motion.reduced();
+            const w = win(), there = w && w.TRLE && w.TRLE.Motion && w.TRLE.Motion.reduced();
+            return !!(here || there);
         };
 
         const sleep = ms => new Promise(res => { const t = setTimeout(res, ms); timers.push(t); });
@@ -272,6 +272,25 @@ TRLE.DemoRunner = (function () {
             reduced,
             wait: sleep,
             click,
+            /* Scroll something into view inside the frame before spotlighting it.
+
+               `demo.js`'s visibleRect clips a target's rect to every scrolling
+               ancestor, deliberately: a ring drawn around something below the
+               fold points at nothing. So a step whose target sits low in a tall
+               modal has to bring it on screen first, or it silently gets no ring
+               at all — which is what happened to lesson 10's organic step the
+               moment the Overlay panel moved into the (scrolling) tuning column.
+
+               'center' rather than 'nearest': the ring has to be fully inside
+               the clipping box, not flush against its edge. */
+            async reveal(sel, block) {
+                const d = doc();
+                const el = d && d.querySelector(sel);
+                if (!el || !el.scrollIntoView) return false;
+                el.scrollIntoView({ block: block || 'center', inline: 'nearest' });
+                await sleep(reduced() ? 60 : 260);
+                return true;
+            },
             /* Waits briefly for `_cap` rather than returning null the instant it
                is missing: a frame reload leaves a window with no TRLE on it for
                a beat, and a step calling straight through would silently no-op. */
@@ -423,8 +442,8 @@ TRLE.DemoRunner = (function () {
             async sweep(spec, previewSel) { return sweep(spec, previewSel); },
             async closeMenu() {
                 const d = doc();
-                const m = d && d.getElementById('at-ctx');
-                if (m) m.style.display = 'none';
+                // Both menus: the tile menu and the empty-slot menu (grid phase 9).
+                for (const id of ['at-ctx', 'at-slot-ctx']) { const m = d && d.getElementById(id); if (m) m.style.display = 'none'; }
                 await api.cap('closeModal');
             },
             /* `{ ifDirty: true }` by default: a lesson's first step wants a clean

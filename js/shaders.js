@@ -12,14 +12,14 @@
    Fragment shaders for the web GPU texture pipeline.
 
    ⚠ BEFORE DELETING AN "UNUSED" SHADER: a grep over engine.js + atlas.js only
-   is NOT enough and will lie to you. `animNoise` is used by js/animgen.js, and
-   `seamlessCrop` + `mix2` are used by js/app.js — the frozen root clone, which
-   is not loaded by AtlasTool's index.html but still backs texturetool.html.
-   Sweep every js/*.js AND the HTML files, app.js included.
+   is NOT enough and will lie to you. `animNoise` is used by js/animgen.js.
+   Sweep every js/*.js, ten/*.js AND the HTML files.
 
    Genuinely unwired, each annotated at its definition with why it is still
    here: combineHeight, normalizeContrast, edgeEnhance, tileMaskBlur,
-   seamProtection. See Roadmap.md "Phase 2".
+   seamProtection. See Roadmap.md "Phase 2". `seamlessCrop` and `mix2` are
+   unwired too: their only caller was js/app.js, deleted 2026-09-13 with
+   texturetool.html (the v1 copy lives in Archive/TextureTool-v1/).
    ============================================================ */
 
 window.TRLE = window.TRLE || {};
@@ -618,6 +618,8 @@ TRLE.Shaders = {
     /* ---------- Seamless pre-pass: Crop & Resample ----------
        Re-samples a cropped sub-rect back to full size to trim dirty edges.
        u_crop = (left, top, right, bottom) as fractions [0–1).
+       Unwired since js/app.js was deleted (2026-09-13); kept like the others
+       in the header's unwired list.
        --------------------------------------------------------- */
     seamlessCrop: `#version 300 es
         precision highp float;
@@ -631,7 +633,9 @@ TRLE.Shaders = {
             fragColor = texture(u_texture, mix(lo, hi, v_uv));
         }`,
 
-    /* ---------- Generic two-texture mix (pre-average blend) ---------- */
+    /* ---------- Generic two-texture mix (pre-average blend) ----------
+       Unwired since js/app.js was deleted (2026-09-13); kept like the others
+       in the header's unwired list. */
     mix2: `#version 300 es
         precision highp float;
         uniform sampler2D u_texA;
@@ -1141,7 +1145,27 @@ TRLE.Shaders = {
     /* ---------- Colour Adjust (HSL / contrast / gamma / temp) ----------
        A non-destructive colour grade applied to a whole tile. Order: white
        balance → gamma → brightness/contrast → hue/saturation → vibrance →
-       invert. Alpha is preserved. ------------------------------------------ */
+       invert. Alpha is preserved.
+
+       THE TWO INTERMEDIATE CLAMPS ARE GONE (2026-09-22). There used to be a hard
+       clamp(c, 0, 1) after white balance and another after contrast. They destroyed
+       information a LATER stage could have used: with Temperature -60 the red
+       channel goes below zero and is pinned at 0, then Brightness +40 lifts a
+       channel that no longer has anywhere to come back from. The pipeline now runs
+       unbounded and rounds once, at the end.
+
+       Measured scope, so nobody oversells this: across nine realistic slider
+       settings on seven textures, EIGHT are byte-identical with and without those
+       clamps. Only opposing-direction combinations differ (temp -60 + bright +40:
+       19.4% of pixels, mean delta 1.165/255, max 22.9, hue error 24.4 deg). Worth
+       fixing because it is free and strictly correct, but Adjust Colours was not
+       broken — the beta report's "chromatic aberrations" came from colorTransfer.
+
+       THE FINAL CLAMP STAYS HARD, and must. Do not reach for colorTransfer's
+       gamutLift here: out-of-range is usually the USER'S INTENT in this shader (at
+       Brightness -50, 89.9% of pixels legitimately fall below zero) and lifting them
+       back would neutralise the slider. See COLOUR-TOOLS-PLAN.md §4 Decision 3.
+       ------------------------------------------------------------------------ */
     colorAdjust: `#version 300 es
         precision highp float;
         uniform sampler2D u_texture;
@@ -1154,6 +1178,13 @@ TRLE.Shaders = {
         uniform float u_tint;       // -1..1 (magenta + / green -)
         uniform float u_vibrance;   // -1..1
         uniform float u_invert;     // 0/1
+        uniform vec3  u_levBlack;   // per-channel black point, 0..1  (UI: "Dark cutoff")
+        uniform vec3  u_levWhite;   // per-channel white point, 0..1  (UI: "Bright cutoff")
+        uniform vec3  u_levGamma;   // per-channel gamma, 0.2..3
+        uniform float u_levOn;      // 0 = skip the levels stage entirely
+        uniform sampler2D u_curveTex; // 256x1 LUT, R/G/B = that channel's curve with the RGB curve on top.
+                                      // EVERY caller must bind it (to the input when unused): see caBlit.
+        uniform float u_curveOn;    // 0 = skip the curves stage entirely
         in vec2 v_uv;
         out vec4 fragColor;
         vec3 rgb2hsv(vec3 c){
@@ -1171,11 +1202,38 @@ TRLE.Shaders = {
         void main(){
             vec4 src = texture(u_texture, v_uv);
             vec3 c = src.rgb;
+            /* Per-channel LEVELS, first, because it is an input transform: it decides
+               what counts as black and white before anything else reads the pixel.
+
+               This stage DOES clamp, and that is not the clipping the rest of this
+               shader was fixed for. A black point is a clip the USER asked for -- drag
+               it to 40 and everything below 40 is meant to go to black. Soft-clipping
+               it, or routing it through colorTransfer's gamutLift, would make the
+               control feel broken. The clamps that were removed were INCIDENTAL ones
+               mid-pipeline. Keep the two ideas apart. */
+            if (u_levOn > 0.5) {
+                vec3 span = max(u_levWhite - u_levBlack, vec3(1e-4));
+                c = pow(clamp((c - u_levBlack) / span, 0.0, 1.0), 1.0 / max(u_levGamma, vec3(0.01)));
+            }
+            /* CURVES, also an input transform. Looked up NEAREST at texel centres, so
+               an 8-bit input lands exactly on its own table entry: the curve is exact,
+               not interpolated. Skipped outright unless a curve is actually bent, which
+               is what keeps every other mode, and an untouched Curves mode, byte for
+               byte what it was. */
+            if (u_curveOn > 0.5) {
+                vec3 k = floor(clamp(c, 0.0, 1.0) * 255.0 + 0.5);
+                c = vec3(texture(u_curveTex, vec2((k.r + 0.5) / 256.0, 0.5)).r,
+                         texture(u_curveTex, vec2((k.g + 0.5) / 256.0, 0.5)).g,
+                         texture(u_curveTex, vec2((k.b + 0.5) / 256.0, 0.5)).b);
+            }
             c.r += u_temp * 0.15; c.b -= u_temp * 0.15; c.g += u_tint * 0.15;   // white balance
-            c = clamp(c, 0.0, 1.0);
-            c = pow(c, vec3(1.0 / max(u_gamma, 0.01)));                          // gamma
+            // gamma on a signed value: keep the sign so a channel driven negative by
+            // white balance can still be recovered by a later brightness lift.
+            c = sign(c) * pow(abs(c), vec3(1.0 / max(u_gamma, 0.01)));            // gamma
             c += u_bright;                                                        // brightness
             c = (c - 0.5) * u_contrast + 0.5;                                     // contrast
+            // rgb2hsv needs a real colour, so the clamp happens HERE and not before:
+            // every stage above ran unbounded, and nothing downstream can recover.
             c = clamp(c, 0.0, 1.0);
             vec3 hsv = rgb2hsv(c);
             hsv.x = fract(hsv.x + u_hue / 360.0);                                 // hue
@@ -1189,23 +1247,115 @@ TRLE.Shaders = {
         }`,
 
     /* ---------- Colour Transfer (recolour from another texture) ----------
-       Reinhard-style per-channel mean/std transfer: shifts a tile's colour
-       distribution toward a reference's. meanA/scale come from the source,
-       meanB from the reference; u_strength blends back to the original. ----- */
+       Reinhard mean/std transfer, done in CIELAB. Shifts a tile's colour
+       distribution toward a reference's: meanA/scale come from the source,
+       meanB from the reference, u_strength blends back to the original.
+
+       WHY LAB AND NOT RGB (measured 2026-09-22, see COLOUR-TOOLS-PLAN.md §1/§4).
+       This used to run three independent gains on gamma-encoded R, G and B. The
+       channels are correlated, so per-channel std matching does NOT land the
+       aggregate statistics on the reference, and the residue turns distance from
+       mean BRIGHTNESS into COLOUR: a pixel 30 units above the mean in all three
+       channels is still grey, but with gains of 2.17/1.73/0.97 it comes out
+       +65/+52/+29, which is orange. Highlights drift one way, shadows the other.
+       That is what a beta report saw as "chromatic aberrations".
+
+       A mean/std transfer promises to land the source's spread on the reference's,
+       so the honest error is |log2(out_spread / ref_spread)| over a 5-source x
+       11-reference sweep. Chroma: RGB 0.534, YCbCr 0.148, Lab 0.070. Luma: 0.281 /
+       0.034 / 0.027. YCbCr was a real candidate (linear matrix, no transcendentals)
+       and still beats RGB by 3.6x, but this is a one-off blit rather than a
+       per-frame path, so Lab's pow/cbrt cost nothing worth having.
+
+       Lab round-trips EXACTLY at scale 1 with equal means (max delta 0.000/255
+       measured), which is what makes the identity assertion in
+       validate-colour-maths.mjs possible. Keep it that way.
+
+       GAMUT: gamutLift, NOT a clamp, and NOT a desaturate-toward-luminance.
+       See the note on gamutLift below. ------------------------------------- */
     colorTransfer: `#version 300 es
         precision highp float;
         uniform sampler2D u_texture;
-        uniform vec3  u_meanA;   // source per-channel mean
-        uniform vec3  u_meanB;   // reference per-channel mean
-        uniform vec3  u_scale;   // stdB / stdA per channel
+        uniform vec3  u_meanA;   // source mean,      Lab
+        uniform vec3  u_meanB;   // reference mean,   Lab
+        uniform vec3  u_scale;   // stdB / stdA per Lab axis, clamped 0.2..3
         uniform float u_strength;
         in vec2 v_uv;
         out vec4 fragColor;
+
+        const mat3 RGB2XYZ = mat3(
+                   0.4124564,  0.2126729,  0.0193339,
+                   0.3575761,  0.7151522,  0.1191920,
+                   0.1804375,  0.0721750,  0.9503041);
+        const mat3 XYZ2RGB = mat3(
+                   3.2404548, -0.9692664,  0.0556434,
+                  -1.5371389,  1.8760109, -0.2040259,
+                  -0.4985315,  0.0415561,  1.0572252);
+        const vec3 D65 = vec3(0.95047, 1.0, 1.08883);
+
+        vec3 srgb2lin(vec3 c){
+            return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));
+        }
+        /* Sign-preserving, and deliberately NOT clamped: the transfer can land a
+           pixel outside the cube and gamutLift needs to see how far out it is. A
+           clamp here would silently become the hard-clamp behaviour we are removing. */
+        vec3 lin2srgb(vec3 c){
+            vec3 a = abs(c);
+            vec3 r = mix(a * 12.92, 1.055 * pow(a, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), a));
+            return sign(c) * r;
+        }
+        float labf(float t)  { return t > 0.008856 ? pow(t, 1.0 / 3.0) : t / 0.128418 + 0.137931; }
+        float labfi(float t) { return t > 0.206897 ? t * t * t : 0.128418 * (t - 0.137931); }
+
+        vec3 rgb2lab(vec3 c){
+            vec3 xyz = (RGB2XYZ * srgb2lin(c)) / D65;
+            float fx = labf(xyz.x), fy = labf(xyz.y), fz = labf(xyz.z);
+            return vec3(116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz));
+        }
+        vec3 lab2rgb(vec3 l){
+            float fy = (l.x + 16.0) / 116.0;
+            float fx = fy + l.y / 500.0;
+            float fz = fy - l.z / 200.0;
+            vec3 xyz = vec3(labfi(fx), labfi(fy), labfi(fz)) * D65;
+            return lin2srgb(XYZ2RGB * xyz);
+        }
+
+        /* Bring an out-of-gamut colour back by moving ALL THREE channels together,
+           which preserves their ratios and therefore the hue. Clamping each channel
+           independently does not: 100% of the clipping here is on the dark side, so
+           a pixel at (-20, 8, 15) loses its red entirely and arrives cyan, while its
+           neighbour one shade lighter does not clip at all. Measured on out-of-gamut
+           pixels, hue angle error: hard clamp 24.4 deg (p99 178.4, i.e. the opposite
+           hue), full lift 4.8 deg (p99 35.3).
+
+           TWO THINGS NOT TO RE-PROPOSE, both measured and both counter-intuitive:
+           - Desaturating toward the pixel's own luminance is WORSE than clamping
+             (38.0 deg vs 28.2 under the old RGB transfer). All the clipping is on the
+             dark side where the target luminance is itself out of range, so pulling
+             toward it does not bring the pixel back and it still needs a clamp.
+           - A PARTIAL lift is useless. Sweeping the strength 0..1, p99 hue error sits
+             at ~177 deg until it reaches exactly 1.0, then collapses to 35.3 - because
+             anything less is still clamped afterwards. It is a cliff, not a dial.
+
+           Cost is a slight shadow lift (1st-percentile luminance moves 0.6 to 2.9 of
+           255 on four of five references; the minimum stays at ~0). It does not wash
+           the blacks out.
+
+           This belongs to colorTransfer ONLY. colorAdjust must NOT use it: there,
+           going out of range is usually the user's intent (at Brightness -50, 89.9%
+           of pixels legitimately fall below zero) and lifting would neutralise the
+           slider. */
+        vec3 gamutLift(vec3 c){
+            c -= min(min(c.r, min(c.g, c.b)), 0.0);
+            c -= max(max(c.r, max(c.g, c.b)) - 1.0, 0.0);
+            return clamp(c, 0.0, 1.0);
+        }
+
         void main(){
             vec4 src = texture(u_texture, v_uv);
-            vec3 mapped = (src.rgb - u_meanA) * u_scale + u_meanB;
-            vec3 outc = clamp(mix(src.rgb, mapped, u_strength), 0.0, 1.0);
-            fragColor = vec4(outc, src.a);
+            vec3 lab = rgb2lab(src.rgb);
+            vec3 mapped = (lab - u_meanA) * u_scale + u_meanB;
+            fragColor = vec4(gamutLift(lab2rgb(mix(lab, mapped, u_strength))), src.a);
         }`,
 
     /* ---------- Animated tileable noise (Phase 0 spike) ----------
@@ -1517,5 +1667,173 @@ TRLE.Shaders = {
             // nothing landed keeps the output defined for any parameter set.
             vec3 outC = (wSqSum > 1e-6) ? mean + acc / sqrt(wSqSum) : mean;
             fragColor = vec4(clamp(outC, 0.0, 1.0), 1.0);
+        }`,
+
+    /* ================================================================
+       SPRITE NOISE BODY (SPRITE-PLAN phase 3), used by js/spritegen.js.
+       A DENSITY field for one sprite frame: periodic fBm (the same
+       classic periodic Perlin as animNoise, copied so animNoise's bytes
+       cannot move), shaped by a body silhouette whose edge the noise
+       roughens, then an erosion threshold that eats the thin parts first
+       (the standard age-driven smoke puff). Writes the density in RGB;
+       colour, background and the card-edge guard are applied on the CPU
+       so both sprite families share them.
+
+       Loop closure is exact by construction: the time and flow offsets
+       arrive already wrapped with fract() on the CPU side, so the frame
+       at t=1 is computed from the SAME inputs as t=0; and both offsets
+       are whole lattice periods apart from any other t, so the wrap is
+       invisible. EVERY uniform is passed on every call (blit leaves
+       uniforms set from the previous draw).
+       ================================================================ */
+    spriteNoise: `#version 300 es
+        precision highp float;
+        uniform float u_period;      // lattice cells across the card (integer)
+        uniform float u_timeZ;       // time along the lattice's z, already wrapped
+        uniform float u_timePeriod;  // z period (integer)
+        uniform vec2  u_shift;       // flow offset in lattice cells, already wrapped
+        uniform float u_octaves;
+        uniform float u_gain;
+        uniform float u_style;       // 0 fBm, 1 ridged, 2 billow
+        uniform float u_warp;
+        uniform float u_seed;
+        uniform float u_body;        // 0 round, 1 flame, 2 column, 3 cloud
+        uniform float u_scale;       // the frame's size factor
+        uniform float u_ragged;      // how far the noise pushes the silhouette
+        uniform float u_feather;     // silhouette edge softness
+        uniform float u_detail;      // 0 = flat body, 1 = fully noise-modulated
+        uniform float u_contrast;
+        uniform float u_erode;       // density below this burns away
+        uniform float u_erodeSoft;
+        uniform float u_bright;
+        in vec2 v_uv;
+        out vec4 fragColor;
+
+        vec3 mod289v3(vec3 x){ return x - floor(x * (1.0/289.0)) * 289.0; }
+        vec4 mod289v4(vec4 x){ return x - floor(x * (1.0/289.0)) * 289.0; }
+        vec4 permute(vec4 x){ return mod289v4(((x*34.0)+1.0)*x); }
+        vec4 taylorInvSqrt(vec4 r){ return 1.79284291400159 - 0.85373472095314 * r; }
+        vec3 fade(vec3 t){ return t*t*t*(t*(t*6.0-15.0)+10.0); }
+        // \`so\` offsets the HASH after the periodic wrap, not the position: an
+        // offset on the position is itself wrapped by \`rep\`, so a seed of
+        // floor(seed * 16) vanished on every period dividing 16 (measured:
+        // seeds 9 and 10 gave identical bytes). A constant on the hashed index
+        // keeps the period and changes every gradient.
+        float pnoise(vec3 P, vec3 rep, vec3 so){
+            vec3 Pi0 = mod(floor(P), rep);
+            vec3 Pi1 = mod(Pi0 + 1.0, rep);
+            Pi0 = mod289v3(Pi0 + so); Pi1 = mod289v3(Pi1 + so);
+            vec3 Pf0 = fract(P);
+            vec3 Pf1 = Pf0 - 1.0;
+            vec4 ix = vec4(Pi0.x, Pi1.x, Pi0.x, Pi1.x);
+            vec4 iy = vec4(Pi0.yy, Pi1.yy);
+            vec4 iz0 = Pi0.zzzz, iz1 = Pi1.zzzz;
+            vec4 ixy = permute(permute(ix) + iy);
+            vec4 ixy0 = permute(ixy + iz0);
+            vec4 ixy1 = permute(ixy + iz1);
+            vec4 gx0 = ixy0 * (1.0/7.0);
+            vec4 gy0 = fract(floor(gx0) * (1.0/7.0)) - 0.5;
+            gx0 = fract(gx0);
+            vec4 gz0 = vec4(0.5) - abs(gx0) - abs(gy0);
+            vec4 sz0 = step(gz0, vec4(0.0));
+            gx0 -= sz0 * (step(0.0, gx0) - 0.5);
+            gy0 -= sz0 * (step(0.0, gy0) - 0.5);
+            vec4 gx1 = ixy1 * (1.0/7.0);
+            vec4 gy1 = fract(floor(gx1) * (1.0/7.0)) - 0.5;
+            gx1 = fract(gx1);
+            vec4 gz1 = vec4(0.5) - abs(gx1) - abs(gy1);
+            vec4 sz1 = step(gz1, vec4(0.0));
+            gx1 -= sz1 * (step(0.0, gx1) - 0.5);
+            gy1 -= sz1 * (step(0.0, gy1) - 0.5);
+            vec3 g000 = vec3(gx0.x,gy0.x,gz0.x);
+            vec3 g100 = vec3(gx0.y,gy0.y,gz0.y);
+            vec3 g010 = vec3(gx0.z,gy0.z,gz0.z);
+            vec3 g110 = vec3(gx0.w,gy0.w,gz0.w);
+            vec3 g001 = vec3(gx1.x,gy1.x,gz1.x);
+            vec3 g101 = vec3(gx1.y,gy1.y,gz1.y);
+            vec3 g011 = vec3(gx1.z,gy1.z,gz1.z);
+            vec3 g111 = vec3(gx1.w,gy1.w,gz1.w);
+            vec4 norm0 = taylorInvSqrt(vec4(dot(g000,g000),dot(g010,g010),dot(g100,g100),dot(g110,g110)));
+            g000*=norm0.x; g010*=norm0.y; g100*=norm0.z; g110*=norm0.w;
+            vec4 norm1 = taylorInvSqrt(vec4(dot(g001,g001),dot(g011,g011),dot(g101,g101),dot(g111,g111)));
+            g001*=norm1.x; g011*=norm1.y; g101*=norm1.z; g111*=norm1.w;
+            float n000 = dot(g000, Pf0);
+            float n100 = dot(g100, vec3(Pf1.x, Pf0.yz));
+            float n010 = dot(g010, vec3(Pf0.x, Pf1.y, Pf0.z));
+            float n110 = dot(g110, vec3(Pf1.xy, Pf0.z));
+            float n001 = dot(g001, vec3(Pf0.xy, Pf1.z));
+            float n101 = dot(g101, vec3(Pf1.x, Pf0.y, Pf1.z));
+            float n011 = dot(g011, vec3(Pf0.x, Pf1.yz));
+            float n111 = dot(g111, Pf1);
+            vec3 f = fade(Pf0);
+            vec4 nz = mix(vec4(n000,n100,n010,n110), vec4(n001,n101,n011,n111), f.z);
+            vec2 nyz = mix(nz.xy, nz.zw, f.y);
+            return 2.2 * mix(nyz.x, nyz.y, f.x);
+        }
+        float shape(float n, int style){
+            if (style == 1) return 1.0 - abs(n);
+            if (style == 2) return abs(n);
+            return n * 0.5 + 0.5;
+        }
+        // fBm over lattice coordinates L (already in cells), periodic in x/y
+        // by u_period and in z by u_timePeriod.
+        float fbm(vec3 L, int style, vec3 so){
+            float amp = 0.5, sum = 0.0, norm = 0.0;
+            vec3 rep = vec3(u_period, u_period, u_timePeriod);
+            vec3 P = L;
+            for (int i = 0; i < 8; i++){
+                if (float(i) >= u_octaves) break;
+                sum  += amp * shape(pnoise(P, rep, so), style);
+                norm += amp;
+                P *= 2.0; rep *= 2.0; amp *= u_gain;
+            }
+            return sum / max(norm, 1e-4);
+        }
+
+        // Distance-like body coordinate: 1.0 on the silhouette, < 1 inside.
+        float bodyDist(vec2 p, int body){
+            if (body == 1) {                                   // flame: wide base, tapering tip
+                vec2 q = p - vec2(0.0, -0.35);
+                float taper = mix(1.0, 0.18, smoothstep(-0.45, 1.0, q.y));
+                return length(vec2(q.x / (0.5 * taper), q.y / (q.y > 0.0 ? 1.15 : 0.42)));
+            }
+            if (body == 2) {                                   // column: a rising plume
+                return length(vec2(p.x / 0.32, max(0.0, abs(p.y) - 0.45) / 0.35));
+            }
+            if (body == 3) {                                   // cloud: wide and low
+                return length(p * vec2(1.0 / 0.85, 1.0 / 0.5));
+            }
+            return length(p) / 0.72;                           // round puff
+        }
+
+        void main(){
+            int style = int(u_style + 0.5);
+            int body = int(u_body + 0.5);
+            // One hash offset per field, all from the seed.
+            vec3 so = mod(floor(u_seed) * vec3(7.0, 13.0, 29.0), 289.0);
+            vec3 L = vec3(v_uv * u_period + u_shift, u_timeZ);
+            if (u_warp > 0.0){
+                vec2 w = vec2(fbm(L, 0, so + vec3(31.0, 0.0, 0.0)) - 0.5,
+                              fbm(L, 0, so + vec3(0.0, 47.0, 0.0)) - 0.5);
+                L.xy += u_warp * 2.0 * w;
+            }
+            float n = fbm(L, style, so);
+            // Contrast about each style's own mean: billow sits low (~0.3) and
+            // ridged high (~0.7), so centring them on 0.5 emptied billow bodies
+            // and burned ridged ones to white.
+            float centre = style == 2 ? 0.3 : (style == 1 ? 0.7 : 0.5);
+            float nc = clamp((n - centre) * u_contrast + 0.5, 0.0, 1.0);
+
+            vec2 p = (v_uv * 2.0 - 1.0) / max(u_scale, 1e-3);
+            // The silhouette is roughed by its OWN plain fBm (mean 0.5 whatever
+            // the style), scaled up because fBm sits in a narrow band round 0.5;
+            // at Ragged 1 it tears tongues off the edge.
+            float ne = fbm(L, 0, so + vec3(71.0, 13.0, 5.0));
+            float d = bodyDist(p, body) - u_ragged * (ne - 0.5) * 3.0;
+            float mask = 1.0 - smoothstep(1.0 - max(u_feather, 0.01), 1.0, d);
+            float dens = mask * mix(1.0, nc, u_detail);
+            float v = dens * smoothstep(u_erode, u_erode + max(u_erodeSoft, 0.005), dens);
+            v = clamp(v * u_bright, 0.0, 1.0);
+            fragColor = vec4(v, v, v, 1.0);
         }`
 };

@@ -23,11 +23,25 @@ window.TRLE = window.TRLE || {};
 TRLE.AnimGen = (function () {
     'use strict';
 
-    /* Frame count: at least 2 (an animation needs two frames); the upper bound
+    /* Frame count: at least 2 (an animation needs two frames). The upper bound
        is a guard against runaway atlas size / memory — N frames become N atlas
-       tiles, so a high count at a large tileSize balloons the export. 64 is a
-       generous cap (e.g. 8×8 tiles) well past TRLE's typical 16-frame ranges. */
-    const LIMITS = { MIN_FRAMES: 2, MAX_FRAMES: 64, MIN_SIZE: 16, MAX_SIZE: 1024 };
+       tiles, so a high count at a large tileSize balloons the export.
+
+       128, and the number is NOT Tomb Engine's. The engine's cap is 256 and it
+       is hard (`std::array<AnimatedFrame, 256>` in AnimatedBuffer.h, with a
+       matching `AnimatedFrameUV AnimFrames[256]` in the shader constant
+       buffer), but two other things bind first:
+
+         - The PREVIEW regenerates every frame on each debounce tick. Measured
+           at the preview's worst size (256) with the heaviest presets, total
+           generateFrames time is linear in N: 16 frames 46-71 ms, 64 frames
+           173-186, 128 frames 343-364, 256 frames 665-701. The debounce is
+           trailing-edge, so that is one wait after you let go of a slider, not
+           a per-frame budget — but 0.7 s of it reads as a hang.
+         - 256 frames would consume the engine's WHOLE array, leaving no room
+           for a single `Repeat`. Half the array keeps that lever available,
+           and Repeat is the one that slows an animation for free. */
+    const LIMITS = { MIN_FRAMES: 2, MAX_FRAMES: 128, MIN_SIZE: 16, MAX_SIZE: 1024 };
 
     const DEFAULTS = {
         size: 256,
@@ -212,6 +226,17 @@ TRLE.AnimGen = (function () {
     /* Generate the full looping sequence. Returns an array of N canvases
        (tileSize²). Deterministic: same params → identical pixels. */
     function generateFrames(params) {
+        /* Two generators, one contract. `animNoise` makes a FIELD; the particle
+           generator makes discrete streaks, which fBm cannot do (see
+           js/animparticles.js). Dispatched here rather than at every call site so
+           refreshAnims, the modal preview and anAdd all route alike.
+
+           An ABSENT `generator` means 'noise', which is what makes every saved
+           project and all 28 existing presets load unchanged with no migration. */
+        if (params && params.generator === 'particles') {
+            if (!TRLE.AnimParticles) throw new Error('TRLE.AnimGen: particle generator unavailable');
+            return TRLE.AnimParticles.generateFrames(params);
+        }
         const E = TRLE.Engine;
         if (!E || !E.programs || !E.programs().animNoise) {
             throw new Error('TRLE.AnimGen: animNoise shader unavailable (is the engine initialised?)');
@@ -226,11 +251,18 @@ TRLE.AnimGen = (function () {
         const f = ssFactor(S, p.supersample);
         const R = S * f;
 
+        /* The glitch stage (js/animglitch.js) needs the noise as a VALUE, not a
+           colour: it mixes a collage in and corrupts after the ramp. So the
+           field is rendered through a mono ramp (which keeps Colour spread,
+           since u_equalize is gated on a ramp being bound) and the real ramp is
+           looked up on the CPU afterwards. Inactive = the original path. */
+        const glitch = !!(TRLE.AnimGlitch && TRLE.AnimGlitch.isActive(p.glitch));
         let rampTex = null;
-        if (p.palette && p.palette.length) {
+        if (glitch || (p.palette && p.palette.length)) {
             const gl = E.gl();
-            rampTex = E.createTextureFromImage(buildRampCanvas(p.palette, p.colorAdjust),
-                { wrap: gl.CLAMP_TO_EDGE, filter: gl.LINEAR });
+            const src = glitch ? buildRampCanvas([{ pos: 0, color: [0, 0, 0] }, { pos: 1, color: [255, 255, 255] }], null)
+                               : buildRampCanvas(p.palette, p.colorAdjust);
+            rampTex = E.createTextureFromImage(src, { wrap: gl.CLAMP_TO_EDGE, filter: gl.LINEAR });
         }
 
         const frames = [];
@@ -247,6 +279,13 @@ TRLE.AnimGen = (function () {
             }
         } finally {
             if (rampTex) E.deleteTexture(rampTex);
+        }
+        if (glitch) {
+            const pal = (p.palette && p.palette.length) ? p.palette
+                : [{ pos: 0, color: [0, 0, 0] }, { pos: 1, color: [255, 255, 255] }];
+            const ramp = buildRampCanvas(pal, p.colorAdjust).getContext('2d').getImageData(0, 0, 256, 1).data;
+            const values = frames.map(c => c.getContext('2d').getImageData(0, 0, S, S).data);
+            return TRLE.AnimGlitch.compose(values, S, ramp, p);
         }
         return frames;
     }
