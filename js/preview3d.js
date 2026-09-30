@@ -26,7 +26,14 @@ window.TRLE = window.TRLE || {};
 TRLE.Preview3D = (function () {
     'use strict';
 
-    const BABYLON_CDN  = 'https://cdn.babylonjs.com/babylon.js';
+    /* Pinned and hashed (SECURITY-PLAN phase 1). The unversioned
+       cdn.babylonjs.com/babylon.js floated: on 2026-09-30 it served a build that
+       matched no release. 9.28.0 is held on purpose, the author's call: Babylon
+       is not a faithful TEN preview anyway, so there is nothing to chase. The
+       hash matches Babylon's own cdn.babylonjs.com/v9.28.0 build byte for byte.
+       Bump version AND hash together, or the 3D preview refuses to load. */
+    const BABYLON_CDN  = 'https://cdn.jsdelivr.net/npm/babylonjs@9.28.0/babylon.js';
+    const BABYLON_SRI  = 'sha384-4Kbm3nj4VMzMufY0FYM9DactmO8CluLjEAe0W1BzVo7hlKEswOLkl46FLI6mxZmx';
     // Neutral studio IBL (prefiltered .env, ~200 KB) for image-based ambient +
     // reflections. Lazy-loaded alongside Babylon; preview-only, never exported.
     const IBL_ENV      = 'https://assets.babylonjs.com/environments/studio.env';
@@ -40,6 +47,7 @@ TRLE.Preview3D = (function () {
         _babylonPromise = new Promise((resolve, reject) => {
             const s = document.createElement('script');
             s.src = BABYLON_CDN; s.async = true;
+            s.integrity = BABYLON_SRI; s.crossOrigin = 'anonymous';
             s.onload  = () => window.BABYLON ? resolve(window.BABYLON) : reject(new Error('Babylon global missing'));
             s.onerror = () => { _babylonPromise = null; reject(new Error('Babylon failed to load')); };
             document.head.appendChild(s);

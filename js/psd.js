@@ -13,14 +13,14 @@
    2. BLOCKING. readPsd and writePsd are both synchronous and CPU-heavy, which
       collides with the hard "never encode/serialise on the main thread" rule in
       PERFORMANCE.md. A five-layer 4096² atlas is seconds of frozen UI. So the
-      work runs in a Worker built from a Blob URL that importScripts() the CDN
-      bundle. We exchange ImageData rather than canvases — ag-psd's `useImageData`
+      work runs in a Worker built from a Blob URL that fetches the CDN bundle
+      (hash-checked, see WORKER_SRC) and importScripts() the verified copy. We exchange ImageData rather than canvases — ag-psd's `useImageData`
       read option and its `imageData` layer field mean the worker never needs
       canvas support, and ImageData's backing buffer is transferable, so handing
       pixels across costs no copy.
 
    file:// gotcha (same family as the tutorial.js one): a blob: worker there gets
-   an opaque origin and importScripts() of an https: URL is blocked. So there is
+   an opaque origin and loading the https: bundle can fail. So there is
    a main-thread fallback that loads the bundle with a <script> tag and does the
    work inline. Slower and it janks, but it works when the tool is opened off
    disk instead of served.
@@ -32,6 +32,11 @@ TRLE.PSD = (function () {
 
     // Pinned. Do not float this to @latest — see header.
     const AG_PSD_CDN = 'https://cdn.jsdelivr.net/npm/ag-psd@31.0.2/dist/bundle.js';
+    /* And hashed (SECURITY-PLAN phase 2), on BOTH load paths: the worker's and the
+       main-thread fallback's. Hashing only one would be no protection, because a
+       worker that fails for any reason retries on the main thread. Bump the version
+       AND this hash together, or PSD import/export refuses to load. */
+    const AG_PSD_SRI = 'sha384-9dhx2Gx3cKvCuBJwLZxPUmqz77LqKJIAzYABzUhCaCPDK5Rz+CFt6/jeKu84tBA6';
 
     /* ---- File sniffing ---------------------------------------------------
        PSD's MIME type is as unreliable as TGA's (often empty, sometimes
@@ -45,9 +50,22 @@ TRLE.PSD = (function () {
     /* ---- Worker ----------------------------------------------------------
        Built from a Blob so there's no extra file to ship and no build step.
        One worker is reused for every job; jobs are tagged with an id because
-       nothing stops two imports overlapping. */
+       nothing stops two imports overlapping.
+
+       importScripts() cannot take an integrity hash, so the bundle is FETCHED with
+       one (the browser rejects a mismatch before any of it runs) and the verified
+       text is imported from a Blob URL. That makes loading asynchronous, so jobs
+       wait on `ready`, and a failure is POSTED back as `fatal`: a rejected promise
+       in a worker never reaches Worker.onerror, and the job would hang instead of
+       falling back. */
     const WORKER_SRC = `
-        importScripts(${JSON.stringify(AG_PSD_CDN)});
+        const ready = fetch(${JSON.stringify(AG_PSD_CDN)}, { integrity: ${JSON.stringify(AG_PSD_SRI)} })
+            .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+            .then(src => {
+                const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+                try { importScripts(url); } finally { URL.revokeObjectURL(url); }
+                initCanvas();
+            });
 
         // ag-psd only auto-wires its canvas factory when \`document\` exists, and
         // in a worker it doesn't — so readPsd's internal createImageData() throws
@@ -55,10 +73,12 @@ TRLE.PSD = (function () {
         // OffscreenCanvas + the ImageData constructor are the worker equivalents.
         // (Without this the worker "works" for writes and quietly never runs a
         // read, which is exactly the case the validator now pins down.)
-        self.agPsd.initializeCanvas(
-            (w, h) => new OffscreenCanvas(Math.max(1, w || 1), Math.max(1, h || 1)),
-            (w, h) => new ImageData(Math.max(1, w || 1), Math.max(1, h || 1))
-        );
+        function initCanvas() {
+            self.agPsd.initializeCanvas(
+                (w, h) => new OffscreenCanvas(Math.max(1, w || 1), Math.max(1, h || 1)),
+                (w, h) => new ImageData(Math.max(1, w || 1), Math.max(1, h || 1))
+            );
+        }
 
         // Flatten PSD groups into a plain list. Groups carry no pixels of their
         // own, so only leaves with imageData are worth returning.
@@ -86,6 +106,12 @@ TRLE.PSD = (function () {
 
         self.onmessage = function (e) {
             const msg = e.data;
+            ready.then(() => run(msg), err => self.postMessage({
+                id: msg.id, ok: false, fatal: true,
+                error: 'PSD library failed to load: ' + String(err && err.message || err)
+            }));
+        };
+        function run(msg) {
             try {
                 if (msg.op === 'read') {
                     const psd = self.agPsd.readPsd(msg.buffer, {
@@ -124,7 +150,7 @@ TRLE.PSD = (function () {
             } catch (err) {
                 self.postMessage({ id: msg.id, ok: false, error: String(err && err.message || err) });
             }
-        };
+        }
     `;
 
     let _worker = null;          // live Worker, or null if unavailable/failed
@@ -140,12 +166,16 @@ TRLE.PSD = (function () {
             _worker = new Worker(url);
             URL.revokeObjectURL(url);
             _worker.onmessage = (e) => {
+                // The library never loaded (hash mismatch, offline, file://): retire
+                // the worker so every waiting job falls back to the main thread.
+                if (e.data.fatal) { killWorker(new Error(e.data.error)); return; }
                 const job = _jobs.get(e.data.id);
                 if (!job) return;
                 _jobs.delete(e.data.id);
                 e.data.ok ? job.resolve(e.data.result) : job.reject(new Error(e.data.error));
             };
-            // importScripts failing (file://, offline, CDN down) surfaces here.
+            // A worker that cannot even start surfaces here; a library that fails
+            // to load arrives as a `fatal` message instead (see WORKER_SRC).
             _worker.onerror = () => { killWorker(new Error('PSD worker failed to start')); };
             return _worker;
         } catch (err) {
@@ -181,6 +211,7 @@ TRLE.PSD = (function () {
         _scriptPromise = new Promise((resolve, reject) => {
             const s = document.createElement('script');
             s.src = AG_PSD_CDN; s.async = true;
+            s.integrity = AG_PSD_SRI; s.crossOrigin = 'anonymous';
             s.onload  = () => window.agPsd ? resolve(window.agPsd) : reject(new Error('ag-psd global missing'));
             s.onerror = () => { _scriptPromise = null; reject(new Error('Could not load the PSD library — check your connection.')); };
             document.head.appendChild(s);

@@ -4442,7 +4442,11 @@
 <canvas id="gl-canvas" style="display:none;"></canvas>
 
 <!-- ============ SCRIPTS ============ -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<!-- Pinned and hashed (SECURITY-PLAN phase 1): the hash is cdnjs's own published
+     SRI for 3.10.1, so a tampered file refuses to run. Bump version AND hash together. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"
+        integrity="sha512-XMVd28F1oH/O71fzwBnV7HucLxVwtxf26XV8P4wPk26EDxuGZ91N8bsOttmnomcCD3CS5ZMRL50H0GgOHvegtg=="
+        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 <!-- ag-psd is NOT loaded here: it is ~172 KB over the wire and most sessions
      never touch a PSD. js/psd.js pulls it on first use (and in a worker). -->
 <script src="js/psd.js"></script>

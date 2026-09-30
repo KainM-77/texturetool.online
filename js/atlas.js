@@ -22426,6 +22426,24 @@ window.TRLE = window.TRLE || {};
         return new Promise(res => { const i = new Image(); i.onload = () => res(i); i.onerror = () => res(null); i.src = src; });
     }
 
+    /* A project file is data someone may have sent you, so its image fields are
+       only ever what the tool itself writes: an embedded data:image URL (saved
+       files) or a Blob (the autosave). Anything else, a web address, a relative
+       path, a javascript: string, would make the browser fetch it on open, which
+       tells whoever wrote the file that you opened it and from where. Rejected
+       sources are treated as missing and counted, so applyProject can say so
+       once. (SECURITY-PLAN phase 3.) */
+    function projImageSrc(v, tally) {
+        if (v == null || v === '') return null;
+        if (v instanceof Blob || (typeof v === 'string' && /^data:image\//i.test(v))) return v;
+        tally.skipped++;
+        return null;
+    }
+    // A layer colour lands in style.background, where url(...) would fetch too.
+    function projHexColor(v, fallback) {
+        return typeof v === 'string' && /^#[0-9a-f]{6}$/i.test(v) ? v : fallback;
+    }
+
     /* PNG-encode a canvas to a data URL *without* blocking the main thread.
        toDataURL() encodes synchronously, so a 64-tile atlas froze the UI for the
        whole save; toBlob() hands the encode off and FileReader does the base64
@@ -22606,6 +22624,8 @@ window.TRLE = window.TRLE || {};
         }
         const S = proj.tileSize;
         const els = [];
+        const tally = { skipped: 0 };
+        const loadImg = async v => { const src = projImageSrc(v, tally); return src ? loadImageURL(src) : null; };
         for (const e of proj.elements) {
             const el = {
                 id: e.id, kind: e.kind,
@@ -22629,18 +22649,18 @@ window.TRLE = window.TRLE || {};
                 hgParams: e.hgParams ? Object.assign({}, e.hgParams, { mask: null }) : null,
                 original: null, canvas: null
             };
-            if (e.customMask) { const im = await loadImageURL(e.customMask); if (im) el.customMask = imgToCanvas(im); }
-            if (e.pushHand) { const im = await loadImageURL(e.pushHand); if (im) el.pushHandPx = imgToCanvas(im); }
+            if (e.customMask) { const im = await loadImg(e.customMask); if (im) el.customMask = imgToCanvas(im); }
+            if (e.pushHand) { const im = await loadImg(e.pushHand); if (im) el.pushHandPx = imgToCanvas(im); }
             if (e.hgParams && e.hgParams.mask) {
-                const im = await loadImageURL(e.hgParams.mask);
+                const im = await loadImg(e.hgParams.mask);
                 if (im) el.hgParams.mask = imgToCanvas(im);
             }
-            if (e.emissive) { const im = await loadImageURL(e.emissive); if (im) el.emissive = imgToCanvas(im); }
+            if (e.emissive) { const im = await loadImg(e.emissive); if (im) el.emissive = imgToCanvas(im); }
             if (e.importedMaps) {
                 const bag = {};
                 for (const mt of TRLE.MapOrder) {
                     if (!e.importedMaps[mt]) continue;
-                    const im = await loadImageURL(e.importedMaps[mt]);
+                    const im = await loadImg(e.importedMaps[mt]);
                     if (im) bag[mt] = imgToCanvas(im);
                 }
                 if (Object.keys(bag).length) el.importedMaps = bag;
@@ -22648,14 +22668,17 @@ window.TRLE = window.TRLE || {};
             if (Array.isArray(e.matLayers)) {
                 el.matLayers = [];
                 for (const L of e.matLayers) {
-                    const mask = L.mask ? imgToCanvas(await loadImageURL(L.mask)) : null;
-                    el.matLayers.push({ name: L.name, color: L.color, feather: L.feather || 0, material: L.material || null, mask });
+                    // imgToCanvas(null) throws, and a mask can now be rejected (or fail to decode).
+                    const im = L.mask ? await loadImg(L.mask) : null;
+                    const mask = im ? imgToCanvas(im) : null;
+                    const color = projHexColor(L.color, MM_COLORS[el.matLayers.length % MM_COLORS.length]);
+                    el.matLayers.push({ name: L.name, color, feather: L.feather || 0, material: L.material || null, mask });
                 }
             }
             if (e.kind === 'tile') {
-                const oim = await loadImageURL(e.original);
+                const oim = await loadImg(e.original);
                 el.original = oim ? imgToCanvas(oim) : blankCanvas(S);
-                const cim = e.canvas ? await loadImageURL(e.canvas) : null;
+                const cim = e.canvas ? await loadImg(e.canvas) : null;
                 el.canvas = cim ? imgToCanvas(cim) : cloneCanvas(el.original);
             } else {
                 el.canvas = blankCanvas(S);   // recomputed by refreshTransitions
@@ -22688,6 +22711,11 @@ window.TRLE = window.TRLE || {};
         collapseUploadCard(`${els.length} elements · click to start a different atlas`);
         renderGrid();
         resetHistory('Project loaded');
+        if (tally.skipped) {
+            const n = tally.skipped;
+            showToast(`${n} image${n === 1 ? '' : 's'} in this project pointed outside the file and `
+                + `${n === 1 ? 'was' : 'were'} skipped. Everything else loaded.`, 'warning');
+        }
         return true;
     }
 
@@ -23924,7 +23952,7 @@ window.TRLE = window.TRLE || {};
             drawLastBrush() { return draw.lastStroke ? JSON.parse(JSON.stringify(draw.lastStroke.brush)) : null; },
             // test-only (2c.3): Make Height Map's recipe on a tile, as that modal leaves it.
             setHgParams(i, p) { const el = state.elements[i]; if (!el) return false; el.hgParams = p; return true; },
-            matLayersOf(i) { const el = state.elements[i]; return el && Array.isArray(el.matLayers) ? el.matLayers.map(L => ({ name: L.name, material: L.material, hasMask: !!L.mask })) : null; },
+            matLayersOf(i) { const el = state.elements[i]; return el && Array.isArray(el.matLayers) ? el.matLayers.map(L => ({ name: L.name, material: L.material, hasMask: !!L.mask, color: L.color })) : null; },
             drawCompPx(x, y) { if (!draw.comp) return null; drawCompose(); return [...draw.comp.getContext('2d').getImageData(x, y, 1, 1).data]; },
             tilePx(i, x, y) { const el = state.elements[i]; return el ? [...el.canvas.getContext('2d').getImageData(x, y, 1, 1).data] : null; },
             drawResetRenderTimes() { draw.renderMs = []; },
