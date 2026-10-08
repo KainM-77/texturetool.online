@@ -285,7 +285,8 @@ TRLE.DemoRunner = (function () {
                the clipping box, not flush against its edge. */
             async reveal(sel, block) {
                 const d = doc();
-                const el = d && d.querySelector(sel);
+                let el = d && d.querySelector(sel);
+                if (el && el._tp && el._tp.trigger) el = el._tp.trigger;   // a wrapped select scrolls its trigger (D9)
                 if (!el || !el.scrollIntoView) return false;
                 el.scrollIntoView({ block: block || 'center', inline: 'nearest' });
                 await sleep(reduced() ? 60 : 260);

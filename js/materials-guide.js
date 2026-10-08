@@ -139,7 +139,9 @@
                 ['AO Intensity', 'how dark the crevices get.'],
                 ['AO Depth', 'the hard limit on how far AO is allowed to darken. At the default 0.5 a crevice bottoms out at mid-grey no matter how high Intensity goes, which keeps AO from crushing dark textures to black. Raise it for real contact shadow, drop it toward 0 for flat stylised shading.'],
                 ['AO Curve', 'the shape of the falloff between exposed and occluded. Lower values shade the mid-tones harder, so more of the surface picks up some shadow instead of just the deepest pockets.'],
-                ['AO Normal Mix', 'blends in the normal map’s shape so the AO hugs the relief more closely.']
+                ['AO Normal Mix', 'blends in the normal map’s shape so the AO hugs the relief more closely.'],
+                ['Crevice Shadow', 'darkens narrow cracks and joints on top of the AO above (each built-in material starts with an amount that suits it, Dramatic a little stronger and Fantasy softer), read from how far each spot sits below its neighbours. In Tomb Engine, AO dims highlights and glow as well as ambient light, so keep it gentle: 20 to 40%. It matters most on a material with a height map, where the engine switches SSAO off and this is the only fine shading left.'],
+                ['Crevice Size', 'how wide a dip counts as a crevice, 1 to 16 px. Crevice Roughness and Edge Shine use it too.']
             ],
             tuning: [
                 ['Bricks / cobble / stone walls', 'high Radius and Intensity (around 16 and 22) so the joints read nice and deep.'],
@@ -152,7 +154,7 @@
         {
             id: 'tiers', icon: '🗂️', title: 'Preset tiers (Realistic, Dramatic, Fantasy)',
             what: `The material picker has a second dropdown next to the preset list. It re-cuts the same solid materials three ways. <strong>Stone</strong> is still stone in all three; what changes is how hard the generated maps push.`,
-            derive: `<strong>📷 Realistic</strong> is the default and the safe choice for TR-style texture packs. <strong>🗿 Dramatic</strong> deepens the crevice shadows and strengthens the relief for a weathered, Elder-Scrolls-ish read. <strong>✨ Fantasy</strong> goes the other way: soft relief, flat shading, a brighter sheen, and a little glow on the precious materials, for a stylised pastel look.<br><br>Each tier scales off how much relief a material actually has, so <em>Stone</em> and <em>Bark</em> shift a lot between tiers while <em>Glass</em> and <em>Chrome</em> barely move. Every material appears in every tier even when the difference is tiny, so you can switch tier without losing your material.`,
+            derive: `<strong>📷 Realistic</strong> is the default and the safe choice for TR-style texture packs. <strong>🗿 Dramatic</strong> deepens the crevice shadows and strengthens the normals, AO and crevice shading for a weathered, Elder-Scrolls-ish read. <strong>✨ Fantasy</strong> goes the other way: soft relief, flat shading, a brighter sheen, and a little glow on the precious materials, for a stylised pastel look.<br><br>Each tier scales off how much relief a material actually has, so <em>Stone</em> and <em>Bark</em> shift a lot between tiers while <em>Glass</em> and <em>Chrome</em> barely move. Every material appears in every tier even when the difference is tiny, so you can switch tier without losing your material.`,
             slidersTitle: 'The tiers',
             tuningTitle: 'Good to know',
             sliders: [
@@ -174,7 +176,8 @@
             derive: `It’s built from the preset’s <strong>Specular Base</strong> (the overall shininess) plus <strong>Specular Contrast</strong> (how much the texture’s own detail brightens or dulls the highlight, so a glaze reads brighter than the mortar around it).`,
             sliders: [
                 ['Specular Base', 'overall reflectivity, and the map’s actual average. Metals and glass sit high (130 to 180), stone, fabric and sand sit low (30 to 55).'],
-                ['Specular Contrast', 'how much the surface detail varies the shine across the tile. The swing is symmetric around the Base: smooth areas go brighter, busy areas go duller, by the same amount either way. Turn it up and the highlight follows the texture more closely.']
+                ['Specular Contrast', 'how much the surface detail varies the shine across the tile. The swing is symmetric around the Base: smooth areas go brighter, busy areas go duller, by the same amount either way. Turn it up and the highlight follows the texture more closely.'],
+                ['Edge Shine', 'brightens the highlight on raised edges, the way worn corners catch the light. Keep it low on a reflective material, where specular also sets how much of the reflection shows.']
             ],
             tuning: [
                 ['Metals (chrome, gold, steel)', 'Base high, 150 to 180.'],
@@ -190,7 +193,8 @@
             derive: `It comes from <strong>Roughness Base</strong> (the overall level) and <strong>Roughness Contrast</strong> (how much local texture detail roughens or smooths it, so scratches read rougher than the base metal).`,
             sliders: [
                 ['Roughness Base', '0 is a mirror, 255 is dead matte.'],
-                ['Roughness Contrast', 'how much the texture’s detail varies roughness locally.']
+                ['Roughness Contrast', 'how much the texture’s detail varies roughness locally.'],
+                ['Crevice Roughness', 'makes cracks and joints rougher than the surface around them, like dust and grime settled in the gaps.']
             ],
             tuning: [
                 ['Chrome / glass / mercury / still water', 'near 0 to 15, basically a mirror.'],
@@ -215,6 +219,22 @@
                 ['Sand / fabric / smooth surfaces', 'low. There’s barely any real relief, and parallax on fine noise makes the surface look like it’s swimming.']
             ],
             tip: `Height costs more than framerate. It is GPU-heavy, and it also switches <strong>SSAO off</strong> for that material and disables <strong>decals</strong>, bullet holes, explosion marks, on it. Use it on a handful of hero textures per level rather than the whole atlas. Leave <strong>Fade height edges to white</strong> ticked: parallax marches the UV out of the texture's own box in the atlas page, and a white border is what stops the black bars along texture edges. For per-texture control of the fade, and a preview of the real in-engine shader, use <strong>🏔️ Make Height Map</strong> from the right-click menu.`
+        },
+        {
+            id: 'bands', icon: '🎚️', title: 'Relief detail bands (detail by size)',
+            what: `A texture's brightness mixes detail of every size: grain a pixel wide, cracks a few pixels wide, whole bricks, and broad shading from the light in the photo. The <strong>Relief detail bands</strong> split the relief into six sizes, from about 1 px to about 32 px, so you can turn each one up or down. They shape the normal, AO and height maps together, so the three keep agreeing. Roughness and specular read the surface finish, and the bands leave them alone.`,
+            derive: `The tool blurs the grey version of your texture six times, each blur twice as wide as the last, and takes the difference between two neighbouring blurs as one band. Each band is multiplied by its slider, then they're added back up. At 100% everywhere you get the original back exactly. Built-in materials now start from a band setting that suits them (bold shapes for brick, cracks and grooves for stone, fine detail for grass), and a material you have tweaked or saved keeps its own six numbers.`,
+            sliders: [
+                ['The picker beside the heading', 'six starting points: Neutral, Fine detail, Cracks &amp; grooves, Bold shapes, Soft and Ignore broad shading. Picking one sets the six sliders. Move a slider yourself and it reads Custom.'],
+                ['Detail 1 px to Detail 32 px', 'one gain per size, 0% to 300%. 100% leaves that size as it is, 0% removes it, 200% doubles it.']
+            ],
+            tuning: [
+                ['Photos with baked light', '<strong>Ignore broad shading</strong> cuts the 16 and 32 px bands, so a shadow or a bright patch in the photo stops reading as a slope.'],
+                ['Grout, mortar, carved lines', '<strong>Cracks &amp; grooves</strong> lifts the 2 to 4 px bands, where thin lines live.'],
+                ['Bricks, cobbles, planks', '<strong>Bold shapes</strong> favours the 8 to 32 px bands, so each stone reads as one block rather than a field of speckle.'],
+                ['Sand, grass, fabric', '<strong>Fine detail</strong> lifts the 1 and 2 px grain. If that turns noisy, try <strong>Soft</strong>.']
+            ],
+            tip: `They live at the bottom of <strong>Set Material</strong>'s <strong>Advanced editor</strong>. Watch the lit preview and the Height thumbnail while you drag: boosting the large bands deepens the parallax too. A very high value can clip the height map to pure black or white, so if a boost stops changing anything, back it off.`
         },
         {
             id: 'transparency', icon: '🕳️', title: 'Cutouts: what the maps do inside a hole',

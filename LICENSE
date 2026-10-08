@@ -10,6 +10,10 @@ TombEngine's own licence: Modified MIT, FOR NON-COMMERCIAL USE ONLY. Its terms
 are in `AtlasTool/ten/LICENSE` and what is in it is described in
 `AtlasTool/ten/README.md`.
 
+Separately from the code, `AtlasTool/Examples/Karnak/` holds nine 64 px tiles of Core Design /
+Eidos artwork (Tomb Raider: The Last Revelation). They are test images, not code, and they are not
+licensed under these terms; see `AtlasTool/Examples/Karnak/README.md`.
+
 The boundary is physical so that it can be checked by looking at a path. Nothing
 outside that directory depends on it, and the Room View preview it serves is the
 only feature that loads it. `AtlasTool/js/engine.js`, `js/shaders.js` and

@@ -381,7 +381,11 @@
         if (!d || !w) return null;
         let r = null;
         if (typeof spec === 'string') {
-            const el = d.querySelector(spec);
+            let el = d.querySelector(spec);
+            /* A select wrapped by attachTilePicker is hidden behind its trigger
+               (HOVER-PREVIEW-PLAN D9): point at what the user sees, so a lesson can
+               keep naming the select. */
+            if (el && el._tp && el._tp.trigger) el = el._tp.trigger;
             if (!el || !el.getBoundingClientRect) return null;
             if (el.checkVisibility && !el.checkVisibility()) return null;
             r = visibleRect(el, w);

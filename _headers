@@ -1,0 +1,16 @@
+# Response headers for texturetool.online: the ONE place the security headers live.
+# Netlify reads this from the published folder (build-public-export.sh copies it), and
+# both server.py files send the same lines locally, so the dev server, the validator
+# suite and the live site all run one policy (docs/SECURITY-PLAN.md, phases 6 and 7).
+#
+# Format (Netlify's): a path line, then indented `Name: value` lines, one value per line.
+# Only the `/*` block is honoured outside Netlify; validate-csp.mjs asserts it is the only one.
+#
+# A NEW EXTERNAL HOST (another CDN, an asset from a new domain) must be added to the
+# Content-Security-Policy below, or that feature is blocked: locally first, since the dev
+# server sends this too. validate-csp.mjs drives every feature that loads something.
+/*
+  Content-Security-Policy-Report-Only: default-src 'self'; script-src 'self' blob: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; worker-src 'self' blob:; connect-src 'self' https://cdn.jsdelivr.net https://assets.babylonjs.com; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; media-src 'self'; frame-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'self'; object-src 'none'
+  X-Frame-Options: SAMEORIGIN
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin

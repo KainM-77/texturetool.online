@@ -41,6 +41,10 @@ TRLE.Store = (() => {
        by useSlot for the same reason the session is: demo.html frames the tool
        and a frame shares its parent's origin. */
     let KEY_ROOMVIEW = 'roomview';
+    /* Work in a folder (FOLDER-SYNC-PLAN D9): the linked directory handle and what was
+       pinned with it. A record of its own, never inside the session, so the project
+       format and the crash net are untouched; slot-namespaced like the rest. */
+    let KEY_FOLDER = 'folder';
 
     /* Point every read and write at a different record. Call before anything else
        touches storage; `null`/'session' restores the real slot. */
@@ -49,9 +53,10 @@ TRLE.Store = (() => {
         KEY_SESSION = slot ? `${slot}-session` : 'session';
         KEY_META = slot ? `${slot}-session-meta` : 'session-meta';
         KEY_ROOMVIEW = slot ? `${slot}-roomview` : 'roomview';
-        return { session: KEY_SESSION, meta: KEY_META, roomview: KEY_ROOMVIEW };
+        KEY_FOLDER = slot ? `${slot}-folder` : 'folder';
+        return { session: KEY_SESSION, meta: KEY_META, roomview: KEY_ROOMVIEW, folder: KEY_FOLDER };
     }
-    function currentSlot() { return { session: KEY_SESSION, meta: KEY_META, roomview: KEY_ROOMVIEW }; }
+    function currentSlot() { return { session: KEY_SESSION, meta: KEY_META, roomview: KEY_ROOMVIEW, folder: KEY_FOLDER }; }
 
     let dbPromise = null;
     let broken = false;   // a failed open stays failed; don't retry every save
@@ -175,7 +180,19 @@ TRLE.Store = (() => {
         });
     }
 
+    /* ---- Linked working folder (FOLDER-SYNC-PLAN D9) ----
+       A FileSystemDirectoryHandle structured-clones into IndexedDB; the record is
+       { handle, baseName, ext, writtenAt, names }. */
+    async function saveFolder(rec) {
+        return await tx('readwrite', (store, set) => { store.put(rec, KEY_FOLDER); set(true); }) === true;
+    }
+    const loadFolder = () => tx('readonly', (store, set) => {
+        const r = store.get(KEY_FOLDER);
+        r.onsuccess = () => set(r.result || null);
+    }, null);
+    const clearFolder = () => tx('readwrite', (store, set) => { store.delete(KEY_FOLDER); set(true); }, false);
+
     return { available, isPersisted, requestPersistence, estimate, saveSession, loadSession, sessionMeta, clearSession,
-             saveRoomView, loadRoomView,
+             saveRoomView, loadRoomView, saveFolder, loadFolder, clearFolder,
              useSlot, currentSlot };
 })();

@@ -33,6 +33,7 @@
     /* before/after → expects `${name}-before.png` + `${name}-after.png` */
     const SECTIONS = [
         {
+            group: 'Basics',
             id: 'getting-started', icon: '🏁', title: 'Getting started',
             what: 'Every project is an <em>atlas</em>, a grid of equal-size tiles. The start screen gives you three ways in: <strong>Upload an atlas</strong>, <strong>Create a new atlas</strong>, or <strong>Load existing atlas project</strong> if you have been here before.',
             how: [
@@ -65,7 +66,8 @@
                 '<strong>Replace Image</strong> (right-click) swaps a tile’s texture; <strong>Reset to Original</strong> reverts it.',
                 'Remove a tile with right-click → <strong>Delete…</strong> (or press <strong>Delete</strong> on a focused tile), which leaves its slot empty; to clear several at once, select them (see below) and hit <strong>Delete</strong> on the bulk bar.',
                 '<strong>👁️ Preview atlas</strong>, on the right of the Layout row, swaps the tiles for the stitched sheet exactly as it exports: same slots, same columns, no gaps or badges, with <strong>Magenta key</strong> beside it for the transparent parts. <strong>▦ Back to tiles</strong>, or Esc, returns to the grid.',
-                '<strong>Undo</strong> / <strong>Redo</strong> sit in the grid header (<strong>Ctrl/Cmd+Z</strong>, <strong>Ctrl/Cmd+Shift+Z</strong>); the <strong>History</strong> panel on the right lists every step, click one to jump back.'
+                '<strong>Undo</strong> / <strong>Redo</strong> sit in the grid header (<strong>Ctrl/Cmd+Z</strong>, <strong>Ctrl/Cmd+Shift+Z</strong>); the <strong>History</strong> panel on the right lists every step, click one to jump back.',
+                'Many dropdowns in the tools preview as you hover. Rest the pointer on an option, or arrow through the list, and the preview shows it applied; move off the list and it goes back, click to keep it. Pressing <strong>Apply</strong> or <strong>Add</strong> always uses the option you had picked, never the one under the pointer.'
             ],
             tip: 'Deleting a tile that other transitions are built on also removes those transitions (you’re warned first, and it’s fully undoable). Older projects may hold black spacer tiles from before empty slots existed; they stay black tiles and ship in the export, and new sets no longer make them. Status messages appear in the log on the left.'
         },
@@ -73,8 +75,8 @@
             id: 'batch-select', icon: '☑️', title: 'Select & batch-edit tiles',
             what: 'Work on many tiles at once, like selecting icons on a desktop. Pick a group of tiles and a <strong>bulk-action bar</strong> appears so you can material, reorder, group or delete them together.',
             how: [
-                '<strong>Click</strong> a tile to select it; <strong>Ctrl/Cmd+click</strong> to add or remove individual tiles; <strong>Shift+click</strong> to select a whole range.',
-                '<strong>Drag a box</strong> across the grid background to rubber-band several tiles at once. <strong>Ctrl/Cmd+A</strong> selects everything; <strong>Esc</strong> clears.',
+                '<strong>Click</strong> a tile to select it; <strong>Ctrl/Cmd+click</strong> to add or remove individual tiles; <strong>Shift+click</strong> to select a run in atlas order.',
+                '<strong>Drag a box</strong> from any empty spot in the grid card (gaps, empty slots, the space below the last row) to select every tile it touches. <strong>Ctrl/Cmd+A</strong> selects everything; <strong>Esc</strong> clears.',
                 'With 2+ selected, use the bar: <strong>🎨 Apply Material</strong> (set one material on all of them, saved ⭐ presets included), <strong>🔗 Group</strong> (tie them together so they move as one piece; Ctrl/Cmd+G), <strong>⏮ To front</strong> / <strong>To back ⏭</strong> (the first or last occupied slots; empty slots stay put), or <strong>🗑️ Delete</strong>. The bar sticks below the header, so it stays reachable while you scroll a tall atlas.',
                 '<strong>Drag</strong> any selected tile and the whole selection moves with it, keeping its shape. A group made with <strong>🔗 Group</strong> or <strong>Ctrl/Cmd+G</strong> (or right-click → <strong>Group</strong>) does the same without a selection, until you ungroup it. A tile can be in one group at a time.',
                 '<strong>Right-clicking any selected tile</strong> works on the whole selection. Any menu entry that can run on several tiles says so, it reads <em>“· N tiles”</em> and applies to all of them: <strong>Set Material</strong>, <strong>Adjust Colours</strong> (in its Simple and Channel levels modes), <strong>Recolor from Texture</strong>, <strong>De-light</strong>, <strong>Surface Noise</strong>, <strong>Make Seamless</strong>, the four <strong>Transform</strong> entries, <strong>Download PNG</strong> and <strong>Reset to Original</strong>. Right-clicking a tile <em>outside</em> the selection drops back to that one tile.',
@@ -84,6 +86,32 @@
             tip: 'A batch modal shows the settings on one tile and applies them to all of them, so tune against the preview then hit Apply once. <strong>Recolor</strong> adds a choice for this: <em>Match each tile to the reference</em> measures every tile separately so they all land on the reference’s tone (good for making mismatched textures sit together), while <em>Apply the same shift to every tile</em> keeps deliberate variants apart. <strong>Apply Material</strong> skips transition tiles (they inherit from their sources). Everything here is one undo step.'
         },
         {
+            group: 'Layers',
+            id: 'layers', icon: '🗂', title: 'Layers (every edit stays editable)',
+            what: 'Every edit you make to a tile is kept as a <em>layer</em>: the text you typed, a colour grade, the noise, a drawing. Each one stays separate, so you can reopen it, hide it or delete it later without redoing the rest. The <strong>Layers</strong> panel in the left rail lists them for the selected tile.',
+            how: [
+                'Select a tile. The <strong>Layers</strong> panel shows what has been done to it. Where the side rails are hidden (a narrow window), right-click → <strong>🗂 Layers…</strong> opens the same list.',
+                'Layers sit in three groups. <strong>Text and drawings</strong> sit on top of the picture. <strong>Picture edits</strong> (Adjust Colours, Recolor, De-light, Surface Noise, Heal, Make Seamless, Slope Blur, Scatter, HD Look) change the texture itself and start underneath the lettering, so a colour grade leaves your text alone. <strong>Finish</strong> (Fade to Transparent, Classic Look) starts last, over everything. The tool puts each layer in its group; you can then move a picture edit or a Finish layer over or under the text (below). HD Look is the exception: it always stays under the text, so it never blurs the lettering.',
+                'The <strong>Original</strong> at the bottom is the picture under all the layers. Delete every layer and the tile shows just that.',
+                'Click a layer to reopen the tool that made it, with its settings as you left them. <strong>Apply</strong> replaces that layer. Right-click → <strong>Edit Text…</strong> or <strong>Edit Drawing…</strong> does the same from the tile.',
+                'The 👁 at the left end of a row hides that layer and the tile redraws without it; click it again to bring the layer back. The 🗑 (it shows when you point at a row) deletes the layer from this tile. Both are one <strong>Undo</strong>.',
+                'Drag a row by its ⠿ grip. Text and drawings move above or below each other. A picture edit or a Finish layer moves over or under the text and drawings: drop it on the other side of the <strong>Text and drawings</strong> group, or click its ↑ or ↓. Over the text, a grade tints the lettering too. With several tiles selected the move happens on each of them; with one selected, only on that tile. A tile with no text or drawing has nothing to move over.',
+                'Right-click a group, or click the ⋯ in its corner, to act on the whole group. <strong>Picture edits</strong> move over the text and drawings together, and <strong>Finish</strong> moves under them. <strong>Flatten into the Original…</strong> bakes the group, and every group under it, into the <strong>Original</strong>. The tile looks the same and exports the same maps (the lettering keeps its material, relief and glow), but those layers can no longer be reopened, hidden or moved. It asks first, deletes any hidden layer in the group, and <strong>Undo</strong> brings the layers back.',
+                'Some tools keep <em>one</em> layer per tile: <strong>Adjust Colours</strong>, <strong>Recolor</strong>, <strong>De-light</strong>, <strong>Classic Look</strong>, <strong>HD Look</strong> and <strong>Make Seamless</strong>. Applying one again edits that layer. The others add a new layer each time. A batch is one layer shared by every tile it was applied to, and editing it from any of them updates all of them.',
+                '<strong>Fade to Transparent</strong> and <strong>Classic Look</strong> show <strong>Include the text and drawings</strong> on a tile that has lettering or drawings. Ticked, they cover the lettering too. Unticked, they work on the picture under it and the lettering stays crisp. Moving the layer in the panel changes the same thing.',
+                'Text and Draw have a <strong>✨ Layer effects</strong> panel: <strong>Drop shadow</strong>, <strong>Inner shadow</strong>, <strong>Outer glow</strong>, <strong>Inner glow</strong>, <strong>Stroke</strong> and <strong>Colour overlay</strong>. On both glows, <strong>Also glow in game</strong> adds that glow to the tile’s emissive map as well, only where the glow is, and Apply ticks the <strong>Emissive</strong> export map so it ships.',
+                'Rotate, Flip, Offset, Free Transform, Perspective and Distort move the layers with the tile. Lettering stays editable after a turn. <strong>Displace by a tile</strong> in Distort is the exception: it turns text and drawings into plain paint, which you can still hide or delete.',
+                'A <strong>Settings, no pixels</strong> section (Material, Height map, Glow) appears once the tile has one of them. Those change the maps and leave the picture alone.'
+            ],
+            before: 'layers',
+            beforeLabel: 'A brick tile',
+            afterLabel: 'Adjust Colours, then EXIT with an Outer Glow',
+            figure: 'layers-panel',
+            figureCaption: 'The Layers panel for that tile: two layers over the original.',
+            tip: '<strong>Reset to Original</strong> removes every layer on the tile. <strong>Distort</strong> driven by another tile turns text and drawings into plain pixels, so they cannot be edited afterwards. A saved project keeps its layers; an older build of the tool shows the picture without them.'
+        },
+        {
+            group: 'Tools',
             id: 'seamless', icon: '🔄', title: 'Make Seamless',
             what: 'Removes the visible seam when a texture is tiled, so it repeats cleanly across a surface.',
             how: ['<strong>Right-click</strong> a tile → <strong>Make Seamless</strong>.', 'Pick a method (<strong>Scattered edges</strong> is the all-rounder) and the blend radius.', 'Click <strong>Save to Atlas</strong>, the tile updates in place and any transitions using it refresh.'],
@@ -232,8 +260,31 @@
         },
         {
             id: 'transforms', icon: '↻', title: 'Transforms',
-            what: 'Quick per-tile geometry: rotate 90°, flip, or offset (roll) to move seams to the centre for healing.',
-            how: ['<strong>Right-click</strong> a tile → <strong>Rotate 90°</strong>, <strong>Flip Horizontal</strong> / <strong>Vertical</strong>, or <strong>Offset ½</strong>.', 'Each is instant and undoable.'],
+            what: 'Per-tile geometry. Rotate 90°, flip and offset (roll) are instant. Free Transform, Perspective and Distort open with a live preview and change nothing until <strong>💾 Apply</strong>.',
+            how: [
+                '<strong>Right-click</strong> a tile → <strong>Transform</strong> › <strong>Rotate 90°</strong>, <strong>Flip Horizontal</strong> / <strong>Vertical</strong>, or <strong>Offset ½</strong>. Each is instant and undoable.',
+                'Every transform moves what is painted onto the tile along with its pixels: a glow from <strong>Make Emissive</strong>, material regions, a height-map mask and the maps that came in with a PSD. A PSD normal map’s relief turns too, so it still lights from the right side.',
+                '<strong>Free Transform</strong>: <strong>Rotate</strong> by any angle, <strong>Scale</strong>, <strong>Skew horizontal</strong>, <strong>Skew vertical</strong>, <strong>Move X</strong> and <strong>Move Y</strong>, each with a number box for exact values. Drag the <strong>After</strong> preview to move the texture.',
+                '<strong>Resample</strong> picks how pixels are blended: <strong>Nearest</strong> keeps hard pixels, <strong>Bilinear</strong> is soft, <strong>Bicubic</strong> is sharp, <strong>Lanczos</strong> is sharpest and can ring on hard edges. <strong>Auto</strong> uses Nearest when no pixel lands in between (a 90° turn, a whole-pixel move) and Bicubic otherwise. <strong>Edges</strong> fills the corners a rotation opens up: repeat the texture, stretch the edge, leave them transparent or mirror.',
+                '<strong>Keep tileable</strong> offers only the changes that land a tiling texture back on itself: 90° turns, angles such as 26.6°, 36.9° and 45° (each shows the texture smaller by a fixed amount), whole repeats and 45° skews. Without it anything goes, and <strong>Make seamless afterwards</strong> blends the edges back together. <strong>Show 2 × 2</strong> lets you check the seams before applying.',
+                '<strong>Perspective</strong>: drag the four numbered corners. <strong>Straighten</strong> makes the area you mark the whole tile, so a wall photographed at an angle comes out flat. <strong>📂 Load a photo…</strong> straightens from the photo at full size, which keeps it sharp; Apply then replaces the tile’s image, like <strong>Replace Image</strong>. <strong>Distort</strong> moves the tile’s own corners instead.',
+                '<strong>Liquify</strong> (<strong>Transform</strong> › <strong>Liquify</strong>, one tile at a time): paint on the texture to push it around. <strong>Forward Warp</strong> drags, <strong>Twirl Clockwise</strong> and <strong>Twirl Counterclockwise</strong> turn, <strong>Pucker</strong> pinches in, <strong>Bloat</strong> pushes out, <strong>Push Left</strong> slides sideways, <strong>Smooth</strong> evens the bend out and <strong>Reconstruct</strong> takes it back toward the original. <strong>Mask all</strong>, the <strong>Freeze Mask</strong> and <strong>Thaw Mask</strong> tools protect parts of the texture from the brush. <strong>Size</strong> is a share of the tile, <strong>Density</strong> softens the edge, <strong>Pressure</strong> sets the strength and <strong>Rate</strong> the speed of the turning and pinching tools. Strokes wrap across the tile edges, and text, drawings and glow on the tile move with it.',
+                '<strong>Distort</strong> also has circular types: <strong>Twirl</strong>, <strong>Pinch</strong>, <strong>Spherize</strong>, <strong>ZigZag</strong> and <strong>Polar coordinates</strong>. The first four fade to nothing at the edge of a circle with a <strong>Centre X</strong>, <strong>Centre Y</strong> and <strong>Radius</strong>; the centre wraps round the tile, so a twirl over an edge still tiles. Keep the radius at 100% or less, and Spherize at 90% or less for a clean border. <strong>Polar coordinates</strong> does not tile.',
+                '<strong>Distort</strong>: <strong>Wave</strong> bends the texture in whole cycles, <strong>Ripple</strong> adds small random waves, and <strong>Displace by a tile</strong> shifts each pixel by another tile’s red (sideways) and green (up and down), with mid-grey leaving it in place. With <strong>Edges</strong> on Wrap, a tiling texture keeps tiling.',
+                'Everything here except Perspective works on a <em>whole selection</em>: select the tiles first, then right-click one of them.'
+            ],
+            gallery: [
+                { src: 'xform-before.png', cap: 'Bricks' },
+                { src: 'xform-after.png', cap: 'Free Transform: 20°, 85%' },
+                { src: 'xform-tileable.png', cap: 'Keep tileable at 45°, shown 2 × 2' },
+                { src: 'persp-photo.png', cap: 'A wall at an angle, corners marked' },
+                { src: 'persp-straight.png', cap: 'Straightened' },
+                { src: 'distort-ripple.png', cap: 'Ripple, 4 px: hand-laid courses' },
+                { src: 'distort-twirl.png', cap: 'Twirl, 150°, centred on the right edge: it wraps' },
+                { src: 'distort-zigzag.png', cap: 'ZigZag, pond ripples' },
+                { src: 'liquify-before.png', cap: 'Bricks' },
+                { src: 'liquify-after.png', cap: 'Liquify: a drag, a twirl and a pucker' }
+            ],
             slideshow: 'Examples/Bricks.png', tip: '<strong>Offset ½</strong> then <strong>Heal</strong> is a fast way to kill a stubborn seam. (The demo above cycles through the transforms automatically, hover to pause.)'
         },
         {
@@ -269,6 +320,49 @@
             tip: '<strong>Match the surroundings</strong> is the one for remaster textures. A lot of them were AI upscaled and carry colour blotches that were never in the original art, green or pink patches that no amount of saturation will fix because they are baked into the pixels. Paint over the patch and it takes the wall’s colour while keeping its grain. Paint the patch itself, not a box around it: the same shift is applied everywhere you painted, so clean texture caught in a sloppy selection comes back over-corrected. It fixes colour, not brightness, so a patch that is also darker stays darker.'
         },
         {
+            id: 'classic', icon: '🕹️', title: 'Classic Look (HD texture, classic resolution)',
+            what: 'Makes an HD texture look low-res without changing its tile size. Useful when a face is mapped to a 128 px texture page and the texture should sit with the classic 64 px ones around it.',
+            how: [
+                '<strong>Right-click</strong> a tile → <strong>Edit</strong> › <strong>Classic Look</strong>. <strong>After</strong> and <strong>Before</strong> update as you change anything. Nothing is written until <strong>Apply</strong>.',
+                '<strong>Look like</strong> picks the resolution it should read as: half, a quarter or an eighth of the tile, shown in pixels.',
+                '<strong>Show as</strong>: <strong>Blocky pixels</strong> for hard classic pixels, <strong>Soft</strong> for a low-res texture with no visible pixels, <strong>Smooth</strong> for a rounder Soft.',
+                '<strong>Shrink with</strong>: <strong>Average</strong> is clean, <strong>Sharp</strong> crisps the small image a little, <strong>Nearest</strong> takes one pixel per block, which is crunchy and shimmers on purpose.',
+                '<strong>Colours</strong> fits a palette to the texture, 256 down to 16. <strong>Dither</strong> spreads the steps between palette colours: <strong>Ordered</strong> tiles cleanly, <strong>Diffusion</strong> looks more organic but can show a seam where the texture repeats. With several tiles selected, <strong>Palette from</strong> can give them one shared palette.',
+                '<strong>Cutout edges</strong>: <strong>Hard</strong> makes every pixel fully clear or fully solid, the way classic cutouts look.',
+                '<strong>Material maps from</strong>: <strong>This result</strong> builds normal, AO and height from the new pixels, so blocky pixels give blocky relief. <strong>The original texture</strong> keeps the detailed relief from before, under the classic colour. Set Material says so on a tile that uses it, and <strong>Reset to Original</strong> clears it.',
+                'Leave <strong>Wrap at the edges</strong> ticked for tiling textures: Soft, Smooth and Sharp then read across the tile edges, and the texture stays seamless.',
+                'Works on a <em>whole selection</em>: select the tiles first, then right-click one of them.'
+            ],
+            gallery: [
+                { src: 'classic-before.png', cap: 'An HD sandstone tile' },
+                { src: 'classic-after.png', cap: 'Looks 64 px, Blocky pixels' },
+                { src: 'classic-soft.png', cap: 'Looks 64 px, Soft' },
+                { src: 'classic-palette.png', cap: 'Blocky, 16 colours, Ordered dither' }
+            ]
+        },
+        {
+            id: 'hdlook', icon: '🔎', title: 'HD Look (low-res texture, HD look)',
+            what: 'Makes a low-res texture look HD without changing its tile size. Everything it adds is built from the pixels the tile already has.',
+            how: [
+                '<strong>Right-click</strong> a tile → <strong>Edit</strong> › <strong>HD Look</strong>. <strong>After</strong> and <strong>Before</strong> update as you change anything, and <strong>Tiled 2×2</strong> shows the repeat. Nothing is written until <strong>Apply</strong>.',
+                '<strong>Looks like</strong> is the resolution the texture was made at: full size, half, a quarter or an eighth of the tile. It starts on the size the tool reads from the pixels. <em>Full size</em> only works on edges.',
+                '<strong>Class</strong> loads a set of options for a kind of surface: <strong>Built</strong>, <strong>Granular</strong>, <strong>Organic</strong>, <strong>Smooth</strong>, <strong>Painted</strong> or <strong>Relief</strong>. A tile with a material opens on its class. Moving an option by hand makes it <strong>Custom</strong>.',
+                '<strong>Faithfulness</strong> at 100% keeps the result shrinking back to the original. Lower it to let the result drift from the original.',
+                '<strong>Edge sharpening</strong> crisps edges. <strong>Detail from the tile itself</strong> takes fine detail from the tile\u2019s own coarser scales. <strong>Smooth contours</strong> redraws the boundaries between colour fields as smooth curves, for painted art. <strong>Guided colour</strong> keeps colour edges on the sharpened lines.',
+                '<strong>Grain</strong> adds fine texture taken from the tile picked in <strong>Grain from</strong>; <strong>Seed</strong> picks the pattern. <strong>Cutouts</strong> reads see-through pixels from the alpha channel, black or magenta, so holes stay holes.',
+                '<strong>Regions</strong> (one tile): the regions painted in Set Material are listed, each with its own class and <em>feather</em>. <strong>＋ Add region</strong> and the brush make more. <strong>Apply</strong> can then ask whether to update the material maps with the regions.',
+                'HD Look is a layer over the tile: right-click the tile and choose <strong>Edit</strong> to change it later. It stays under text and drawings. Adding or replacing an image smaller than the tile offers it as well, before the tile is made.',
+                'Leave <strong>Wrap at the edges</strong> ticked for tiling textures, so the texture stays seamless.',
+                'Works on a <em>whole selection</em>: select the tiles first, then right-click one of them.'
+            ],
+            gallery: [
+                { src: 'hdlook-before.png', cap: 'A 64 px mosaic, taken up to 256' },
+                { src: 'hdlook-after.png', cap: 'HD Look, Painted class' },
+                { src: 'hdlook-relief-before.png', cap: 'A 64 px carved obelisk' },
+                { src: 'hdlook-relief-after.png', cap: 'HD Look, Relief class' }
+            ]
+        },
+        {
             id: 'draw', icon: '🖌', title: 'Draw',
             what: 'Paints on your texture with a photo editor’s brush. Strokes go on a layer over the tile and nothing changes until <strong>💾 Apply</strong>. Select several tiles first and one stroke runs across all of them, laid out as they sit in the grid, so a blood trail can cross from brick onto stone and on into grass.',
             how: [
@@ -283,6 +377,104 @@
             beforeLabel: 'Four tiles selected',
             afterLabel: 'One Liquid stroke across all four',
             tip: 'Apply writes the tiles’ pixels, like <strong>Adjust Colours</strong>: one <strong>Undo</strong> takes the whole Apply back and <strong>Reset to Original</strong> clears it per tile. A mouse has no pressure, so thin ends come from the tapers and from speed: a quick flick with <strong>Ink pen</strong> comes out thinner. A selection wider or taller than 4096 px is refused.'
+        },
+        {
+            id: 'text', icon: '🔤', title: 'Text',
+            what: 'Writes lettering onto a texture in any installed, loaded or online font. The letters can be carved into the material maps or stand out from them, and can have a material of their own, such as gold. Nothing changes until <strong>💾 Apply</strong>.',
+            how: [
+                '<strong>Right-click</strong> a tile → <strong>Text…</strong>, just below Draw. With several tiles selected it opens on the area they cover as they sit in the grid, so one word can run across two tiles. Tiles in that area you did not select are dimmed and stay as they are.',
+                '<strong>Text</strong> tab: type the words, then pick the <strong>Font</strong>, <strong>Weight</strong>, <strong>Align</strong>, <strong>Size</strong>, <strong>Stretch X</strong>, <strong>Stretch Y</strong>, <strong>Rotate</strong>, <strong>Line spacing</strong> and <strong>Letter spacing</strong>. Drag the letters on the preview to place them. A corner handle resizes them and keeps their shape (it changes <strong>Size</strong>); hold <strong>Shift</strong> to stretch them freely instead, and a side handle stretches one way. Drag just outside a corner to rotate (<strong>Shift</strong> snaps to 15°). <strong>Alt</strong> resizes from the centre. These are Photoshop\u2019s keys. After a click on the preview, the arrow keys move the letters one pixel at a time (<strong>Shift</strong>: ten). Or type <strong>Position X</strong> and <strong>Position Y</strong>. A font that is not installed says so under the field.',
+                '<strong>Style</strong> tab: <strong>Edges</strong> sets how the letters meet the texture. <strong>Smooth</strong> is antialiased, <strong>Sharp</strong> and <strong>Crisp</strong> are firmer, <strong>Strong</strong> is bolder, and <strong>None</strong> gives hard pixels for a classic look. Add an <strong>Outline</strong> and a <strong>Shadow</strong>, and set <strong>Text opacity</strong> and <strong>Blend</strong> as for a Draw layer.',
+                '<strong>Material</strong> tab: <strong>Material of the letters</strong> gives them their own preset as a region of the tile, the way Draw does. <strong>Relief</strong> carves them in (<strong>Engrave</strong>) or makes them stand out (<strong>Raise</strong>) in the normal, AO and height maps, by <strong>Depth</strong>, with a <strong>Bevel</strong> to round the edges. Roughness and specular keep following the colours.',
+                '<strong>Letter floors</strong>: <strong>Smooth</strong> ignores the letters’ colour, so gold and black letters carve the same. <strong>Keep the surface’s texture</strong> keeps the stone’s own bumps inside the letters, and their colour counts too. Set <strong>Show</strong> to <strong>Normal map (relief)</strong> to check the result before applying.',
+                '<strong>Fonts</strong> tab: <strong>💻 List installed fonts</strong> works in Chrome and Edge; in other browsers type the name. <strong>📂 Font file…</strong> loads a TTF, OTF, WOFF or WOFF2. The <strong>Online library</strong> lists the Google Fonts families, each name drawn in its own font, so you can scroll and compare without downloading anything. Rest on one to see your text in it (that one file comes from jsDelivr), then double-click it or press <strong>⬇ Load</strong> to use it. Nothing is requested from Google. Loaded fonts last for the session, and the text itself is baked into the tile.',
+                'Tick <strong>Wrap at the edges</strong> on a seamless texture: letters that run off one edge come back on the other.'
+            ],
+            gallery: [
+                { src: 'text-before.png', cap: 'A stone tile' },
+                { src: 'text-after.png', cap: 'TOMB in gold with an outline, engraved' },
+                { src: 'text-relief.png', cap: 'Its normal map: the letters carved in' },
+                { src: 'text-hard.png', cap: 'Edges: None, raised, on brick' },
+                { src: 'text-fonts.png', cap: 'The Online library: Display families, each in its own font' }
+            ],
+            tip: 'Raised letters become the highest part of the height map, so the rest of the surface sits lower under parallax. That is how a height map shows something standing out.'
+        },
+        {
+            id: 'stickers', icon: '🏷️', title: 'Stickers',
+            what: 'Images laid over a texture as an editable layer: signs, plaques, bolts, cracks, graffiti. They come from the project\u2019s <strong>📚 Sticker Gallery</strong>, which you fill from image files or by cutting part of a tile out with <strong>✂️ Make Sticker</strong>. All three are in the <strong>Overlay</strong> category of the right-click menu. A placed sticker is a copy, so changing or deleting the gallery image never changes a tile.',
+            how: [
+                '<strong>Right-click</strong> → <strong>Overlay</strong> › <strong>Sticker Gallery…</strong>: <strong>➕ Add images…</strong> (PNG, JPG, WebP, TGA), <strong>📁 Add a folder…</strong>, a PSD (one sticker per layer), or paste and drop images on the window. A file named like <em>bolt_normal.png</em> beside <em>bolt.png</em> becomes that sticker\u2019s normal map (also <em>_height</em>, <em>_rough</em>, <em>_ao</em>, <em>_spec</em>, <em>_glow</em>). <strong>💾 Save pack</strong> and <strong>📦 Load pack…</strong> carry the gallery to another project; it is saved with this one anyway.',
+                '<strong>✂️ Make Sticker…</strong> on any tile: select what to cut with <strong>Rect</strong>, <strong>Lasso</strong>, <strong>🪄 Wand</strong> or the brush. <strong>Keep its maps</strong> gives the sticker this tile\u2019s material maps. <strong>Lift it off and heal the hole</strong> adds a Heal layer over the spot, which you can hide or delete later. <strong>🏷️ Add and place it</strong> puts it straight back where you cut it, ready to move.',
+                '<strong>🏷️ Add Stickers…</strong>: click a sticker in the strip, or drag it onto the texture. Drag a corner to resize it and keep its shape, <strong>Shift</strong> to stretch it, a side handle to stretch one way, just outside a corner to turn it. <strong>Alt</strong>-drag makes a copy. The arrow keys nudge it, <strong>Delete</strong> removes it, Ctrl+Z undoes inside the window. With several tiles selected, stickers run across them as they sit in the grid; <strong>Place</strong> › <strong>At the same spot on each tile</strong> puts the same stickers on every one.',
+                '<strong>Sticker</strong> tab: size, <strong>Rotate</strong>, <strong>Opacity</strong>, <strong>Blend</strong>, and <strong>Resampling</strong> (<strong>Auto</strong> keeps pixel art sharp at whole sizes and right angles). <strong>Colour</strong> tab: <strong>Hue</strong>, <strong>Saturation</strong>, <strong>Brightness</strong>, a <strong>Tint colour</strong>, and <strong>Replace colour</strong> to swap one colour for another. Each sticker has its own settings.',
+                '<strong>Maps</strong> tab: <strong>Maps under this sticker</strong> is <strong>Follow the tile</strong> (made from the picture, as for any tile), <strong>A material preset</strong> (gold, metal, wood as a region of the tile), or <strong>Its own maps</strong> (the map files it came with, turned with it). <strong>Relief</strong> presses it in or raises it in the normal, AO and height maps. <strong>Glows in game</strong> puts its own colours into the emissive map.',
+                '<strong>Effects</strong> tab: drop and inner shadows, outer and inner glows, a stroke and a colour overlay. A drop shadow and an outer glow stay out of the sticker\u2019s material and relief; a glow ticked <strong>Also glow in game</strong> goes into the emissive map.',
+                'Tick <strong>Wrap at the edges</strong> on a seamless texture: a sticker that runs off one edge comes back on the other. <strong>💾 Apply</strong> makes one layer; <strong>Edit Stickers…</strong> reopens it with every sticker where you left it.'
+            ],
+            gallery: [
+                { src: 'stickers-before.png', cap: 'A stone tile' },
+                { src: 'stickers-after.png', cap: 'The pulley medallion cut out with Make Sticker, placed large with a shadow and small, tinted and wrapped' },
+                { src: 'stickers-normal.png', cap: 'Its normal map: the medallion brings its own relief' }
+            ],
+            tip: 'Stickers also go on transitions and animation frames, the one layer that can. An animation takes them on every frame at the same place, and they stay on top when the transition is rebuilt.'
+        },
+        {
+            id: 'oilpaint', icon: '🖼', title: 'Oil Paint',
+            what: 'Smears the colours along the texture’s own edges into brush strokes, like the Oil Paint filter in a photo editor. It is a layer: you can hide it, change it or delete it later, and stack more than one.',
+            how: [
+                '<strong>Right-click</strong> a tile → <strong>Filter</strong> › <strong>Oil Paint</strong>. <strong>After</strong> and <strong>Before</strong> update as you change anything, and nothing is written until <strong>Apply</strong>.',
+                '<strong>Stylization</strong> is how long the strokes are. <strong>Cleanliness</strong> smooths the picture first, so fine grain does not break the strokes up. <strong>Scale</strong> sets how big the shapes are that the strokes follow. <strong>Bristle detail</strong> sets how much streaking shows in the shading.',
+                '<strong>Lighting</strong> is off. Ticking it shades the strokes as a relief under a light, with <strong>Angle</strong> and <strong>Shine</strong>. That bakes light into the colour, which is what <strong>De-light</strong> removes for the game, so leave it off for textures you will export.',
+                'The sizes are written for a 256 px tile and scale with it, so a 1024 px tile looks the same as the preview. With <strong>Edges</strong> on <strong>Wrap</strong> a tiling texture keeps tiling; <strong>Show 2 × 2</strong> checks the seams.',
+                '<strong>Material maps from</strong>: <strong>This result</strong> builds normal, AO and height from the painted pixels. <strong>The original texture</strong> keeps the relief it had. Works on a <em>whole selection</em>.'
+            ],
+            gallery: [
+                { src: 'oil-before.png', cap: 'Stone slabs' },
+                { src: 'oil-after.png', cap: 'Oil Paint at the defaults' },
+                { src: 'oil-lit.png', cap: 'With Lighting on: shading baked in' }
+            ]
+        },
+        {
+            id: 'tone', icon: '🌗', title: 'Dodge & Burn',
+            what: 'Paint over a texture to lighten it (Dodge), darken it (Burn), add or take away colour (Sponge), soften it (Blur) or sharpen it. The brush is the one 🖌 Draw uses. Each tool you paint with becomes its own layer, so you can hide it or change it later.',
+            how: [
+                '<strong>Right-click</strong> a tile → <strong>Edit</strong> › <strong>Dodge &amp; Burn</strong>. Pick a tool, then drag on the picture. <strong>Eraser</strong> paints your marks back off. <strong>Undo</strong> and <strong>Redo</strong> work inside the window.',
+                '<strong>Dodge</strong> and <strong>Burn</strong> have a <strong>Range</strong>: <strong>Shadows</strong>, <strong>Midtones</strong> or <strong>Highlights</strong>, the part of the tone scale they push hardest. <strong>Exposure</strong> is how strong a full stroke is. <strong>Protect tones</strong> keeps hue and saturation from shifting while the brightness changes.',
+                '<strong>Sponge</strong> either <strong>Saturate</strong>s or <strong>Desaturate</strong>s. <strong>Vibrance</strong> eases off where colours are already strong, or already grey.',
+                '<strong>Blur</strong> softens and <strong>Sharpen</strong> crisps up, with a <strong>Radius</strong>. <strong>Protect detail</strong> stops sharpening making halos.',
+                'The <strong>Brush</strong> list is Draw’s. <strong>Size</strong> is a share of the tile, <strong>Hardness</strong> softens the edge, <strong>Opacity</strong> caps a stroke and <strong>Flow</strong> builds up as you go over the same place. Strokes add together, so a faint stroke made twice is a stronger one.',
+                'Paint with two different tool settings in one go, say Dodge then Burn, and <strong>Apply</strong> makes two layers. They move with the tile when you rotate or flip it. Open one from the <strong>Layers</strong> panel to change its settings or paint more.'
+            ],
+            gallery: [
+                { src: 'tone-before.png', cap: 'Bricks' },
+                { src: 'tone-after.png', cap: 'Dodge on the left, Burn on the right' }
+            ]
+        },
+        {
+            id: 'weathering', icon: '💧', title: 'Weathering (Slope Blur and Scatter)',
+            what: 'Two tools that keep a texture from looking machine-perfect. <strong>Slope Blur</strong> smears or erodes the texture along a slope, so wear runs downhill and edges chip. <strong>Scatter</strong> stamps soft random patches of this tile or another over the texture: moss, dirt, plaster. Both are in <strong>Edit</strong>, and both appear in <strong>Build Pattern</strong> as one <strong>🌧️ Weather</strong> accordion.',
+            how: [
+                '<strong>Right-click</strong> a tile → <strong>Filter</strong> › <strong>Slope Blur</strong>. <strong>After</strong> and <strong>Before</strong> update as you change anything, and nothing is written until <strong>Apply</strong>.',
+                '<strong>Slope from</strong> is the map that says which way is downhill. <strong>This tile\'s relief</strong> uses its height map if it has one, otherwise its brightness. The other choices are <strong>This tile\'s brightness</strong>, <strong>A noise field</strong> and <strong>Another tile</strong>.',
+                '<strong>Mode</strong>: <strong>Blur</strong> smears along the slope. Min and Max keep one pixel of the run instead of averaging it: <strong>Min</strong> lets the darkest win, which eats bright edges away; <strong>Max</strong> lets the brightest win, which smears them out. <strong>Direction</strong> picks downhill or uphill.',
+                '<strong>Length</strong> is how far the run goes, as a percentage of the tile, so it looks the same at any tile size. <strong>Smooth the slope</strong> blurs the map first, so the direction follows the big shapes and not the grain. <strong>Strength</strong> mixes the result with the original.',
+                'Tick <strong>Follow the slope\'s strength</strong> to make the run short on gentle slopes and long on steep ones, so flat areas stay clean. <strong>Slope sensitivity</strong> sets how steep counts as steep.',
+                '<strong>Right-click</strong> a tile → <strong>Filter</strong> › <strong>Scatter</strong> for patches. <strong>Patches from</strong> picks this tile or <strong>Another tile</strong>. A tile with transparency stamps only its solid parts.',
+                '<strong>Amount</strong>, <strong>Patch size</strong> and <strong>Size variation</strong> set how many and how big. <strong>Rotation (±)</strong> turns each patch at random. <strong>Edge softness</strong> feathers the rim and <strong>Edge roughness</strong> makes it irregular. <strong>Opacity</strong> and <strong>Blend</strong> decide how it sits on the texture: <strong>Multiply</strong> for dirt, <strong>Normal</strong> for moss.',
+                '<strong>Seed</strong> gives a different layout. The preview shows the first selected tile with the seed as typed; every other tile gets its own layout.',
+                'Leave <strong>Edges</strong> on <strong>Wrap</strong> and both tools keep a tiling texture tiling: a patch over the edge appears on the other side. <strong>Show 2 × 2</strong> checks the seams.',
+                '<strong>Material maps from</strong>: <strong>This result</strong> builds normal, AO and height from the weathered pixels, so chips show in the relief. <strong>The original texture</strong> keeps the relief it had.',
+                'In <strong>Build Pattern</strong>, open <strong>🌧️ Weather</strong> and tick <strong>Weather the pattern</strong>. It runs Slope Blur on the finished wall, then Scatter, seeded from the pattern seed. It is off until you tick it.',
+                'Both tools work on a <em>whole selection</em>: select the tiles first, then right-click one of them.'
+            ],
+            gallery: [
+                { src: 'slope-before.png', cap: 'A brick wall' },
+                { src: 'slope-after.png', cap: 'Slope Blur, Max' },
+                { src: 'slope-min.png', cap: 'Slope Blur, Min' },
+                { src: 'scatter-before.png', cap: 'Stone slabs' },
+                { src: 'scatter-after.png', cap: 'Scatter with patches of the grass tile' },
+                { src: 'weather-wall.png', cap: 'Build Pattern brick with Weather on' }
+            ]
         },
         {
             id: 'variations', icon: '✨', title: 'Variations',
@@ -311,15 +503,26 @@
         },
         {
             id: 'origami', icon: '🪞', title: 'Origami Frame',
-            what: 'Folds a texture into a concentric frame: a ridge, stripe or plank texture becomes nested rings, as if the strip were folded around all four edges. Fold lines meet cleanly through the corners.',
+            what: 'Folds a texture like paper and adds the result as a new tile. Four kinds of fold: <strong>Frame</strong> wraps it into nested rings, <strong>Pleats</strong> fold it in parallel strips, <strong>Kaleidoscope</strong> mirrors it into a grid of cells and <strong>Fan</strong> folds it around a point. Every fold meets cleanly through its corners and creases.',
             how: [
-                '<strong>Right-click</strong> a tile → <strong>Origami Frame</strong>.',
-                'Pick a <strong>Ring shape</strong> (Square / Diamond / Circle). <strong>Detail axis</strong> tells it which way the source’s ridges run (Auto usually gets it right), and <strong>Repeats</strong> mirrors the source into more nested rings.',
-                '<strong>Ring thickness</strong> biases ring widths toward the centre or the rim, <strong>Origin X/Y</strong> moves the fold centre off-middle (the frame still reaches all four edges), and <strong>Outer shape</strong> morphs the rings from one shape at the centre into another at the rim: circle centre flowing into a square frame, say.',
-                'Click <strong>➕ Add Folded Tile</strong>, it lands next to the source and inherits its material.'
+                '<strong>Right-click</strong> a tile → <strong>Origami Frame</strong>, then pick a <strong>Fold type</strong>. The controls on the left change with it.',
+                '<strong>Frame</strong>: <strong>Ring shape</strong> is Square, Diamond or Circle, and <strong>Outer shape</strong> morphs the rings from one into another toward the rim. <strong>Detail axis</strong> says which way the source’s ridges run (Auto usually gets it right), <strong>Ring thickness</strong> biases ring widths toward the centre or the rim and <strong>Origin X/Y</strong> moves the fold centre off-middle; the frame still reaches all four edges.',
+                '<strong>Ring size</strong> picks how the texture sits in the rings. <strong>Fit whole texture</strong> squeezes all of it into every ring, so more <strong>Repeats</strong> means smaller detail (the classic look). <strong>Keep texture size</strong> lays it down at its own scale, so more Repeats means more, narrower rings and a brick stays a brick.',
+                '<strong>Pleats</strong>: <strong>Crease direction</strong> is Vertical, Horizontal, Both (a folded grid) or Auto, which creases across the way the texture’s detail runs. <strong>Folds</strong> sets the number of strips. <strong>Spacing</strong> is Even, Irregular (reroll with <strong>Seed</strong>) or Graded, where the strips widen across the tile. <strong>Strip start</strong> picks which part of the texture the first strip shows.',
+                '<strong>Kaleidoscope</strong>: <strong>Cells across</strong> sets the grid of mirrored cells. <strong>Fan</strong>: <strong>Fan folds</strong> sets how many creases radiate from the origin. Pleats, Kaleidoscope and Fan keep the texture at its own size, and <strong>Texture scale</strong> resizes it inside the folds.',
+                '<strong>Crease shading</strong> tints alternate facets lighter and darker and softly darkens the creases, like folded paper. At 0 the pixels are untouched.',
+                'Click <strong>➕ Add Folded Tile</strong>. It lands next to the source and inherits its material.'
             ],
-            before: 'origami',
-            tip: 'Works best on textures with directional detail: planks, mouldings, ridges, rope. The single-texture mode of Borders &amp; Corners uses the same fold to build a whole trim set.'
+            gallery: [
+                { src: 'origami-source.png', cap: 'Cobble' },
+                { src: 'origami-fit.png', cap: 'Frame, Fit whole texture, Repeats 2' },
+                { src: 'origami-keep.png', cap: 'Frame, Keep texture size, Repeats 3' },
+                { src: 'origami-pleats.png', cap: 'Pleats, irregular, 8 folds' },
+                { src: 'origami-kaleido.png', cap: 'Kaleidoscope, 2 cells' },
+                { src: 'origami-fan.png', cap: 'Fan, 6 folds' },
+                { src: 'origami-shade.png', cap: 'Fan with Crease shading 50' }
+            ],
+            tip: 'Frame, Pleats and Kaleidoscope repeat across tiles. A <strong>Fan</strong> repeats too with an even number of folds and a centred origin; otherwise it is a single panel, like the Rose window in Stained Glass. Frame works best on directional detail such as planks, mouldings and rope; Pleats and Kaleidoscope suit stone and murals. The single-texture mode of Borders &amp; Corners uses the same fold to build a whole trim set.'
         },
         {
             id: 'stainedglass', icon: '🪟', title: 'Stained Glass',
@@ -369,7 +572,7 @@
             id: 'surfacenoise', icon: '🌾', title: 'Surface noise',
             what: 'Lays procedural grain into a texture: grit, pitting, wood grain, cracks, scuffs, weave. All of it tiles seamlessly, and all of it is optional. Material maps are generated <em>from</em> the diffuse, so a flat or heavily cleaned-up texture gives the map generator nothing to read. This is what gives it something.',
             how: [
-                '<strong>Right-click</strong> a tile → <strong>🌾 Surface Noise</strong>. The before/after previews sit side by side.',
+                '<strong>Right-click</strong> a tile → <strong>Filter</strong> › <strong>🌾 Surface Noise</strong>. The before/after previews sit side by side.',
                 'Pick a <strong>Preset</strong> (Brick grit, Stone pitting, Concrete mottle, Wood grain, Brushed metal, Dust &amp; dirt, Damp stains, Scratches, Fabric weave, Hairline cracks, Film grain). It loads a full recipe you can then take apart.',
                 '<strong>Strength</strong> is the subtle-to-dramatic control. <strong>Scale</strong> sets feature size, <strong>Contrast</strong> how hard the grain reads, and <strong>Blend</strong> how it combines: <strong>Overlay</strong> and <strong>Soft light</strong> keep the texture\'s brightness, <strong>Multiply</strong> only darkens (dirt, damp), <strong>Screen</strong> only lightens (scuffs).',
                 'Directional types (wood grain, streaks, scratches, weave) get a <strong>Grain direction</strong>. It only offers vertical and horizontal, because rotating the grain off-axis would break the seamless tiling.',
@@ -438,7 +641,7 @@
                 '<strong>\u{1F30A} Moving level</strong> sweeps a line across the tile over the loop and hides the texture behind it, so the animation floods over and drains back: lava climbing out of a grate. Pick a <strong>Direction</strong>, a <strong>Motion</strong> (smooth, or rise-hold-fall-hold), the <strong>Low</strong> and <strong>High</strong> reach and how many <strong>Cycles</strong>. A straight line cannot repeat across the edge it travels towards, so use <strong>Spreads out from the shape</strong> if the tile has to tile. Turn it on while <strong>Where the surface is deep or raised</strong> is selected and it stops sweeping a line: it drives the depth threshold instead, so the liquid rises and falls through the texture\u2019s own relief.',
                 'How long all of this takes is arithmetic, and the tool now says it. A loop lasts <em>frames divided by fps</em>, so the default 16 frames at 12 fps is 1.3 seconds, and the line under <strong>Preview speed</strong> prints that as you change either. <strong>Cycles</strong> divides it again, and cannot go below 1 because a whole number of cycles over the loop is what makes the last frame meet the first. To slow something down you have four levers: lower the <strong>fps</strong> (which slows the churn with it), add <strong>Frames</strong> up to 128 (one atlas tile each, and it decouples the two), set <strong>Repeat</strong> on the frames in Tomb Editor (it holds each frame for several ticks and costs no atlas space at all, only frame slots out of the engine\u2019s 256), or narrow <strong>Low</strong> and <strong>High</strong> so the swell covers less ground in the same time, which costs nothing.',
                 '<strong>\u{1F33F} Organic edge</strong> roughens whichever contour the overlay has, the edge of <strong>Where it shows</strong> and the level line, into a ragged water line or creeping grime. Same panel as the transition sets: <strong>Amount</strong>, <strong>Scatter</strong>, <strong>Feature size</strong> and five edge styles. <strong>Contact shadow</strong> darkens whatever sits <em>under</em> the texture, so a rim shades the water it stands in; send it to the <strong>AO map</strong> rather than the diffuse if you are exporting relief maps.',
-                '<strong>\u{1F39E}\uFE0F Second animated layer</strong>, at the top of the modal, runs a second generator in the same animation: steam in front of lava, rain over a flickering fire. <strong>Edit layer 1</strong> and <strong>Edit layer 2</strong> point the <strong>Preset</strong>, <strong>Shape</strong> and <strong>Colour</strong> tabs at one layer or the other, and each keeps its own settings while you edit the other. <strong>Layer 2 sits</strong> behind layer 1, in front of it, or <strong>On top of everything, the overlay too</strong>, which is how steam goes over the grate the lava shows through. Both layers share the frame count, so the loop still closes and nothing extra goes into the atlas. Give layer 2 a gradient with a transparent end, or it hides layer 1.',
+                '<strong>\u{1F39E}\uFE0F Second Animation Layer</strong>, at the top of the modal, runs a second generator in the same animation: steam in front of lava, rain over a flickering fire. <strong>Edit Animation Layer 1</strong> and <strong>Edit Animation Layer 2</strong> point the <strong>Preset</strong>, <strong>Shape</strong> and <strong>Colour</strong> tabs at one Animation Layer or the other, and each keeps its own settings while you edit the other. <strong>Animation Layer 2 sits</strong> behind Animation Layer 1, in front of it, or <strong>On top of everything, the overlay too</strong>, which is how steam goes over the grate the lava shows through. Both Animation Layers share the frame count, so the loop still closes and nothing extra goes into the atlas. Give Animation Layer 2 a gradient with a transparent end, or it hides Animation Layer 1.',
                 '<strong>Emissive-only</strong>: on the <strong>\u2728 Glow</strong> tab, set <strong>Diffuse</strong> to <strong>A static texture, only the glow moves</strong> and pick the texture. Every frame then shows that texture unchanged, with the same material maps, and only its glow animates: blinking panels, pulsing runes, lit windows that flicker. <strong>Glow follows</strong> either <strong>The pulse</strong> (the glow tab\u2019s own pulse, so turn <strong>Pulse</strong> on) or <strong>The animation\u0027s brightness</strong>, which runs the moving field across the glowing parts. What glows is still picked by the controls below it, from the static texture.',
                 'Click <strong>Add \u2026 Frames</strong>. Everything above is stored on the animation, so <strong>Right-click</strong> \u2192 <strong>Edit Animation\u2026</strong> reopens it with the overlay, level and organic settings intact.'
             ],
@@ -451,10 +654,28 @@
                 { src: 'anim-particle-depth.png', cap: 'The same rain with the depth sliders off, then on' },
                 { src: 'anim-depth.png', cap: 'Lava rising through a brick wall\u2019s own mortar' },
                 { src: 'anim-twinkle.png', cap: 'Sparks, twinkling: six frames, each spark on its own beat' },
-                { src: 'anim-layer2.png', cap: 'Two layers: lava under the grate, steam on top of everything' },
+                { src: 'anim-layer2.png', cap: 'Two Animation Layers: lava under the grate, steam on top of everything' },
                 { src: 'anim-still.png', cap: 'Emissive-only: the glow map alone, three frames. The windows stay put, their light ripples' }
             ],
             tip: 'An overlay forces the <strong>Animated sequence</strong> output. UV-rotate scrolls the whole texture, so a rim baked into the tile would slide around with the water, and <strong>Single seamless tile</strong> is disabled while one is set. Tomb Engine only swaps UVs, it has no way to layer two textures at runtime, so anything on top has to be baked into every frame, and a second variant (lava, and lava with stepping stones) costs a second full set of tiles. The material maps follow <em>where the texture shows</em> and ignore the blend mode: a multiply pass changes how a surface looks, not what it is.'
+        },
+        {
+            id: 'caustics', icon: '\u{1F30A}', title: 'Water caustics (for Additive)',
+            what: 'The bright lines the sun draws on a pool floor through moving water. The <strong>Caustics (light for Additive)</strong> presets draw only that light, on black. Lay the frames in Tomb Editor with <strong>Additive</strong> blending: black adds nothing, so only the light lands on the floor or wall under it.',
+            how: [
+                'Open <strong>\u{1F39E}\uFE0F Add Animated\u2026</strong> and pick a preset from the <strong>Caustics (light for Additive)</strong> group: <strong>Pool Floor</strong>, <strong>Sea Bed</strong>, <strong>Sunlit Shallows</strong>, <strong>Wall Reflection</strong>, <strong>Calm Surface</strong> or <strong>Choppy Surface</strong>.',
+                '<strong>Model</strong>: <strong>Refraction</strong> traces light through moving waves, and every preset uses it. <strong>Cells (stylised)</strong> draws a network of cells instead, a flatter, more graphic look. Each model shows its own controls on the <strong>\u{1F300} Shape &amp; motion</strong> tab.',
+                'Tick <strong>Preview as laid Additive over</strong> and pick a texture to see the frames the way the engine adds them. It works on every preset. The older water presets were made for Normal blending: under Additive the bright ones (Caustic Water) wash out to white, and the dark ones (Deep Water) add a flat blue haze, because their darkest colour is dark blue rather than black.',
+                '<strong>Background</strong>: <strong>Black (Additive)</strong> is the default. <strong>Transparent</strong> turns the light into the frames\u2019 transparency instead, for light on top of another animation: tick <strong>\u{1F39E}\uFE0F Second Animation Layer</strong>, keep a water preset such as Deep Water on layer 1 and put a caustics preset with a Transparent background on layer 2.',
+                'The <strong>\u{1F5BC} Overlay</strong> tab works on caustics as on any animation, for a grate or a rim baked over the light.'
+            ],
+            before: 'caustics',
+            beforeLabel: 'Pool Floor, one frame',
+            afterLabel: 'The same frame laid Additive over stone',
+            gallery: [
+                { src: 'caustics-old.png', cap: 'Caustic Water laid the same way: washed out' }
+            ],
+            tip: 'Additive only ever brightens, so keep the light sparse: a frame that is mostly black is what lets the floor show through.'
         },
         {
             id: 'materials', icon: '🎨', title: 'Materials (PBR)',
@@ -475,7 +696,7 @@
         },
         {
             id: 'paint-tools', icon: '🖌', title: 'The paint tools (shared by every brush)',
-            what: 'Nine places in the tool let you paint a region: <strong>Set Material</strong>\u2019s multi-material layers, <strong>Make Emissive</strong>, <strong>Heal</strong>, <strong>Fade to Transparent</strong>, <strong>De-light</strong>, <strong>Make Height Map</strong>, <strong>Overlay Texture</strong>, <strong>Adjust Colours</strong>\u2019 Paint a region, and a transition\u2019s custom mask. They all run the same toolbar, so what you learn once works everywhere: the same tools, the same modifier keys and the same undo.',
+            what: 'Nine places in the tool let you paint a region: <strong>Set Material</strong>\u2019s Material Layers, <strong>Make Emissive</strong>, <strong>Heal</strong>, <strong>Fade to Transparent</strong>, <strong>De-light</strong>, <strong>Make Height Map</strong>, <strong>Overlay Texture</strong>, <strong>Adjust Colours</strong>\u2019 Paint a region, and a transition\u2019s custom mask. They all run the same toolbar, so what you learn once works everywhere: the same tools, the same modifier keys and the same undo.',
             how: [
 '<strong>🖌 Brush</strong> paints freehand; <strong>Edge softness</strong> feathers the stroke, and 0% is a crisp edge. <strong>🪨 Stamp</strong> lays an irregular blob instead of a disc, for things that should not look drawn: moss, rust, rubble, pitting. Click for one, drag for a scattered run. <strong>Roughness</strong> takes it from a clean pebble to a ragged clump, and no two are the same shape.',
                 '<strong>🪢 Lasso</strong> takes either gesture and you can mix them in one outline: click to drop straight corners, or press and drag to trace freehand. It closes and fills when you land on the <em>start dot</em>, or press <strong>Enter</strong>. <strong>Escape</strong> throws the outline away. <strong>▭ Rect</strong> and <strong>⬭ Ellipse</strong> just drag.',
@@ -492,11 +713,11 @@
             id: 'multi-material', icon: '🎭', title: 'Multiple materials on one tile',
             what: 'A single texture often mixes surfaces, a wall that is <strong>brick + a wooden door + a metal knob</strong>. Multi-material lets you paint a different material onto each region, so the brick reads as stone, the door as wood and the knob as metal in one tile.',
             how: [
-                'In <strong>Set Material</strong>, tick <strong>🎭 Multiple materials</strong>. The <strong>Base</strong> layer covers the whole tile, set its material (e.g. Brick) with the normal controls.',
-                '<strong>＋ Add layer</strong> for each extra surface, then <strong>select where it applies</strong> using the shared paint tools above, brush, stamp, lasso, rectangle, ellipse or wand. With a layer selected, the material controls below edit <em>that</em> layer.',
-                '<strong>Order matters</strong>, layers stack bottom→top, each painting over the ones beneath. For a wall it’s <em>Base = Brick → Wooden door → Metal knob</em>. Reorder with ▲▼, soften a boundary with <strong>Feather</strong>, then <strong>Assign</strong>.'
+                'In <strong>Set Material</strong>, tick <strong>🎭 Multiple materials</strong>. The <strong>Base</strong> covers the whole tile, set its material (e.g. Brick) with the normal controls.',
+                '<strong>＋ Add Material Layer</strong> for each extra surface, then <strong>select where it applies</strong> using the shared paint tools above, brush, stamp, lasso, rectangle, ellipse or wand. With a Material Layer selected, the material controls below edit <em>that</em> Material Layer.',
+                '<strong>Order matters</strong>, Material Layers stack bottom→top, each painting over the ones beneath. For a wall it’s <em>Base = Brick → Wooden door → Metal knob</em>. Reorder with ▲▼, soften a boundary with <strong>Feather</strong>, then <strong>Assign</strong>.'
             ],
-            tip: 'The lit preview and 🧊 3D preview show the <em>composited</em> result as you paint, so you can see brick meet wood meet metal. Transition/Wang tiles inherit materials and so don’t take layers. Each tile’s layers are saved in your project file.'
+            tip: 'The lit preview and 🧊 3D preview show the <em>composited</em> result as you paint, so you can see brick meet wood meet metal. Transition/Wang tiles inherit materials and so don’t take Material Layers. Each tile’s Material Layers are saved in your project file.'
         },
         {
             id: 'transparency', icon: '🫥', title: 'Transparency & decals',
@@ -559,6 +780,22 @@
                 'Browsers can discard stored data when disk space runs low. <strong>Protect from cleanup</strong> asks yours not to, Firefox will ask your permission, Chrome decides on its own. Optional either way: it only affects the autosave, never your files.'
             ],
             tip: 'An <strong>● unsaved changes</strong> marker sits next to <strong>Save Project</strong> whenever you have edits that are not in a save file, and the browser asks before you close the tab. Autosave covers crashes, not backups, clearing your browser data deletes it, so keep real work in exported files.'
+        },
+        {
+            id: 'folder', icon: '📁', title: 'Work in a folder',
+            what: 'Skip the download and unzip. Link a working folder once, and the tool writes the atlas, its maps and the project file straight into it. It sits beside the ZIP export and never replaces it.',
+            how: [
+                'In the export card, click <strong>Link working folder…</strong> and pick any folder: the one TombIDE made for your project, or one of your own. The browser asks for permission to that one folder, and only after you click.',
+                'If the folder already holds files the tool would replace, a confirm lists them first. <strong>Cancel</strong> writes nothing and links nothing.',
+                'Files go in flat, as PNG or TGA (<strong>PSD</strong> is one layered file, so it stays with the ZIP). The project file is written first, then the maps, and the atlas last. Tomb Editor watches the atlas file only, so a reload it triggers never runs ahead of the maps.',
+                '<strong>Overwrite</strong> writes again on a click. <strong>Unlink</strong> forgets the folder and leaves its files alone.',
+                'Tick <strong>Auto-sync</strong> and it writes by itself: the moment you switch away from the tool, or about a second and a half after you stop editing, and never more than once every 10 seconds.',
+                'Auto-sync never opens a dialog and never changes your grid. When it needs an answer (empty slots between your textures, a renamed project, a folder the browser has not re-approved) it pauses and the status line says why. <strong>Overwrite</strong> resolves it.',
+                'Renaming the project changes the file names, and Tomb Editor still points at the old ones. So the tool asks before writing under a new name.',
+                'Chrome forgets folder access between visits unless you chose to allow it every time. Then <strong>Reconnect</strong> appears, and one click gives it back.',
+                'On the start screen, <strong>Open project folder</strong> reads the project file from a folder, loads it and links the folder. If the folder holds several projects, you pick one.'
+            ],
+            tip: 'Tomb Editor reloads a changed texture on its own by default, and reads the map files (<code>_n</code>, <code>_ao</code> and the rest) next to it at every Build. A <code>yourname.xml</code> saved from its material editor wins over those, so the tool warns when it sees one and never touches it. Folder access needs Chrome, Edge or Opera. Brave has it behind a flag, Firefox does not offer it, and Safari is untested here, so use the ZIP there. Any folder works, but Tomb Editor copies everything in its own install-folder <code>Textures</code> into every new project, so keep that one for beta textures.'
         },
         {
             id: 'filetypes', icon: '🗂️', title: 'File types',
@@ -918,11 +1155,15 @@
     function render() {
         const toc = document.getElementById('tut-toc');
         const main = document.getElementById('tut-main');
-        const tocList = el('ul', 'tut-toc-list');
-        toc.appendChild(el('div', 'tut-toc-title', 'Tools'));
-        toc.appendChild(tocList);
+        let tocList = null;
 
         SECTIONS.forEach(s => {
+            // A section may open a new contents group (`group`); the group stays until another one is named.
+            if (s.group || !tocList) {
+                tocList = el('ul', 'tut-toc-list');
+                toc.appendChild(el('div', 'tut-toc-title', s.group || 'Tools'));
+                toc.appendChild(tocList);
+            }
             const li = el('li');
             li.innerHTML = `<a href="#${s.id}"><span class="toc-ico">${s.icon}</span>${s.title}</a>`;
             tocList.appendChild(li);

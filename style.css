@@ -466,7 +466,7 @@ label {
     font-weight: 500;
 }
 
-select, input[type="number"], input[type="text"] {
+select, input[type="number"], input[type="text"], textarea {
     background: var(--bg-input);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
@@ -476,7 +476,7 @@ select, input[type="number"], input[type="text"] {
     outline: none;
     transition: border-color var(--transition);
 }
-select:focus, input[type="number"]:focus, input[type="text"]:focus {
+select:focus, input[type="number"]:focus, input[type="text"]:focus, textarea:focus {
     border-color: var(--accent);
 }
 select { cursor: pointer; padding-right: 24px; }
@@ -1671,7 +1671,7 @@ html[data-motion="off"] .btn-spinner { animation-duration: 1.6s; }   /* as befor
 /* "Applying to all N selected tiles" — sits directly under a batchable modal's
    title so the scope of the Apply button is stated before it is pressed. Same
    accent treatment as .at-mat-advice: informational, never an error. */
-.at-batch-note {
+.at-batch-note, .at-edit-note {
     background: var(--accent-bg);
     border-left: 3px solid var(--accent);
     border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
@@ -2064,6 +2064,7 @@ body.at-grid-dragging.at-drop-refused, body.at-grid-dragging.at-drop-refused * {
 .at-badge-a { background: #c586c0; }
 .at-badge-e { background: #f2c94c; }
 .at-badge-h { background: #9cdcfe; }
+.at-badge-l { background: #b48cf2; }
 
 /* Animated-texture modal: Shape / Colour tab bar */
 .at-anim-tabs {
@@ -2329,6 +2330,7 @@ body.at-grid-dragging.at-drop-refused, body.at-grid-dragging.at-drop-refused * {
 .at-ctx-v2 .at-ctx-tail { display: flex; flex-direction: column; }
 .at-ctx-v2 .at-ctx-pinned { border-bottom: 1px solid var(--border); margin-bottom: 4px; padding-bottom: 4px; }
 .at-ctx-v2 .at-ctx-tail { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 4px; }
+.at-ctx-sub .at-ctx-sep { border-top: 1px solid var(--border); margin: 4px 0; }
 .at-ctx-sub {
     position: fixed;
     display: none;
@@ -2994,7 +2996,9 @@ body.at-modal-open { overflow: hidden; }
 }
 .at-mat-sliders {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    /* Three columns in the docked advanced column at 1920 (two when narrower):
+       what pays for the cavity and band sliders inside the 881 px budget. */
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
     gap: 6px 16px;
 }
 .at-mat-sliders .form-group label { font-size: 0.72rem; }
@@ -3164,6 +3168,12 @@ body.at-modal-open { overflow: hidden; }
    the left column with an empty cell beside it, and it is the control in the
    group that gains most from a longer track. */
 .at-slider-wide { grid-column: 1 / -1; }
+/* Relief detail bands (HEIGHT-BANDS-PLAN.md): the band-preset picker shares the
+   heading row, which is what keeps the Material modal inside 881 px at 1920. */
+.at-band-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.at-band-head label { font: inherit; color: inherit; letter-spacing: inherit; }
+.at-band-head select { font-size: 0.75rem; padding: 2px 6px; text-transform: none; letter-spacing: 0; font-weight: 400; }
+.at-band-hint { margin-top: -2px; }
 
 /* ============================================================
    Tutorial page (tutorial.html)
@@ -4006,6 +4016,16 @@ html.at-demo-frame.at-demo-rail-l.at-demo-rail-r .at-shell {
 .at-tp-rows .at-tp-opt { width: 100%; height: auto; display: flex; align-items: center; gap: 10px; padding: 3px 6px; }
 .at-tp-rows .at-tp-opt canvas { width: 160px; height: 48px; background: #202022; }
 .at-tp-rows .at-tp-badge { position: static; max-width: none; background: none; font-size: 0.8rem; padding: 0; color: var(--text-primary); }
+/* Text rows (blend modes, styles; HOVER-PREVIEW-PLAN): no thumbnails, and a trigger
+   that reads like the select it stands in for. */
+.at-tp-trigger.at-tp-text { display: inline-flex; width: auto; min-width: 9em; min-height: 0; padding: 5px 8px 5px 10px; background: var(--bg-input); }
+.at-tp-pop.at-tp-text { grid-template-columns: 1fr; gap: 1px; width: max-content; max-width: min(360px, calc(100vw - 16px)); padding: 4px; }
+.at-tp-text .at-tp-opt { width: 100%; height: auto; padding: 3px 10px; border-width: 1px; text-align: left; color: var(--text-primary); font: inherit; font-size: 0.85rem; white-space: nowrap; }
+/* `opts.note`: width 0 + min-width 100% keeps a long sentence from widening the list;
+   it wraps to whatever width the options give it. */
+.at-tp-note { width: 0; min-width: 100%; box-sizing: border-box; padding: 4px 8px 6px; margin-bottom: 2px; border-bottom: 1px solid var(--border);
+    font-size: 0.75rem; line-height: 1.35; color: var(--text-secondary); white-space: normal; }
+.at-tp-text .at-tp-badge { position: static; max-width: none; background: none; font-size: inherit; line-height: 1.4; padding: 0; color: inherit; }
 .at-tp-group { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-secondary); padding: 6px 4px 2px; }
 .at-tp-badge {
     position: absolute; left: 5px; bottom: 5px; max-width: 58px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -4145,3 +4165,195 @@ html.at-demo-frame.at-demo-rail-l.at-demo-rail-r .at-shell {
     background: repeating-conic-gradient(#888 0% 25%, #bbb 0% 50%) 50% / 16px 16px;
 }
 .at-view-pane figcaption { font-size: 0.8rem; color: var(--text-secondary); text-align: center; }
+
+/* Free Transform (TRANSFORMS-PLAN phase 2): a slider with a number box beside
+   it, because a rotation is often a number someone already knows. */
+.at-numslider { display: flex; gap: 8px; align-items: center; }
+.at-numslider input[type="range"] { flex: 1; min-width: 0; }
+.at-numslider input[type="number"] { width: 76px; }
+.at-xf-readout { font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--text-secondary); }
+.at-xf-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+/* Liquify (FILTERS-PLAN phase 4): the tool buttons, a row of small buttons, and the paint stage with its brush ring on top. */
+.at-lq-tools { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.at-lq-tools button { text-align: left; padding: 5px 8px; font-size: 12px; }
+.at-lq-tools button[aria-checked="true"] { border-color: var(--accent); color: var(--accent); background: rgba(232, 133, 42, 0.12); }
+.at-lq-row { display: flex; flex-wrap: wrap; gap: 4px; }
+.at-lq-stage { position: relative; width: 100%; line-height: 0; }
+.at-lq-stage canvas { display: block; width: 100%; height: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); background: #111; }
+.at-lq-stage #at-lq-ring { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: none; pointer-events: none; }
+.at-lq-stage #at-lq-surface { cursor: none; touch-action: none; }
+.at-xf-grid .at-xf-span { grid-column: 1 / -1; }
+.at-xf-grid + .at-xf-grid { margin-top: 8px; }
+
+/* 🔤 Text (TEXT-PLAN phase 2): the tuning column is 340 px, too narrow for two
+   slider + number pairs side by side, so its rows stack. */
+#at-modal-text textarea { width: 100%; resize: vertical; font-family: inherit; }
+#at-modal-text input[type="color"] { width: 64px; height: 30px; padding: 2px; background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+#at-modal-text .at-numslider input[type="text"] { flex: 1; min-width: 0; }
+#at-modal-text #at-tx-online-list { width: 100%; }
+#at-modal-text [data-tx-panel="fonts"] { display: flex; flex-direction: column; gap: 6px; }
+
+/* Text > Fonts > Online library: each family's name in its own typeface (FONT-PREVIEW-PLAN).
+   The glyph is a white-on-transparent sprite crop used as a mask, so the theme colours it. */
+.at-tx-frows { height: 290px; overflow-y: auto; background: var(--bg-primary); border: 1px solid var(--border); border-radius: 4px; }
+.at-tx-frows:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.at-tx-frow { display: flex; align-items: center; min-height: 40px; padding: 2px 8px; cursor: pointer; color: var(--text-primary); font-size: 0.8rem; content-visibility: auto; contain-intrinsic-size: auto 40px; }
+.at-tx-frow:hover { background: rgba(255, 255, 255, 0.06); }
+.at-tx-frow.current { background: rgba(232, 133, 42, 0.22); box-shadow: inset 3px 0 0 var(--accent); }
+.at-tx-fglyph { display: block; flex: none; background: var(--text-primary); -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat; }
+
+/* The rebuild dim (LAYERS-PLAN decision 20): shown only when a layer rebuild is
+   estimated slow. The bar's width is set from JS; the pulse is CSS so it keeps
+   moving while a single long step (Make Seamless at 1024) blocks the script. */
+#at-rebuild-dim {
+    position: fixed; inset: 0; z-index: 9500;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, 0.6);
+}
+#at-rebuild-dim[hidden] { display: none; }
+#at-rebuild-dim .at-rebuild-box {
+    min-width: 260px; padding: 18px 22px; border-radius: 8px;
+    background: var(--bg-primary); border: 1px solid var(--border); color: var(--text-primary, #ddd);
+    text-align: center;
+}
+#at-rebuild-dim .at-rebuild-bar {
+    margin-top: 12px; height: 6px; border-radius: 3px; overflow: hidden;
+    background: var(--border); animation: at-rebuild-pulse 1.2s ease-in-out infinite;
+}
+#at-rebuild-dim .at-rebuild-bar i { display: block; height: 100%; background: var(--accent); }
+@keyframes at-rebuild-pulse { 50% { opacity: 0.55; } }
+
+/* The Layers panel (LAYERS-PLAN phase 2): left rail and the Layers… modal share it. */
+.at-layers-body { display: flex; flex-direction: column; gap: 3px; }
+.at-ly-head { font-weight: 600; font-size: 0.84rem; margin-bottom: 2px; }
+.at-ly-hint { font-size: 0.74rem; color: var(--text-secondary); margin: 2px 0; }
+/* One tinted card per zone, a name and a sentence each; the original is a plinth under them. The row for a content layer carries a grip, since only those drag. */
+.at-ly-maps-label { font-size: 0.66rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-secondary); }
+.at-ly-maps-label + .at-ly-map { margin-top: 0; }
+.at-ly-map:last-of-type { margin-bottom: 4px; }
+.at-ly-zonecard { --zc: var(--text-secondary); display: flex; flex-direction: column; gap: 3px; margin-top: 6px; padding: 6px; border: 1px solid var(--border); border-top: 2px solid var(--zc); border-radius: 6px; background: color-mix(in srgb, var(--zc) 7%, var(--bg-secondary, #252526)); }
+.at-ly-zonecard[data-zone="finish"] { --zc: #c7a1e8; }
+.at-ly-zonecard[data-zone="content"] { --zc: #5fb3e8; }
+.at-ly-zonecard[data-zone="texture"] { --zc: #7cc98a; }
+.at-ly-zone { font-size: 0.74rem; font-weight: 600; color: var(--zc); }
+.at-ly-zdesc { font-size: 0.68rem; color: var(--text-secondary); margin-bottom: 2px; }
+/* A group's menu (LAYERS-PLAN phase 16): the ⋯ in each zone card's corner, or a right-click on the card. */
+.at-ly-zonecard { position: relative; }
+.at-ly-zmenu { position: absolute; top: 3px; right: 4px; background: none; border: 0; color: var(--text-secondary); cursor: pointer; padding: 1px 6px; font-size: 0.95rem; line-height: 1; border-radius: 3px; }
+.at-ly-zmenu:hover, .at-ly-zmenu:focus-visible, .at-ly-zmenu[aria-expanded="true"] { color: var(--accent); background: var(--accent-bg); }
+.at-ly-menu { position: fixed; z-index: 3000; min-width: 220px; max-width: 320px; padding: 4px; background: var(--bg-secondary, #252526); border: 1px solid var(--border); border-radius: 6px; box-shadow: var(--shadow); display: flex; flex-direction: column; }
+.at-ly-menu-head { font-size: 0.7rem; color: var(--text-secondary); padding: 3px 8px 5px; border-bottom: 1px solid var(--border); margin-bottom: 3px; }
+.at-ly-menu-item { background: none; border: 0; color: var(--text-primary, inherit); text-align: left; padding: 6px 8px; font-size: 0.8rem; border-radius: 4px; cursor: pointer; }
+.at-ly-menu-item:hover, .at-ly-menu-item:focus-visible { background: var(--accent-bg); color: var(--accent); outline: none; }
+.at-ly-grip { color: var(--text-secondary); font-size: 0.8rem; line-height: 1; cursor: grab; flex: none; }
+.at-ly-row {
+    display: flex; align-items: center; gap: 6px; padding: 3px 6px; min-height: 34px;
+    border: 1px solid var(--border); border-radius: 5px; background: var(--bg-primary);
+    font: inherit; font-size: 0.8rem; color: inherit; text-align: left; width: 100%; box-sizing: border-box;
+}
+button.at-ly-map { cursor: pointer; min-height: 28px; }
+button.at-ly-map:hover, .at-ly-layer:hover { border-color: var(--accent); }
+.at-ly-layer { cursor: pointer; }
+.at-ly-sel { border-color: var(--accent); }
+.at-ly-off .at-ly-name, .at-ly-off .at-ly-thumb { opacity: 0.45; }
+.at-ly-drag { cursor: grab; }
+.at-ly-dragging, .at-ly-dragging * { cursor: grabbing; user-select: none; }
+.at-ly-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.at-ly-note { font-size: 0.68rem; color: var(--text-secondary); white-space: nowrap; }
+.at-ly-thumb { width: 28px; height: 28px; flex: none; border-radius: 3px; background: repeating-conic-gradient(#555 0 25%, #444 0 50%) 0 0 / 8px 8px; image-rendering: pixelated; }
+.at-ly-eye, .at-ly-bin { background: none; border: 0; color: inherit; cursor: pointer; padding: 2px; font-size: 0.9rem; line-height: 1; }
+.at-ly-bin { visibility: hidden; }
+.at-ly-layer:hover .at-ly-bin, .at-ly-layer:focus-within .at-ly-bin { visibility: visible; }
+.at-ly-orig { margin-top: 8px; min-height: 42px; background: #2a2620; border-color: #4a4030; }
+.at-ly-orig .at-ly-thumb { width: 34px; height: 34px; }
+html[data-theme="light"] .at-ly-zonecard[data-zone="finish"] { --zc: #8a55c0; }
+html[data-theme="light"] .at-ly-zonecard[data-zone="content"] { --zc: #1f78b4; }
+html[data-theme="light"] .at-ly-zonecard[data-zone="texture"] { --zc: #2f8a45; }
+html[data-theme="light"] .at-ly-orig { background: #efe6d6; border-color: #cdbb98; }
+/* LAYERS-PLAN phase 14. The eye is the whole left part of a layer row (users aiming for it opened the
+   tool instead), and a picture edit moves over or under the text: a button (the drag's keyboard twin)
+   and a drag dressed like the texture grid's (a floating thumbnail, the dragged row faded, a dashed
+   accent landing slot, rows sliding to make room; with Animations off an insert bar and no slide). */
+.at-ly-layer { padding-left: 0; }
+.at-ly-layer .at-ly-eye {
+    align-self: stretch; flex: none; width: 34px; margin: -3px 0; padding: 0;
+    display: flex; align-items: center; justify-content: center;
+    border-right: 1px solid var(--border); border-radius: 4px 0 0 4px;
+}
+.at-ly-layer .at-ly-eye:hover, .at-ly-layer .at-ly-eye:focus-visible { background: var(--accent-bg); }
+.at-ly-move { background: none; border: 0; color: var(--accent); cursor: pointer; padding: 2px 3px; font-size: 0.9rem; font-weight: 700; line-height: 1; visibility: hidden; }
+.at-ly-layer:hover .at-ly-move, .at-ly-layer:focus-within .at-ly-move { visibility: visible; }
+.at-ly-move:hover, .at-ly-move:focus-visible { background: var(--accent-bg); border-radius: 3px; }
+.at-layers-body { position: relative; }
+/* With the eye strip and a grip on every movable row, a one-line name was cut to "Adjust …": two lines instead. */
+.at-ly-layer .at-ly-name { white-space: normal; line-height: 1.15; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
+.at-drag-ghost.at-ly-ghost { width: 40px; height: 40px; }
+.at-ly-row.at-ly-src { opacity: 0.4; }
+.at-ly-row.at-ly-landing-row { border: 1px dashed var(--accent); }
+.at-ly-dragging > *, .at-ly-dragging .at-ly-row { transition: transform var(--transition-lg), border-color var(--transition); }
+.at-ly-landing {
+    position: absolute; left: 0; right: 0; z-index: 2; box-sizing: border-box; pointer-events: none;
+    border: 2px dashed var(--accent); border-radius: 6px; background: var(--accent-bg);
+    display: flex; align-items: center; justify-content: center; font-size: 0.7rem; color: var(--accent);
+    transition: transform var(--transition-lg);
+}
+.at-ly-insert { position: absolute; left: 0; right: 0; height: 3px; z-index: 2; pointer-events: none; background: var(--accent); border-radius: 2px; box-shadow: 0 0 0 1px rgba(0,0,0,0.4); }
+body.at-ly-body-dragging, body.at-ly-body-dragging * { cursor: grabbing !important; user-select: none; }
+
+/* Draw's layer effects (LAYERS-PLAN phase 11): the panel is long, so it scrolls inside its own box instead of pushing the surface off the modal. */
+.at-draw-fx-body { max-height: 260px; overflow-y: auto; padding: 4px 2px; }
+
+/* Work in a folder (FOLDER-SYNC-PLAN). aria-disabled rather than disabled, so the reason
+   is still reachable on click, focus and touch (D3). */
+.at-folder { margin: 12px 0; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; }
+.at-folder-title { font-weight: 600; margin-bottom: 4px; }
+.at-folder-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.at-folder #at-folder-status { margin-top: 8px; }
+.at-folder .btn.at-unavailable { opacity: 0.45; cursor: not-allowed; }
+
+/* ── 📚 Sticker Gallery (STICKERS-PLAN phase 3) ─────────────────────────────
+   Two zones: adding and the selected sticker's details on the left, the grid on
+   the right. Thumbnails sit on the dark checkerboard transparent pixels need. */
+.at-stl-adds { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.at-stl-save { display: flex; align-items: flex-end; gap: 8px; margin: 10px 0; }
+.at-stl-save .form-group { flex: 1; margin: 0; }
+.at-stl-detail { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 4px; }
+.at-stl-detail canvas { display: block; width: 100%; max-width: 256px; aspect-ratio: 1; margin: 0 auto 8px;
+    background: repeating-conic-gradient(#2a2a2a 0% 25%, #1e1e1e 0% 50%) 50% / 16px 16px; border-radius: 4px; }
+.at-stl-del { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0; }
+.at-stl-count { font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 6px; }
+.at-stl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px;
+    max-height: 560px; overflow-y: auto; padding: 2px; align-content: start; min-height: 120px;
+    border: 1px dashed transparent; border-radius: 6px; }
+.at-stl-grid.drag-over, #at-modal-stickerlib.drag-over .at-stl-grid { border-color: var(--accent); }
+.at-stl-empty { grid-column: 1 / -1; color: var(--text-secondary); font-size: 0.85rem; padding: 24px 8px; text-align: center; }
+.at-stl-cell { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 4px;
+    background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; color: inherit; min-width: 0; }
+.at-stl-cell:hover { border-color: #5a5a5a; }
+.at-stl-cell[aria-selected="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.at-stl-cell canvas { width: 88px; height: 88px; border-radius: 3px;
+    background: repeating-conic-gradient(#2a2a2a 0% 25%, #1e1e1e 0% 50%) 50% / 12px 12px; }
+.at-stl-cell span { font-size: 0.72rem; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── 🏷️ Add Stickers (STICKERS-PLAN phase 4) ── */
+.at-st-selname { font-weight: 600; margin: 6px 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.at-st-btns { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.at-st-strip { display: flex; gap: 6px; overflow-x: auto; padding: 2px 2px 6px; min-height: 64px; }
+.at-st-strip .at-st-chip { flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 3px;
+    background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 5px; cursor: pointer; color: inherit; width: 60px; }
+.at-st-strip .at-st-chip:hover { border-color: var(--accent); }
+.at-st-strip .at-st-chip canvas { width: 48px; height: 48px; border-radius: 3px;
+    background: repeating-conic-gradient(#2a2a2a 0% 25%, #1e1e1e 0% 50%) 50% / 10px 10px; }
+.at-st-strip .at-st-chip span { font-size: 0.65rem; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.at-st-strip .at-stl-empty { padding: 12px 4px; }
+.at-st-bar { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+.at-st-bar .checkbox-row { margin: 0; }
+.at-st-modewrap { display: flex; align-items: center; gap: 6px; font-size: 0.8rem; }
+/* An author display (.btn is inline-flex, .form-group flex) beats the UA's [hidden]: inside the
+   sticker windows the attribute must win, or a hidden button stays on screen. */
+#at-modal-stickerlib [hidden], #at-modal-stickers [hidden], #at-modal-stickercut [hidden] { display: none !important; }
+
+/* ORGANIC-SETS-PLAN: parked 2026-10-08. The patchy directions, partial regions, Size volatility and the
+   Wang Catalogue / Terrain layouts are built and validated but hidden until the author picks them up again;
+   `?organicsets=on` (script-only) shows them. */
+html:not(.at-orgsets) [data-orgsets] { display: none !important; }

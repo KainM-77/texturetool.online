@@ -331,6 +331,51 @@ TRLE.AnimPresets = {
         material: null, emissive: true
     },
 
+    /* ---- Batch G: CAUSTICS (WATER-CAUSTICS-PLAN phase 5c, 2026-10-03) ----
+       The third generator (js/animcaustics.js), REFRACTION model: light through
+       a moving wave surface, landing on the floor. On BLACK, for faces laid
+       with Additive blending. Pool Floor is tuned against the classic reference
+       collage on six measures (§2, phase 5c's table); the rest are variations.
+       The Cells model stays reachable through the modal's Model select. */
+    caustic_pool: {
+        label: 'Pool Floor', icon: '✨', gradient: 'caustic_teal',
+        description: 'Light through a gently moving pool surface, landing on the floor: soft curved lines, brighter where they focus. Made for Additive blending.',
+        params: { generator: 'caustics', model: 'refraction', depth: 0.03, waveMax: 7, black: 0.1, toneGain: 0.6, exposure: 0.65 },
+        material: { type: 'liquid', key: 'pool_water' }
+    },
+    caustic_sea: {
+        label: 'Sea Bed', icon: '🐚', gradient: 'caustic_aqua',
+        description: 'Big, slow swells over a sandy sea bed: wide soft cells in blue-green light. Made for Additive blending.',
+        params: { generator: 'caustics', model: 'refraction', depth: 0.04, waveMax: 4, blur: 0.004, black: 0.1, toneGain: 0.6, exposure: 0.65 },
+        material: { type: 'liquid', key: 'ocean_deep' }
+    },
+    caustic_shallows: {
+        label: 'Sunlit Shallows', icon: '☀️', gradient: 'caustic_sun',
+        description: 'Strong sun through shallow water: sharp, folded lines of warm light. The brightest of the set. Made for Additive blending.',
+        params: { generator: 'caustics', model: 'refraction', depth: 0.06, waveMax: 6, waveSpeed: 2, black: 0.15, toneGain: 0.7, exposure: 0.75 },
+        material: { type: 'liquid', key: 'pool_water' }
+    },
+    caustic_wall: {
+        label: 'Wall Reflection', icon: '🧱', gradient: 'caustic_aqua',
+        description: 'Light thrown up onto a wall beside water: long, soft horizontal bands drifting with the wind. Made for Additive blending.',
+        params: { generator: 'caustics', model: 'refraction', depth: 0.03, waveMax: 6, stretch: -3, windX: 1, windY: 0, wind: 0.6,
+                  blur: 0.005, waveSpeed: 2, black: 0.1, toneGain: 0.7, exposure: 0.7 },
+        material: { type: 'liquid', key: 'pool_water' }
+    },
+    caustic_calm: {
+        label: 'Calm Surface', icon: '🪷', gradient: 'caustic_teal',
+        description: 'A still surface with a slow, faint swell: broad patches of light rather than lines. For water seen from above. Made for Additive blending.',
+        params: { generator: 'caustics', model: 'refraction', depth: 0.025, waveMax: 4, slope: 4, blur: 0.004, black: 0.05, toneGain: 0.8, exposure: 0.8 },
+        material: { type: 'liquid', key: 'pool_water' }
+    },
+    caustic_choppy: {
+        label: 'Choppy Surface', icon: '🌬️', gradient: 'caustic_teal',
+        description: 'Wind-driven, fast water: a busy network of small cells with fine ripples on top. Made for Additive blending.',
+        params: { generator: 'caustics', model: 'refraction', depth: 0.035, waveMax: 8, slope: 1.5, waveSpeed: 3, windX: 1, windY: 1, wind: 0.4,
+                  black: 0.1, toneGain: 0.7, exposure: 0.7 },
+        material: { type: 'liquid', key: 'pool_water' }
+    },
+
     aurora_sky: {
         label: 'Aurora Sky', icon: '🌌', gradient: 'aurora',
         description: 'Slow shimmering curtains of aurora light drifting across the sky — ceilings, skyboxes and magical vistas. Glows.',
@@ -350,6 +395,7 @@ TRLE.AnimPresetOrder = [
     'rain_drizzle', 'rain_downpour', 'rain_window', 'snow_fall', 'ash_fall',
     'sparks_rising', 'sparks_twinkle', 'bubbles_rising', 'drips_wall',
     'rain_glass', 'rain_soft', 'snow_deep',
+    'caustic_pool', 'caustic_sea', 'caustic_shallows', 'caustic_wall', 'caustic_calm', 'caustic_choppy',
     'glitch_corrupt', 'glitch_collage'
 ];
 

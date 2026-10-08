@@ -226,9 +226,10 @@ TRLE.AnimGen = (function () {
     /* Generate the full looping sequence. Returns an array of N canvases
        (tileSize²). Deterministic: same params → identical pixels. */
     function generateFrames(params) {
-        /* Two generators, one contract. `animNoise` makes a FIELD; the particle
+        /* Three generators, one contract. `animNoise` makes a FIELD; the particle
            generator makes discrete streaks, which fBm cannot do (see
-           js/animparticles.js). Dispatched here rather than at every call site so
+           js/animparticles.js); the caustics generator draws closed cells of
+           light on black for Additive water (js/animcaustics.js). Dispatched here rather than at every call site so
            refreshAnims, the modal preview and anAdd all route alike.
 
            An ABSENT `generator` means 'noise', which is what makes every saved
@@ -236,6 +237,10 @@ TRLE.AnimGen = (function () {
         if (params && params.generator === 'particles') {
             if (!TRLE.AnimParticles) throw new Error('TRLE.AnimGen: particle generator unavailable');
             return TRLE.AnimParticles.generateFrames(params);
+        }
+        if (params && params.generator === 'caustics') {
+            if (!TRLE.AnimCaustics) throw new Error('TRLE.AnimGen: caustics generator unavailable');
+            return TRLE.AnimCaustics.generateFrames(params);
         }
         const E = TRLE.Engine;
         if (!E || !E.programs || !E.programs().animNoise) {

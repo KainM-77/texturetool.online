@@ -44,8 +44,49 @@ window.TRLE = window.TRLE || {};
         dirty: false,            // unsaved edits since the last save / load
         emptyFill: null,         // what empty slots become at export: 'compact' | 'black' | 'transparent' | null (ask)
         lockCols: false,         // a push may not add a column (GRID-SLOT-PLAN D6)
-        lockRows: false          // a push may not add a row
+        lockRows: false,         // a push may not add a row
+        layerDefs: {}            // layer definitions by lid (TRLE.Layers); pieces live on el.layers
     };
+    const LAYERS_CAPTURE = /[?&]capture/i.test(location.search);   // enables TRLE.Layers' per-edit invariant check
+    const hasLayers = el => TRLE.Layers.hasLayers(el);
+    /* A new picture becomes the bottom of the stack and the layers rebuild over it. `defer`: the caller
+       rebuilds with layersSettle (a slow stack dims, decision 20) before anything reads el.canvas. */
+    function rebaseLayers(el, defer) {
+        if (!hasLayers(el)) return;
+        el.under = TRLE.Layers.imm(cloneCanvas(el.original));
+        if (!defer) TRLE.Layers.rebuild(el, state.layerDefs);
+    }
+    /* STICKERS-PLAN D9: transitions and animation frames are rebuilt from their recipes. One that carries
+       (sticker) layers gets its recipe's render as the stack's BOTTOM, and the stack rebuilds over it, at once,
+       so anything built from it (a transition of a transition, an animated overlay) reads the finished picture.
+       Without layers the render is the picture, byte for byte as before. The ONE writer of both. A loaded
+       project restores the pieces with no bottom (`under` is not needed: the render makes it), hence the test
+       on `layers` and not `hasLayers`. */
+    const derivedLayered = el => !!el && el.kind !== 'tile' && Array.isArray(el.layers) && el.layers.length > 0;
+    function writeDerived(el, c) {
+        if (!derivedLayered(el)) { drawReplace(el.canvas, c); return; }
+        const u = document.createElement('canvas'); u.width = el.canvas.width; u.height = el.canvas.height;
+        drawReplace(u, c);
+        el.under = TRLE.Layers.imm(u);
+        TRLE.Layers.rebuild(el, state.layerDefs);
+    }
+    /* An animation's frames take a sticker together (Q9d): the whole group, or the element alone. */
+    const animGroupOf = el => (el && el.kind === 'anim' && el.anim
+        ? state.elements.filter(e => e.kind === 'anim' && e.anim && e.anim.group === el.anim.group).sort((a, b) => a.anim.index - b.anim.index)
+        : (el ? [el] : []));
+    /* Rebuild the layered tiles among `els` after deferred moves and rebases: one pass, dimmed with a
+       progress bar when the estimate is slow (Make Seamless is about 1 s at 1024). */
+    function layersSettle(els) { return TRLE.Layers.rebuildMany(els.filter(hasLayers), state.layerDefs); }
+    /* The tile's OWN seamless value changed under its layers (a new picture, a move that breaks tiling). With a
+       deciding layer the own value is kept in that layer's `data.was`, so it goes there and the flag is derived again. */
+    function setBaseSeamless(el, v) {
+        el.seamless = !!v;
+        const p = decidingPieces(el).find(q => q.data && q.data.was !== undefined);
+        if (p) p.data = Object.assign({}, p.data, { was: !!v });
+        syncSeamless([el]);
+    }
+    /* The tile has no layers any more (Reset to Original). The caller prunes definitions. */
+    function dropLayers(el) { el.under = null; el.layers = null; el.layerSig = null; }
 
     /* element: {
          id, kind: 'tile' | 'transition',
@@ -373,8 +414,16 @@ window.TRLE = window.TRLE || {};
         EdgeTop:           CORNER_NW | CORNER_NE,
         EdgeBottom:        CORNER_SW | CORNER_SE,
         EdgeLeft:          CORNER_NW | CORNER_SW,
-        EdgeRight:         CORNER_NE | CORNER_SE
+        EdgeRight:         CORNER_NE | CORNER_SE,
+        // Terrain cells (ORGANIC-SETS-PLAN P5): the four vertex combinations no
+        // single-tile button makes, so a random vertex map has a mode for every cell.
+        TerrainNone:       0,
+        TerrainAll:        CORNER_NW | CORNER_NE | CORNER_SE | CORNER_SW,
+        TerrainNWSE:       CORNER_NW | CORNER_SE,
+        TerrainNESW:       CORNER_NE | CORNER_SW
     });
+    /* bits -> a CORNER_BITS name, first name wins (Corner, Notch, Edge, Terrain). */
+    const CORNER_NAME_OF = (() => { const o = []; for (const [k, b] of Object.entries(CORNER_BITS)) if (o[b] === undefined) o[b] = k; return o; })();
     /* Legacy ratio-field mode -> its corner-state counterpart. ONE table for both
        places that swap families: the Full Set's 'seamless' style (transSetCells)
        and the Single tab's "Seamless corners" checkbox. The edge rows matter as
@@ -1778,7 +1827,7 @@ window.TRLE = window.TRLE || {};
         // not offered alongside it (the modal disables one while the other is
         // on), and ignored here if a hand-edited recipe has both.
         const still = el.anim && animStillSource(el.anim.still);
-        if (still) { drawReplace(el.canvas, resizeCanvas(still.canvas, S, S), S, S); return; }
+        if (still) { writeDerived(el, resizeCanvas(still.canvas, S, S)); return; }
         let out = src;
         if (ovl && src && animOverlaySource(ovl))
             out = composeAnimOverlay(src, ovl, S, plan, el.anim.index, el.anim.total);
@@ -1789,8 +1838,8 @@ window.TRLE = window.TRLE || {};
         // refresh, and a cutout overlay (a grate, a well rim) has real holes for
         // the previous pass to show through. The eleven-site alpha bug, and this
         // is precisely the shape that shows it.
-        if (out) drawReplace(el.canvas, out, S, S);
-        else el.canvas.getContext('2d').clearRect(0, 0, S, S);
+        if (!out) { out = document.createElement('canvas'); out.width = out.height = S; }
+        writeDerived(el, out);   // stickers on the frame go on top (STICKERS-PLAN D9)
     }
 
     /* Does this recipe's SELECTION change frame to frame? It does not, unless it
@@ -1957,18 +2006,165 @@ window.TRLE = window.TRLE || {};
        overlay fraction), roughness (0..1 edge raggedness), edgeSafe (fade to
        black near borders for seamless tiling), edgeMargin (0..1 of min side),
        hint (grayscale canvas biasing where overlay lands), hintStrength }. */
+    /* The Organic Transition's patch field, out of buildOrganicMask so the patchy
+       transitions (ORGANIC-SETS-PLAN) draw the same patches: value noise, a domain
+       warp, Patch size and Roughness meaning what they mean there. (u, v) is the
+       pixel over the tile, 0..1. `k` scales the frequency (Size volatility); at 1
+       the arithmetic is exactly buildOrganicMask's, which validate-organic-sets pins. */
+    function orgPatchField(seed, scale, roughness) {
+        const noise  = makeValueNoise(seed);
+        const warp   = makeValueNoise((seed ^ 0x9e3779b9) >>> 0);
+        const baseFreq = 1.5 + (1 - scale) * 10;     // lattice cells across the tile
+        const octaves  = 2 + Math.round(roughness * 3);
+        const warpAmt  = roughness * 0.6;
+        const fbm = (nx, ny) => {
+            let amp = 1, freq = 1, sum = 0, norm = 0;
+            for (let i = 0; i < octaves; i++) { sum += amp * noise(nx * freq, ny * freq); norm += amp; amp *= 0.5; freq *= 2; }
+            return sum / norm;
+        };
+        const f = (u, v, k) => {
+            const bf = k === undefined || k === 1 ? baseFreq : baseFreq * k;
+            let nx = u * bf, ny = v * bf;
+            nx += (warp(nx + 5.2, ny + 1.3) - 0.5) * warpAmt * bf * 0.3;
+            ny += (warp(nx + 9.7, ny + 4.1) - 0.5) * warpAmt * bf * 0.3;
+            return fbm(nx, ny);
+        };
+        f.soft = 0.04 + roughness * 0.18;
+        return f;
+    }
+
+    /* ORGANIC-SETS-PLAN D5: organic patches on BOTH sides of any transition's
+       boundary. `plain` is the transition's own mask (white = overlay); the result
+       grows overlay islands into the base (A into B) and opens base holes in the
+       overlay (B into A), densest at the boundary and thinning out over `reach`.
+
+       The seam rule is the Organic Transition's: every patch term is multiplied by
+       the edge-margin fade, which is exactly 0 on the tile border, so the border
+       pixels come out byte-identical to `plain` and a patchy tile swaps for its
+       plain twin anywhere (D1). Patches never straddle two tiles.
+
+       `region` replaces the boundary with a place on a SOLID base tile (no plain
+       mask): 'whole' scatters everywhere, which at Size volatility 0 is
+       buildOrganicMask with the uniform edge fade pixel for pixel; 'top', 'tl' and
+       the rest thin out from that side or corner. B into A on a solid tile is the
+       same tile with the textures swapped, so `region` ignores bIntoA. */
+    /* Size volatility: a slow field picks, place by place, between patches smaller
+       and bigger than the set size. Sharpened so a place is mostly one size or the
+       other, which reads as mixed sizes rather than as mush. At 0 it is the field. */
+    function patchSampler(seed, volatility) {
+        const vol = Math.max(0, Math.min(1, volatility || 0));
+        if (!vol) return (f, u, v) => f(u, v);
+        const mix = makeValueNoise(((seed >>> 0) ^ 0x27d4eb2f) >>> 0);
+        return (f, u, v) => {
+            let t = (mix(u * 2.3 + 3.7, v * 2.3 + 1.9) - 0.5) * 4 + 0.5;
+            t = t < 0 ? 0 : t > 1 ? 1 : t;
+            t = t * t * (3 - 2 * t);
+            return f(u, v, 1 + vol * 0.7) * (1 - t) + f(u, v, 1 - vol * 0.55) * t;
+        };
+    }
+    const PATCH_DEFAULTS = { seed: 1, aIntoB: 0.35, bIntoA: 0.35, reach: 0.3, scale: 0.5,
+                             roughness: 0.5, volatility: 0, margin: 0.12, region: null, hint: null };
+    const PATCH_REGIONS = ['whole', 'top', 'bottom', 'left', 'right', 'tl', 'tr', 'bl', 'br'];
+    const patchSeedB = seed => (Math.imul((seed >>> 0) + 7, 2246822519) ^ 0x5bd1e995) >>> 0;
+    function patchMask(plain, S, p) {
+        const o = Object.assign({}, PATCH_DEFAULTS, p);
+        const region = o.region && PATCH_REGIONS.includes(o.region) ? o.region : null;
+        const src = plain && !region ? plain.getContext('2d').getImageData(0, 0, S, S).data : null;
+        const sgn = src && o.aIntoB + o.bIntoA > 0 ? maskSignedDistance(plain, S, S).sgn : null;
+        const fA = orgPatchField(o.seed >>> 0, o.scale, o.roughness);
+        const fB = orgPatchField(patchSeedB(o.seed), o.scale, o.roughness);
+        const sample = patchSampler(o.seed, o.volatility);
+        /* Calibrated thresholds. The fbm sits in a narrow band around 0.5, so a raw
+           `1 - amount` threshold (what buildOrganicMask uses) leaves "35%" as a few
+           specks, and its softness is wide next to that spread, so they blur. Every
+           mode except 'whole' therefore reads the threshold off the field's own
+           quantiles (amount = the share of the area it covers where the density is
+           full) and scales the softness to the field's spread. 'whole' keeps the raw
+           rule when asked (`raw`), and is then buildOrganicMask. */
+        const calib = !(region === 'whole' && o.raw);
+        const quant = f => {
+            const n = 24, a = new Float32Array(n * n);
+            for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) a[j * n + i] = sample(f, (i + 0.5) / n, (j + 0.5) / n);
+            a.sort();
+            const q = t => a[Math.max(0, Math.min(a.length - 1, Math.round(t * (a.length - 1))))];
+            return { q, soft: fA.soft * (q(0.9) - q(0.1)) * 0.5 };
+        };
+        const qA = calib ? quant(fA) : null, qB = calib && sgn ? quant(fB) : null;
+        const reachPx = Math.max(1, o.reach * S);
+        const edgePx = Math.max(2, S * o.margin);
+        const fade = dist => { const e = dist / edgePx; return e >= 1 ? 1 : e * e * (3 - 2 * e); };
+        /* Calibrated modes thin the DENSITY toward the border over twice the margin,
+           so patches shrink and end in their own organic shape, and keep only a
+           narrow alpha fade (a third of the margin) for the exact border. Fading the
+           alpha over the whole margin, as buildOrganicMask does, cuts every patch off
+           along a straight line, and on a block of tiles those lines draw the grid. */
+        const covFade = calib ? (dist => { const e = dist / (edgePx * 2); return e >= 1 ? 1 : e * e * (3 - 2 * e); }) : () => 1;
+        const alphaFade = calib ? (dist => { const e = dist / Math.max(1.5, edgePx / 3); return e >= 1 ? 1 : e * e * (3 - 2 * e); }) : fade;
+        const fall = dist => { const t = dist / reachPx; return t >= 1 ? 0 : 1 - t * t * (3 - 2 * t); };
+        const thresh = (f, cov, qq) => {
+            const soft = qq ? qq.soft : fA.soft;
+            const t = qq ? qq.q(1 - cov) : 1 - cov;
+            let v = (f - (t - soft)) / (2 * soft);
+            v = v < 0 ? 0 : v > 1 ? 1 : v;
+            return v * v * (3 - 2 * v);
+        };
+        const rdist = region && {
+            whole: () => 0, top: (x, y) => y, bottom: (x, y) => S - 1 - y,
+            left: x => x, right: x => S - 1 - x,
+            tl: (x, y) => Math.hypot(x, y), tr: (x, y) => Math.hypot(S - 1 - x, y),
+            bl: (x, y) => Math.hypot(x, S - 1 - y), br: (x, y) => Math.hypot(S - 1 - x, S - 1 - y)
+        }[region];
+        let hintData = null;
+        if (o.hint) hintData = resizeCanvas(o.hint, S, S).getContext('2d').getImageData(0, 0, S, S).data;
+        const out = document.createElement('canvas'); out.width = S; out.height = S;
+        const ctx = out.getContext('2d');
+        const img = ctx.createImageData(S, S), d = img.data;
+        for (let y = 0; y < S; y++) {
+            for (let x = 0; x < S; x++) {
+                const i = y * S + x, idx = i * 4;
+                const pv = src ? src[idx] : 0;
+                const bd = Math.min(x, S - 1 - x, y, S - 1 - y);
+                const f = alphaFade(bd), cf = covFade(bd);
+                let m = pv / 255;
+                if (f > 0) {
+                    const u = x / S, v = y / S;
+                    if (o.aIntoB > 0) {
+                        // distance INTO the base, and a gate that keeps islands on its side
+                        const s = sgn ? sgn[i] : 0;
+                        const dist = rdist ? rdist(x, y) : s < 0 ? -s : 0;
+                        const gate = rdist || !sgn ? 1 : s <= -1 ? 1 : s >= 1 ? 0 : (1 - s) * 0.5;
+                        const cov = o.aIntoB * fall(dist) * cf;
+                        if (cov > 0 && gate > 0) {
+                            let fv = sample(fA, u, v);
+                            if (hintData) { const h = hintData[idx] / 255; fv = fv * 0.3 + (fv * 0.45 + h * 0.55) * 0.7; }
+                            const w = thresh(fv, cov, qA) * f * gate;
+                            if (w > m) m = w;
+                        }
+                    }
+                    if (o.bIntoA > 0 && sgn) {
+                        const s = sgn[i];
+                        const gate = s >= 1 ? 1 : s <= -1 ? 0 : (1 + s) * 0.5;
+                        const cov = o.bIntoA * fall(s > 0 ? s : 0) * cf;
+                        if (cov > 0 && gate > 0) m *= 1 - thresh(sample(fB, u, v), cov, qB) * f * gate;
+                    }
+                }
+                const g = f > 0 ? Math.round(m * 255) : pv;
+                d[idx] = d[idx + 1] = d[idx + 2] = g; d[idx + 3] = 255;
+            }
+        }
+        ctx.putImageData(img, 0, 0);
+        return out;
+    }
+
     function buildOrganicMask(W, H, opts) {
         const o = Object.assign({
             seed: 1, scale: 0.5, coverage: 0.5, roughness: 0.5,
-            edgeSafe: true, edgeMargin: 0.12, hint: null, hintStrength: 0.7,
+            edgeSafe: true, edgeMargin: 0.12, hint: null, hintStrength: 0.7, volatility: 0,
             seam: null   // {segs, top[], right[], bottom[], left[]} — per-side seamless control
         }, opts);
-        const noise  = makeValueNoise(o.seed);
-        const warp   = makeValueNoise((o.seed ^ 0x9e3779b9) >>> 0);
-        const baseFreq = 1.5 + (1 - o.scale) * 10;     // lattice cells across the tile
-        const octaves  = 2 + Math.round(o.roughness * 3);
-        const warpAmt  = o.roughness * 0.6;
-        const soft     = 0.04 + o.roughness * 0.18;    // threshold softness → edge feather
+        const field    = orgPatchField(o.seed, o.scale, o.roughness);
+        const sample   = patchSampler(o.seed, o.volatility);
+        const soft     = field.soft;                    // threshold softness → edge feather
         const thr      = 1 - o.coverage;
         const edgePx   = Math.max(2, Math.min(W, H) * o.edgeMargin);
         const seam     = o.seam && o.seam.segs > 0 ? o.seam : null;
@@ -1976,27 +2172,19 @@ window.TRLE = window.TRLE || {};
         const fade = (dist) => { const e = dist / edgePx; return e >= 1 ? 1 : e * e * (3 - 2 * e); };
         let hintData = null;
         if (o.hint) hintData = resizeCanvas(o.hint, W, H).getContext('2d').getImageData(0, 0, W, H).data;
-        const fbm = (nx, ny) => {
-            let amp = 1, freq = 1, sum = 0, norm = 0;
-            for (let i = 0; i < octaves; i++) { sum += amp * noise(nx * freq, ny * freq); norm += amp; amp *= 0.5; freq *= 2; }
-            return sum / norm;
-        };
         const out = document.createElement('canvas'); out.width = W; out.height = H;
         const ctx = out.getContext('2d');
         const img = ctx.createImageData(W, H);
         const d = img.data;
         for (let y = 0; y < H; y++) {
             for (let x = 0; x < W; x++) {
-                let nx = (x / W) * baseFreq, ny = (y / H) * baseFreq;
-                nx += (warp(nx + 5.2, ny + 1.3) - 0.5) * warpAmt * baseFreq * 0.3;
-                ny += (warp(nx + 9.7, ny + 4.1) - 0.5) * warpAmt * baseFreq * 0.3;
-                let field = fbm(nx, ny);
+                let f = sample(field, x / W, y / H);
                 const idx = (y * W + x) * 4;
                 if (hintData) {
                     const h = hintData[idx] / 255;
-                    field = field * (1 - o.hintStrength) + (field * 0.45 + h * 0.55) * o.hintStrength;
+                    f = f * (1 - o.hintStrength) + (f * 0.45 + h * 0.55) * o.hintStrength;
                 }
-                let v = (field - (thr - soft)) / (2 * soft);
+                let v = (f - (thr - soft)) / (2 * soft);
                 v = v < 0 ? 0 : v > 1 ? 1 : v;
                 v = v * v * (3 - 2 * v);
                 if (seam) {
@@ -2733,8 +2921,1146 @@ window.TRLE = window.TRLE || {};
         return c;
     }
 
+    /* Draw an IMPORTED image (or a PSD's map layer) at tile size, as a true area
+       average (CLASSIC-LOOK-PLAN phase 1). A plain drawImage aliases any big
+       downscale into moire: a 1024 zone plate into a 128 tile came out mean 31.7 /
+       max 136 off an exact area average. How much that bites depends on the
+       browser and the source: Chrome resamples an <img> well by itself but not a
+       canvas (a PSD's map layers) or an ImageBitmap, and FIREFOX aliases all of
+       them and ignores imageSmoothingQuality entirely. So it halves in steps: an
+       exact 2x bilinear step IS a 2x2 box average, and the chain is mean 1.11 /
+       max 2 in both browsers, for every source type. `src` = [sx, sy, sw, sh]
+       takes one cell of an imported sheet. Shrinking only: resizeCanvas is shared
+       by everything else and its output is pinned by reference images.
+       drawImported is ALSO called by layer kinds and their previews (Slope Blur,
+       Scatter's patch), and a saved layer must rebuild to the pixels it was saved
+       with, so its upscale branch stays a single smoothed drawImage. The IMPORT
+       paths call importToTile below instead. */
+    function drawImported(ctx, img, S, src) {
+        let cur = img;
+        let w = src ? src[2] : (img.naturalWidth || img.width);
+        let h = src ? src[3] : (img.naturalHeight || img.height);
+        if (src) {   // the cell at native size first, so the halving sees only it
+            const c = document.createElement('canvas');
+            c.width = w; c.height = h;
+            c.getContext('2d').drawImage(img, src[0], src[1], w, h, 0, 0, w, h);
+            cur = c;
+        }
+        while (w > 2 * S || h > 2 * S) {
+            const nw = w > 2 * S ? Math.ceil(w / 2) : w, nh = h > 2 * S ? Math.ceil(h / 2) : h;
+            const t = document.createElement('canvas');
+            t.width = nw; t.height = nh;
+            const x = t.getContext('2d');
+            x.imageSmoothingEnabled = true;
+            x.imageSmoothingQuality = 'high';
+            x.drawImage(cur, 0, 0, nw, nh);
+            cur = t; w = nw; h = nh;
+        }
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(cur, 0, 0, S, S);
+    }
+    /* How visible a wrap seam is: the mean step across the left/right and top/bottom
+       wrap edges over the mean step between interior neighbours (~1 invisible; a
+       tile that does not tile reads several times that). RGBA bytes, all four
+       channels, so a cutout's edge counts. */
+    function seamRatio(cv) {
+        const w = cv.width, h = cv.height;
+        if (w < 3 || h < 3) return 1;
+        const d = cv.getContext('2d').getImageData(0, 0, w, h).data;
+        const step = (a, b) => { let t = 0; for (let k = 0; k < 4; k++) t += Math.abs(d[a + k] - d[b + k]); return t; };
+        let seam = 0, inner = 0, ni = 0;
+        for (let y = 0; y < h; y++) seam += step(y * w * 4, (y * w + w - 1) * 4);
+        for (let x = 0; x < w; x++) seam += step(x * 4, ((h - 1) * w + x) * 4);
+        seam /= (w + h);
+        for (let y = 0; y < h; y++) for (let x = 0; x < w - 1; x++) { inner += step((y * w + x) * 4, (y * w + x + 1) * 4); ni++; }
+        for (let y = 0; y < h - 1; y++) for (let x = 0; x < w; x++) { inner += step((y * w + x) * 4, ((y + 1) * w + x) * 4); ni++; }
+        inner /= ni;
+        return inner > 0 ? seam / inner : (seam > 0 ? Infinity : 1);
+    }
+    /* A source this much above its own interior steps is not a tiling texture. The
+       step measure is weak on detailed low-res art (NotSeamless.png reads 1.08 at 64
+       px and 1.57 at 256, a tiling Sand 1.5 at 64; PulleyMural, a mural, reads 3.2
+       at 256), so the bar is high on purpose: a wrong WRAP only blends an edge
+       with the opposite edge over a few source pixels, a wrong CLAMP leaves a
+       visible seam in a texture that tiles. */
+    const IMPORT_TILES_BELOW = 2.5;
+    /* IMPORT paths only (add, replace, Import from Atlas, PSD map layers): an
+       image or cell SMALLER than the tile is upscaled by Engine.warp Lanczos,
+       premultiplied, wrapping when the source tiles (seamRatio) and stretching
+       its edge pixels outward when it does not. Today's single clamped drawImage
+       put a seam 3.7 to 6.7x the normal step into a seamless tile (HD-LOOK-PLAN
+       1a). Anything not smaller goes through drawImported unchanged. `wrap`
+       forces the choice (validators; null = decide from the pixels). */
+    function importToTile(ctx, img, S, src, wrap) {
+        const w = src ? src[2] : (img.naturalWidth || img.width);
+        const h = src ? src[3] : (img.naturalHeight || img.height);
+        if (!(w < S || h < S) || !TRLE.Engine || !TRLE.Engine.warp) return drawImported(ctx, img, S, src);
+        let cell = img;
+        if (src || !img.getContext) {   // a canvas of exactly the source, readable for the seam test
+            cell = document.createElement('canvas'); cell.width = w; cell.height = h;
+            if (src) cell.getContext('2d').drawImage(img, src[0], src[1], w, h, 0, 0, w, h);
+            else cell.getContext('2d').drawImage(img, 0, 0);
+        }
+        const wraps = wrap != null ? !!wrap : seamRatio(cell) < IMPORT_TILES_BELOW;
+        const up = warpCanvas(cell, S, S, { m0: [w / S, 0, 0], m1: [0, h / S, 0] }, { filter: 'lanczos', edge: wraps ? 'wrap' : 'clamp', ss: 1 });
+        ctx.clearRect(0, 0, S, S);
+        ctx.drawImage(up, 0, 0);
+    }
+    /* ============ CLASSIC LOOK (CLASSIC-LOOK-PLAN.md) ============
+       An HD tile made to LOOK like a low-res classic texture at the same tile
+       size. Pure CPU on purpose: tiles are at most 1024 px, every step here is
+       milliseconds, and the result is byte-identical on every machine.
+         factor   2 | 4 | 8       the look's resolution is tile / factor
+         shrink   'average' | 'sharp' | 'nearest'
+         show     'blocky' | 'soft' | 'smooth'   (nearest / bilinear / bicubic up)
+         colours  0 (off) | 256 | 64 | 32 | 16
+         dither   'none' | 'ordered' | 'diffusion'
+         alpha    'soft' | 'hard'                 (hard: 0 / 255 per pixel)
+         wrap     true: soft / smooth and the sharpen wrap at the edges (tiling)
+         palette  optional [[r,g,b], ...], shared across a selection
+       Colour is averaged PREMULTIPLIED, so a cutout's transparent pixels (black
+       under alpha 0) cannot bleed into its edges. The palette is order-
+       independent (integer sums, full-colour tie-breaks): a half-rolled tile gets
+       the same palette, which is what keeps a seamless tile seamless. */
+    const CLASSIC_BAYER4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+    function classicDefaults(o) {
+        return Object.assign({ factor: 2, shrink: 'average', show: 'blocky', colours: 0,
+                               dither: 'none', alpha: 'soft', wrap: true, palette: null }, o);
+    }
+    /* Shrink to s x s, RGBA floats 0..255, colour NOT premultiplied. */
+    function classicShrink(src, o) {
+        const S = src.width, f = o.factor, s = Math.max(1, Math.round(S / f));
+        const d = src.getContext('2d').getImageData(0, 0, S, S).data;
+        const out = new Float32Array(s * s * 4);
+        for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+            let r = 0, g = 0, b = 0, a = 0, n = 0;
+            if (o.shrink === 'nearest') {
+                const i = ((y * f + (f >> 1)) * S + x * f + (f >> 1)) * 4;
+                r = d[i] * d[i + 3]; g = d[i + 1] * d[i + 3]; b = d[i + 2] * d[i + 3]; a = d[i + 3]; n = 1;
+            } else {
+                for (let j = 0; j < f; j++) for (let k = 0; k < f; k++) {
+                    const i = ((y * f + j) * S + x * f + k) * 4, al = d[i + 3];
+                    r += d[i] * al; g += d[i + 1] * al; b += d[i + 2] * al; a += al; n++;
+                }
+            }
+            const o4 = (y * s + x) * 4;
+            out[o4] = a ? r / a : 0; out[o4 + 1] = a ? g / a : 0; out[o4 + 2] = a ? b / a : 0; out[o4 + 3] = a / n;
+        }
+        if (o.shrink === 'sharp') {   // a light unsharp on the small image, 3x3 box
+            const cp = out.slice();
+            const at = (x, y) => { if (o.wrap) { x = (x + s) % s; y = (y + s) % s; } else { x = Math.min(s - 1, Math.max(0, x)); y = Math.min(s - 1, Math.max(0, y)); } return (y * s + x) * 4; };
+            for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) for (let c = 0; c < 3; c++) {
+                let m = 0; for (let j = -1; j <= 1; j++) for (let k = -1; k <= 1; k++) m += cp[at(x + k, y + j) + c];
+                const i = (y * s + x) * 4 + c;
+                out[i] = Math.min(255, Math.max(0, cp[i] + 0.6 * (cp[i] - m / 9)));
+            }
+        }
+        if (o.alpha === 'hard') for (let i = 3; i < out.length; i += 4) out[i] = out[i] >= 127.5 ? 255 : 0;
+        return { s, px: out };
+    }
+    /* Median cut over the opaque-ish pixels of one or more shrunk images, then one
+       k-means pass. Integer colours and integer sums, so the result does not
+       depend on pixel order. */
+    function classicPalette(smalls, n) {
+        const cols = [];
+        for (const { px } of smalls) for (let i = 0; i < px.length; i += 4)
+            if (px[i + 3] >= 8) cols.push((Math.round(px[i]) << 16) | (Math.round(px[i + 1]) << 8) | Math.round(px[i + 2]));
+        if (!cols.length) return [[0, 0, 0]];
+        cols.sort((a, b) => a - b);
+        const ch = (c, k) => (c >> (16 - 8 * k)) & 255;
+        let boxes = [cols];
+        while (boxes.length < n) {
+            let bi = -1, bw = -1, bk = 0;
+            boxes.forEach((bx, i) => {
+                if (bx.length < 2) return;
+                for (let k = 0; k < 3; k++) {
+                    let lo = 255, hi = 0; for (const c of bx) { const v = ch(c, k); if (v < lo) lo = v; if (v > hi) hi = v; }
+                    if (hi - lo > bw) { bw = hi - lo; bi = i; bk = k; }
+                }
+            });
+            if (bi < 0 || bw <= 0) break;
+            const bx = boxes[bi].slice().sort((a, b) => (ch(a, bk) - ch(b, bk)) || (a - b));
+            const mid = bx.length >> 1;
+            boxes.splice(bi, 1, bx.slice(0, mid), bx.slice(mid));
+        }
+        const mean = bx => { let r = 0, g = 0, b = 0; for (const c of bx) { r += ch(c, 0); g += ch(c, 1); b += ch(c, 2); } return [Math.round(r / bx.length), Math.round(g / bx.length), Math.round(b / bx.length)]; };
+        let pal = boxes.filter(b => b.length).map(mean);
+        // one k-means refinement, with integer accumulators
+        const acc = pal.map(() => [0, 0, 0, 0]), near = classicNearest(pal);
+        for (const c of cols) { const p = acc[near(ch(c, 0), ch(c, 1), ch(c, 2))]; p[0] += ch(c, 0); p[1] += ch(c, 1); p[2] += ch(c, 2); p[3]++; }
+        pal = pal.map((p, i) => acc[i][3] ? [Math.round(acc[i][0] / acc[i][3]), Math.round(acc[i][1] / acc[i][3]), Math.round(acc[i][2] / acc[i][3])] : p);
+        return pal;
+    }
+    /* Nearest palette index, memoised per exact colour; ties go to the lower index. */
+    function classicNearest(pal) {
+        const memo = new Map();
+        return (r, g, b) => {
+            r = Math.min(255, Math.max(0, Math.round(r))); g = Math.min(255, Math.max(0, Math.round(g))); b = Math.min(255, Math.max(0, Math.round(b)));
+            const key = (r << 16) | (g << 8) | b;
+            let hit = memo.get(key);
+            if (hit === undefined) {
+                let bd = Infinity; hit = 0;
+                for (let i = 0; i < pal.length; i++) { const dr = r - pal[i][0], dg = g - pal[i][1], db = b - pal[i][2], dd = dr * dr + dg * dg + db * db; if (dd < bd) { bd = dd; hit = i; } }
+                memo.set(key, hit);
+            }
+            return hit;
+        };
+    }
+    function classicQuantise(small, pal, dither) {
+        const { s, px } = small, near = classicNearest(pal);
+        /* Ordered-dither amplitude = the palette's own step: the mean distance from
+           each colour to its nearest neighbour. A FITTED palette is packed around
+           the texture's colours, so sizing it for a uniform cube (255 / cbrt(n),
+           the first cut) put a +-50 checkerboard over sandstone whose 16 colours sit
+           about a dozen levels apart. */
+        let spread = 0;
+        for (let i = 0; i < pal.length; i++) {
+            let m = Infinity;
+            for (let j = 0; j < pal.length; j++) if (j !== i) {
+                const dr = pal[i][0] - pal[j][0], dg = pal[i][1] - pal[j][1], db = pal[i][2] - pal[j][2];
+                m = Math.min(m, Math.sqrt(dr * dr + dg * dg + db * db));
+            }
+            spread += isFinite(m) ? m : 32;
+        }
+        spread = pal.length ? spread / pal.length : 32;
+        if (dither === 'diffusion') {   // Floyd-Steinberg, serpentine; does NOT tile
+            const e = Float32Array.from(px);
+            for (let y = 0; y < s; y++) {
+                const rtl = y & 1;
+                for (let xi = 0; xi < s; xi++) {
+                    const x = rtl ? s - 1 - xi : xi, i = (y * s + x) * 4;
+                    if (px[i + 3] < 8) continue;
+                    const p = pal[near(e[i], e[i + 1], e[i + 2])];
+                    for (let c = 0; c < 3; c++) {
+                        const err = e[i + c] - p[c]; e[i + c] = p[c];
+                        const push = (dx, dy, w) => { const xx = x + (rtl ? -dx : dx), yy = y + dy; if (xx < 0 || xx >= s || yy >= s) return; e[(yy * s + xx) * 4 + c] += err * w; };
+                        push(1, 0, 7 / 16); push(-1, 1, 3 / 16); push(0, 1, 5 / 16); push(1, 1, 1 / 16);
+                    }
+                }
+            }
+            for (let i = 0; i < px.length; i += 4) if (px[i + 3] >= 8) { px[i] = e[i]; px[i + 1] = e[i + 1]; px[i + 2] = e[i + 2]; }
+            return;
+        }
+        for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) {
+            const i = (y * s + x) * 4;
+            const t = dither === 'ordered' ? (CLASSIC_BAYER4[(y & 3) * 4 + (x & 3)] / 16 - 0.5 + 1 / 32) * spread : 0;
+            const p = pal[near(px[i] + t, px[i + 1] + t, px[i + 2] + t)];
+            px[i] = p[0]; px[i + 1] = p[1]; px[i + 2] = p[2];
+        }
+    }
+    /* Back up to S x S. Interpolation is in premultiplied space. */
+    function classicExpand(small, S, o) {
+        const { s, px } = small, f = S / s;
+        const out = document.createElement('canvas'); out.width = out.height = S;
+        const g = out.getContext('2d'), im = g.createImageData(S, S), d = im.data;
+        const idx = (x, y) => { if (o.wrap) { x = ((x % s) + s) % s; y = ((y % s) + s) % s; } else { x = Math.min(s - 1, Math.max(0, x)); y = Math.min(s - 1, Math.max(0, y)); } return (y * s + x) * 4; };
+        const cr = t => { const a = Math.abs(t); return a <= 1 ? 1.5 * a * a * a - 2.5 * a * a + 1 : a < 2 ? -0.5 * a * a * a + 2.5 * a * a - 4 * a + 2 : 0; };
+        for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+            const o4 = (y * S + x) * 4;
+            if (o.show === 'blocky') {
+                const i = idx(Math.floor(x / f), Math.floor(y / f));
+                d[o4] = px[i]; d[o4 + 1] = px[i + 1]; d[o4 + 2] = px[i + 2]; d[o4 + 3] = px[i + 3];
+                continue;
+            }
+            const u = (x + 0.5) / f - 0.5, v = (y + 0.5) / f - 0.5, x0 = Math.floor(u), y0 = Math.floor(v);
+            let r = 0, gg = 0, b = 0, a = 0, wsum = 0;
+            const R = o.show === 'smooth' ? 2 : 1;
+            for (let j = 1 - R; j <= R; j++) for (let k = 1 - R; k <= R; k++) {
+                const w = o.show === 'smooth' ? cr(u - (x0 + k)) * cr(v - (y0 + j)) : (1 - Math.abs(u - (x0 + k))) * (1 - Math.abs(v - (y0 + j)));
+                if (!w) continue;
+                const i = idx(x0 + k, y0 + j), al = px[i + 3];
+                r += px[i] * al * w; gg += px[i + 1] * al * w; b += px[i + 2] * al * w; a += al * w; wsum += w;
+            }
+            const A = Math.max(0, a / wsum);
+            d[o4] = A ? r / a : 0; d[o4 + 1] = A ? gg / a : 0; d[o4 + 2] = A ? b / a : 0;
+            d[o4 + 3] = o.alpha === 'hard' ? (A >= 127.5 ? 255 : 0) : A;
+        }
+        g.putImageData(im, 0, 0);
+        return out;
+    }
+    function classicLook(src, opts) {
+        const o = classicDefaults(opts);
+        const small = classicShrink(src, o);
+        if (o.colours > 0) classicQuantise(small, o.palette || classicPalette([small], o.colours), o.dither);
+        return classicExpand(small, src.width, o);
+    }
+    /* One palette for a whole selection: fitted to all their shrunk pixels. */
+    function classicSharedPalette(canvases, opts) {
+        const o = classicDefaults(opts);
+        return classicPalette(canvases.map(c => classicShrink(c, o)), o.colours);
+    }
+
+    /* ============ HD LOOK (HD-LOOK-PLAN.md) ============
+       A low-res tile made to look HD at the SAME tile size, with no generative step.
+       The input is treated as an upscale: it is shrunk by `factor` (an exact area
+       average, so the result is judged against what the tile really held at that
+       resolution), taken back up with Lanczos-3 and corrected by back-projection so
+       that shrinking the RESULT gives that low-res image back (consistency, P4).
+         factor        2 | 4 | 8   the source resolution is tile / factor (S % factor == 0)
+         faithfulness  0..100      how much of the final correction is applied; 100 = exact
+         wrap          true: the taps wrap at the edges (a tiling texture stays seamless)
+         cutout        'auto' | 'alpha' | 'black' | 'magenta' | 'off'
+         seed          kept in the recipe for the detail sources that follow (unused here)
+         sharpen       0..100  edge sharpening: a shock filter (Osher & Rudin 1990) on the luminance steepens a
+                       blurred edge into a crisp one and, limited by minmod differences, makes no new extreme,
+                       so there is no halo. 0 = off.
+         contours      0 | 8 | 16 | 32  smooth contours: the low-res tile is fitted to that many colours
+                       (classicPalette), each colour's coverage is taken up smooth (Lanczos) and every HD pixel
+                       takes the colour with the most coverage, so a boundary comes out a smooth curve and no
+                       colour appears that the tile does not hold; the shading inside each region comes back
+                       from the low-res residual. Raster only, no vector graph and no distance field: Adobe's
+                       US10403005 (active to 2037) claims those. Off when the tile has cutouts.
+         selfex        0..100  detail borrowed from the tile's own coarser scales (patch search at x2 steps)
+         grain         0..100  grain with the spectrum of the reference tile `ref` (a canvas), seeded by `seed`, in the
+                               band the low-res tile lacks and with its own block averages removed
+         guided        true: the colour is taken back up from the low-res colour, guided by the sharpened
+                       luminance (joint bilateral upsampling, Kopf et al. 2007, US7889949, expired), so a colour
+                       edge lands on its luminance edge
+       Pure: canvas and recipe in, a new canvas out, no reads of anything else (P1).
+       Everything runs in premultiplied float, in JS doubles into Float32 buffers with
+       a fixed order of taps, so a rolled or flipped tile gives the rolled or flipped
+       result. Cutouts (P5): the alpha is upscaled smooth, then steepened to a crisp
+       edge about 1 px wide, and colour is carried premultiplied so a hole never bleeds
+       into a bar. A KEYED hole (exact black or magenta, no alpha) is treated as
+       transparent going in and written back as exactly that colour. */
+    const HD_DEFAULTS = { factor: 4, faithfulness: 100, wrap: true, cutout: 'auto', seed: 1, sharpen: 0, guided: false, contours: 0, selfex: 0, grain: 0, ref: null };
+    const HD_KEYS = { black: [0, 0, 0], magenta: [255, 0, 255] };
+    const hdLanczos = x => { x = Math.abs(x); if (x >= 3) return 0; if (x < 1e-9) return 1; const p = Math.PI * x; return 3 * Math.sin(p) * Math.sin(p / 3) / (p * p); };
+    /* Per-phase weights for an integer factor: output pixel p of a block reads source taps -3..3 around it. */
+    function hdWeights(f) {
+        const W = [];
+        for (let p = 0; p < f; p++) {
+            const u = (p + 0.5) / f - 0.5, w = [];
+            let sum = 0;
+            for (let t = 0; t < 7; t++) { const v = hdLanczos(u - (t - 3)); w.push(v); sum += v; }
+            W.push(w.map(v => v / sum));
+        }
+        return W;
+    }
+    /* s x s -> S x S, `ch` interleaved channels, separable. */
+    function hdUp(src, s, f, wrap, ch) {
+        const S = s * f, W = hdWeights(f);
+        const ix = (i) => wrap ? ((i % s) + s) % s : Math.min(s - 1, Math.max(0, i));
+        const tmp = new Float64Array(s * S * ch), out = new Float32Array(S * S * ch);
+        const acc = new Float64Array(ch);
+        for (let y = 0; y < s; y++) for (let x = 0; x < S; x++) {
+            const bx = (x / f) | 0, w = W[x - bx * f];
+            acc.fill(0);
+            for (let t = 0; t < 7; t++) { const wt = w[t]; if (!wt) continue; const o = (y * s + ix(bx + t - 3)) * ch; for (let c = 0; c < ch; c++) acc[c] += wt * src[o + c]; }
+            const o = (y * S + x) * ch; for (let c = 0; c < ch; c++) tmp[o + c] = acc[c];
+        }
+        for (let y = 0; y < S; y++) {
+            const by = (y / f) | 0, w = W[y - by * f];
+            for (let x = 0; x < S; x++) {
+                acc.fill(0);
+                for (let t = 0; t < 7; t++) { const wt = w[t]; if (!wt) continue; const o = (ix(by + t - 3) * S + x) * ch; for (let c = 0; c < ch; c++) acc[c] += wt * tmp[o + c]; }
+                const o = (y * S + x) * ch; for (let c = 0; c < ch; c++) out[o + c] = acc[c];
+            }
+        }
+        return out;
+    }
+    /* The exact area average: S x S -> s x s. */
+    function hdShrink(P, S, f, ch) {
+        const s = S / f, out = new Float32Array(s * s * ch), n = f * f;
+        for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) for (let c = 0; c < ch; c++) {
+            let t = 0;
+            for (let j = 0; j < f; j++) for (let k = 0; k < f; k++) t += P[((y * f + j) * S + x * f + k) * ch + c];
+            out[(y * s + x) * ch + c] = t / n;
+        }
+        return out;
+    }
+    /* RGBA bytes -> premultiplied float RGBA (colour * alpha / 255, alpha 0..255). `key` = [r, g, b] marks transparent pixels. */
+    function hdPremult(d, key) {
+        const P = new Float32Array(d.length);
+        for (let i = 0; i < d.length; i += 4) {
+            let a = d[i + 3];
+            if (key) a = d[i] === key[0] && d[i + 1] === key[1] && d[i + 2] === key[2] ? 0 : 255;
+            P[i] = d[i] * a / 255; P[i + 1] = d[i + 1] * a / 255; P[i + 2] = d[i + 2] * a / 255; P[i + 3] = a;
+        }
+        return P;
+    }
+    function hdMode(d, cutout) {
+        if (cutout === 'black' || cutout === 'magenta') return cutout;
+        if (cutout === 'alpha') return 'alpha';
+        if (cutout === 'off') return 'off';
+        for (let i = 3; i < d.length; i += 4) if (d[i] < 255) return 'alpha';
+        return 'off';
+    }
+    function hdClamp(H) {
+        for (let i = 0; i < H.length; i += 4) {
+            const a = Math.min(255, Math.max(0, H[i + 3]));
+            H[i + 3] = a;
+            for (let c = 0; c < 3; c++) H[i + c] = Math.min(a, Math.max(0, H[i + c]));
+        }
+    }
+    /* ---- phase 4: edge detail. Luminance of the straight colour; a shock filter; optional guided colour. ---- */
+    const hdShockIters = (f, amount) => amount > 0 ? Math.max(1, Math.ceil(amount / 100 * Math.max(f, 2) * 0.75 / 0.5)) : 0;
+    function hdEdge(H, L, S, s, f, wrap, sharpen, guided) {
+        const N = S * S, Y = new Float64Array(N), Y0 = new Float64Array(N), op = new Uint8Array(N);
+        for (let i = 0; i < N; i++) {
+            const a = H[i * 4 + 3];
+            if (a > 0.5) { const k = 255 / a; Y[i] = 0.299 * H[i * 4] * k + 0.587 * H[i * 4 + 1] * k + 0.114 * H[i * 4 + 2] * k; }
+            op[i] = a >= 254 ? 1 : 0;
+        }
+        Y0.set(Y);
+        if (sharpen > 0) {
+            const iters = hdShockIters(f, sharpen), dt = sharpen / 100 * Math.max(f, 2) * 0.75 / iters;
+            const xm = new Int32Array(S), xp = new Int32Array(S);
+            for (let x = 0; x < S; x++) { xm[x] = wrap ? (x + S - 1) % S : Math.max(0, x - 1); xp[x] = wrap ? (x + 1) % S : Math.min(S - 1, x + 1); }
+            const mm = (a, b) => a * b > 0 ? (Math.abs(a) < Math.abs(b) ? a : b) : 0;
+            let cur = Y, nxt = new Float64Array(N);
+            for (let it = 0; it < iters; it++) {
+                for (let y = 0; y < S; y++) {
+                    const ro = y * S, up = xm[y] * S, dn = xp[y] * S;
+                    for (let x = 0; x < S; x++) {
+                        const i = ro + x, c = cur[i];
+                        if (!op[i]) { nxt[i] = c; continue; }
+                        const iw = ro + xm[x], ie = ro + xp[x], inn = up + x, is = dn + x;
+                        // a neighbour that is not opaque (a hole edge) counts as the centre, so the contour is not pushed
+                        const w = op[iw] ? cur[iw] : c, e = op[ie] ? cur[ie] : c, n = op[inn] ? cur[inn] : c, so = op[is] ? cur[is] : c;
+                        const gx = mm(e - c, c - w), gy = mm(so - c, c - n), g = Math.sqrt(gx * gx + gy * gy);
+                        const lap = e + w + n + so - 4 * c, sg = lap > 0 ? 1 : lap < 0 ? -1 : 0;
+                        const m = Math.min(1, Math.max(0, (g - 1.5) / 3));   // flat texture and noise are left alone
+                        nxt[i] = c - dt * sg * g * m;
+                    }
+                }
+                const t = cur; cur = nxt; nxt = t;
+            }
+            if (cur !== Y) Y.set(cur);
+        }
+        // colour: follow the sharpened luminance, from the low-res colour when guided
+        let chroma = null, Yl = null;
+        if (guided) {
+            chroma = new Float64Array(s * s * 3); Yl = new Float64Array(s * s);
+            for (let q = 0; q < s * s; q++) {
+                const a = L[q * 4 + 3];
+                if (a <= 0.5) continue;
+                const k = 255 / a, r = L[q * 4] * k, g = L[q * 4 + 1] * k, b = L[q * 4 + 2] * k, y = 0.299 * r + 0.587 * g + 0.114 * b;
+                Yl[q] = y; chroma[q * 3] = r - y; chroma[q * 3 + 1] = g - y; chroma[q * 3 + 2] = b - y;
+            }
+        }
+        const LUT = new Float64Array(2048), sr = 8;   // range weight exp(-d^2 / 2 sr^2), d in 0.25-level steps (8 measured best on Karnak 18, 56, 69)
+        for (let i = 0; i < 2048; i++) { const d = i / 4; LUT[i] = Math.exp(-d * d / (2 * sr * sr)); }
+        // spatial weights per phase and tap: Gaussian over the 4 nearest low-res pixels, which sit at -2..1 around the block for the
+        // first half of it and -1..2 for the second, so the window mirrors with a flip (equivariance)
+        const sp = new Float64Array(f * 4), gsg = 0.75;
+        for (let p = 0; p < f; p++) { const u = (p + 0.5) / f - 0.5, b0 = p < f / 2 ? -2 : -1; for (let t = 0; t < 4; t++) { const d = u - (b0 + t); sp[p * 4 + t] = Math.exp(-d * d / (2 * gsg * gsg)); } }
+        const ix = i => wrap ? ((i % s) + s) % s : Math.min(s - 1, Math.max(0, i));
+        for (let y = 0; y < S; y++) {
+            const by = (y / f) | 0, py = y - by * f;
+            for (let x = 0; x < S; x++) {
+                const i = y * S + x, a = H[i * 4 + 3];
+                if (a <= 0.5) continue;
+                const bx = (x / f) | 0, px = x - bx * f, k = 255 / a;
+                let r = H[i * 4] * k, g = H[i * 4 + 1] * k, b = H[i * 4 + 2] * k;
+                const ys = Y[i];
+                if (guided) {
+                    let ws = 0, c0 = 0, c1 = 0, c2 = 0;
+                    const by0 = py < f / 2 ? -2 : -1, bx0 = px < f / 2 ? -2 : -1;
+                    for (let ty = 0; ty < 4; ty++) {
+                        const qy = ix(by + ty + by0) * s, wy = sp[py * 4 + ty];
+                        for (let tx = 0; tx < 4; tx++) {
+                            const q = qy + ix(bx + tx + bx0);
+                            if (L[q * 4 + 3] <= 0.5) continue;
+                            const d = Math.abs(ys - Yl[q]), w = wy * sp[px * 4 + tx] * (d < 511 ? LUT[(d * 4) | 0] : 0);
+                            ws += w; c0 += w * chroma[q * 3]; c1 += w * chroma[q * 3 + 1]; c2 += w * chroma[q * 3 + 2];
+                        }
+                    }
+                    if (ws > 1e-9) { r = ys + c0 / ws; g = ys + c1 / ws; b = ys + c2 / ws; }
+                    else { const dy = ys - Y0[i]; r += dy; g += dy; b += dy; }
+                } else { const dy = ys - Y0[i]; r += dy; g += dy; b += dy; }
+                H[i * 4] = r * a / 255; H[i * 4 + 1] = g * a / 255; H[i * 4 + 2] = b * a / 255;
+            }
+        }
+    }
+    /* factor 1, "full size": the tile already holds all its own detail, so there is nothing to shrink and rebuild.
+       Only the edge options act (a shock filter, then colour guided by it, taken from the tile's own colour); with
+       both off the tile comes back untouched. */
+    function hdLookFull(src, o) {
+        const S = src.width;
+        if (!(o.sharpen > 0) && !o.guided) return cloneCanvas(src);
+        const d = src.getContext('2d').getImageData(0, 0, S, S).data, mode = hdMode(d, o.cutout), key = HD_KEYS[mode] || null;
+        const H = hdPremult(d, key), L = Float32Array.from(H);
+        hdEdge(H, L, S, S, 1, !!o.wrap, o.sharpen > 0 ? Math.min(100, o.sharpen) : 0, !!o.guided);
+        hdClamp(H);
+        const out = document.createElement('canvas'); out.width = out.height = S;
+        const g = out.getContext('2d'), im = g.createImageData(S, S), od = im.data;
+        for (let i = 0; i < H.length; i += 4) {
+            const a = H[i + 3];
+            if (key) {
+                if (a < 127.5) { od[i] = key[0]; od[i + 1] = key[1]; od[i + 2] = key[2]; od[i + 3] = 255; continue; }
+                const q = 255 / Math.max(a, 1); od[i] = H[i] * q; od[i + 1] = H[i + 1] * q; od[i + 2] = H[i + 2] * q; od[i + 3] = 255; continue;
+            }
+            if (a <= 0) { od[i + 3] = 0; continue; }
+            const q = 255 / a; od[i] = H[i] * q; od[i + 1] = H[i + 1] * q; od[i + 2] = H[i + 2] * q; od[i + 3] = a;
+        }
+        g.putImageData(im, 0, 0);
+        return out;
+    }
+    /* ---- phase 5: painted detail. Smooth contours over a fitted palette (generic form, see the recipe note). ---- */
+    const HD_SOFT_LO = 30, HD_SOFT_HI = 90;   // RGB distance between palette colours: below LO a gradient (smooth), above HI an edge (crisp)
+    function hdContours(H, L, S, s, f, wrap, n, dbg) {
+        const small = { s, px: new Float32Array(s * s * 4) };
+        for (let q = 0; q < s * s; q++) {
+            const a = L[q * 4 + 3], k = a > 0.5 ? 255 / a : 0;
+            small.px[q * 4] = L[q * 4] * k; small.px[q * 4 + 1] = L[q * 4 + 1] * k; small.px[q * 4 + 2] = L[q * 4 + 2] * k; small.px[q * 4 + 3] = a;
+        }
+        const pal = classicPalette([small], n), near = classicNearest(pal);
+        const lab = new Int16Array(s * s), res = new Float32Array(s * s * 3), used = new Set();
+        for (let q = 0; q < s * s; q++) {
+            const r = small.px[q * 4], g = small.px[q * 4 + 1], b = small.px[q * 4 + 2], c = near(r, g, b), p = pal[c];
+            lab[q] = c; used.add(c);
+            res[q * 3] = r - p[0]; res[q * 3 + 1] = g - p[1]; res[q * 3 + 2] = b - p[2];
+        }
+        const R = hdUp(res, s, f, wrap, 3), np = pal.length;
+        // Coverage of each colour, taken up with a cubic B-spline (positive, sums to 1: a smooth, rounded boundary), over the
+        // 4 x 4 nearest pixels; the colour is the mix with weight coverage^K, which is crisp and anti-aliased, and only colours
+        // met in that window can appear. The window sits at -2..1 around a block for its first half and -1..2 for the second,
+        // so it mirrors with a flip.
+        const K = 6, wb = [];
+        for (let p = 0; p < f; p++) { const u = (p + 0.5) / f - 0.5, t = u < 0 ? u + 1 : u; wb.push([(1 - t) ** 3 / 6, (3 * t ** 3 - 6 * t * t + 4) / 6, (-3 * t ** 3 + 3 * t * t + 3 * t + 1) / 6, t ** 3 / 6]); }
+        const ix = i => wrap ? ((i % s) + s) % s : Math.min(s - 1, Math.max(0, i));
+        const acc = new Float64Array(np), seen = new Int16Array(16);
+        if (dbg) { dbg.pal = pal; dbg.low = lab; dbg.arg = new Int16Array(S * S); }
+        for (let y = 0; y < S; y++) {
+            const by = (y / f) | 0, py = y - by * f, y0 = py < f / 2 ? -2 : -1, wy = wb[py];
+            for (let x = 0; x < S; x++) {
+                const bx = (x / f) | 0, px = x - bx * f, x0 = px < f / 2 ? -2 : -1, wx = wb[px];
+                let m = 0;
+                for (let ty = 0; ty < 4; ty++) {
+                    const row = ix(by + ty + y0) * s;
+                    for (let tx = 0; tx < 4; tx++) {
+                        const l = lab[row + ix(bx + tx + x0)], w = wy[ty] * wx[tx];
+                        if (acc[l] === 0) seen[m++] = l;
+                        acc[l] += w;
+                    }
+                }
+                /* The weight exponent follows how far apart the colours in the window are: crisp (K) where they differ a lot, which is a
+                   real edge, down to 1 (a plain smooth blend) where they are near, which is a gradient the palette cut into steps. */
+                let dmax = 0;
+                for (let k = 0; k < m; k++) for (let j = k + 1; j < m; j++) { const pa = pal[seen[k]], pb = pal[seen[j]], d = Math.hypot(pa[0] - pb[0], pa[1] - pb[1], pa[2] - pb[2]); if (d > dmax) dmax = d; }
+                const tq = Math.min(1, Math.max(0, (dmax - HD_SOFT_LO) / (HD_SOFT_HI - HD_SOFT_LO))), Kp = 1 + (K - 1) * tq * tq * (3 - 2 * tq);
+                let sum = 0, r = 0, g = 0, b = 0, top = -1, topc = -1;
+                for (let k = 0; k < m; k++) { const l = seen[k], c = Math.pow(acc[l], Kp); if (dbg && (c > topc + 1e-12 || (c > topc - 1e-12 && l < top))) { topc = c; top = l; } sum += c; r += c * pal[l][0]; g += c * pal[l][1]; b += c * pal[l][2]; acc[l] = 0; }
+                const i = y * S + x, a = H[i * 4 + 3];
+                if (dbg) dbg.arg[i] = top;
+                H[i * 4] = (r / sum + R[i * 3]) * a / 255; H[i * 4 + 1] = (g / sum + R[i * 3 + 1]) * a / 255; H[i * 4 + 2] = (b / sum + R[i * 3 + 2]) * a / 255;
+            }
+        }
+    }
+    /* ---- phase 6: borrowed detail. Self-examples (from the tile's own coarser scales) and reference grain (a chosen HD
+       tile's spectrum). Neither can bring in anything the tile or the picked tile does not hold. ---- */
+    /* An FFT for any size: radix 2 when n is a power of two, Bluestein's chirp otherwise (tiles are 16 to 2048, not always 2^k). */
+    function hdFftPow2(re, im, n, inv) {
+        for (let i = 1, j = 0; i < n; i++) {
+            let bit = n >> 1;
+            for (; j & bit; bit >>= 1) j ^= bit;
+            j ^= bit;
+            if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+        }
+        const half = n >> 1, cs = new Float64Array(half), sn = new Float64Array(half);
+        for (let k = 0; k < half; k++) { const a = 2 * Math.PI * k / n; cs[k] = Math.cos(a); sn[k] = (inv ? 1 : -1) * Math.sin(a); }
+        for (let len = 2; len <= n; len <<= 1) {
+            const h = len >> 1, step = n / len;
+            for (let i = 0; i < n; i += len) for (let k = 0; k < h; k++) {
+                const wr = cs[k * step], wi = sn[k * step], a = i + k, b = a + h;
+                const xr = re[b] * wr - im[b] * wi, xi = re[b] * wi + im[b] * wr;
+                re[b] = re[a] - xr; im[b] = im[a] - xi; re[a] += xr; im[a] += xi;
+            }
+        }
+    }
+    function hdFft(re, im, n, inv) {
+        if ((n & (n - 1)) === 0) return hdFftPow2(re, im, n, inv);
+        let m = 1; while (m < 2 * n - 1) m <<= 1;
+        const wr = new Float64Array(n), wi = new Float64Array(n), sg = inv ? 1 : -1;
+        for (let k = 0; k < n; k++) { const a = sg * Math.PI * ((k * k) % (2 * n)) / n; wr[k] = Math.cos(a); wi[k] = Math.sin(a); }
+        const ar = new Float64Array(m), ai = new Float64Array(m), br = new Float64Array(m), bi = new Float64Array(m);
+        for (let k = 0; k < n; k++) { ar[k] = re[k] * wr[k] - im[k] * wi[k]; ai[k] = re[k] * wi[k] + im[k] * wr[k]; br[k] = wr[k]; bi[k] = -wi[k]; if (k) { br[m - k] = wr[k]; bi[m - k] = -wi[k]; } }
+        hdFftPow2(ar, ai, m, false); hdFftPow2(br, bi, m, false);
+        for (let k = 0; k < m; k++) { const r = ar[k] * br[k] - ai[k] * bi[k], i = ar[k] * bi[k] + ai[k] * br[k]; ar[k] = r; ai[k] = i; }
+        hdFftPow2(ar, ai, m, true);
+        for (let k = 0; k < n; k++) { const r = ar[k] / m, i = ai[k] / m; re[k] = r * wr[k] - i * wi[k]; im[k] = r * wi[k] + i * wr[k]; }
+    }
+    /* In place on n x n; the inverse is normalised. */
+    function hdFft2(re, im, n, inv) {
+        const tr = new Float64Array(n), ti = new Float64Array(n);
+        for (let y = 0; y < n; y++) {
+            for (let x = 0; x < n; x++) { tr[x] = re[y * n + x]; ti[x] = im[y * n + x]; }
+            hdFft(tr, ti, n, inv);
+            for (let x = 0; x < n; x++) { re[y * n + x] = tr[x]; im[y * n + x] = ti[x]; }
+        }
+        for (let x = 0; x < n; x++) {
+            for (let y = 0; y < n; y++) { tr[y] = re[y * n + x]; ti[y] = im[y * n + x]; }
+            hdFft(tr, ti, n, inv);
+            for (let y = 0; y < n; y++) { re[y * n + x] = tr[y]; im[y * n + x] = ti[y]; }
+        }
+        if (inv) { const k = 1 / (n * n); for (let i = 0; i < n * n; i++) { re[i] *= k; im[i] *= k; } }
+    }
+    const hdRng = seed => { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; };
+    /* Grain with the SPECTRUM of a reference tile (random phase, Galerne, Gousseau & Morel; the conditioning is Pierret & Galerne's):
+       white noise from the seed takes the reference luminance's amplitude at every frequency, kept to the band ABOVE the low-res
+       tile's Nyquist (the band the tile lacks), so what it adds is the reference's texture and nothing of its layout. n x n, mean 0,
+       periodic. A reference canvas is immutable, so the result is cached on it. */
+    const hdGrainCache = new WeakMap();
+    function hdGrainField(ref, S, f, seed) {
+        const key = S + '|' + f + '|' + seed;
+        /* Cached on the reference only while it is immutable (a layer's own copy): a live tile can be painted over, and a stale
+           grain would outlive the paint. */
+        let cache = ref.__immutable ? hdGrainCache.get(ref) : null;
+        if (!cache) { cache = new Map(); if (ref.__immutable) hdGrainCache.set(ref, cache); }
+        if (cache.has(key)) return cache.get(key);
+        let rc = ref;
+        if (ref.width !== S || ref.height !== S) { rc = document.createElement('canvas'); rc.width = rc.height = S; drawImported(rc.getContext('2d'), ref, S); }
+        const d = rc.getContext('2d').getImageData(0, 0, S, S).data, N = S * S;
+        let amp = cache.get('amp|' + S);
+        if (!amp) {
+            const re = new Float64Array(N), im = new Float64Array(N);
+            for (let i = 0; i < N; i++) re[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+            hdFft2(re, im, S, false);
+            amp = new Float32Array(N);
+            for (let i = 0; i < N; i++) amp[i] = Math.hypot(re[i], im[i]);
+            cache.set('amp|' + S, amp);
+        }
+        const rnd = hdRng(seed), re = new Float64Array(N), im = new Float64Array(N);
+        for (let i = 0; i < N; i++) { const u = Math.max(rnd(), 1e-12), v = rnd(); re[i] = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+        hdFft2(re, im, S, false);
+        const nyq = S / (2 * f), c0 = 0.75 * nyq;   // keep the band above (a little under) the low-res Nyquist
+        for (let ky = 0; ky < S; ky++) for (let kx = 0; kx < S; kx++) {
+            const i = ky * S + kx, fx = Math.min(kx, S - kx), fy = Math.min(ky, S - ky), kr = Math.hypot(fx, fy);
+            const t = Math.min(1, Math.max(0, (kr - c0) / (nyq - c0))), m = t * t * (3 - 2 * t), mag = Math.hypot(re[i], im[i]);
+            const g = mag > 1e-12 ? m * amp[i] / mag : 0;
+            re[i] *= g; im[i] *= g;
+        }
+        hdFft2(re, im, S, true);
+        const out = new Float32Array(N);
+        for (let i = 0; i < N; i++) out[i] = re[i];
+        cache.set(key, out);
+        return out;
+    }
+    /* Add `amount` (0..1) of the grain to the premultiplied H, minus its own block averages (so a block still averages to the
+       low-res pixel: the grain lives in the null space of the shrink, Pierret & Galerne's u = ... + (g - A g)). */
+    function hdAddGrain(H, S, f, ref, seed, amount) {
+        const g = hdGrainField(ref, S, f, seed), s = S / f, n = f * f;
+        for (let by = 0; by < s; by++) for (let bx = 0; bx < s; bx++) {
+            let m = 0;
+            for (let j = 0; j < f; j++) for (let k = 0; k < f; k++) m += g[(by * f + j) * S + bx * f + k];
+            m /= n;
+            for (let j = 0; j < f; j++) for (let k = 0; k < f; k++) {
+                const i = (by * f + j) * S + bx * f + k, a = H[i * 4 + 3] / 255, v = (g[i] - m) * amount * a;
+                H[i * 4] += v; H[i * 4 + 1] += v; H[i * 4 + 2] += v;
+            }
+        }
+    }
+    /* Self-examples (Glasner, Bagon & Irani 2009; Freedman & Fattal 2011): a patch of the blurry up-scaled image looks like a
+       patch of the tile's own blurred version, and what the SHARP version holds there is the detail to put back. One x2 step:
+       B = the image seen through one scale less, D = C - B its detail, U = C taken up; each pixel of U finds the pixel of B
+       (within `R`) whose 5-sample cross looks most alike and takes that pixel's detail. x4 and x8 are repeated steps. */
+    function hdSelfStep(C, n, wrap, amount) {
+        const R = 3, S2 = 2 * n;
+        const B = hdUp(hdShrink(C, n, 2, 4), n / 2, 2, wrap, 4), U = hdUp(C, n, 2, wrap, 4);
+        const lum = (a, i) => 0.299 * a[i * 4] + 0.587 * a[i * 4 + 1] + 0.114 * a[i * 4 + 2];
+        const lb = new Float32Array(n * n), lu = new Float32Array(S2 * S2);
+        for (let i = 0; i < n * n; i++) lb[i] = lum(B, i);
+        for (let i = 0; i < S2 * S2; i++) lu[i] = lum(U, i);
+        const ix = (v, m) => wrap ? ((v % m) + m) % m : Math.min(m - 1, Math.max(0, v));
+        const xb = new Int32Array(n + 2 * R + 2).map((_, k) => ix(k - R - 1, n));   // wrapped index of -R-1 .. n+R
+        for (let y = 0; y < S2; y++) {
+            const by = y >> 1, ym = ix(y - 1, S2) * S2, yp = ix(y + 1, S2) * S2;
+            for (let x = 0; x < S2; x++) {
+                const bx = x >> 1, xm = ix(x - 1, S2), xp = ix(x + 1, S2), c = lu[y * S2 + x], w = lu[y * S2 + xm], e = lu[y * S2 + xp], u = lu[ym + x], d = lu[yp + x];
+                let best = Infinity, bq = 0;
+                for (let j = -R; j <= R; j++) {
+                    const qy = ix(by + j, n), qm = ix(by + j - 1, n) * n, qp = ix(by + j + 1, n) * n, qr = qy * n;
+                    for (let k = -R; k <= R; k++) {
+                        const qx = xb[bx + k + R + 1], q = qr + qx;
+                        const dc = lb[q] - c, dw = lb[qr + xb[bx + k + R]] - w, de = lb[qr + xb[bx + k + R + 2]] - e, du = lb[qm + qx] - u, dd = lb[qp + qx] - d;
+                        const ssd = dc * dc + dw * dw + de * de + du * du + dd * dd + 1e-4 * (j * j + k * k);
+                        if (ssd < best) { best = ssd; bq = q; }
+                    }
+                }
+                const o = (y * S2 + x) * 4, q4 = bq * 4;
+                for (let ch = 0; ch < 3; ch++) U[o + ch] += amount * (C[q4 + ch] - B[q4 + ch]);
+            }
+        }
+        return U;
+    }
+    function hdSelfUp(L, s, f, wrap, amount) {
+        let C = L, n = s;
+        for (let st = 1; st < f; st *= 2) {
+            if (n % 2) C = hdUp(C, n, 2, wrap, 4); else C = hdSelfStep(C, n, wrap, amount);
+            n *= 2;
+        }
+        return C;
+    }
+    function hdLook(src, opts) {
+        const o = Object.assign({}, HD_DEFAULTS, opts), S = src.width, f = o.factor | 0;
+        if (!(f >= 1) || S % f || (f > 1 && S / f < 2)) return cloneCanvas(src);
+        if (f === 1) return hdLookFull(src, o);
+        const s = S / f, wrap = !!o.wrap;
+        const d = src.getContext('2d').getImageData(0, 0, S, S).data;
+        const mode = hdMode(d, o.cutout), key = HD_KEYS[mode] || null, cut = mode !== 'off';
+        const L = hdShrink(hdPremult(d, key), S, f, 4);
+        const H = o.selfex > 0 ? hdSelfUp(L, s, f, wrap, Math.min(100, o.selfex) / 100) : hdUp(L, s, f, wrap, 4);
+        if (o.contours > 0 && !cut) hdContours(H, L, S, s, f, wrap, o.contours | 0, o._dbg);
+        if (cut) {
+            // Steepen the smooth alpha to a crisp edge, and keep the colour as the premultiplied estimate over it.
+            const k = f;
+            for (let i = 0; i < H.length; i += 4) {
+                const al = Math.min(255, Math.max(0, H[i + 3])), t = Math.min(1, Math.max(0, (al / 255 - 0.5) * k + 0.5));
+                const as = 255 * t * t * (3 - 2 * t);
+                const g = al > 0.5 ? as / al : 0;
+                H[i] *= g; H[i + 1] *= g; H[i + 2] *= g; H[i + 3] = as;
+            }
+        }
+        if (o.sharpen > 0 || o.guided) hdEdge(H, L, S, s, f, wrap, o.sharpen > 0 ? Math.min(100, o.sharpen) : 0, !!o.guided);
+        if (o.grain > 0 && o.ref) hdAddGrain(H, S, f, o.ref, o.seed >>> 0, Math.min(100, o.grain) / 100);
+        hdClamp(H);
+        // One smooth back-projection step, then the exact block correction (scaled by faithfulness).
+        const back = (scale, smooth) => {
+            const R = hdShrink(H, S, f, 4);
+            for (let i = 0; i < R.length; i++) R[i] = L[i] - R[i];
+            if (smooth) { const U = hdUp(R, s, f, wrap, 4); for (let i = 0; i < H.length; i++) H[i] += scale * U[i]; }
+            else for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+                const r = ((((y / f) | 0) * s) + ((x / f) | 0)) * 4, i = (y * S + x) * 4;
+                for (let c = 0; c < 4; c++) H[i + c] += scale * R[r + c];
+            }
+            hdClamp(H);
+        };
+        back(1, true);
+        back(Math.min(1, Math.max(0, o.faithfulness / 100)), false);
+        const out = document.createElement('canvas'); out.width = out.height = S;
+        const g = out.getContext('2d'), im = g.createImageData(S, S), od = im.data;
+        for (let i = 0; i < H.length; i += 4) {
+            const a = H[i + 3];
+            if (key) {
+                if (a < 127.5) { od[i] = key[0]; od[i + 1] = key[1]; od[i + 2] = key[2]; od[i + 3] = 255; continue; }
+                const q = 255 / Math.max(a, 1);
+                od[i] = H[i] * q; od[i + 1] = H[i + 1] * q; od[i + 2] = H[i + 2] * q; od[i + 3] = 255;
+                continue;
+            }
+            if (a <= 0) { od[i + 3] = 0; continue; }
+            const q = 255 / a;
+            od[i] = H[i] * q; od[i + 1] = H[i + 1] * q; od[i + 2] = H[i + 2] * q; od[i + 3] = a;
+        }
+        g.putImageData(im, 0, 0);
+        return out;
+    }
+    /* A region's feather. Wrapping, the mask is tiled 3 x 3 before it is blurred, so a region that reaches the tile's edge continues
+       across it (a plain blur fades it to nothing at the edge, which is a seam on a tiling texture). */
+    function hdFeather(mask, S, px, wrap) {
+        if (!px || px < 0.5) return mask;
+        if (!wrap) return featherMask(mask, S, px);
+        const big = document.createElement('canvas'); big.width = big.height = 3 * S;
+        const g = big.getContext('2d');
+        for (let y = 0; y < 3; y++) for (let x = 0; x < 3; x++) g.drawImage(mask, x * S, y * S, S, S);
+        const out = document.createElement('canvas'); out.width = out.height = S;
+        const o = out.getContext('2d'); o.filter = `blur(${px}px)`;
+        o.drawImage(big, -S, -S);
+        o.filter = 'none';
+        return out;
+    }
+    /* HD Look over REGIONS (HD-LOOK-PLAN phase 8, D6). `regions` is [{ mask, feather, over }], painted over the whole-tile result in
+       order (later wins): each is `hdLook` with its own options (`over`, a class's five detail settings) blended in through its mask
+       (alpha is the coverage), feathered by `feather` px. Away from a feather band every pixel is exactly the whole-tile result of its
+       class; inside a band the two results are mixed and then corrected so the band's blocks shrink back to the input (P4). */
+    function hdLookRegions(src, opts, regions) {
+        const base = hdLook(src, opts), R = (regions || []).filter(r => r && r.mask);
+        if (!R.length) return base;
+        const S = src.width, f = (opts.factor | 0) || 1, N = S * S, wrap = !!Object.assign({}, HD_DEFAULTS, opts).wrap;
+        const out = Float64Array.from(base.getContext('2d').getImageData(0, 0, S, S).data), mixed = new Uint8Array(N);
+        for (const r of R) {
+            const rr = hdLook(src, Object.assign({}, opts, r.over || {})).getContext('2d').getImageData(0, 0, S, S).data;
+            const m = hdFeather(r.mask, S, r.feather || 0, wrap).getContext('2d').getImageData(0, 0, S, S).data;
+            for (let i = 0; i < N; i++) {
+                const a = m[i * 4 + 3];
+                if (!a) continue;
+                const w = a / 255, q = i * 4;
+                if (a < 255) mixed[i] = 1;
+                for (let c = 0; c < 4; c++) out[q + c] = out[q + c] * (1 - w) + rr[q + c] * w;
+            }
+        }
+        const od = new Uint8ClampedArray(out);
+        if (f > 1 && mixed.some(v => v)) {
+            const s = S / f, d = src.getContext('2d').getImageData(0, 0, S, S).data;
+            const Pin = hdShrink(hdPremult(d, null), S, f, 4), Pout = hdShrink(hdPremult(od, null), S, f, 4), Q = hdPremult(od, null);
+            for (let by = 0; by < s; by++) for (let bx = 0; bx < s; bx++) {
+                let hit = false;
+                for (let j = 0; j < f && !hit; j++) for (let k = 0; k < f; k++) if (mixed[(by * f + j) * S + bx * f + k]) { hit = true; break; }
+                if (!hit) continue;
+                const b = (by * s + bx) * 4;
+                for (let j = 0; j < f; j++) for (let k = 0; k < f; k++) {
+                    const i = ((by * f + j) * S + bx * f + k) * 4;
+                    for (let c = 0; c < 4; c++) Q[i + c] += Pin[b + c] - Pout[b + c];
+                    const a = Math.min(255, Math.max(0, Q[i + 3]));
+                    if (a <= 0) { od[i + 3] = 0; continue; }
+                    const q = 255 / a;
+                    od[i] = Q[i] * q; od[i + 1] = Q[i + 1] * q; od[i + 2] = Q[i + 2] * q; od[i + 3] = a;
+                }
+            }
+        }
+        const c = document.createElement('canvas'); c.width = c.height = S;
+        const g = c.getContext('2d'), im = g.createImageData(S, S); im.data.set(od); g.putImageData(im, 0, 0);
+        return c;
+    }
+    /* The largest factor (8, 4, 2) at which the tile reads as an upscale from tile / factor: take the sample at the
+       centre of every block (an interpolating upscale reproduces its source samples exactly at their nodes, noise
+       and all, which a block average would blur), take it back up with Lanczos, and compare. A tile that was
+       upscaled from that resolution comes back within a couple of levels; a native tile does not. null = it
+       already holds its own detail, or the size does not divide. An import baked with HD Look reads as full
+       resolution (D8). A very smooth native tile can still read as an upscale: nothing in its pixels says otherwise. */
+    const HD_EST_TOL = 2;
+    function hdEstimate(src, tol) {   // tol: an override for the validators
+        const S = src.width, d = src.getContext('2d').getImageData(0, 0, S, S).data, P = hdPremult(d, null);
+        for (const f of [8, 4, 2]) {
+            if (S % f || S / f < 4) continue;
+            const s = S / f, C = new Float32Array(s * s * 4), a = f / 2 - 1, b = f / 2;
+            for (let y = 0; y < s; y++) for (let x = 0; x < s; x++) for (let c = 0; c < 4; c++) {
+                let t = 0;
+                for (const j of [a, b]) for (const k of [a, b]) t += P[((y * f + j) * S + x * f + k) * 4 + c];
+                C[(y * s + x) * 4 + c] = t / 4;
+            }
+            const R = hdUp(C, s, f, false, 4);
+            let t = 0;
+            for (let i = 0; i < P.length; i += 4) t += Math.abs(R[i] - P[i]) + Math.abs(R[i + 1] - P[i + 1]) + Math.abs(R[i + 2] - P[i + 2]);
+            if (t / (S * S * 3) <= (typeof tol === 'number' ? tol : HD_EST_TOL)) return f;
+        }
+        return null;
+    }
+
+    function resizeImported(src, S) {
+        const c = document.createElement('canvas');
+        c.width = S; c.height = S;
+        importToTile(c.getContext('2d'), src, S);
+        return c;
+    }
+
+    /* What a tile's MATERIAL MAPS are generated from: the pre-filter diffuse that
+       Classic Look keeps when asked to ("Material maps from: the original"), else
+       the tile's own pixels. Every generator goes through here (export, multi-
+       material, both Material previews, Make Height Map) so they cannot disagree. */
+    /* With layers (LAYERS-PLAN D7) the original is DERIVED: a visible Classic Look layer whose Maps
+       setting is "the original" makes it the composite BELOW the lowest such layer, replayed on demand
+       and kept per tile until the stack changes. A project saved before layers keeps its stored
+       `el.mapSource`, which wins. Hidden or deleted, the layer gives the tile its own pixels again. */
+    const mapSrcCache = new WeakMap();
+    function originalMapLayer(el) {
+        if (!hasLayers(el)) return null;
+        const i = el.layers.findIndex(p => { const d = state.layerDefs[p.lid]; return d && d.visible !== false && d.recipe && d.recipe.maps === 'original'; });
+        return i < 0 ? null : i;
+    }
+    function mapSourceOf(el) {
+        if (!el) return el;
+        if (el.mapSource) return el.mapSource;
+        const i = originalMapLayer(el);
+        if (i == null) return el.canvas;
+        const L = TRLE.Layers, defs = el.layers.map(p => state.layerDefs[p.lid]), c = mapSrcCache.get(el);
+        if (c && c.under === el.under && c.i === i && c.n === el.layers.length && c.pieces.every((p, k) => p === el.layers[k]) && c.defs.every((d, k) => d === defs[k])) return c.out;
+        const out = L.inputAt(el, state.layerDefs, i);
+        mapSrcCache.set(el, { under: el.under, i, n: el.layers.length, pieces: el.layers.slice(), defs, out });
+        return out;
+    }
+    const hasMapSource = el => !!el && (!!el.mapSource || originalMapLayer(el) != null);
+
+    /* 🔤 Text's relief (TEXT-PLAN D5): `el.textRelief = { up, down, hole, floors }`.
+       `up` / `down` are opaque greyscale masks of depth x coverage (read from R)
+       for raised and engraved letters, max-merged over every Apply; `hole` marks
+       everything the text changed (letters, outline, shadow). Every map generator
+       adds `textReliefExtra(el, src)` to its preset, which feeds generateMaps'
+       existing relief route (`reliefPaint.field`, lift 1). With smooth letter
+       floors the relief's grey under `hole` is the surface INPAINTED from around
+       it, made here from the current map source, so the letters' colour and
+       shadow do not count and nothing stale is ever saved. Absent: {} and every
+       map is what it was. */
+    function cloneTextRelief(r) {
+        if (!r) return null;
+        const c = k => r[k] ? cloneCanvas(r[k]) : null;
+        return { up: c('up'), down: c('down'), hole: c('hole'), floors: r.floors === 'keep' ? 'keep' : 'smooth' };
+    }
+    function inpaintedBase(src, hole) {
+        const E = TRLE.Engine, S = src.width;
+        const o = E.createTextureFromImage(src), m = E.createTextureFromImage(hole);
+        const fbo = E.inpaintDiffusion(o, m, S);
+        const out = E.fboToCanvas(fbo);
+        E.deleteFBO(fbo); E.deleteTexture(o); E.deleteTexture(m);
+        // The solve writes alpha 1; a cutout's alpha must stay the source's, or the
+        // grey under its holes would change and move maps far from the letters.
+        const ctx = out.getContext('2d'), od = ctx.getImageData(0, 0, S, S), sd = src.getContext('2d').getImageData(0, 0, S, S).data;
+        for (let i = 3; i < sd.length; i += 4) od.data[i] = sd[i];
+        ctx.putImageData(od, 0, 0);
+        return out;
+    }
+    function textReliefExtra(el, src) {
+        const r = effectiveTextRelief(el);
+        if (!r || !(r.up || r.down)) return {};
+        const base = r.floors !== 'keep' && r.hole ? inpaintedBase(src, r.hole) : undefined;
+        return { reliefPaint: { field: { up: r.up || null, down: r.down || null, lift: 1 }, base } };
+    }
+
     function cloneCanvas(src) {
         return resizeCanvas(src, src.width, src.height);
+    }
+
+    /* ---- Text as a content layer (LAYERS-PLAN phase 3, D7) ----
+       A text layer's material region and relief are NOT merged into the tile when
+       it is applied: they are derived at map time from its pieces and appended to
+       what the tile already carries (el.matLayers, el.textRelief, both still saved
+       as before for old projects). Moving, editing, hiding or deleting the layer
+       therefore moves its material and relief with it. A piece carries its
+       coverage (`aux.cover`, for the material region) and its relief and hole
+       crops (`aux.rel`, `aux.hole`); the recipe says which preset, which sign. */
+    /* What each visible content layer feeds the maps (STICKERS-PLAN phase 7 generalises Text and Draw's readers):
+       one entry per text or draw piece, and one per placed STICKER (a sticker layer holds several, each with its own
+       settings in `def.recipe.items[i]` and its crops in the piece: `k<i>` as drawn, `b<i>` its body before effects,
+       `e<i>` its effects' in-game glow, `k<i><map>` its own maps). Everything is derived from those crops, so a move,
+       a hide or a delete takes it along. Entry: { def, piece, kind, label, op (opacity), material ('type:key' or
+       null), cover, relief ({ sign, depth, floors, relief, hole } or null), glows ([{ img, alpha }]), own ({ map:
+       canvas } or null) }. */
+    const whiteCache = new WeakMap();
+    function whiteOf(c) {   // a crop's coverage as white (relief and hole canvases read R); crops are immutable, so cached
+        let w = whiteCache.get(c);
+        if (w) return w;
+        w = document.createElement('canvas'); w.width = c.width; w.height = c.height;
+        const g = w.getContext('2d');
+        g.drawImage(c, 0, 0); g.globalCompositeOperation = 'source-in'; g.fillStyle = '#fff'; g.fillRect(0, 0, w.width, w.height);
+        whiteCache.set(c, w);
+        return w;
+    }
+    function stOwnCrops(aux, i) {
+        let o = null;
+        for (const mt of TRLE.MapOrder) if (aux['k' + i + mt]) (o = o || {})[mt] = aux['k' + i + mt];
+        return o;
+    }
+    function mapParts(el) {
+        if (!el || !Array.isArray(el.layers) || !el.layers.length) return [];
+        const out = [];
+        for (const piece of el.layers) {
+            const def = state.layerDefs[piece.lid];
+            if (!def || def.visible === false) continue;
+            const lop = def.opacity == null ? 1 : def.opacity, a = piece.aux || {};
+            if (def.kind === 'text' || def.kind === 'draw') {
+                const rl = def.recipe && def.recipe.relief;
+                out.push({ def, piece, kind: def.kind, label: def.kind === 'draw' ? 'Draw' : 'Text', op: lop,
+                           material: def.recipe && def.recipe.material && a.cover ? def.recipe.material : null, cover: a.cover || null,
+                           relief: rl && a.rel ? { sign: rl.sign, depth: rl.depth, floors: rl.floors, relief: a.rel, hole: a.hole } : null,
+                           glows: a.glow ? [{ img: a.glow, alpha: lop }] : [], own: null });
+            } else if (def.kind === 'sticker') {
+                ((def.recipe && def.recipe.items) || []).forEach((it, i) => {
+                    const k = a['k' + i];
+                    if (!k) return;
+                    const body = a['b' + i] || k, op = lop * (it.opacity == null ? 1 : it.opacity), maps = it.maps || 'follow';
+                    const glows = [];
+                    if (it.glow && it.glowAmt > 0) glows.push({ img: body, alpha: op * it.glowAmt / 100 });   // the sticker itself, x strength
+                    if (a['e' + i]) glows.push({ img: a['e' + i], alpha: op });                              // its effects' "Also glow in game"
+                    out.push({ def, piece, kind: 'sticker', item: it, index: i, label: 'Sticker', op, crop: k,
+                               material: maps === 'preset' && it.material ? it.material : null, cover: body,
+                               relief: it.relief && maps !== 'own' ? { sign: it.relief === 'raise' ? 'up' : 'down', depth: (it.depth || 40) / 100, floors: it.floors === 'keep' ? 'keep' : 'smooth', relief: whiteOf(body), hole: whiteOf(k) } : null,
+                               glows, own: maps === 'own' ? stOwnCrops(a, i) : null });
+                });
+            }
+        }
+        return out;
+    }
+    const hasKindLayer = (el, kind) => hasLayers(el) && el.layers.some(p => { const d = state.layerDefs[p.lid]; return d && d.kind === kind; });
+    const hasTextLayer = el => hasKindLayer(el, 'text');
+    function effectiveTextRelief(el) {
+        const T = el ? mapParts(el).filter(t => t.relief) : [];
+        if (!T.length) return el ? el.textRelief : null;
+        const S = el.canvas.width;
+        let r = cloneTextRelief(el.textRelief);
+        for (const { relief: rl } of T) r = txMergedRelief(r, rl, { x: 0, y: 0 }, S);
+        return r;
+    }
+    /* "Also glow in game" (LAYERS-PLAN phase 12): the glows a text or draw layer ticked, kept per piece (`aux.glow`), and a sticker's
+       "Glows in game" (its own pixels x strength), are added to the tile's emissive map at MAP time, by max with whatever the tile
+       already has. Nothing is stored on el.emissive. null when no visible layer glows. `_noLayerGlow` marks a stand-in that must not. */
+    function layerGlowOf(el) {
+        const G = el && el.canvas && !el._noLayerGlow ? mapParts(el).flatMap(t => t.glows) : [];
+        if (!G.length) return null;
+        const S = el.canvas.width, c = document.createElement('canvas'); c.width = c.height = S;
+        const g = c.getContext('2d');
+        for (const { img, alpha } of G) { g.globalAlpha = alpha; g.drawImage(img, 0, 0, S, S); }
+        return c;
+    }
+    /* Does a visible layer glow in game? The cheap test for `elementEmits` (no canvas is made). */
+    const layerGlows = el => !!el && !el._noLayerGlow && mapParts(el).some(t => t.glows.length);
+    /* `base` (the tile's emissive canvas, or null) with the layers' glow lightened in; a new canvas, `base` itself when nothing glows. */
+    function withLayerGlow(el, base) {
+        const gl = layerGlowOf(el);
+        if (!gl) return base;
+        const S = el.canvas.width, c = document.createElement('canvas'); c.width = c.height = S;
+        const g = c.getContext('2d');
+        g.fillStyle = '#000'; g.fillRect(0, 0, S, S);
+        if (base) g.drawImage(base, 0, 0, S, S);
+        g.globalCompositeOperation = 'lighten'; g.drawImage(gl, 0, 0);
+        return c;
+    }
+    function textRegions(el) {
+        // A tile with Make Height Map settings ignores multi-material regions (as Apply always said).
+        if (!el || el.hgParams) return [];
+        const S = el.canvas.width;
+        return mapParts(el).filter(t => t.material && t.cover)
+            .map(t => ({ value: t.material, name: t.def.name, label: t.label, mask: layerMaterialMask(t.cover, { x: 0, y: 0 }, S, t.op) }));
+    }
+    /* A sticker's own maps (STICKERS-PLAN D7, "Its own maps"), as patches over the generated maps: per map, the
+       stickers' map crops at their body's coverage x opacity, merged in stack order over transparent. Laid over at the
+       END of deriveMaps (a PSD-imported map still wins). Flatten bakes them into `el.mapPatches` (P2 a), which sits
+       under any live sticker's. null when there are none. */
+    function stickerPatches(el) {
+        const T = el && !el._noLivePatches ? mapParts(el).filter(t => t.own) : [];
+        if (!T.length) return null;
+        const S = el.canvas.width, out = {};
+        for (const t of T) for (const [mt, c] of Object.entries(t.own)) {
+            const one = document.createElement('canvas'); one.width = one.height = S;
+            const g = one.getContext('2d');
+            g.drawImage(t.cover, 0, 0, S, S); g.globalCompositeOperation = 'source-in'; g.drawImage(c, 0, 0, S, S);
+            if (!out[mt]) { out[mt] = document.createElement('canvas'); out[mt].width = out[mt].height = S; }
+            const o = out[mt].getContext('2d');
+            o.globalAlpha = t.op; o.drawImage(one, 0, 0); o.globalAlpha = 1;
+        }
+        return out;
+    }
+    /* Lay `el.mapPatches` and the live stickers' own maps over `maps` (a { map: canvas } bag; each changed map is
+       replaced by a new canvas, never drawn into). Returns the map types it changed. */
+    function withMapPatches(el, maps, enabled) {
+        const changed = [];
+        for (const P of [el && el.mapPatches, stickerPatches(el)]) {
+            if (!P) continue;
+            for (const mt of TRLE.MapOrder) {
+                if (!P[mt] || !maps[mt] || (enabled && !enabled[mt])) continue;
+                const c = cloneCanvas(maps[mt]);
+                c.getContext('2d').drawImage(P[mt], 0, 0, c.width, c.height);
+                maps[mt] = c;
+                if (!changed.includes(mt)) changed.push(mt);
+            }
+        }
+        return changed;
+    }
+    function cloneMapPatches(P) {
+        if (!P) return null;
+        const out = {};
+        for (const mt of TRLE.MapOrder) if (P[mt]) out[mt] = cloneCanvas(P[mt]);
+        return Object.keys(out).length ? out : null;
+    }
+    /* A region of preset `value` into a layer list: the union with an earlier region of
+       the same preset, else a new one. Shared by Draw's Apply and the text regions. */
+    function mergeRegion(layers, mask, value, label) {
+        const [type, key] = value.split(':');
+        const preset = getPreset(type, key, 'realistic');
+        const same = layers.find((L, i) => i > 0 && L.material && !L.material.custom && L.material.type === type && L.material.key === key);
+        if (same && same.mask) {
+            const g = same.mask.getContext('2d');
+            g.globalCompositeOperation = 'lighten'; g.drawImage(mask, 0, 0); g.globalCompositeOperation = 'source-over';
+        } else {
+            layers.push({ name: label + ': ' + (preset && preset.label ? preset.label : key), color: MM_COLORS[layers.length % MM_COLORS.length],
+                          feather: 0, material: { type, key, aesthetic: 'realistic' }, mask });
+        }
+    }
+    /* The region stack the maps are made from: the tile's own, plus its text layers'
+       regions. null when the tile is single-material. Never mutates el.matLayers. */
+    function effectiveMatLayers(el) {
+        const T = textRegions(el);
+        if (!T.length) return hasMatLayers(el) ? el.matLayers : null;
+        const L = hasMatLayers(el) ? cloneMatLayers(el.matLayers)
+            : [{ name: 'Base', color: MM_COLORS[0], feather: 0, material: deepCopyMaterial(el.material), mask: null }];
+        T.forEach(t => mergeRegion(L, t.mask, t.value, t.label));
+        return L;
+    }
+    TRLE.Layers.register('text', { zone: 'content', mode: 'content', apply: (input, def, piece) => piece.px,
+        edit: (el, def) => openTextLayer(el, def) });
+
+    /* ---- the colour tools as layers (LAYERS-PLAN phase 5) ----
+       Adjust Colours, Recolor and De-light are kinds in the Texture zone, ONE per tile
+       (decision 14): applying one again edits the tile's layer rather than stacking a
+       second. A kind is a pure function of (input, recipe, piece), so a rebuild, an
+       edit and the original Apply all run the same code. */
+    const kindLayerOf = (el, kind) => {
+        if (!hasLayers(el)) return null;
+        const p = el.layers.find(q => { const d = state.layerDefs[q.lid]; return d && d.kind === kind; });
+        return p ? { piece: p, def: state.layerDefs[p.lid] } : null;
+    };
+    /* What a colour tool is shown on a tile: the composite BELOW the tool's own layer when the
+       tile already has one (it is about to be replaced), else below where a new one would sit. */
+    function layerInput(el, kind, zone = 'texture') {
+        if (!hasLayers(el)) return el.canvas;
+        const L = TRLE.Layers, old = kindLayerOf(el, kind);
+        if (old && L.zoneOf(old.def) === zone) return L.inputOf(el, state.layerDefs, old.def.lid);
+        // Moving to the other zone: the old piece leaves its place, so it is not part of the input.
+        const rest = old ? el.layers.filter(q => q !== old.piece) : el.layers;
+        if (!rest.length) return el.under;
+        return L.inputFor(Object.assign({}, el, { layers: rest }), state.layerDefs, { kind, zone });
+    }
+    /* A modal's inputs, taken once at open: a tile with a stack replays it to produce its input,
+       which a slider drag must not do per frame. Tiles with no layers keep their live canvas. */
+    function modalInputs(ids, kind, zone) {
+        const m = new Map();
+        ids.forEach(id => { const el = byId(id); if (el && el.kind === 'tile') m.set(id, layerInput(el, kind, zone)); });
+        return m;
+    }
+    const xin = (inputs, el) => (inputs && inputs.get(el.id)) || el.canvas;
+    /* Apply one colour-tool layer across `targets`: ONE new definition; a tile that already had a layer
+       of this kind swaps its piece in place (it keeps its place in the stack), the others insert one.
+       `zone` overrides the kind's own (Classic Look's "include the text and drawings"); a piece whose
+       zone changed leaves its old place and is inserted in the new one. */
+    async function colourLayerApply(kind, name, targets, recipe, pieceFor, label, pixels, zone) {
+        const L = TRLE.Layers;
+        /* No zone asked for: a tile whose layer of this kind was moved over or under the text keeps that place
+           (LAYERS-PLAN phase 14), so the tiles are grouped by it and each group gets its own definition. */
+        const groups = new Map();
+        for (const el of targets) {
+            const old = zone ? null : kindLayerOf(el, kind), z = zone || (old ? L.zoneOf(old.def) : '');
+            if (!groups.has(z)) groups.set(z, []);
+            groups.get(z).push(el);
+        }
+        let first = null;
+        for (const [z, els] of groups) {
+            const lid = L.add(state.layerDefs, [], { kind, name, recipe, pixels, zone: z || undefined });
+            const made = state.layerDefs[lid];
+            first = first || lid;
+            for (const el of els) {
+                const p = Object.assign({ lid }, pieceFor(el));
+                L.imm(p.mask);
+                const old = kindLayerOf(el, kind);
+                if (old && L.zoneOf(old.def) === L.zoneOf(made)) el.layers = el.layers.map(q => q === old.piece ? p : q);
+                else {
+                    if (old) el.layers = el.layers.filter(q => q !== old.piece);
+                    L.insertPiece(el, made, p, state.layerDefs);
+                }
+            }
+        }
+        refreshTransitions();
+        await layersCommit(targets, label);
+        L.prune(state.layerDefs, state.elements);
+        return first;
+    }
+    const hasContentLayers = el => hasLayers(el) && el.layers.some(p => TRLE.Layers.zoneOf(state.layerDefs[p.lid]) === 'content');
+    /* A form's controls as {id: value}, and back: Classic Look and Fade keep theirs in the layer's recipe so
+       Edit shows what was set. A select's own change (the organic style) is replayed first, because it
+       loads the sliders' defaults, which the saved values then overwrite. */
+    function ctlSnap(ids) {
+        const o = {};
+        for (const id of ids) { const e = $(id); if (e) o[id] = e.type === 'checkbox' ? e.checked : e.value; }
+        return o;
+    }
+    function ctlRestore(o) {
+        const entries = Object.entries(o || {});
+        for (const pass of [0, 1]) for (const [id, v] of entries) {
+            const e = $(id); if (!e) continue;
+            const isStyle = id.endsWith('-style');
+            if ((pass === 0) !== isStyle) continue;
+            if (e.type === 'checkbox') e.checked = !!v; else e.value = v;
+            if (isStyle) { e.dispatchEvent(new Event('change')); continue; }
+            const lab = $(id + '-val'); if (lab) lab.textContent = e.value;
+            if (e.tagName === 'SELECT') tilePickerSync(e);
+        }
+    }
+    /* "Editing this tile's Recolor": the note a colour modal shows when Apply will replace a layer. */
+    function setEditNote(modalId, text) {
+        const modal = $(modalId); if (!modal) return;
+        let note = modal.querySelector('.at-edit-note');
+        if (!note) { note = document.createElement('div'); note.className = 'at-edit-note'; modal.querySelector('.at-modal-title').after(note); }
+        note.style.display = text ? '' : 'none';
+        note.textContent = text || '';
     }
 
     /* ============ VISUAL TILE PICKER (TILE-PICKER-PLAN.md) ============
@@ -2765,9 +4091,68 @@ window.TRLE = window.TRLE || {};
        Not only tiles (push-markings 2c): `opts.thumb(option)` returns the image to
        show for an option instead of that tile's canvas, and `opts.rows` lists the
        options as wide rows (thumbnail + name) under their <optgroup> headings, which
-       is how 🖌 Draw's brush dropdown shows each brush's own sample stroke (D10). */
+       is how 🖌 Draw's brush dropdown shows each brush's own sample stroke (D10).
+
+       Hover preview (HOVER-PREVIEW-PLAN.md): `opts.preview(value)` shows the result
+       of an option while the pointer rests on it (or the arrow keys land on it), and
+       `opts.previewEnd(committed)` puts the committed one back. Neither may write
+       anything that outlives the hover: no 'change', no other control, no tile. The
+       select's own value MAY be borrowed for a "reads at render" control
+       (`previewByValue`), because the end runs SYNCHRONOUSLY before anything else:
+       the outside pointerdown that closes the list can be the press on Apply, and
+       Apply must bake the committed option. `opts.text` lists plain text rows (blend
+       modes, styles) under a trigger that reads like a select. A preview picker is
+       placed clear of the modal's preview zones (D6). `opts.note` puts one line of
+       explanation at the top of the list, neither an option nor focusable. */
     const TP_THUMB = 64;
-    let tpOpen = null;             // { sel, trigger, pop, opts } while a popover is up
+    let tpOpen = null;             // { sel, trigger, pop, opts, committed, previewing, timer } while a popover is up
+
+    /* On by default; the off switch is script-only (author, 2026-10-02, plan D10).
+       `?hoverpreview=off|on` sets it and remembers it; `?hoverms=` is the hover-intent
+       tuning knob (D3), not remembered. */
+    const HoverPreview = (() => {
+        const KEY = 'atlas.hoverPreview';
+        const q = new URLSearchParams(location.search);
+        const asked = q.get('hoverpreview');
+        let on = asked !== 'off';
+        try {
+            if (asked === 'on' || asked === 'off') localStorage.setItem(KEY, asked);
+            else on = localStorage.getItem(KEY) !== 'off';
+        } catch (e) { /* storage blocked: the URL alone decides */ }
+        const qms = parseInt(q.get('hoverms'), 10);
+        const ms = Number.isFinite(qms) && qms >= 0 ? qms : 60;
+        return {
+            enabled: () => on,
+            set(v) { on = !!v; try { localStorage.setItem(KEY, on ? 'on' : 'off'); } catch (e) { /* session only */ } },
+            ms: () => ms,
+        };
+    })();
+    TRLE.HoverPreview = HoverPreview;
+    /* The "reads at render" kind (plan D4.1): the render reads the select's value, so
+       a preview borrows the value without an event and renders; the end puts the
+       committed value back the same way. */
+    /* The same, for a render that REPLACES the canvases Apply bakes (a fresh canvas per
+       render, as Stained Glass and Origami build them): keep the committed references,
+       let the preview render swap in its own, and put the references back on the end. */
+    function previewSwap(sel, st, keys, render, redraw) {
+        let saved = null;
+        return {
+            preview(v) { if (!saved) saved = keys.map(k => st[k]); sel.value = v; render(); },
+            previewEnd(committed) {
+                sel.value = committed;
+                if (!saved) return;
+                keys.forEach((k, i) => { st[k] = saved[i]; });
+                saved = null;
+                redraw();
+            },
+        };
+    }
+    function previewByValue(sel, render) {
+        return {
+            preview(v) { sel.value = v; render(); },
+            previewEnd(committed) { sel.value = committed; render(); },
+        };
+    }
     function tpDrawThumb(cv, src) {
         const ctx = cv.getContext('2d');
         ctx.clearRect(0, 0, cv.width, cv.height);
@@ -2791,13 +4176,15 @@ window.TRLE = window.TRLE || {};
         const trigger = document.createElement('button');
         trigger.type = 'button';
         trigger.id = base;
-        trigger.className = 'at-tp-trigger' + (opts.compact ? ' at-tp-compact' : '');
+        trigger.className = 'at-tp-trigger' + (opts.compact ? ' at-tp-compact' : '') + (opts.text ? ' at-tp-text' : '');
         trigger.setAttribute('aria-haspopup', 'listbox');
         trigger.setAttribute('aria-expanded', 'false');
-        const tcv = document.createElement('canvas');
-        tcv.width = opts.rows ? 80 : 32; tcv.height = opts.rows ? 24 : 32;
-        tcv.className = 'at-tp-thumb' + (opts.rows ? ' at-tp-wide' : '');
-        trigger.appendChild(tcv);
+        const tcv = opts.text ? null : document.createElement('canvas');   // text rows: no thumbnail
+        if (tcv) {
+            tcv.width = opts.rows ? 80 : 32; tcv.height = opts.rows ? 24 : 32;
+            tcv.className = 'at-tp-thumb' + (opts.rows ? ' at-tp-wide' : '');
+            trigger.appendChild(tcv);
+        }
         const label = document.createElement('span');
         label.className = 'at-tp-label';
         trigger.appendChild(label);
@@ -2813,7 +4200,7 @@ window.TRLE = window.TRLE || {};
 
         const sync = () => {
             const opt = sel.options[sel.selectedIndex] || null;
-            tpDrawThumb(tcv, tpSrcOf(opt, opts));
+            if (tcv) tpDrawThumb(tcv, tpSrcOf(opt, opts));
             const txt = opt ? opt.textContent : 'No tiles to pick';
             if (label) label.textContent = txt;
             trigger.title = (opts.title ? opts.title + ': ' : '') + txt;
@@ -2842,8 +4229,36 @@ window.TRLE = window.TRLE || {};
         if (top < pop.scrollTop) pop.scrollTop = top - 4;
         else if (bottom > pop.scrollTop + pop.clientHeight) pop.scrollTop = bottom - pop.clientHeight + 4;
     }
+    /* Hover intent (D3): preview the option the pointer or the keyboard has RESTED on
+       for HoverPreview.ms(). Every new target resets the timer, so a sweep across the
+       list renders only where it stops, however slow one render is (latest wins, D2):
+       pointer events queued behind a long render arrive together and each one just
+       resets the timer. Resting back on the committed option ends the preview. */
+    function tpPreviewAt(value) {
+        const o = tpOpen;
+        if (!o || !o.opts.preview || !HoverPreview.enabled()) return;
+        clearTimeout(o.timer);
+        if (value === (o.previewing === null ? o.committed : o.previewing)) return;
+        o.timer = setTimeout(() => {
+            if (tpOpen !== o) return;
+            if (value === o.committed) { tpPreviewStop(); return; }
+            o.previewing = value;
+            o.opts.preview(value);
+        }, HoverPreview.ms());
+    }
+    /* SYNCHRONOUS on purpose (D7): it runs before a commit, before every close, and
+       from the outside pointerdown, which may be the press on Apply. */
+    function tpPreviewStop() {
+        const o = tpOpen;
+        if (!o) return;
+        clearTimeout(o.timer);
+        if (o.previewing === null) return;
+        o.previewing = null;
+        o.opts.previewEnd(o.committed);
+    }
     function tpClose(refocus) {
         if (!tpOpen) return;
+        tpPreviewStop();
         const { trigger, pop } = tpOpen;
         pop.remove();
         trigger.setAttribute('aria-expanded', 'false');
@@ -2867,6 +4282,7 @@ window.TRLE = window.TRLE || {};
            popover's scroll position, which fires scroll and lands back here.
            scrollHeight is the natural height whatever maxHeight is. */
         if (e && e.target instanceof Node && pop.contains(e.target)) return;
+        if (tpOpen.opts.preview && tpPlaceClear(trigger, pop)) return;
         const r = trigger.getBoundingClientRect(), m = 8;
         const ph = pop.scrollHeight + 2, pw = pop.offsetWidth;
         const below = innerHeight - r.bottom - m, above = r.top - m;
@@ -2876,21 +4292,66 @@ window.TRLE = window.TRLE || {};
         pop.style.top = Math.max(m, top) + 'px';
         pop.style.left = Math.max(m, Math.min(r.left, innerWidth - pw - m)) + 'px';
     }
+    /* A preview picker must not cover what it previews (D6, from the author's finding
+       that the Material list "goes over the material maps"). Try below the trigger,
+       above it, then beside the zone the trigger sits in (left, then right), and take
+       the first spot that keeps clear of every preview zone of the modal and shows at
+       least 160px of the list. False = no such spot; the caller falls back. */
+    function tpPlaceClear(trigger, pop) {
+        const modal = trigger.closest('.at-modal');
+        if (!modal) return false;
+        /* Only zones that SHOW something: Build Pattern's middle zone is accordions,
+           and a list there belongs beside its own trigger. "Shows" = holds a visible
+           canvas at least 96 px across (Draw's surface, every preview rail). */
+        const zones = [...modal.querySelectorAll('.at-modal-side, .at-modal-work')]
+            .filter(z => [...z.querySelectorAll('canvas')].some(c => c.checkVisibility() && c.getBoundingClientRect().width >= 96))
+            .map(z => z.getBoundingClientRect()).filter(z => z.width > 1 && z.height > 1);
+        const r = trigger.getBoundingClientRect(), m = 8;
+        const pw = pop.offsetWidth, ph = pop.scrollHeight + 2;
+        const clear = (x, y, h) => !zones.some(z => x < z.right - 1 && x + pw > z.left + 1 && y < z.bottom - 1 && y + h > z.top + 1);
+        const own = zones.find(z => r.left >= z.left - 1 && r.right <= z.right + 1);
+        const ref = own ? [own] : zones;
+        const x0 = Math.max(m, Math.min(r.left, innerWidth - pw - m));
+        const tall = Math.min(ph, innerHeight - 2 * m);
+        const ySide = Math.max(m, Math.min(r.top, innerHeight - m - tall));
+        const hBelow = Math.min(ph, innerHeight - r.bottom - m - 4), hAbove = Math.min(ph, r.top - m - 4);
+        const cands = [
+            { x: x0, y: r.bottom + 4, h: hBelow },
+            { x: x0, y: r.top - 4 - hAbove, h: hAbove },
+        ];
+        if (ref.length) {
+            cands.push({ x: Math.min(...ref.map(z => z.left)) - pw - 6, y: ySide, h: tall });
+            cands.push({ x: Math.max(...ref.map(z => z.right)) + 6, y: ySide, h: tall });
+        }
+        const need = Math.min(ph, 160);
+        const c = cands.find(c => c.h >= need && c.x >= m && c.x + pw <= innerWidth - m && clear(c.x, c.y, c.h));
+        if (!c) return false;
+        pop.style.maxHeight = c.h + 'px';
+        pop.style.top = c.y + 'px';
+        pop.style.left = c.x + 'px';
+        return true;
+    }
     function tpOpenFor(sel, trigger, opts) {
         tpClose(false);
         if (trigger.disabled) return;
         sel._tp.sync();
         const pop = document.createElement('div');
-        pop.className = 'at-tp-pop' + (opts.rows ? ' at-tp-rows' : '');
+        pop.className = 'at-tp-pop' + (opts.rows ? ' at-tp-rows' : '') + (opts.text ? ' at-tp-text' : '');
+        if (opts.text) pop.style.minWidth = trigger.offsetWidth + 'px';
         pop.id = trigger.id + '-pop';
         pop.setAttribute('role', 'listbox');
         pop.setAttribute('aria-label', opts.title || 'Pick a texture');
+        if (opts.note) {
+            const n = document.createElement('div');
+            n.className = 'at-tp-note'; n.textContent = opts.note;
+            pop.appendChild(n);
+        }
         const cells = [];
         let group = null;
         [...sel.options].forEach((opt, i) => {
             // Rows keep the select's <optgroup>s as headings (not focusable, not cells).
             const og = opt.parentElement && opt.parentElement.tagName === 'OPTGROUP' ? opt.parentElement : null;
-            if (opts.rows && og && og !== group) {
+            if ((opts.rows || opts.text) && og && og !== group) {
                 const h = document.createElement('div');
                 h.className = 'at-tp-group'; h.textContent = og.label;
                 pop.appendChild(h);
@@ -2903,17 +4364,21 @@ window.TRLE = window.TRLE || {};
             b.setAttribute('aria-selected', i === sel.selectedIndex ? 'true' : 'false');
             b.dataset.value = opt.value;
             b.title = opt.textContent;
-            const cv = document.createElement('canvas');
-            const src = tpSrcOf(opt, opts);
-            cv.width = opts.rows && src ? src.width : TP_THUMB; cv.height = opts.rows && src ? src.height : TP_THUMB;
-            tpDrawThumb(cv, src);
+            if (!opts.text) {
+                const cv = document.createElement('canvas');
+                const src = tpSrcOf(opt, opts);
+                cv.width = opts.rows && src ? src.width : TP_THUMB; cv.height = opts.rows && src ? src.height : TP_THUMB;
+                tpDrawThumb(cv, src);
+                b.appendChild(cv);
+            }
             const badge = document.createElement('span');
             badge.className = 'at-tp-badge';
             // The number from "Tile 12", plus anything the caller appended.
-            badge.textContent = opts.rows ? opt.textContent : opt.textContent.replace(/^Tile\s*/, '');
-            b.appendChild(cv); b.appendChild(badge);
+            badge.textContent = opts.rows || opts.text ? opt.textContent : opt.textContent.replace(/^Tile\s*/, '');
+            b.appendChild(badge);
             b.addEventListener('click', e => {
                 e.stopPropagation();
+                tpPreviewStop();           // the select holds the COMMITTED value again before the pick
                 const changed = sel.value !== opt.value;
                 sel.value = opt.value;
                 if (changed) sel.dispatchEvent(new Event('change', { bubbles: true }));
@@ -2926,7 +4391,7 @@ window.TRLE = window.TRLE || {};
         pop.addEventListener('keydown', e => {
             const i = cells.indexOf(document.activeElement);
             const cols = Math.max(1, Math.round(pop.clientWidth / (cells[0] ? cells[0].offsetWidth + 6 : 1)));
-            const go = j => { j = Math.max(0, Math.min(cells.length - 1, j)); tpReveal(pop, cells[j]); cells[j].focus({ preventScroll: true }); };
+            const go = j => { j = Math.max(0, Math.min(cells.length - 1, j)); tpReveal(pop, cells[j]); cells[j].focus({ preventScroll: true }); tpPreviewAt(cells[j].dataset.value); };
             if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); tpClose(true); }
             /* Enter / Space picked by US on keydown, with the default prevented: one
                activation in every browser, and never the browser's own on a cell the
@@ -2940,8 +4405,15 @@ window.TRLE = window.TRLE || {};
             else if (e.key === 'Home') { e.preventDefault(); go(0); }
             else if (e.key === 'End') { e.preventDefault(); go(cells.length - 1); }
         });
+        if (opts.preview) {
+            pop.addEventListener('pointerover', e => {
+                const b = e.target instanceof Element ? e.target.closest('.at-tp-opt') : null;
+                if (b) tpPreviewAt(b.dataset.value);
+            });
+            pop.addEventListener('pointerleave', tpPreviewStop);   // off the list: back to the committed option
+        }
         document.body.appendChild(pop);
-        tpOpen = { sel, trigger, pop, opts };
+        tpOpen = { sel, trigger, pop, opts, committed: sel.value, previewing: null, timer: 0 };
         trigger.setAttribute('aria-expanded', 'true');
         tpPlace();
         window.addEventListener('resize', tpPlace);
@@ -3092,7 +4564,7 @@ window.TRLE = window.TRLE || {};
         if (!maps) return null;
         const out = {};
         for (const mt of TRLE.MapOrder) {
-            if (maps[mt]) out[mt] = resizeCanvas(maps[mt], S, S);
+            if (maps[mt]) out[mt] = resizeImported(maps[mt], S);
         }
         return Object.keys(out).length ? out : null;
     }
@@ -4303,7 +5775,7 @@ window.TRLE = window.TRLE || {};
             const a = byId(el.base), b = byId(el.overlay);
             return `${a ? materialLabel(a) : '?'} ↔ ${b ? materialLabel(b) : '?'}`;
         }
-        if (hasMatLayers(el)) return `Multi-material (${el.matLayers.length} layers)`;
+        if (hasMatLayers(el)) return `Multi-material (${el.matLayers.length} Material Layers)`;
         if (!el.material) return 'Stone (default)';
         const p = resolvePreset(el);
         return (p.label || el.material.key) + (el.material.custom ? ' *' : '');
@@ -4339,6 +5811,7 @@ window.TRLE = window.TRLE || {};
     let renderGridCalls = 0;   // test-only: a drag must not re-render (validate-grid-dnd)
     function renderGrid() {
         renderGridCalls++;
+        scheduleLayersView();
         const grid = $('at-grid');
         // Preserve keyboard focus across re-render if a cell was focused.
         const active = document.activeElement;
@@ -4445,6 +5918,8 @@ window.TRLE = window.TRLE || {};
             // Same reasoning as the glow badge: an authored height map never touches
             // el.canvas, so without this the cell looks identical to one without.
             if (el.hgParams) badges.innerHTML += '<span class="at-badge at-badge-h" title="Has an authored height map (Make Height Map)">H</span>';
+            // Layers (LAYERS-PLAN D8): the stack is invisible state, like the glow above.
+            if (hasLayers(el)) badges.innerHTML += `<span class="at-badge at-badge-l" title="Has ${el.layers.length} layer${el.layers.length === 1 ? '' : 's'} (right-click, Layers…)">L</span>`;
             cell.appendChild(badges);
 
             const lbl = document.createElement('span');
@@ -5596,9 +7071,10 @@ window.TRLE = window.TRLE || {};
 
     /* ---- Bulk-action bar (appears when ≥2 tiles are selected) ---- */
     function updateBulkBar() {
+        scheduleLayersView();   // the selection moved: the Layers panel follows it
         const bar = $('at-bulk-bar'); if (!bar) return;
         const n = state.selSet.size;
-        bar.style.display = n >= 2 ? 'flex' : 'none';
+        if (!marqueeActive) bar.style.display = n >= 2 ? 'flex' : 'none';   // a box drag moves it on release, not mid-drag
         const cnt = $('at-bulk-count'); if (cnt) cnt.textContent = n;
         const last = $('at-bulk-lastmaterial');
         if (last) {
@@ -5671,7 +7147,7 @@ window.TRLE = window.TRLE || {};
        tweak, so it doesn't get one. */
     function lastMaterialLabel() {
         if (!state.lastMaterial) return '';
-        if (state.lastMatLayers) return `Multi-material, ${state.lastMatLayers.length} layers`;
+        if (state.lastMatLayers) return `Multi-material, ${state.lastMatLayers.length} Material Layers`;
         const m = state.lastMaterial;
         const p = presetFromMaterial(m);
         const tweaked = m.custom && m.aesthetic !== 'saved';
@@ -5691,7 +7167,7 @@ window.TRLE = window.TRLE || {};
         const label = lastMaterialLabel();
         pushHistory(targets.length > 1 ? `Material → ${targets.length} tiles` : `Material: ${label}`);
         if (state.lastMatLayers && !layers) {
-            showToast(`Applied the base material of “${label}” to ${targets.length} tiles, layer masks are per-tile 🎨`, 'info', 4000);
+            showToast(`Applied the base material of “${label}” to ${targets.length} tiles, Material Layer masks are per-tile 🎨`, 'info', 4000);
         } else {
             showToast(targets.length > 1
                 ? `Applied “${label}” to ${targets.length} tiles 🎨`
@@ -5702,26 +7178,39 @@ window.TRLE = window.TRLE || {};
 
     /* ---- Rubber-band marquee selection over the grid background ---- */
     let marqueeJustDragged = false;   // the click that ends a marquee is not a click on a slot
+    let marqueeActive = false;        // while a box is dragged, the bulk bar must not move the grid
     function setupSelectionMarquee() {
         const grid = $('at-grid');
-        grid.addEventListener('mousedown', e => {
+        const card = $('at-grid-card');
+        card.addEventListener('mousedown', e => {
             if (e.button !== 0 || state.pickBaseId !== null) return;
-            if (e.target.closest('.at-cell')) return;  // drags start on background only (empty slots count)
+            if ($('at-grid-scroll').classList.contains('at-pan-ready') || card.classList.contains('at-atlas-viewing')) return;
+            const t = e.target;
+            if (t.closest('.at-cell')) return;  // drags start on background only (empty slots count)
+            // Empty card area only: the grid's background, gaps and empty slots, the scroller and the card's own padding.
+            // The head, toolbar, notice, banners, bulk bar and layout row never start a box.
+            if (!(t === card || t === $('at-grid-scroll') || grid.contains(t))) return;
             const additive = e.ctrlKey || e.metaKey || e.shiftKey;
-            const onEmpty = !!e.target.closest('.at-slot-empty');
+            const onEmpty = !!t.closest('.at-slot-empty');
             const baseSel = new Set(state.selSet);
-            const start = { x: e.clientX, y: e.clientY };
+            // The anchor lives in GRID coordinates, so anything that moves the grid (a scroll, a layout shift) takes it along.
+            const g0 = grid.getBoundingClientRect();
+            const start = { x: e.clientX - g0.left, y: e.clientY - g0.top };
+            let last = { x: e.clientX, y: e.clientY };
             let moved = false;
             const box = document.createElement('div');
             box.className = 'at-marquee';
-            grid.appendChild(box);
-            const onMove = ev => {
-                const x0 = Math.min(start.x, ev.clientX), y0 = Math.min(start.y, ev.clientY);
-                const x1 = Math.max(start.x, ev.clientX), y1 = Math.max(start.y, ev.clientY);
-                if (Math.abs(ev.clientX - start.x) + Math.abs(ev.clientY - start.y) > 4) moved = true;
+            box.style.position = 'fixed';
+            document.body.appendChild(box);
+            marqueeActive = true;
+            const update = () => {
                 const gr = grid.getBoundingClientRect();
-                box.style.left = (x0 - gr.left + grid.scrollLeft) + 'px';
-                box.style.top  = (y0 - gr.top + grid.scrollTop) + 'px';
+                const sx = gr.left + start.x, sy = gr.top + start.y;
+                const x0 = Math.min(sx, last.x), y0 = Math.min(sy, last.y);
+                const x1 = Math.max(sx, last.x), y1 = Math.max(sy, last.y);
+                if (Math.abs(last.x - sx) + Math.abs(last.y - sy) > 4) moved = true;
+                box.style.left = x0 + 'px';
+                box.style.top = y0 + 'px';
                 box.style.width = (x1 - x0) + 'px';
                 box.style.height = (y1 - y0) + 'px';
                 const hit = [];
@@ -5734,10 +7223,15 @@ window.TRLE = window.TRLE || {};
                 grid.querySelectorAll('.at-cell').forEach(c => c.classList.toggle('selected', state.selSet.has(Number(c.dataset.id))));
                 updateBulkBar();
             };
+            const onMove = ev => { last = { x: ev.clientX, y: ev.clientY }; update(); };
+            const onScroll = () => update();   // a wheel scroll mid-drag extends the box over the content
             const onUp = () => {
                 document.removeEventListener('mousemove', onMove);
                 document.removeEventListener('mouseup', onUp);
+                document.removeEventListener('scroll', onScroll, true);
                 if (box.parentNode) box.parentNode.removeChild(box);
+                marqueeActive = false;
+                updateBulkBar();   // the bar shows or hides now, not while the box was moving
                 // A plain click on an empty slot adds an image there (the click
                 // handler), so leave the grid alone for it to land on.
                 if (!moved && onEmpty && !additive) return;
@@ -5747,6 +7241,7 @@ window.TRLE = window.TRLE || {};
             };
             document.addEventListener('mousemove', onMove);
             document.addEventListener('mouseup', onUp);
+            document.addEventListener('scroll', onScroll, true);
             e.preventDefault();
         });
         // Ctrl/Cmd+A → select all (when not typing and no modal is open)
@@ -6206,6 +7701,7 @@ window.TRLE = window.TRLE || {};
         if (!state.elements.some(e => e.id === state.focusedId)) {
             state.focusedId = state.elements.length ? state.elements[0].id : null;
         }
+        TRLE.Layers.prune(state.layerDefs, state.elements);   // a definition no tile uses goes with its last tile
         blocksChanged('the delete');
         renderGrid();
         updateBulkBar();
@@ -6330,6 +7826,8 @@ window.TRLE = window.TRLE || {};
                 push: el.push ? JSON.parse(JSON.stringify(el.push)) : null,  // pushable-marking recipe
                 pushHandPx: el.pushHandPx || null,                    // immutable ref: always replaced, never drawn into
                 organic: el.organic ? { ...el.organic } : null,         // organic-edge recipe
+                patch: el.patch ? { ...el.patch } : null,               // organic patches (ORGANIC-SETS-PLAN)
+                patchHint: el.patchHint || null,                       // immutable ref (set once at add)
                 block: el.block ? { ...el.block } : null,               // grid-block membership
                 group: el.group ? { ...el.group } : null,               // user group (phase 8)
                 spacer: !!el.spacer,
@@ -6337,6 +7835,9 @@ window.TRLE = window.TRLE || {};
                 overlayGeom: el.overlayGeom ? { ...el.overlayGeom } : null, // transition overlay re-orient
                 emissive: el.emissive ? cloneCanvas(el.emissive) : null, // authored glow (mutable)
                 importedMaps: cloneImportedMaps(el.importedMaps),        // maps read out of a PSD's layers
+                mapSource: el.mapSource ? cloneCanvas(el.mapSource) : null, // Classic Look's pre-filter diffuse
+                textRelief: cloneTextRelief(el.textRelief),             // 🔤 Text's engraved / raised letters
+                mapPatches: cloneMapPatches(el.mapPatches),             // flattened stickers' own maps (STICKERS-PLAN P2)
                 // Animation metadata — frames are regenerated from params on
                 // restore (like transitions), so no pixels are snapshotted.
                 anim: el.anim ? JSON.parse(JSON.stringify(el.anim)) : null,
@@ -6347,10 +7848,16 @@ window.TRLE = window.TRLE || {};
                 // later edit silently removed every tile's height map.
                 hgParams: cloneHgParams(el.hgParams),
                 original: el.original || null,                          // immutable ref (tiles)
+                // Layers (LAYERS-PLAN D2): the bottom and the pieces are immutable
+                // references, held not cloned; the canvas below is still cloned.
+                under: el.under || null,
+                layers: TRLE.Layers.clonePieces(el.layers),
+                layerSig: el.layerSig == null ? null : el.layerSig,
                 // Snapshot the canvas whenever it diverges from `original`
                 // (seamless or healed/transformed); otherwise rebuild from original.
-                canvasSnap: (el.kind === 'tile' && (el.seamless || el.edited)) ? cloneCanvas(el.canvas) : null
-            }))
+                canvasSnap: (el.kind === 'tile' && (el.seamless || el.edited || hasLayers(el))) ? cloneCanvas(el.canvas) : null
+            })),
+            layerDefs: Object.assign({}, state.layerDefs)   // definitions are replaced, never mutated
         };
     }
 
@@ -6367,7 +7874,7 @@ window.TRLE = window.TRLE || {};
         state.elements = snap.elements.map(s => {
             let canvas;
             if (s.kind === 'tile') {
-                const src = ((s.seamless || s.edited) && s.canvasSnap) ? s.canvasSnap : s.original;
+                const src = ((s.seamless || s.edited || s.under) && s.canvasSnap) ? s.canvasSnap : s.original;
                 canvas = cloneCanvas(src);
             } else {
                 canvas = document.createElement('canvas');
@@ -6388,6 +7895,8 @@ window.TRLE = window.TRLE || {};
                 push: s.push ? JSON.parse(JSON.stringify(s.push)) : null,
                 pushHandPx: s.pushHandPx || null,
                 organic: s.organic ? { ...s.organic } : null,
+                patch: s.patch ? { ...s.patch } : null,
+                patchHint: s.patchHint || null,
                 block: s.block ? { ...s.block } : null,
                 group: s.group ? { ...s.group } : null,
                 spacer: !!s.spacer,
@@ -6395,18 +7904,26 @@ window.TRLE = window.TRLE || {};
                 overlayGeom: s.overlayGeom ? { ...s.overlayGeom } : null,
                 emissive: s.emissive ? cloneCanvas(s.emissive) : null,
                 importedMaps: cloneImportedMaps(s.importedMaps),
+                mapSource: s.mapSource ? cloneCanvas(s.mapSource) : null,
+                textRelief: cloneTextRelief(s.textRelief),
+                mapPatches: cloneMapPatches(s.mapPatches),
                 anim: s.anim ? JSON.parse(JSON.stringify(s.anim)) : null,
                 htParams: s.htParams ? JSON.parse(JSON.stringify(s.htParams)) : null,
                 ovParams: s.ovParams ? JSON.parse(JSON.stringify(s.ovParams)) : null,
                 sgParams: s.sgParams ? JSON.parse(JSON.stringify(s.sgParams)) : null,
                 hgParams: cloneHgParams(s.hgParams),
+                under: s.under || null,
+                layers: TRLE.Layers.clonePieces(s.layers),
+                layerSig: s.layerSig == null ? null : s.layerSig,
                 edited: s.edited
             };
         });
+        state.layerDefs = Object.assign({}, snap.layerDefs || {});
         adoptLayout(snap.rows, snap.layout);
         refreshAnims();         // regenerate animation frames from restored params
         refreshTransitions();   // rebuild transition canvases from restored parents
         renderGrid();
+        noteCells();            // undo and redo are not rearrangements: the next push compares against this
     }
 
     /* An animation's RAW frames: layer 1, plus layer 2 composited in when the
@@ -6489,9 +8006,13 @@ window.TRLE = window.TRLE || {};
     }
 
     function resetHistory(label) {
+        // GRID-SELECTION-PLAN phase 4: an atlas opened from a project or the autosave is a LATER session.
+        atlasFromEarlierSession = label === 'Project loaded';
+        rearrangeAsked = false;
         history.stack = [snapshotState()];
         history.labels = [label || 'Start'];
         history.index = 0;
+        noteCells();
         markSaved();            // a fresh / just-loaded atlas has nothing unsaved yet
         // A new atlas or a just-loaded project is worth protecting immediately —
         // waiting for the first edit meant that after a manual "Clear stored
@@ -6515,6 +8036,10 @@ window.TRLE = window.TRLE || {};
         if (!state.dirty) { state.dirty = true; renderSavedState(); }
         scheduleAutosave();
     }
+    /* The sticker library is project state but not on the undo stack (STICKERS-PLAN P7): a change
+       only marks the project unsaved and schedules the autosave. Loading a project fills it quietly. */
+    let stickersLoading = false;
+    TRLE.Stickers.onChange(() => { if (!stickersLoading && state.elements && state.elements.length) markDirty(); });
     function markSaved() { if (state.dirty !== false) { state.dirty = false; renderSavedState(); } }
     function renderSavedState() {
         const dot = $('at-unsaved');
@@ -6578,7 +8103,42 @@ window.TRLE = window.TRLE || {};
         });
     }
 
+    /* ---- The rearrange warning (GRID-SELECTION-PLAN phase 4) ----
+       Only in a LATER session: an atlas opened through Load Project or the restore strip, where a level may already
+       be textured with it. Detected centrally: every committing action passes pushHistory, so each tile's cell is
+       compared with where it was after the previous action. Undo and redo restore snapshots without pushHistory and
+       re-note the cells, so an Undo from the warning cannot trigger it again. */
+    let atlasFromEarlierSession = false, rearrangeAsked = false, prevCells = new Map();
+    // Reads the layout as it stands: layoutCells() would syncLayout() and place tiles mid-action.
+    function currentCells() {
+        const m = new Map();
+        state.layout.forEach((id, slot) => { if (id != null) m.set(id, slot); });
+        return m;
+    }
+    function noteCells() { prevCells = currentCells(); }
+    function checkRearranged() {
+        const now = currentCells();
+        let moved = 0;
+        for (const [id, slot] of now) if (prevCells.has(id) && prevCells.get(id) !== slot) moved++;
+        prevCells = now;
+        if (!atlasFromEarlierSession || !moved) return;
+        const n = `${moved} texture${moved === 1 ? '' : 's'}`;
+        const overlayOpen = $('at-overlay').style.display !== 'none';
+        if (rearrangeAsked || overlayOpen) {
+            showToast(`${n} moved. A level using this atlas will show the old textures there until you re-apply it.`, 'info', 4000);
+            return;
+        }
+        rearrangeAsked = true;
+        setTimeout(() => openConfirm('Textures moved in an atlas you opened again',
+            `${n} changed place. A level already textured with this atlas will show the wrong texture in those spots until you re-apply the atlas in Tomb Editor. Keep the new layout, or undo the move?`,
+            'Keep the new layout', () => {}, { danger: false, cancelLabel: 'Undo', onNo: () => undo() }), 0);
+    }
     function pushHistory(label) {
+        // A layered tile whose canvas moved without a rebuild had a stray write
+        // (a tool that is not a layer kind yet): flatten it, so it is never
+        // inconsistent. Under ?capture the stack is also re-checked against a rebuild.
+        TRLE.Layers.checkTiles(state.elements, state.layerDefs, LAYERS_CAPTURE);
+        TRLE.Layers.prune(state.layerDefs, state.elements);   // definitions of a flattened or replaced stack
         // Drop any redo branch, then append the new current state.
         history.stack = history.stack.slice(0, history.index + 1);
         history.labels = history.labels.slice(0, history.index + 1);
@@ -6586,6 +8146,7 @@ window.TRLE = window.TRLE || {};
         history.labels.push(label || 'Edit');
         if (history.stack.length > history.limit) { history.stack.shift(); history.labels.shift(); }
         history.index = history.stack.length - 1;
+        checkRearranged();
         markDirty();
         updateHistoryButtons();
         renderHistory();
@@ -6847,6 +8408,15 @@ window.TRLE = window.TRLE || {};
         menu.querySelectorAll('[data-ovonly]').forEach(b => {
             b.style.display = el.ovParams ? '' : 'none';
         });
+        menu.querySelectorAll('[data-drawonly]').forEach(b => {
+            b.style.display = hasKindLayer(el, 'draw') ? '' : 'none';
+        });
+        menu.querySelectorAll('[data-textonly]').forEach(b => {
+            b.style.display = hasTextLayer(el) ? '' : 'none';
+        });
+        menu.querySelectorAll('[data-stickeronly]').forEach(b => {
+            b.style.display = hasStickerLayer(el) ? '' : 'none';
+        });
         menu.querySelectorAll('[data-pushonly]').forEach(b => {
             b.style.display = el.push ? '' : 'none';
         });
@@ -6924,29 +8494,40 @@ window.TRLE = window.TRLE || {};
        transitions and sets from it. "Edit" was "Adjust" until the author renamed
        it (2026-09-26): File, Edit reads the way application menus do. */
     const CTX_TREE = {
-        pinned: ['editanim', 'edithtrans', 'editoverlay', 'editstainedglass', 'editpushmarks', 'gotobase', 'gotooverlay'],
+        pinned: ['editanim', 'edithtrans', 'editoverlay', 'editstainedglass', 'editpushmarks', 'edittext', 'editdrawing', 'editstickers', 'gotobase', 'gotooverlay'],
         root: [
             { cat: 'file', label: 'File' },
             { cat: 'transform', label: 'Transform' },
             { cat: 'edit', label: 'Edit' },
+            /* FILTERS-PLAN D1: the tools that change how the pixels look, grouped while few
+               users have learned where Slope Blur, Scatter and Surface Noise used to be. */
+            { cat: 'filter', label: 'Filter' },
             { action: 'draw' },
+            { action: 'text' },
             { cat: 'transitions', label: 'Transitions' },
+            /* STICKERS-PLAN D12 (A5): Overlay leaves Transitions for a category of its own,
+               the things laid OVER a texture rather than blended into it. */
+            { cat: 'overlay', label: 'Overlay' },
             { cat: 'generate', label: 'Create' },
             { cat: 'material', label: 'Material' },
         ],
         tail: ['addanim', 'addsprite'],
         cats: {
-            file: ['view', 'copyorig', 'copy', 'duporig', 'duplicate',
+            file: ['view', 'layers', 'copyorig', 'copy', 'duporig', 'duplicate',
                    'download', 'replace', 'reset', 'group', 'ungroup',
-                   '@editanim', '@edithtrans', '@editoverlay', '@editstainedglass', '@editpushmarks',
+                   '@editanim', '@edithtrans', '@editoverlay', '@editstainedglass', '@editpushmarks', '@edittext', '@editdrawing', '@editstickers',
                    '@gotobase', '@gotooverlay', 'delete'],
-            transform: ['rotate', 'fliph', 'flipv', 'offset'],
+            transform: ['rotate', 'fliph', 'flipv', 'offset', 'xform', 'persp', 'distort', 'liquify'],
             /* seamless sits in Edit, above De-light, not in Create: users went
                looking for it there (2026-09-28), and it edits the tile in
                place rather than building a new one. */
-            edit: ['coloradj', 'recolor', 'seamless', 'delight', 'heal', 'fade'],
-            transitions: ['transition', 'wang', 'anchor', 'transgrid', 'organic', 'heighttrans', 'overlay'],
-            generate: ['borderset', 'pushmarks', 'variations', 'buildpattern', 'origami', 'stainedglass', 'surfacenoise'],
+            /* '|' is a separator (HD-LOOK-PLAN D2): a divider, not an action. Classic Look
+               sits under it, with HD Look to follow. */
+            edit: ['coloradj', 'recolor', 'seamless', 'delight', 'heal', 'tone', 'fade', '|', 'classic', 'hdlook'],
+            filter: ['oil', 'slope', 'scatter', 'surfacenoise'],
+            transitions: ['transition', 'wang', 'anchor', 'transgrid', 'organic', 'heighttrans'],
+            overlay: ['overlay', 'stickers', 'stickercut', 'stickerlib'],
+            generate: ['borderset', 'pushmarks', 'variations', 'buildpattern', 'origami', 'stainedglass'],
             material: ['material', 'lastmaterial', 'emissive', 'heightmap'],
         },
     };
@@ -6960,11 +8541,18 @@ window.TRLE = window.TRLE || {};
     const CTX_KEYWORDS = {
         editanim: ['animation', 'frames', 'water', 'lava'],
         edithtrans: ['height', 'transition', 'crevices'],
-        editoverlay: ['overlay', 'decal', 'layer'],
+        editoverlay: ['overlay', 'decal'],
+        stickerlib: ['sticker', 'stickers', 'decal', 'logo', 'sign', 'badge', 'pack', 'gallery', 'library', 'images'],
+        stickercut: ['sticker', 'cut', 'cutout', 'extract', 'decal', 'lift', 'stamp'],
         editstainedglass: ['stained', 'glass', 'window', 'leaded'],
         editpushmarks: ['pushable', 'push', 'block', 'tracks', 'scrape', 'drips'],
+        edittext: ['text', 'lettering', 'font', 'sign', 'words', 'layer'],
+        editdrawing: ['draw', 'paint', 'brush', 'strokes', 'layer'],
+        editstickers: ['sticker', 'stickers', 'decal', 'layer'],
+        stickers: ['sticker', 'decal', 'logo', 'sign', 'badge', 'place', 'stamp'],
         gotobase: ['jump', 'source', 'parent', 'base'],
         gotooverlay: ['jump', 'source', 'parent', 'overlay'],
+        layers: ['layer', 'layers', 'stack', 'history', 'memory', 'hide', 'show', 'edits', 'undo'],
         view: ['preview', 'look', 'inspect', 'zoom', '2x2', 'repeat', 'tiling', 'seam'],
         copyorig: ['clipboard', 'original', 'unedited', 'paste'],
         copy: ['clipboard', 'paste', 'png'],
@@ -6981,24 +8569,35 @@ window.TRLE = window.TRLE || {};
         flipv: ['mirror', 'vertical'],
         offset: ['roll', 'shift', 'wrap', 'seam', 'half'],
         coloradj: ['colour', 'color', 'brightness', 'contrast', 'saturation', 'hue', 'levels', 'curves', 'tint'],
+        distort: ['distort', 'wave', 'ripple', 'displace', 'warp', 'wobble', 'water', 'wavy', 'twirl', 'pinch', 'spherize', 'zigzag', 'polar'],
+        tone: ['dodge', 'burn', 'sponge', 'lighten', 'darken', 'saturate', 'desaturate', 'retouch', 'brush', 'shade', 'highlight', 'blur', 'sharpen', 'soften'],
+        oil: ['oil', 'paint', 'painting', 'painterly', 'brush', 'strokes', 'smear', 'stylize', 'artistic', 'impasto'],
+        liquify: ['liquify', 'warp', 'push', 'smear', 'bend', 'melt', 'twirl', 'pucker', 'bloat', 'pinch', 'sculpt'],
+        persp: ['perspective', 'straighten', 'rectify', 'keystone', 'corners', 'distort', 'photo', 'wall', 'angle'],
+        xform: ['free transform', 'rotate', 'angle', 'scale', 'resize', 'skew', 'shear', 'move', 'shift', 'zoom'],
+        scatter: ['stamp', 'patches', 'moss', 'dirt', 'plaster', 'chips', 'weather', 'weathering', 'age', 'old', 'decal', 'splatter', 'tile sampler', 'randomise', 'random'],
+        slope: ['erode', 'erosion', 'wear', 'weather', 'weathering', 'smear', 'drip', 'run', 'slope', 'blur', 'dirt', 'age', 'old', 'chip', 'crumble', 'min', 'max'],
+        hdlook: ['upscale', 'upsample', 'enhance', 'detail', 'resolution', 'low res', 'lowres', 'bigger', 'sharpen', 'hd', 'remaster'],
+        classic: ['pixelate', 'pixel', 'retro', 'low res', 'lowres', 'downscale', 'resolution', 'palette', '8-bit', 'dither', 'mosaic', 'old school', 'hd'],
         recolor: ['recolour', 'colour', 'color', 'match', 'transfer', 'tint'],
         delight: ['delight', 'shadows', 'lighting', 'baked', 'flatten'],
         heal: ['fill', 'clone', 'patch', 'remove', 'spot', 'fix', 'brush'],
         fade: ['transparent', 'alpha', 'cutout', 'edge', 'vignette'],
         draw: ['paint', 'brush', 'pen'],
+        text: ['text', 'type', 'letters', 'lettering', 'font', 'sign', 'inscription', 'words', 'label', 'engrave', 'writing'],
         transition: ['blend', 'mix', 'edge'],
         wang: ['blob', 'set', 'connect', 'autotile'],
         anchor: ['anchor', 'points', 'blend', 'line'],
         transgrid: ['grid', 'map', 'blend'],
         organic: ['blobby', 'natural', 'blend'],
         heighttrans: ['height', 'crevices', 'depth', 'blend'],
-        overlay: ['decal', 'layer', 'stack', 'top'],
+        overlay: ['decal', 'stack', 'top'],
         seamless: ['tile', 'tileable', 'seam', 'repeat', 'wrap'],
         borderset: ['border', 'corner', 'edge', 'trim', 'frame', 'set'],
         pushmarks: ['pushable', 'push', 'block', 'tracks', 'scrape', 'drips'],
         variations: ['variants', 'random', 'copies', 'generate'],
         buildpattern: ['bricks', 'tiles', 'mortar', 'grout', 'masonry', 'planks', 'pattern'],
-        origami: ['fold', 'rings', 'border', 'frame'],
+        origami: ['fold', 'rings', 'border', 'frame', 'pleat', 'kaleidoscope', 'fan', 'mirror', 'crease', 'paper'],
         stainedglass: ['window', 'leaded', 'glass'],
         surfacenoise: ['grain', 'grit', 'scratches', 'cracks', 'pitting', 'weathering', 'dirt'],
         material: ['pbr', 'normal', 'roughness', 'specular', 'maps'],
@@ -7032,9 +8631,9 @@ window.TRLE = window.TRLE || {};
        through the same compositor the modal itself calls (no UI needed),
        Anchored/Transition Grid cropped to the live editor canvas with and
        without its own "Hide handles" toggle, Borders & Corners cropped to
-       the modal's own "set assembled" sample wall. Every one of the 48
-       actions is accounted for above: 25 have `media: true`, 4 are `'css'`,
-       13 are `false`, 6 alias another action's file. */
+       the modal's own "set assembled" sample wall. Every one of the
+       actions is accounted for above; count `media: true` in the table, the
+       number drifts as previews are added. */
     const CTX_PREVIEW = {
         view:      { blurb: 'Shows the texture at its resolution, plus a 2×2 so seams are easy to spot.', learn: null, media: false },
         copyorig:  { blurb: 'Copies this tile’s original pixels to the clipboard.', learn: null, media: false },
@@ -7052,14 +8651,28 @@ window.TRLE = window.TRLE || {};
         fliph:  { blurb: 'Flips the tile horizontally.', learn: 'transforms', media: 'css' },
         flipv:  { blurb: 'Flips the tile vertically.', learn: 'transforms', media: 'css' },
         offset: { blurb: 'Rolls the tile by half its size, moving a seam to the centre so it’s easy to heal.', learn: 'transforms', media: 'css' },
+        distort: { blurb: 'Pushes pixels around: a regular wave, small random ripples, a shift read from another tile, or a twirl, pinch, spherize or zigzag round a centre. Keeps tiling with Wrap edges.', learn: 'transforms', media: true },
+        tone: { blurb: 'Paint to lighten (Dodge), darken (Burn), saturate or desaturate (Sponge), soften (Blur) or sharpen. Each tool becomes its own layer.', learn: 'tone', media: true },
+        oil: { blurb: 'Smears the colours along the texture’s own edges into brush strokes. Lighting is off by default, since baked shading is what De-light removes.', learn: 'oilpaint', media: true },
+        liquify: { blurb: 'Push, twirl, pucker and bloat the texture with a brush. Text, drawings, glow and regions move with it. Strokes wrap across the tile edges.', learn: 'transforms', media: true },
+        persp:  { blurb: 'Drag four corners: straighten a wall photographed at an angle into a flat tile (from the tile or a full-size photo), or distort the tile’s corners.', learn: 'transforms', media: true },
+        xform:  { blurb: 'Rotates by any angle, scales, skews and moves the texture inside its tile, with a choice of resampling and an option to keep it tileable.', learn: 'transforms', media: true },
 
         coloradj: { blurb: 'Re-grades a tile’s colours by hand: hue, saturation, brightness, contrast, channel levels or curves.', learn: 'colour', media: true },
+        hdlook:   { blurb: 'Makes a low-res texture look HD at the same tile size.', learn: 'hdlook', media: true },
+        classic:  { blurb: 'Makes an HD texture look low-res at the same tile size: blocky pixels or a soft low-res look, with an optional palette.', learn: 'classic', media: true },
+        scatter:  { blurb: 'Stamps soft random patches of this tile or another over the texture: moss, dirt, plaster, chips. Keeps tiling with Wrap.', learn: 'weathering', media: true },
+        slope:    { blurb: 'Smears or erodes the texture along a slope so wear runs downhill and edges chip, instead of staying machine-perfect.', learn: 'weathering', media: true },
         recolor:  { blurb: 'Samples another texture’s palette and shifts this tile toward it.', learn: 'colour', media: true },
         delight:  { blurb: 'Flattens baked-in lighting so a found texture reacts correctly to Tomb Engine’s dynamic lights.', learn: 'delight', media: true },
         heal:     { blurb: 'Paints out blemishes, logos or scratches with surrounding colour or re-synthesised texture.', learn: 'heal', media: true },
         fade:     { blurb: 'Fades a texture’s edge into transparency instead of ending at a hard line.', learn: 'transparency', media: true },
 
+        edittext: { blurb: 'Reopens this tile’s text layer with every setting as you left it, over the arrangement it was made on.', learn: 'text', media: false },
+        editdrawing: { blurb: 'Reopens this tile’s drawing layer to carry on painting, erase or clear, over the arrangement it was made on.', learn: 'draw', media: false },
+        layers: { blurb: 'Lists every layer this tile carries, with an eye to hide one and a bin to delete it.', learn: null, media: false },
         draw: { blurb: 'Paints on the texture with a photo editor’s brush; nothing changes until Apply.', learn: 'draw', media: true },
+        text: { blurb: 'Writes lettering on the texture in any installed, loaded or online font, with outline, shadow, a material of its own and carved or raised relief; nothing changes until Apply.', learn: 'text', media: true },
 
         transition:  { blurb: 'Blends two textures along an edge or corner so terrain types meet without a hard line.', learn: 'transitions', media: true },
         wang:        { blurb: 'Creates the full 16-tile edge set so an overlay terrain connects in every direction.', learn: 'wang', media: true },
@@ -7068,13 +8681,17 @@ window.TRLE = window.TRLE || {};
         organic:     { blurb: 'Scatters one texture into another as noise-driven patches instead of a clean line.', learn: 'organic', media: true },
         heighttrans: { blurb: 'Blends two textures by height: the overlay settles into the low ground or caps the high ground.', learn: 'heighttrans', media: true },
         overlay:     { blurb: 'Lays one texture on top of another, respecting its transparency, instead of blending them.', learn: 'overlay', media: true },
+        stickers:    { blurb: 'Places gallery images over the texture: move, scale, turn, flip, recolour each one; nothing changes until Apply.', learn: 'stickers', media: true },
+        editstickers: { blurb: 'Reopens this tile’s sticker layer with every sticker where you left it, over the arrangement it was placed on.', learn: 'stickers', media: 'stickers' },
+        stickerlib:  { blurb: 'Keeps the images you lay over textures: add files, a folder, a PSD or a pack, rename, delete, and save a pack for another project.', learn: 'stickers', media: false },
+        stickercut:  { blurb: 'Cuts part of this tile out as a gallery sticker, with its maps if you like, and can lift it off and heal the hole.', learn: 'stickers', media: 'stickers' },
 
         seamless:     { blurb: 'Removes the visible seam so a texture repeats cleanly across a surface.', learn: 'seamless', media: true },
         borderset:    { blurb: 'Builds a reusable border tile set from a fill and a trim texture.', learn: 'borderset', media: true },
         pushmarks:    { blurb: 'Builds the 16-tile set of scrape marks a pushed block leaves on the floor.', learn: 'pushmarks', media: true },
         variations:   { blurb: 'Creates jittered copies to break up obvious repetition across a wall or floor.', learn: 'variations', media: true },
         buildpattern: { blurb: 'Turns a plain material into a built surface: brick, cobbles, planks, tile or shingles.', learn: 'buildpattern', media: true },
-        origami:      { blurb: 'Folds a texture into a concentric frame, as if the strip were wrapped around all four edges.', learn: 'origami', media: true },
+        origami:      { blurb: 'Folds a texture like paper: nested frame rings, parallel pleats, a mirrored grid or a fan.', learn: 'origami', media: true },
         stainedglass: { blurb: 'Splits a tile into glass panes separated by lead came, with a glow map for the panes.', learn: 'stainedglass', media: true },
         surfacenoise: { blurb: 'Lays procedural grain into a texture: grit, pitting, cracks, scuffs, weave.', learn: 'surfacenoise', media: true },
 
@@ -7173,6 +8790,7 @@ window.TRLE = window.TRLE || {};
             sub.setAttribute('role', 'menu');
             sub.setAttribute('aria-label', r.label);
             for (const a of CTX_TREE.cats[r.cat]) {
+                if (a === '|') { const sp = document.createElement('div'); sp.className = 'at-ctx-sep'; sp.setAttribute('role', 'separator'); sub.appendChild(sp); continue; }
                 const b = a[0] === '@' ? alias(a.slice(1), r.cat) : take(a);
                 if (b) sub.appendChild(b);
             }
@@ -7230,8 +8848,15 @@ window.TRLE = window.TRLE || {};
             a.style.display = c.style.display;
         });
         menu.querySelectorAll('.at-ctx-sub').forEach(sub => {
+            const kids = [...sub.children];
             menu.querySelector(`.at-ctx-cat[data-cat="${sub.dataset.cat}"]`).style.display =
-                [...sub.children].some(shown) ? '' : 'none';
+                kids.some(b => b.tagName === 'BUTTON' && shown(b)) ? '' : 'none';
+            // a separator shows only with a visible button on each side of it
+            kids.forEach((b, i) => {
+                if (!b.classList.contains('at-ctx-sep')) return;
+                const vis = list => list.some(x => x.tagName === 'BUTTON' && shown(x));
+                b.style.display = vis(kids.slice(0, i)) && vis(kids.slice(i + 1)) ? '' : 'none';
+            });
         });
         const pin = menu.querySelector('.at-ctx-pinned');
         pin.style.display = [...pin.children].some(shown) ? '' : 'none';
@@ -7287,7 +8912,7 @@ window.TRLE = window.TRLE || {};
         const out = CTX_TREE.pinned.map(a => ({ a, cat: null }));
         for (const r of CTX_TREE.root) {
             if (r.action) out.push({ a: r.action, cat: null });
-            else CTX_TREE.cats[r.cat].forEach(a => { if (a[0] !== '@') out.push({ a, cat: r.label }); });
+            else CTX_TREE.cats[r.cat].forEach(a => { if (a[0] !== '@' && a !== '|') out.push({ a, cat: r.label }); });
         }
         CTX_TREE.tail.forEach(a => out.push({ a, cat: null }));
         return out;
@@ -7569,7 +9194,7 @@ window.TRLE = window.TRLE || {};
         const menu = $('at-ctx');
         const rows = pane === 'root'
             ? [...menu.querySelectorAll('.at-ctx-recent > button, .at-ctx-results > button, .at-ctx-pinned > button, .at-ctx-body > button, .at-ctx-tail > button')]
-            : [...ctxPane(pane).children];
+            : [...ctxPane(pane).children].filter(b => b.tagName === 'BUTTON');
         // offsetParent, not the inline display: while searching, CSS hides whole
         // groups (.at-ctx-searching) without touching their inline style.
         return rows.filter(b => b.offsetParent !== null && !b.disabled);
@@ -7782,6 +9407,11 @@ window.TRLE = window.TRLE || {};
             material: deepCopyMaterial(src.material), matLayers: cloneMatLayers(src.matLayers),
             emissive: (!original && src.emissive) ? cloneCanvas(src.emissive) : null,
             importedMaps: cloneImportedMaps(src.importedMaps),
+            // A copy of the ORIGINAL has no Classic Look on it, so no map source.
+            mapSource: (!original && src.mapSource) ? cloneCanvas(src.mapSource) : null,
+            // ...nor any lettering.
+            textRelief: original ? null : cloneTextRelief(src.textRelief),
+            mapPatches: original ? null : cloneMapPatches(src.mapPatches),
             hgParams: cloneHgParams(src.hgParams),
             // sgParams.srcId names the tile Edit Stained Glass re-samples for its
             // colour source (sgRender reads that tile's LIVE canvas) — copying it
@@ -7789,7 +9419,9 @@ window.TRLE = window.TRLE || {};
             // next re-edit. null makes editStainedGlassModal fall back to "source
             // gone → tile itself feeds texture modes", its existing path for
             // exactly this shape of gap, which points it at the duplicate itself.
-            sgParams: src.sgParams ? Object.assign(JSON.parse(JSON.stringify(src.sgParams)), { srcId: null }) : null
+            sgParams: src.sgParams ? Object.assign(JSON.parse(JSON.stringify(src.sgParams)), { srcId: null }) : null,
+            // Layers copy unlinked (a new lid each); a copy of the ORIGINAL has none.
+            ...(original ? {} : TRLE.Layers.duplicate(state.layerDefs, src, id, state.tileSize))
         };
     }
 
@@ -7879,6 +9511,20 @@ window.TRLE = window.TRLE || {};
             case 'organic': enterPickMode(id, 'organic'); showToast('Now click the second texture for the organic transition', 'info'); break;
             case 'heighttrans': enterPickMode(id, 'heighttrans'); showToast('Now click the texture to settle into the crevices (overlay)', 'info'); break;
             case 'overlay': enterPickMode(id, 'overlay'); showToast('Now click the texture to lay on top', 'info'); break;
+            case 'stickerlib': openStickerGallery(); break;
+            case 'stickercut': openStickerCut(id); break;
+            case 'stickers': {
+                if (!(el.kind === 'tile' || el.kind === 'transition' || el.kind === 'anim')) { showToast('Stickers cannot go there', 'info'); return; }
+                // As Text: the whole selection, shown as the area it covers.
+                openStickersModal(ctxActsOnSelection(id) ? [id, ...selectedIdsInOrder().filter(i => i !== id)] : [id]);
+                break;
+            }
+            case 'editstickers': {
+                const top = hasStickerLayer(el) ? el.layers.slice().reverse().map(p => state.layerDefs[p.lid]).find(d => d && d.kind === 'sticker') : null;
+                if (!top) { showToast('This tile has no sticker layer', 'info'); return; }
+                openStickerLayer(el, top);
+                break;
+            }
             case 'editoverlay': if (el.ovParams) editOverlayModal(el); break;
             case 'pushmarks':
                 if (el.kind !== 'tile') { showToast('Pushable Markings works on source tiles only', 'info'); return; }
@@ -7905,6 +9551,24 @@ window.TRLE = window.TRLE || {};
                 }
                 break;
             }
+            case 'editdrawing': {
+                const top = hasKindLayer(el, 'draw') ? el.layers.slice().reverse().map(p => state.layerDefs[p.lid]).find(d => d && d.kind === 'draw') : null;
+                if (!top) { showToast('This tile has no drawing layer', 'info'); return; }
+                openDrawLayer(el, top);
+                break;
+            }
+            case 'edittext': {
+                const top = hasTextLayer(el) ? el.layers.slice().reverse().map(p => state.layerDefs[p.lid]).find(d => d && d.kind === 'text') : null;
+                if (!top) { showToast('This tile has no text layer', 'info'); return; }
+                openTextLayer(el, top);
+                break;
+            }
+            case 'layers':
+                if (el.kind !== 'tile' && !derivedLayered(el)) { showToast('Transitions and animation frames take stickers only, and this one has none', 'info'); return; }
+                layersModalId = id;
+                openModal('layers');
+                renderLayersViews();
+                break;
             case 'material':
                 // A right-click inside a multi-selection acts on the whole selection,
                 // so Ctrl+click → Set Material matches the bulk bar's Apply Material.
@@ -7931,10 +9595,10 @@ window.TRLE = window.TRLE || {};
                 if (el.kind !== 'tile') { showToast('Height maps work on source tiles only', 'info'); return; }
                 openHeightMapModal(id);
                 break;
-            case 'rotate': applyTileTransform(ctxTargets(id), c => rotateTile90(c), 'Rotated 90°'); break;
-            case 'fliph':  applyTileTransform(ctxTargets(id), c => flipTile(c, true), 'Flipped horizontally'); break;
-            case 'flipv':  applyTileTransform(ctxTargets(id), c => flipTile(c, false), 'Flipped vertically'); break;
-            case 'offset': applyTileTransform(ctxTargets(id), c => offsetTileHalf(c), 'Offset by ½'); break;
+            case 'rotate': applyTileTransform(ctxTargets(id), c => rotateTile90(c), 'Rotated 90°', TURN_ROT90, 'rot'); break;
+            case 'fliph':  applyTileTransform(ctxTargets(id), c => flipTile(c, true), 'Flipped horizontally', TURN_FLIPH, 'fh'); break;
+            case 'flipv':  applyTileTransform(ctxTargets(id), c => flipTile(c, false), 'Flipped vertically', TURN_FLIPV, 'fv'); break;
+            case 'offset': applyTileTransform(ctxTargets(id), c => offsetTileHalf(c), 'Offset by ½', undefined, 'off'); break;
             case 'coloradj': {
                 if (el.kind !== 'tile') { showToast('Adjust Colours works on source tiles only', 'info'); return; }
                 const t = ctxTargets(id);
@@ -7942,11 +9606,81 @@ window.TRLE = window.TRLE || {};
                 openColorAdjModal(t);
                 break;
             }
+            case 'distort': {
+                if (el.kind !== 'tile') { showToast('Distort works on source tiles only', 'info'); return; }
+                const t = ctxTargets(id);
+                noteSkipped(ctxTargets(id, 'any'), t, 'Distort works on source tiles only');
+                openDistortModal(t);
+                break;
+            }
+            case 'tone': {
+                if (el.kind !== 'tile') { showToast('Dodge & Burn works on source tiles only', 'info'); return; }
+                openToneModal(id);
+                break;
+            }
+            case 'oil': {
+                if (el.kind !== 'tile') { showToast('Oil Paint works on source tiles only', 'info'); return; }
+                const t = ctxTargets(id);
+                noteSkipped(ctxTargets(id, 'any'), t, 'Oil Paint works on source tiles only');
+                openOilModal(t);
+                break;
+            }
+            case 'liquify': {
+                if (el.kind !== 'tile') { showToast('Liquify works on source tiles only', 'info'); return; }
+                openLiquifyModal(id);
+                break;
+            }
+            case 'persp': {
+                if (el.kind !== 'tile') { showToast('Perspective works on source tiles only', 'info'); return; }
+                openPerspModal(id);
+                break;
+            }
+            case 'xform': {
+                if (el.kind !== 'tile') { showToast('Free Transform works on source tiles only', 'info'); return; }
+                const t = ctxTargets(id);
+                noteSkipped(ctxTargets(id, 'any'), t, 'Free Transform works on source tiles only');
+                openXformModal(t);
+                break;
+            }
+            case 'scatter': {
+                if (el.kind !== 'tile') { showToast('Scatter works on source tiles only', 'info'); return; }
+                const t = ctxTargets(id);
+                noteSkipped(ctxTargets(id, 'any'), t, 'Scatter works on source tiles only');
+                openScatterModal(t);
+                break;
+            }
+            case 'slope': {
+                if (el.kind !== 'tile') { showToast('Slope Blur works on source tiles only', 'info'); return; }
+                const t = ctxTargets(id);
+                noteSkipped(ctxTargets(id, 'any'), t, 'Slope Blur works on source tiles only');
+                openSlopeModal(t);
+                break;
+            }
+            case 'classic': {
+                if (el.kind !== 'tile') { showToast('Classic Look works on source tiles only', 'info'); return; }
+                const t = ctxTargets(id);
+                noteSkipped(ctxTargets(id, 'any'), t, 'Classic Look works on source tiles only');
+                openClassicModal(t);
+                break;
+            }
+            case 'hdlook': {
+                if (el.kind !== 'tile') { showToast('HD Look works on source tiles only', 'info'); return; }
+                const t = ctxTargets(id);
+                noteSkipped(ctxTargets(id, 'any'), t, 'HD Look works on source tiles only');
+                openHdModal(t);
+                break;
+            }
             case 'draw': {
                 if (el.kind !== 'tile') { showToast('Draw works on source tiles only', 'info'); return; }
                 // The WHOLE selection, recipe tiles included: they are shown in place,
                 // dimmed, so the picture of the area is complete (openDrawModal).
                 openDrawModal(ctxActsOnSelection(id) ? [id, ...selectedIdsInOrder().filter(i => i !== id)] : [id]);
+                break;
+            }
+            case 'text': {
+                if (el.kind !== 'tile') { showToast('Text works on source tiles only', 'info'); return; }
+                // As Draw: the whole selection, shown as the area it covers.
+                openTextModal(ctxActsOnSelection(id) ? [id, ...selectedIdsInOrder().filter(i => i !== id)] : [id]);
                 break;
             }
             case 'recolor':
@@ -8005,13 +9739,18 @@ window.TRLE = window.TRLE || {};
                 if (!targets.length) return;
                 // Say what went with it. The glow lives off-canvas, so a silent
                 // "restored to original" leaves no way to tell it was cleared.
-                const hadGlow = targets.some(t => !!t.emissive);
+                const hadGlow = targets.some(t => !!t.emissive || layerGlows(t));   // a text or drawing layer's glow goes with its layers
                 targets.forEach(t => {
                     drawReplace(t.canvas, t.original);
                     t.seamless = false;
                     t.edited = false;
+                    t.mapSource = null;   // back to the original: maps follow the pixels again
+                    t.textRelief = null;  // and the lettering it carried is gone
+                    t.mapPatches = null;  // and its flattened stickers' maps
                     t.emissive = null;
+                    dropLayers(t);        // and its layers (LAYERS-PLAN D5)
                 });
+                TRLE.Layers.prune(state.layerDefs, state.elements);
                 refreshTransitions();
                 renderGrid();
                 const unticked = hadGlow && syncEmissiveExport();
@@ -8171,19 +9910,44 @@ window.TRLE = window.TRLE || {};
         });
     }
 
+    /* A transition's mask, rebuilt from its recipe. `el.patch` (ORGANIC-SETS-PLAN)
+       lays organic patches over the plain shape, or, with a `region`, over a solid
+       base tile; its border is the plain mask's byte for byte. */
+    function transitionMaskOf(el, S) {
+        if (el.patch && el.patch.region) return patchMask(null, S, patchRecipeOf(el));
+        const plain = el.customMask
+            ? softenMask(el.customMask, S)
+            : el.wangBits != null
+                ? buildWangMask(S, el.wangBits, el.pivot, el.hardness, el.organic)
+                : buildTopologyMask(S, el.mode, el.pivot, el.hardness, el.organic);
+        return el.patch ? patchMask(plain, S, patchRecipeOf(el)) : plain;
+    }
+    const patchRecipeOf = el => el.patchHint ? Object.assign({}, el.patch, { hint: el.patchHint }) : el.patch;
+    /* A saved patch recipe is untrusted (a project file): numbers clamped, the
+       region one of the names, anything else dropped. */
+    function sanitizePatch(p) {
+        if (!p || typeof p !== 'object') return null;
+        const n = (v, d, lo, hi) => { v = Number(v); return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : d; };
+        const D = PATCH_DEFAULTS;
+        return {
+            seed: Math.floor(n(p.seed, 1, 0, 0xffffffff)),
+            aIntoB: n(p.aIntoB, D.aIntoB, 0, 1), bIntoA: n(p.bIntoA, D.bIntoA, 0, 1),
+            reach: n(p.reach, D.reach, 0.01, 1), scale: n(p.scale, D.scale, 0, 1),
+            roughness: n(p.roughness, D.roughness, 0, 1), volatility: n(p.volatility, 0, 0, 1),
+            margin: n(p.margin, D.margin, 0.02, 0.4),
+            region: PATCH_REGIONS.includes(p.region) ? p.region : null
+        };
+    }
+
     function refreshOneTransition(el, S) {
         if (el.push) {   // pushable-marking slot: the source tile plus its marks
             const c = buildPushTile(el, S);
-            if (c) drawReplace(el.canvas, c);
+            if (c) writeDerived(el, c);
             return;
         }
         if (el.bset) {   // border-set slot — rebuilt from its recipe
             const c = buildBsetTile(el, S);
-            if (c) {
-                const tctx = el.canvas.getContext('2d');
-                tctx.clearRect(0, 0, S, S);
-                tctx.drawImage(c, 0, 0);
-            }
+            if (c) writeDerived(el, c);
             return;
         }
         // An overlay tile is checked BEFORE customMask: paint mode stores its
@@ -8191,29 +9955,23 @@ window.TRLE = window.TRLE || {};
         // on top (see composeOverlayDiffuse).
         if (el.ovParams) {
             const c = buildOverlayTile(el, S);
-            if (c) drawReplace(el.canvas, c);
+            if (c) writeDerived(el, c);
             return;
         }
         const base = byId(el.base), overlay = byId(el.overlay);
         if (!base || !overlay) return;
-        const mask = el.customMask
-            ? softenMask(el.customMask, S)
-            : el.wangBits != null
-                ? buildWangMask(S, el.wangBits, el.pivot, el.hardness, el.organic)
-                : buildTopologyMask(S, el.mode, el.pivot, el.hardness, el.organic);
+        const mask = transitionMaskOf(el, S);
         const overlayCanvas = el.overlayGeom ? geomTransform(overlay.canvas, el.overlayGeom) : overlay.canvas;
         let comp = composeTransitionDiffuse(base.canvas, overlayCanvas, mask, S, el.blendMethod);
         // Diffuse only — it's a painted contact cue, not geometry. The maps in
         // deriveMaps stay clean so a material can still light the tile itself.
         if (el.organic && el.organic.shadow > 0 && shadowHitsDiffuse(el.organic))
             comp = applyContactShadow(comp, mask, S, el.organic.shadow, shadowOpts(el.organic));
-        const tctx = el.canvas.getContext('2d');
-        tctx.clearRect(0, 0, S, S);   // clear so transparent transitions don't keep stale pixels
-        tctx.drawImage(comp, 0, 0);
+        writeDerived(el, comp);   // cleared first, so transparent transitions don't keep stale pixels
     }
 
     /* ============ MODAL INFRASTRUCTURE ============ */
-    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'bset', 'fade', 'emissive', 'heightmap', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'delight', 'overlay', 'import', 'origami', 'stainedglass', 'noise', 'emptyfill', 'draw', 'push', 'view', 'sprite', 'confirm'];
+    const MODAL_NAMES = ['seamless', 'trans', 'mat', 'heal', 'var', 'build', 'wang', 'bset', 'fade', 'emissive', 'heightmap', 'anchor', 'heighttrans', 'grid', 'organic', 'anim', 'coloradj', 'recolor', 'classic', 'hdlook', 'importadvice', 'slope', 'scatter', 'oil', 'xform', 'persp', 'distort', 'liquify', 'tone', 'delight', 'overlay', 'import', 'origami', 'stainedglass', 'noise', 'emptyfill', 'draw', 'text', 'push', 'view', 'sprite', 'layers', 'folderpick', 'stickers', 'stickerlib', 'stickercut', 'confirm'];
 
     function visibleModal() {
         return MODAL_NAMES
@@ -8301,6 +10059,9 @@ window.TRLE = window.TRLE || {};
        more work to lose than a mask. */
     function requestCloseModal() {
         if (drawAskDiscard()) return;
+        if (lqAskDiscard()) return;
+        if (tnAskDiscard()) return;
+        if (stAskDiscard()) return;
         if (drawSetLeave(null)) return;   // Draw opened from Pushable Markings goes back there
         closeModal();
     }
@@ -8328,7 +10089,20 @@ window.TRLE = window.TRLE || {};
         anCleanup();
         spCleanup();
         caCleanup();
+        clCleanup();
+        hdCleanup();
+        iaCleanup();
+        sbCleanup();
+        scCleanup();
+        xfCleanup();
+        psCleanup();
+        dsCleanup();
+        lqCleanup();
+        oilCleanup();
+        tnCleanup();
         drawCleanup();
+        txCleanup();
+        stCleanup();
         rcCleanup();
         dlCleanup();
         importCleanup();
@@ -8593,7 +10367,8 @@ window.TRLE = window.TRLE || {};
     const SM_PREVIEW = 512;
     const SM_SEAM_COLOR = [0.91, 0.52, 0.16];
 
-    const sm = { id: null, srcTex: null, resultFBO: null, previewFBO: null, batchIds: [] };
+    const sm = { id: null, srcTex: null, resultFBO: null, previewFBO: null, batchIds: [], inputs: null, edit: null };
+    const SM_IDS = ['at-sm-method', 'at-sm-falloff', 'at-sm-overlapx', 'at-sm-overlapy', 'at-sm-lock-xy', 'at-sm-splat-rotation', 'at-sm-splat-rotrandom', 'at-sm-splat-scale', 'at-sm-splat-wobble', 'at-sm-splat-randomize', 'at-sm-seam-marker'];
 
     function smCleanup() {
         if (sm.srcTex)     { TRLE.Engine.deleteTexture(sm.srcTex); sm.srcTex = null; }
@@ -8601,9 +10376,25 @@ window.TRLE = window.TRLE || {};
         if (sm.previewFBO) { TRLE.Engine.deleteFBO(sm.previewFBO); sm.previewFBO = null; }
         sm.id = null;
         sm.batchIds = [];
+        sm.inputs = null; sm.edit = null;
     }
 
-    function openSeamlessModal(ids) {
+    /* Make Seamless as a layer (LAYERS-PLAN phase 7, F6): ONE per tile, a second edits it. The recipe is the
+       method and its sliders; the tile's `seamless` flag is derived (see syncSeamless). The costliest replay
+       (2.2 s at 1024), so a rebuild past it shows the dim. */
+    TRLE.Layers.register('seamless', { zone: 'texture', mode: 'adjust', cost: (def, S) => 2200 * (S / 1024) ** 2,
+        apply: (input, def) => {
+            const E = TRLE.Engine, tex = E.createTextureFromImage(input), fbo = smBuildResult(tex, input.width, def.recipe);
+            const out = E.fboToCanvas(fbo);
+            E.deleteFBO(fbo); E.deleteTexture(tex);
+            return out;
+        },
+        edit: (el, def) => {
+            const ids = TRLE.Layers.tilesOf(def.lid, state.elements).map(e => e.id);
+            ids.sort((a, b) => (a === el.id ? -1 : b === el.id ? 1 : 0));
+            openSeamlessModal(ids, { def });
+        } });
+    function openSeamlessModal(ids, editing) {
         const list = Array.isArray(ids) ? ids : [ids];
         const id = list[0];
         const el = byId(id);
@@ -8611,9 +10402,14 @@ window.TRLE = window.TRLE || {};
         smCleanup();
         sm.id = id;
         sm.batchIds = list.slice();
+        sm.edit = editing ? { lid: editing.def.lid } : null;
+        sm.inputs = modalInputs(list, 'seamless');
         $('at-sm-tileno').textContent = numberOf(id);
         setBatchNote('at-modal-seamless', list.length, numberOf(id));
-        sm.srcTex = TRLE.Engine.createTextureFromImage(el.canvas);
+        if (editing) ctlRestore(editing.def.recipe.controls);
+        const replacing = list.filter(i => kindLayerOf(byId(i), 'seamless')).length;
+        setEditNote('at-modal-seamless', replacing ? `✏️ Editing ${list.length === 1 ? 'this tile\'s' : 'the'} Make Seamless layer: Apply replaces it${list.length > 1 ? ` on ${replacing} tile${replacing > 1 ? 's' : ''}` : ''}.` : '');
+        sm.srcTex = TRLE.Engine.createTextureFromImage(xin(sm.inputs, el));
         openModal('seamless');
         smUpdateControls();
         smProcess();
@@ -8630,13 +10426,18 @@ window.TRLE = window.TRLE || {};
        Split out of smProcess so the Save path can run the SAME settings over
        every selected tile — each needs its own source texture, so nothing here
        may read sm.srcTex. Caller owns the returned FBO. */
-    function smBuildResult(srcTex, S) {
+    /* The modal's settings as a recipe (numbers, not DOM), which smBuildResult and the layer both run. */
+    function smRecipeNow() {
+        const v = id => parseInt($(id).value) / 100;
+        return { method: $('at-sm-method').value, falloff: v('at-sm-falloff'), overlapX: v('at-sm-overlapx'), overlapY: v('at-sm-overlapy'),
+                 splat: { rotation: v('at-sm-splat-rotation'), rotRandom: v('at-sm-splat-rotrandom'), scale: v('at-sm-splat-scale'),
+                          wobble: v('at-sm-splat-wobble'), randomize: v('at-sm-splat-randomize') },
+                 controls: ctlSnap(SM_IDS) };
+    }
+    function smBuildResult(srcTex, S, r = smRecipeNow()) {
         const temps = [];
 
-        const method   = $('at-sm-method').value;
-        const falloff  = parseInt($('at-sm-falloff').value) / 100;
-        const overlapX = parseInt($('at-sm-overlapx').value) / 100;
-        const overlapY = parseInt($('at-sm-overlapy').value) / 100;
+        const method = r.method, falloff = r.falloff, overlapX = r.overlapX, overlapY = r.overlapY;
 
         const resultFBO = TRLE.Engine.createFBO(S, S);
         if (method === 'multiband') {
@@ -8659,11 +10460,11 @@ window.TRLE = window.TRLE || {};
             TRLE.Engine.blit('seamlessStamp', {
                 u_texture: srcTex,
                 u_falloff: falloff,
-                u_rotation:       parseInt($('at-sm-splat-rotation').value) / 100,
-                u_rotationRandom: parseInt($('at-sm-splat-rotrandom').value) / 100,
-                u_scale:          parseInt($('at-sm-splat-scale').value) / 100,
-                u_wobble:         parseInt($('at-sm-splat-wobble').value) / 100,
-                u_randomize:      parseInt($('at-sm-splat-randomize').value) / 100
+                u_rotation:       r.splat.rotation,
+                u_rotationRandom: r.splat.rotRandom,
+                u_scale:          r.splat.scale,
+                u_wobble:         r.splat.wobble,
+                u_randomize:      r.splat.randomize
             }, resultFBO);
         } else { // 'scattered'
             TRLE.Engine.blit('seamlessScattered', {
@@ -8702,6 +10503,7 @@ window.TRLE = window.TRLE || {};
 
     function setupSeamlessModal() {
         $('at-sm-method').addEventListener('change', () => { smUpdateControls(); smProcess(); });
+        attachTilePicker($('at-sm-method'), { text: true, title: 'Method', ...previewByValue($('at-sm-method'), smProcess) });
         $('at-sm-seam-marker').addEventListener('change', smProcess);
 
         const wireSlider = (id) => {
@@ -8734,34 +10536,59 @@ window.TRLE = window.TRLE || {};
 
         $('at-sm-save').addEventListener('click', () => {
             if (!sm.resultFBO || sm.id === null) return;
-            const S = state.tileSize;
             const targets = sm.batchIds.map(byId).filter(e => e && e.canvas);
             if (!targets.length) return;
-            targets.forEach(el => {
-                let out;
-                if (el.id === sm.id) {
-                    // The tile that was previewed writes the preview's own FBO, so
-                    // what lands in the atlas is exactly what was on screen.
-                    out = TRLE.Engine.fboToCanvas(sm.resultFBO);
-                } else {
-                    const tex = TRLE.Engine.createTextureFromImage(el.canvas);
-                    const fbo = smBuildResult(tex, S);
-                    out = TRLE.Engine.fboToCanvas(fbo);
-                    TRLE.Engine.deleteFBO(fbo);
-                    TRLE.Engine.deleteTexture(tex);
-                }
-                drawReplace(el.canvas, out);
+            const recipe = smRecipeNow(), n = targets.length, S = state.tileSize;
+            const tiles = targets.filter(e => e.kind === 'tile'), others = targets.filter(e => e.kind !== 'tile');
+            closeModal();
+            // A transition carries no layers (it is rebuilt from its recipe), so it keeps the old direct write.
+            others.forEach(el => {
+                const E = TRLE.Engine, tex = E.createTextureFromImage(el.canvas), fbo = smBuildResult(tex, S, recipe);
+                drawReplace(el.canvas, E.fboToCanvas(fbo));
+                E.deleteFBO(fbo); E.deleteTexture(tex);
                 el.seamless = true;
             });
-            const n = targets.length;
-            closeModal();
-            refreshTransitions();
-            renderGrid();
-            pushHistory(n > 1 ? `Make seamless: ${n} tiles` : 'Make seamless');
-            showToast(n > 1
-                ? `${n} tiles updated in atlas, transitions refreshed`
-                : 'Tile updated in atlas, transitions refreshed', 'success');
+            const label = n > 1 ? `Make seamless: ${n} tiles` : 'Make seamless';
+            const toast = () => showToast(n > 1 ? `${n} tiles updated in atlas, transitions refreshed` : 'Tile updated in atlas, transitions refreshed', 'success');
+            if (!tiles.length) { refreshTransitions(); renderGrid(); pushHistory(label); toast(); return; }
+            colourLayerApply('seamless', 'Make Seamless', tiles, recipe, el => {
+                // Remember what the tile's flag was before, so hiding or deleting the layer gives it back.
+                const old = kindLayerOf(el, 'seamless');
+                return { data: { was: old ? old.piece.data.was : undefined } };
+            }, label).then(toast);
         });
+    }
+
+    /* A tile's `seamless` flag with layers (LAYERS-PLAN D4, phase 8): DERIVED from the layers that decide it, in order:
+       a visible Make Seamless makes it true, a visible Slope Blur or Scatter whose edge is not "wrap" makes it false.
+       With none visible it is what it was before the first of them, kept in that piece's `data.was`. Called wherever a
+       layer is added, edited, hidden, shown or deleted; undo restores the flag with the rest of the snapshot. */
+    const SEAM_DECIDERS = ['seamless', 'slope', 'scatter', 'oil'];
+    const decidingPieces = el => hasLayers(el) ? el.layers.filter(p => { const d = state.layerDefs[p.lid]; return d && SEAM_DECIDERS.includes(d.kind); }) : [];
+    function syncSeamless(els) {
+        for (const el of els) {
+            const ps = decidingPieces(el);
+            if (!ps.length) continue;
+            if (!ps.some(p => p.data && p.data.was !== undefined)) ps[0].data = Object.assign({}, ps[0].data, { was: !!el.seamless });
+            let v = !!ps.find(p => p.data && p.data.was !== undefined).data.was;
+            for (const p of ps) {
+                const d = state.layerDefs[p.lid];
+                if (d.visible === false) continue;
+                if (d.kind === 'seamless') v = true;
+                else if (d.recipe.edge !== 'wrap') v = false;
+            }
+            el.seamless = v;
+        }
+    }
+    /* Inputs for a kind that stacks (several per tile): a new layer is shown the composite below where it will sit,
+       an edited one the composite below itself. A tile with no layers keeps its live canvas. */
+    function layerInputsMany(ids, kind, editing) {
+        const L = TRLE.Layers, m = new Map();
+        ids.forEach(i => {
+            const t = byId(i);
+            m.set(i, !hasLayers(t) ? t.canvas : editing ? L.inputOf(t, state.layerDefs, editing.def.lid) : L.inputFor(t, state.layerDefs, { kind, zone: 'texture' }));
+        });
+        return m;
     }
 
     /* ============ ANIMATED TEXTURE MODAL (Phase 3) ============
@@ -8789,6 +10616,13 @@ window.TRLE = window.TRLE || {};
         none: [0, 0], up: [0, -1], down: [0, 1], left: [-1, 0], right: [1, 0],
         upleft: [-1, -1], upright: [1, -1], downleft: [-1, 1], downright: [1, 1]
     };
+
+    /* Below this many pixels per cell the caustic network stops reading as
+       cells (anCausticNote). Measured (WATER-CAUSTICS-PLAN phase 4) as the
+       lag-1 neighbour correlation of a frame, which turned out to depend on
+       px per cell alone, the same at 32, 64 and 128 px tiles: 16 px 0.67,
+       10.7 px 0.47 to 0.50, 8 px 0.36 to 0.39, 5.3 px 0.19, 2 px -0.03. */
+    const AN_CAUSTIC_MIN_CELL_PX = 10;
 
     /* Read the flow dir + speed controls → integer {flowX, flowY}. */
     function anFlowFromControls() {
@@ -8823,6 +10657,11 @@ window.TRLE = window.TRLE || {};
         return !!(p && p.params && p.params.generator === 'particles');
     };
     const anIsParticle = () => anIsParticlePreset($('at-anim-preset').value);
+    const anIsCausticPreset = key => {
+        const p = TRLE.AnimPresets[key];
+        return !!(p && p.params && p.params.generator === 'caustics');
+    };
+    const anIsCaustic = () => anIsCausticPreset($('at-anim-preset').value);
     // A glitch preset is the noise generator plus a `glitch` stage, so it keeps
     // every noise control; the key only decides which <optgroup> it sits in.
     const anIsGlitchPreset = key => {
@@ -8830,14 +10669,16 @@ window.TRLE = window.TRLE || {};
         return !!(p && p.params && p.params.glitch);
     };
 
-    /* Two <optgroup>s, because the two generators answer different questions and
-       a flat list of 36 made that invisible. */
+    /* One <optgroup> per generator (and one for the glitch stage), because they
+       answer different questions and a flat list made that invisible. Caustics
+       sit before Glitch (the author, 2026-10-03). */
     function anPopulatePresets() {
         const sel = $('at-anim-preset');
         if (sel.options.length) return;   // populate once
         const groups = [
-            ['Flowing surfaces (noise)', k => !anIsParticlePreset(k) && !anIsGlitchPreset(k)],
+            ['Flowing surfaces (noise)', k => !anIsParticlePreset(k) && !anIsCausticPreset(k) && !anIsGlitchPreset(k)],
             ['Falling & rising (particles)', anIsParticlePreset],
+            ['Caustics (light for Additive)', anIsCausticPreset],
             ['Glitch & corruption', anIsGlitchPreset]
         ];
         groups.forEach(([label, want]) => {
@@ -8876,20 +10717,156 @@ window.TRLE = window.TRLE || {};
        flatten — leaving the slider on screen driving nothing is exactly the
        inert-control bug the mask-editor naming rules exist to stop. */
     function anSyncGenerator() {
-        const part = anIsParticle();
-        $('at-anim-noise-controls').style.display    = part ? 'none' : '';
+        const part = anIsParticle(), caus = anIsCaustic();
+        $('at-anim-noise-controls').style.display    = part || caus ? 'none' : '';
         $('at-anim-particle-controls').style.display = part ? '' : 'none';
-        $('at-anim-res-note').style.display          = part ? 'none' : '';
+        $('at-anim-caustic-controls').style.display  = caus ? '' : 'none';
+        $('at-anim-res-note').style.display          = part || caus ? 'none' : '';
+        $('at-anim-additive-note').style.display     = caus ? '' : 'none';
+        // Crisp is ONE checkbox that both the noise and the caustics blocks show:
+        // it moves (id and listeners intact) rather than being duplicated.
+        const crisp = $('at-anim-crisp').closest('.form-group');
+        const home = caus ? $('at-anim-c-crisp-slot') : $('at-anim-crisp-home');
+        if (crisp && crisp.parentNode !== home) home.appendChild(crisp);
         const spread = $('at-anim-col-spread');
         if (spread) {
             const row = spread.closest('.form-row');
-            if (row) row.style.display = part ? 'none' : '';
+            if (row) row.style.display = part || caus ? 'none' : '';
         }
         // A particle field is transparent between the drops, so UV-rotate is
         // still fine, but the Crisp note and the frame advice both belong to
         // whichever generator is showing.
         $('at-anim-p-note').style.display = part ? '' : 'none';
         $('at-anim-cost-note').style.display = part ? '' : 'none';
+    }
+
+    /* ---- ✨ Caustics (js/animcaustics.js) ---------------------------------
+       Slider -> recipe scaling lives in anCSliders, anCausticParams and
+       anCausticWrite only. [key, control id, slider -> param, param -> slider,
+       label]. */
+    const anCPct = v => (+v ? v + '%' : 'Off');
+    const anCSliders = [
+        ['cells',        'at-anim-c-cells',     v => +v,       q => q,                    v => v + ' across'],
+        ['speed',        'at-anim-c-speed',     v => +v,       q => q,                    v => v + ' / loop'],
+        ['exposure',     'at-anim-c-exposure',  v => v / 100,  q => Math.round(q * 100),  v => v + '%'],
+        ['fringe',       'at-anim-c-fringe',    v => v / 100,  q => Math.round(q * 100),  anCPct],
+        ['width',        'at-anim-c-width',     v => v / 100,  q => Math.round(q * 100),  v => (v / 100).toFixed(2) + ' of a cell'],
+        ['lineVary',     'at-anim-c-vary',      v => v / 100,  q => Math.round(q * 100),  anCPct],
+        ['junctions',    'at-anim-c-junc',      v => v / 100,  q => Math.round(q * 100),  anCPct],
+        ['lineBright',   'at-anim-c-lbright',   v => v / 100,  q => Math.round(q * 100),  v => v + '%'],
+        ['wobble',       'at-anim-c-wobble',    v => v / 100,  q => Math.round(q * 100),  v => (+v ? (v / 100).toFixed(2) + ' of a cell' : 'Off')],
+        ['jitter',       'at-anim-c-jitter',    v => v / 100,  q => Math.round(q * 100),  v => (v / 100).toFixed(2)],
+        ['glow',         'at-anim-c-glow',      v => v / 100,  q => Math.round(q * 100),  anCPct],
+        ['glowScale',    'at-anim-c-gscale',    v => v / 100,  q => Math.round(q * 100),  v => (v / 100).toFixed(2) + '×'],
+        ['glowSoft',     'at-anim-c-gsoft',     v => v / 100,  q => Math.round(q * 100),  v => v + '%'],
+        ['glowSpeed',    'at-anim-c-gspeed',    v => +v,       q => q,                    v => v + ' / loop'],
+        ['glowOffset',   'at-anim-c-goff',      v => v / 100,  q => Math.round(q * 100),  v => (v / 100).toFixed(2) + ' of a cell'],
+        ['warp',         'at-anim-c-warp',      v => v / 100,  q => Math.round(q * 100),  anCPct],
+        ['warpScale',    'at-anim-c-wscale',    v => +v,       q => q,                    v => String(v)],
+        ['warpSpeed',    'at-anim-c-wspeed',    v => +v,       q => q,                    v => v + ' / loop'],
+        ['surface',      'at-anim-c-surface',   v => v / 100,  q => Math.round(q * 100),  anCPct],
+        ['shimmer',      'at-anim-c-shim',      v => v / 100,  q => Math.round(q * 100),  anCPct],
+        ['shimmerSpeed', 'at-anim-c-shimspeed', v => +v,       q => q,                    v => v + ' / loop'],
+        // Refraction (WATER-CAUSTICS-PLAN phase 5b). Detail is the spectrum's
+        // falloff turned round: more detail = a flatter spectrum (lower slope).
+        ['depth',        'at-anim-c-depth',     v => v / 1000, q => Math.round(q * 1000), v => (v / 10).toFixed(1) + '% of the tile'],
+        ['waveMax',      'at-anim-c-waves',     v => +v,       q => q,                    v => v + ' across'],
+        ['slope',        'at-anim-c-detail',    v => 6 - v * 0.05, q => Math.round((6 - q) / 0.05), v => v + '%'],
+        ['waveSpeed',    'at-anim-c-wspd',      v => +v,       q => q,                    v => v + ' / loop'],
+        ['wind',         'at-anim-c-wind',      v => v / 100,  q => Math.round(q * 100),  v => v + '%'],
+        ['blur',         'at-anim-c-soft',      v => v / 10000, q => Math.round(q * 10000), v => (+v ? (v / 100).toFixed(2) + '% of the tile' : 'Off')],
+        ['black',        'at-anim-c-black',     v => v / 100,  q => Math.round(q * 100),  v => (v / 100).toFixed(2) + '×'],
+        ['toneGain',     'at-anim-c-gain',      v => v / 100,  q => Math.round(q * 100),  v => (v / 100).toFixed(2)]
+    ];
+    const anCIsRefr = () => $('at-anim-c-model').value === 'refraction';
+    /* Settings that act only while a switch is on (measured byte-inert while it
+       is off, validate-animcaustics). Disabled with the reason, not hidden, so
+       the panel does not jump about. [control id, is it inert?, why]. */
+    const anCDeps = [
+        ['at-anim-c-speed',     () => !+$('at-anim-c-wobble').value, 'Does nothing while Wobble is Off: the cells do not move.'],
+        ['at-anim-c-gscale',    () => !+$('at-anim-c-glow').value,   'Turn Underglow up to use this.'],
+        ['at-anim-c-gsoft',     () => !+$('at-anim-c-glow').value,   'Turn Underglow up to use this.'],
+        ['at-anim-c-gspeed',    () => !+$('at-anim-c-glow').value,   'Turn Underglow up to use this.'],
+        ['at-anim-c-goff',      () => !+$('at-anim-c-glow').value,   'Turn Underglow up to use this.'],
+        ['at-anim-c-wscale',    () => !+$('at-anim-c-warp').value && !+$('at-anim-c-surface').value, 'Turn Ripple or Surface noise up to use this.'],
+        ['at-anim-c-wspeed',    () => !+$('at-anim-c-warp').value && !+$('at-anim-c-surface').value, 'Turn Ripple or Surface noise up to use this.'],
+        ['at-anim-c-shimspeed', () => !+$('at-anim-c-shim').value,   'Turn Shimmer up to use this.'],
+        ['at-anim-c-flowspeed', () => $('at-anim-c-flowdir').value === 'none', 'Pick a Drift direction to use this.'],
+        ['at-anim-c-wind',      () => $('at-anim-c-winddir').value === 'none', 'Pick a Wind direction to use this.']
+    ];
+    function anCausticSyncLabels() {
+        // One model's controls at a time; Background, Stretch, Drift, Brightness,
+        // Colour fringe and Crisp serve both.
+        const refr = anCIsRefr();
+        $('at-anim-c-refr').style.display = refr ? '' : 'none';
+        $('at-anim-c-cellsrow').style.display = refr ? 'none' : '';
+        $('at-anim-c-cellsonly').style.display = refr ? 'none' : '';
+        anCSliders.forEach(([, id, , , fmt]) => { const e = $(id + '-val'); if (e) e.textContent = fmt($(id).value); });
+        const fs = +$('at-anim-c-flowspeed').value;
+        $('at-anim-c-flowspeed-val').textContent = fs + (fs === 1 ? ' tile' : ' tiles') + ' / loop';
+        const [cx, cy] = TRLE.AnimCaustics.cellsXY(anCausticParams());
+        $('at-anim-c-cells-val').textContent = cx === cy ? cx + ' across' : `${cx} × ${cy}`;
+        anCDeps.forEach(([id, inert, why]) => {
+            const e = $(id), off = inert();
+            e.disabled = off;
+            e.title = off ? why : '';
+            const g = e.closest('.form-group');
+            if (g) g.style.opacity = off ? '0.5' : '';
+        });
+        anCausticNote();
+    }
+    /* Resolution advice, the caustics counterpart of anResNote: how many pixels
+       a cell and a line get at the size the frames will be ADDED at. */
+    function anCausticNote() {
+        const tile = state.tileSize || 256;
+        const q = anCausticParams();
+        if (q.model === 'refraction') {
+            const fmt1 = v => (v < 10 ? v.toFixed(1) : String(Math.round(v)));
+            const e = $('at-anim-c-res-note');
+            e.textContent = `≈${fmt1(tile / Math.max(1, q.waveMax))} px per wave, softness ≈${fmt1(q.blur * tile)} px at ${tile}×${tile}`;
+            e.style.color = 'var(--text-secondary)';
+            return;
+        }
+        const [cx] = TRLE.AnimCaustics.cellsXY(q);
+        const cellPx = tile / cx, linePx = q.width * cellPx;
+        const fmt = v => (v < 10 ? v.toFixed(1) : String(Math.round(v)));
+        const parts = [`≈${fmt(cellPx)} px per cell, lines ≈${fmt(linePx)} px at ${tile}×${tile}`];
+        let warn = false;
+        if (cellPx < AN_CAUSTIC_MIN_CELL_PX) {
+            warn = true;
+            parts.push(`cells this small merge into a wash, use about ${Math.max(2, Math.floor(tile / AN_CAUSTIC_MIN_CELL_PX))} cells or a bigger tile`);
+        } else if (linePx < 0.75) {
+            parts.push('lines thinner than a pixel break up, widen them or use Crisp');
+        }
+        const e = $('at-anim-c-res-note');
+        e.textContent = parts.join(' · ');
+        e.style.color = warn ? 'var(--warning)' : 'var(--text-secondary)';
+    }
+    function anCausticParams() {
+        const q = { generator: 'caustics' };
+        anCSliders.forEach(([k, id, toParam]) => { q[k] = toParam($(id).value); });
+        q.stretch = +$('at-anim-c-stretch').value;
+        q.background = $('at-anim-c-bg').value === 'transparent' ? 'transparent' : 'black';
+        q.model = anCIsRefr() ? 'refraction' : 'cells';
+        const wd = AN_DIRS[$('at-anim-c-winddir').value] || AN_DIRS.none;
+        q.windX = wd[0]; q.windY = wd[1];
+        const d = AN_DIRS[$('at-anim-c-flowdir').value] || AN_DIRS.none;
+        const fs = +$('at-anim-c-flowspeed').value || 1;
+        q.flowX = d[0] * fs; q.flowY = d[1] * fs;
+        return q;
+    }
+    function anCausticWrite(params) {
+        const q = Object.assign({}, TRLE.AnimCaustics.DEFAULTS, params || {});
+        anCSliders.forEach(([k, id, , toSlider]) => { $(id).value = toSlider(q[k]); });
+        const st = Math.round(q.stretch || 1);
+        $('at-anim-c-stretch').value = String(st < -1 || st > 1 ? Math.max(-3, Math.min(3, st)) : 1);
+        $('at-anim-c-bg').value = q.background === 'transparent' ? 'transparent' : 'black';
+        $('at-anim-c-model').value = q.model === 'refraction' ? 'refraction' : 'cells';
+        $('at-anim-c-winddir').value = anFlowToControls(Math.sign(q.windX || 0), Math.sign(q.windY || 0)).dir;
+        const fc = anFlowToControls(q.flowX || 0, q.flowY || 0);
+        $('at-anim-c-flowdir').value = fc.dir;
+        $('at-anim-c-flowspeed').value = fc.dir === 'none' ? 1 : Math.min(3, fc.speed);
+        anCausticSyncLabels();
     }
 
     /* ---- 📼 Glitch (js/animglitch.js) ------------------------------------
@@ -9280,6 +11257,49 @@ window.TRLE = window.TRLE || {};
     }
 
     /* Push a preset's params into the controls. */
+    /* The animated modal's selects are wrapped by attachTilePicker (hover preview, phase 4),
+       and its loaders write them with a bare .value, which fires no event. */
+    const anSyncPickers = () => document.querySelectorAll('#at-modal-anim select').forEach(sl => tilePickerSync(sl));
+    /* Hover preview of a PRESET (HOVER-PREVIEW-PLAN phase 4, D4.2): it loads a dozen
+       controls, the particle and glitch controls, and an.color, so the preview saves
+       all of that, applies the preset, regenerates, and puts it back. */
+    let anHover = null;
+    function anSnap() {
+        const stops = an.color && an.color.stops;
+        return {
+            ctl: [...$('at-modal-anim').querySelectorAll('input, select, textarea')]
+                .filter(e => e.id && e.type !== 'file')
+                .map(e => [e, e.type === 'checkbox' || e.type === 'radio' ? e.checked : e.value]),
+            color: JSON.parse(JSON.stringify(an.color)),
+            selStop: stops ? stops.indexOf(an.selStop) : -1,
+            desc: $('at-anim-desc').textContent, emi: $('at-anim-emissive-note').style.display,
+        };
+    }
+    function anUnsnap(sn) {
+        for (const [e, v] of sn.ctl) { if (e.type === 'checkbox' || e.type === 'radio') e.checked = v; else e.value = v; }
+        an.color = sn.color;
+        an.selStop = sn.selStop >= 0 ? an.color.stops[sn.selStop] : null;
+        $('at-anim-desc').textContent = sn.desc; $('at-anim-emissive-note').style.display = sn.emi;
+        anUpdateMatNote($('at-anim-preset').value);
+        anColorSyncControls(); anStopSyncControls(); anRenderStops(); anDrawRamp();
+        anSyncGenerator(); anSyncLabels(); anCausticSyncLabels(); anSyncPickers();
+    }
+    const anPresetPreview = {
+        preview(v) { if (!anHover) anHover = anSnap(); anApplyPreset(v); anRegenerate(); },
+        previewEnd() { if (!anHover) return; const sn = anHover; anHover = null; anUnsnap(sn); anRegenerate(); },
+    };
+    /* The gradient is state (an.color), not a control the render reads: swap the stops. */
+    let anGradHover = null;
+    const anGradientPreview = {
+        preview(v) {
+            if (v === '__custom__') return;
+            if (!anGradHover) anGradHover = an.color;
+            an.color = Object.assign({}, anGradHover, { gradient: v, stops: TRLE.AnimGradients_stops(v) });
+            anRegenerate();
+        },
+        previewEnd() { if (!anGradHover) return; an.color = anGradHover; anGradHover = null; anRegenerate(); },
+    };
+
     function anApplyPreset(key) {
         const p = TRLE.AnimPresets[key];
         if (!p) return;
@@ -9293,9 +11313,10 @@ window.TRLE = window.TRLE || {};
         $('at-anim-contrast').value = Math.round((q.contrast != null ? q.contrast : 1) * 100);
         $('at-anim-stretch').value  = q.stretch != null ? q.stretch : 1;
         const fc = anFlowToControls(q.flowX || 0, q.flowY || 0);
-        $('at-anim-flowdir').value  = fc.dir;
+        $('at-anim-flowdir').value  = fc.dir; tilePickerSync($('at-anim-flowdir'));
         $('at-anim-flowspeed').value = fc.speed;
         if (q.generator === 'particles') anParticleWrite(q);
+        if (q.generator === 'caustics') anCausticWrite(q);
         // Always written, so leaving a glitch preset for lava resets the stage.
         anGlitchWrite(q.glitch || null);
         $('at-anim-desc').textContent = p.description || '';
@@ -9304,6 +11325,7 @@ window.TRLE = window.TRLE || {};
         anColorFromPreset(key);   // colour follows the chosen preset's default gradient
         anSyncGenerator();
         anSyncLabels();
+        anSyncPickers();
     }
 
     /* Load an existing group's stored params back into the controls (edit mode).
@@ -9326,7 +11348,7 @@ window.TRLE = window.TRLE || {};
         $('at-anim-contrast').value = Math.round((params.contrast != null ? params.contrast : 1) * 100);
         $('at-anim-stretch').value  = params.stretch != null ? params.stretch : 1;
         const fc = anFlowToControls(params.flowX || 0, params.flowY || 0);
-        $('at-anim-flowdir').value  = fc.dir;
+        $('at-anim-flowdir').value  = fc.dir; tilePickerSync($('at-anim-flowdir'));
         $('at-anim-flowspeed').value = fc.speed;
         $('at-anim-seed').value     = seed != null ? seed : 0;
         // Legacy groups predate supersampling and have no stored factor → off,
@@ -9335,9 +11357,11 @@ window.TRLE = window.TRLE || {};
         // A stored recipe carries its own generator; an absent one is the noise
         // field, which is what makes every pre-particle project reload unchanged.
         if (params.generator === 'particles') anParticleWrite(params);
+        if (params.generator === 'caustics') anCausticWrite(params);
         anGlitchWrite(params.glitch || null);
         anSyncGenerator();
         anSyncLabels();
+        anSyncPickers();
     }
 
     function anFramesVisibility() {
@@ -9430,7 +11454,7 @@ window.TRLE = window.TRLE || {};
     /* Push an.color.adjust → the sliders/checkbox (+ gradient dropdown). */
     function anColorSyncControls() {
         const a = an.color.adjust;
-        $('at-anim-gradient').value         = an.color.gradient || '__custom__';
+        $('at-anim-gradient').value         = an.color.gradient || '__custom__'; tilePickerSync($('at-anim-gradient'));
         $('at-anim-col-hue').value          = a.hue;
         $('at-anim-col-sat').value          = Math.round(a.sat * 100);
         $('at-anim-col-val').value          = Math.round(a.val * 100);
@@ -9502,7 +11526,7 @@ window.TRLE = window.TRLE || {};
     /* Manual stop edits make the gradient "custom" (no named preset). */
     function anColorMarkCustom() {
         an.color.gradient = null;
-        $('at-anim-gradient').value = '__custom__';
+        $('at-anim-gradient').value = '__custom__'; tilePickerSync($('at-anim-gradient'));
     }
 
     /* Draw the draggable handle for each stop over the ramp bar. */
@@ -9679,11 +11703,12 @@ window.TRLE = window.TRLE || {};
         const g = el.anim && el.anim.glow;
         if (!g || !g.enabled) { el.emissive = null; return; }
         const k = el.anim.index || 0, N = el.anim.total || 1;
-        if (animStillSource(el.anim.still)) {
-            el.emissive = animStillEmissive(el.canvas, el.animRaw, g, k, N, el.anim.still.drive);
-            return;
-        }
-        el.emissive = TRLE.Engine.emissiveFromDiffuse(el.canvas, anGlowOpts(g, k, N, el.canvas.width));
+        // The frame UNDER any stickers glows (STICKERS-PLAN D9), then a sticker covers its glow as it covers the
+        // frame: a sign over lava must not glow in game. A sticker's own glow is its own setting.
+        const frame = derivedLayered(el) && el.under ? el.under : el.canvas;
+        if (animStillSource(el.anim.still)) el.emissive = animStillEmissive(frame, el.animRaw, g, k, N, el.anim.still.drive);
+        else el.emissive = TRLE.Engine.emissiveFromDiffuse(frame, anGlowOpts(g, k, N, el.canvas.width));
+        if (el.emissive && derivedLayered(el)) stickerCoverGlow(el, el.emissive);
     }
 
     /* The glow of an emissive-only frame. The MASK is the static texture's own
@@ -9735,6 +11760,17 @@ window.TRLE = window.TRLE || {};
        match, which is the silent-collision failure this codebase has hit four
        times (at-fade-hardness, at-tr-hardness, at-hg-invert, at-heal-hint). */
     function anOvPopulateTiles() { return anSourcePopulate($('at-anim-ov-tile')); }
+    /* The Additive preview resets to OFF on every open, like "Preview at": it is
+       a way of looking, and a look left on from last time would read as the
+       animation itself being brighter. */
+    function anAddPrevReset() {
+        const n = anSourcePopulate($('at-anim-addprev-tile'));
+        const cb = $('at-anim-addprev');
+        cb.disabled = !n;
+        cb.title = n ? '' : 'Add a texture to the atlas to preview the animation over it.';
+        cb.checked = false;
+        tilePickerSync($('at-anim-addprev-tile'));
+    }
 
     /* Fill a picker with what an animation may be DERIVED from: the overlay's
        texture and the emissive-only static diffuse share the rule. */
@@ -9811,7 +11847,7 @@ window.TRLE = window.TRLE || {};
             opt.disabled = block;
             opt.title = ov ? 'Not available with an overlay: UV-rotate scrolls the whole texture, including the overlay.'
                 : st ? 'Not available with a static diffuse: UV-rotate would scroll the static texture too, and only the glow is meant to move.'
-                : l2 ? 'Not available with a second layer: UV-rotate would scroll both layers together as one.'
+                : l2 ? 'Not available with a second Animation Layer: UV-rotate would scroll both Animation Layers together as one.'
                 : '';
         }
         if (block && out.value === 'single') { out.value = 'sequence'; anFramesVisibility(); }
@@ -10034,6 +12070,7 @@ window.TRLE = window.TRLE || {};
         anOrgWrite(ovl && ovl.org);
         anOvSyncLabels();
         anOvSyncVisibility();
+        anSyncPickers();
     }
 
     /* Recipe -> the level controls, resetting to Off when there is none. */
@@ -10110,13 +12147,13 @@ window.TRLE = window.TRLE || {};
            palette, colorAdjust) still apply; `equalize` and the animNoise field
            params do not, and are dropped so a saved recipe carries only what its
            generator reads. */
-        if (anIsParticlePreset(key)) {
+        if (anIsParticlePreset(key) || anIsCausticPreset(key)) {
             ['style', 'spatialPeriod', 'timePeriod', 'octaves', 'gain', 'warp',
              'contrast', 'stretch', 'equalize', 'flowX', 'flowY', 'glitch'].forEach(k => delete overrides[k]);
-            Object.assign(overrides, anParticleParams());
+            Object.assign(overrides, anIsCausticPreset(key) ? anCausticParams() : anParticleParams());
         }
         const params = TRLE.AnimPresets_resolve(key, overrides);
-        if (!params.glitch || anIsParticlePreset(key)) delete params.glitch;
+        if (!params.glitch || anIsParticlePreset(key) || anIsCausticPreset(key)) delete params.glitch;
         return { key, params, single, frames };
     }
 
@@ -10190,12 +12227,12 @@ window.TRLE = window.TRLE || {};
         $('at-anim-l2-opacity-val').textContent = $('at-anim-l2-opacity').value;
         const h = $('at-anim-l2-hint');
         if (h) h.innerHTML = on
-            ? `<strong>Preset</strong>, <strong>Shape</strong> and <strong>Colour</strong> are editing <strong>layer ${an.layer.active}</strong>. `
+            ? `<strong>Preset</strong>, <strong>Shape</strong> and <strong>Colour</strong> are editing <strong>Animation Layer ${an.layer.active}</strong>. `
               + ($('at-anim-l2-z').value === 'top'
-                  ? 'Layer 2 goes over the <strong>Overlay</strong> tab\u2019s texture as well (steam in front of a grate), and stays out of the material maps, which describe the surface underneath. '
-                  : 'The <strong>Overlay</strong> tab\u2019s texture goes over both layers. ')
-              + 'Glow reads both. Layer 2 runs at the same frame count, so the loop still closes. '
-              + 'Give it a gradient with a transparent end, or it covers layer 1 completely.'
+                  ? 'Animation Layer 2 goes over the <strong>Overlay</strong> tab\u2019s texture as well (steam in front of a grate), and stays out of the material maps, which describe the surface underneath. '
+                  : 'The <strong>Overlay</strong> tab\u2019s texture goes over both Animation Layers. ')
+              + 'Glow reads both. Animation Layer 2 runs at the same frame count, so the loop still closes. '
+              + 'Give it a gradient with a transparent end, or it covers Animation Layer 1 completely.'
             : '';
         anSingleGuard();
     }
@@ -10290,38 +12327,68 @@ window.TRLE = window.TRLE || {};
         an.regenTimer = setTimeout(anRegenerate, 110);
     }
 
-    function anStartPlayback() {
-        if (an.playId) { cancelAnimationFrame(an.playId); an.playId = null; }
+    /* The texture the "Preview as laid Additive" toggle adds the frames over,
+       or null when it is off (WATER-CAUSTICS-PLAN phase 4b). Preview only:
+       nothing here reaches a recipe, a tile or the export. */
+    function anAddPrevBase() {
+        if (!$('at-anim-addprev').checked) return null;
+        const t = byId(parseInt($('at-anim-addprev-tile').value, 10));
+        return t && t.canvas ? t.canvas : null;
+    }
+
+    /* Draw preview frame `idx` into both preview canvases. With the Additive
+       toggle on, the frame is ADDED over the chosen texture with 'lighter',
+       which is dst + src * alpha clamped at 255: the engine's Additive blend
+       (SrcAlpha, One). The glow is added on top either way. */
+    function anDrawPreviewFrame(idx) {
+        if (!an.frames.length) return;
+        const D = 256;
         const pctx = $('at-anim-preview').getContext('2d');
         const tctx = $('at-anim-tiled').getContext('2d');
-        const D = 256;
+        const f = an.frames[idx % an.frames.length];
+        const gf = an.glowFrames ? an.glowFrames[idx % an.glowFrames.length] : null;
+        const base = anAddPrevBase();
+        // Blow the frame up nearest-neighbour so a 32/64px tile shows
+        // its real pixels instead of a bilinear blur that no engine
+        // will ever produce. Downscales (a 256px frame into the 128px
+        // tiled cell) still smooth, or they'd alias on their own.
+        pctx.clearRect(0, 0, D, D);
+        if (base) {
+            pctx.imageSmoothingEnabled = base.width > D;
+            pctx.drawImage(base, 0, 0, D, D);
+            pctx.globalCompositeOperation = 'lighter';
+        }
+        pctx.imageSmoothingEnabled = f.width > D;
+        pctx.drawImage(f, 0, 0, D, D);
+        if (gf) { pctx.globalCompositeOperation = 'lighter'; pctx.drawImage(gf, 0, 0, D, D); }
+        pctx.globalCompositeOperation = 'source-over';
+        tctx.clearRect(0, 0, D, D);
+        if (base) {
+            tctx.imageSmoothingEnabled = base.width > D / 2;
+            for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++)
+                tctx.drawImage(base, x * (D / 2), y * (D / 2), D / 2, D / 2);
+            tctx.globalCompositeOperation = 'lighter';
+        }
+        tctx.imageSmoothingEnabled = f.width > D / 2;
+        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++)
+            tctx.drawImage(f, x * (D / 2), y * (D / 2), D / 2, D / 2);
+        if (gf) {
+            tctx.globalCompositeOperation = 'lighter';
+            for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++)
+                tctx.drawImage(gf, x * (D / 2), y * (D / 2), D / 2, D / 2);
+        }
+        tctx.globalCompositeOperation = 'source-over';
+    }
+
+    function anStartPlayback() {
+        if (an.playId) { cancelAnimationFrame(an.playId); an.playId = null; }
         an.lastTs = 0;
         const step = (ts) => {
             if (an.frames.length) {
                 const fps = +$('at-anim-fps').value || 12;
                 if (ts - an.lastTs > 1000 / fps) {
                     an.lastTs = ts;
-                    const idx = an.playIdx % an.frames.length;
-                    const f = an.frames[idx];
-                    const gf = an.glowFrames ? an.glowFrames[idx % an.glowFrames.length] : null;
-                    // Blow the frame up nearest-neighbour so a 32/64px tile shows
-                    // its real pixels instead of a bilinear blur that no engine
-                    // will ever produce. Downscales (a 256px frame into the 128px
-                    // tiled cell) still smooth, or they'd alias on their own.
-                    pctx.imageSmoothingEnabled = f.width > D;
-                    pctx.clearRect(0, 0, D, D);
-                    pctx.drawImage(f, 0, 0, D, D);
-                    if (gf) { pctx.globalCompositeOperation = 'lighter'; pctx.drawImage(gf, 0, 0, D, D); pctx.globalCompositeOperation = 'source-over'; }
-                    tctx.imageSmoothingEnabled = f.width > D / 2;
-                    tctx.clearRect(0, 0, D, D);
-                    for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++)
-                        tctx.drawImage(f, x * (D / 2), y * (D / 2), D / 2, D / 2);
-                    if (gf) {
-                        tctx.globalCompositeOperation = 'lighter';
-                        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++)
-                            tctx.drawImage(gf, x * (D / 2), y * (D / 2), D / 2, D / 2);
-                        tctx.globalCompositeOperation = 'source-over';
-                    }
+                    anDrawPreviewFrame(an.playIdx % an.frames.length);
                     an.playIdx++;
                 }
             }
@@ -10416,6 +12483,7 @@ window.TRLE = window.TRLE || {};
             state.elements = state.elements.filter(e => !(e.kind === 'anim' && e.anim && e.anim.group === group));
             const newEls = frames.map((src, i) => makeAnimElement(src, S,
                 { group, index: i, total, preset: info.key, single: info.single, seed, fps, gradient, params: info.params, material, glow, overlay, still, layer2, top: tops ? tops[i] : null, plan: addPlan }));
+            stickerRepiece(old, newEls);        // the group's stickers go onto the new frames (STICKERS-PLAN D9)
             newEls.forEach(anBakeMemberGlow);   // bake per-frame emissive from the recipe
             state.elements.splice(pos, 0, ...newEls);
             /* The new frames are new elements, so without this they would take
@@ -10965,17 +13033,19 @@ window.TRLE = window.TRLE || {};
             anLayerWrite(m.layer2 || null);
             anWriteGlow(m.glow);   // restore the group's stored glow recipe
             anOvPopulateTiles();
+            anAddPrevReset();
             anOvWrite(m.overlay || null);
             anStillWrite(m.still || null);
         } else {
             an.editGroup = null;
             an.editShape = null; an.perRowAuto = true; an.perRowTouched = false;
             $('at-anim-title').textContent = 'Animated Texture';
-            if (!$('at-anim-preset').value) $('at-anim-preset').value = TRLE.AnimPresetOrder[0];
+            if (!$('at-anim-preset').value) { $('at-anim-preset').value = TRLE.AnimPresetOrder[0]; tilePickerSync($('at-anim-preset')); }
             anApplyPreset($('at-anim-preset').value);
             anLayerWrite(null);  // one layer, editing layer 1
             anWriteGlow(null);   // default: glow off
             anOvPopulateTiles();
+            anAddPrevReset();
             anOvWrite(null);     // reset, or the next animation inherits this one's overlay
             anStillWrite(null);  // likewise the emissive-only static texture
             // Crisp pays for itself at small tile sizes (measurably less
@@ -11057,6 +13127,22 @@ window.TRLE = window.TRLE || {};
             });
         });
         $('at-anim-p-dir').addEventListener('change', () => { anParticleNote(); anRegenerate(); });
+        anCSliders.forEach(([, id]) => $(id).addEventListener('input', () => { anCausticSyncLabels(); anScheduleRegen(); }));
+        $('at-anim-c-flowspeed').addEventListener('input', () => { anCausticSyncLabels(); anScheduleRegen(); });
+        ['at-anim-c-bg', 'at-anim-c-stretch', 'at-anim-c-flowdir', 'at-anim-c-model', 'at-anim-c-winddir'].forEach(id =>
+            $(id).addEventListener('change', () => { anCausticSyncLabels(); anRegenerate(); }));
+        /* Hover previews (HOVER-PREVIEW-PLAN phase 4). The first three read a control at render
+           (previewByValue); the preset saves and restores everything it loads; the gradient
+           swaps an.color. The preview is the regenerated frame set, so a restore regenerates. */
+        attachTilePicker($('at-anim-preset'), { text: true, title: 'Preset', ...anPresetPreview });
+        attachTilePicker($('at-anim-gradient'), { text: true, title: 'Gradient', ...anGradientPreview });
+        attachTilePicker($('at-anim-flowdir'), { text: true, title: 'Flow direction', ...previewByValue($('at-anim-flowdir'), anRegenerate) });
+        attachTilePicker($('at-anim-p-dir'), { text: true, title: 'Direction', ...previewByValue($('at-anim-p-dir'), () => { anParticleNote(); anRegenerate(); }) });
+        [['at-anim-c-bg', 'Background'], ['at-anim-c-stretch', 'Stretch'], ['at-anim-c-flowdir', 'Drift'],
+         ['at-anim-c-model', 'Model'], ['at-anim-c-winddir', 'Wind']].forEach(([id, title]) =>
+            attachTilePicker($(id), { text: true, title, ...previewByValue($(id), () => { anCausticSyncLabels(); anRegenerate(); }) }));
+        attachTilePicker($('at-anim-ov-blend'), { text: true, title: 'Overlay blend', ...previewByValue($('at-anim-ov-blend'), anRegenerate) });
+        attachTilePicker($('at-anim-lv-dir'), { text: true, title: 'Moving level', ...previewByValue($('at-anim-lv-dir'), anRegenerate) });
         anGSliders.forEach(([k]) => anG(k).addEventListener('input', () => {
             anGlitchSyncLabels(); anGlitchNote(); anScheduleRegen();
         }));
@@ -11134,8 +13220,12 @@ window.TRLE = window.TRLE || {};
             $('at-anim-lv-' + k).addEventListener('change', () => { anLvSync(); anScheduleRegen(); }));
         ['low', 'high', 'cycles', 'soft'].forEach(k =>
             $('at-anim-lv-' + k).addEventListener('input', () => { anOvSyncLabels(); anScheduleRegen(); }));
-        anOrg = wireOrgPanel('at-anorg', anScheduleRegen);
+        anOrg = wireOrgPanel('at-anorg', anScheduleRegen, { render: anRegenerate });
         attachTilePicker($('at-anim-ov-tile'), { title: 'Overlay texture' });
+        // Picking a texture for the Additive preview turns it on; the playback
+        // loop reads both controls live, so nothing else needs redrawing.
+        attachTilePicker($('at-anim-addprev-tile'), { title: 'Preview Additive over' });
+        $('at-anim-addprev-tile').addEventListener('change', () => { $('at-anim-addprev').checked = true; });
         attachTilePicker($('at-anim-still-tile'), { title: 'Static texture' });
 
         $('at-anim-add').addEventListener('click', anAdd);
@@ -11224,6 +13314,24 @@ window.TRLE = window.TRLE || {};
        (Make Transition's Full Set panel is deliberately NOT on this helper: it has
        Drift, Alternates and a shadow-position slider the others do not. Folding it
        in would mean making the helper take an option bag for every difference.) */
+    /* Hover preview of an organic STYLE (HOVER-PREVIEW-PLAN phase 3). Committing a
+       style loads its defaults into the sliders; a hover renders exactly that by laying
+       the style and its defaults over what the panel reads, and writes no control.
+       Every panel's reader (readOrgPanel, wangOrgParams, trOrgParams) applies it. */
+    let orgHover = null;                     // { pre, over } while a style is being previewed
+    function orgStyleOver(style) {
+        const d = (ORG_STYLES[style] || ORG_STYLES.blobs).defaults, o = { style };
+        for (const k of ['wobble', 'scatter', 'feather', 'shadow']) if (d[k] != null) o[k] = d[k] / 100;
+        if (d.scale != null) o.scale = parseInt(d.scale) || 3;
+        return o;
+    }
+    const orgHoverOn = (p, pre) => { if (orgHover && orgHover.pre === pre) Object.assign(p, orgHover.over); return p; };
+    function orgStylePreview(pre, render) {
+        return {
+            preview(v) { orgHover = { pre, over: orgStyleOver(v) }; render(); },
+            previewEnd() { orgHover = null; render(); },
+        };
+    }
     function readOrgPanel(pre, seed) {
         if (!$(pre + '-wobble')) return null;
         const v = id => parseInt($(pre + '-' + id).value) / 100;
@@ -11236,15 +13344,20 @@ window.TRLE = window.TRLE || {};
                     shadowTarget: $(pre + '-shtarget').value,
                     scale: parseInt($(pre + '-scale').value) || 3,
                     seed: seed, driftSeed: 1 };
+        orgHoverOn(p, pre);
         // Detail softness alone does nothing — it only widens or narrows a band
         // around detail the other sliders create — so it does not arm the panel.
         return (p.wobble || p.scatter || p.shadow) ? p : null;
     }
     /* Wire one up. Returns a handle owning the reroll seed, which the caller
        passes back into readOrgPanel. */
-    function wireOrgPanel(pre, onPreview) {
+    function wireOrgPanel(pre, onPreview, o = {}) {
         const h = { seed: 1 };
         if (!$(pre + '-wobble')) return h;
+        // `o.hover === false`: the caller's preview is not a still image yet (the animated overlay, phase 4).
+        // `o.render`: a hover renders at once, where `onPreview` may be a debounced schedule.
+        if (o.hover !== false)
+            attachTilePicker($(pre + '-style'), { text: true, title: 'Edge style', ...orgStylePreview(pre, o.render || onPreview) });
         const styleHint = () => {
             const e = $(pre + '-style-hint');
             if (e) e.textContent = orgStyle({ style: $(pre + '-style').value }).hint;
@@ -11260,6 +13373,7 @@ window.TRLE = window.TRLE || {};
             });
         });
         $(pre + '-style').addEventListener('change', function () {
+            orgHover = null;                 // a click commits; nothing of the hover survives
             const st = ORG_STYLES[this.value] || ORG_STYLES.blobs;
             for (const [k, v] of Object.entries(st.defaults)) {
                 const e = $(pre + '-' + k);
@@ -11309,6 +13423,7 @@ window.TRLE = window.TRLE || {};
                     shadowTarget: $('at-tr-org-shtarget').value,
                     scale: parseInt($('at-tr-org-scale').value) || 3,
                     seed: trOrgSeed, driftSeed: trOrgDriftSeed };
+        orgHoverOn(p, 'at-tr-org');
         return (p.wobble || p.drift || p.scatter || p.feather || p.shadow) ? p : null;
     }
     /* Single Tiles organic. Same trimmed panel as Wang (no Drift: it is the one
@@ -11640,7 +13755,9 @@ window.TRLE = window.TRLE || {};
            unchanged slider is how a good style gets written off as broken. Only
            the controls inside this panel move — Hardness stays where the user put
            it, and each style carries its own crispness instead. */
+        if ($('at-tr-org-style')) attachTilePicker($('at-tr-org-style'), { text: true, title: 'Edge style', ...orgStylePreview('at-tr-org', trPreview) });
         if ($('at-tr-org-style')) $('at-tr-org-style').addEventListener('change', function () {
+            orgHover = null;
             const st = ORG_STYLES[this.value] || ORG_STYLES.blobs;
             for (const [k, v] of Object.entries(st.defaults)) {
                 const el = $('at-tr-org-' + k);
@@ -11826,6 +13943,7 @@ window.TRLE = window.TRLE || {};
                     shadowTarget: $('at-wang-org-shtarget').value,
                     scale: parseInt($('at-wang-org-scale').value) || 3,
                     seed: wangOrgSeed, driftSeed: 1 };
+        orgHoverOn(p, 'at-wang-org');
         return (p.wobble || p.scatter || p.shadow) ? p : null;
     }
 
@@ -11865,6 +13983,7 @@ window.TRLE = window.TRLE || {};
 
     function wangPreview() {
         if (wang.baseId === null) return;
+        if (wangXActive()) { wangXPreview(); return; }
         const P = 256;
         const { method, pivot, hardness } = wangParams();
         const base    = resizeCanvas(byId(wang.baseId).canvas, P, P);
@@ -11872,6 +13991,7 @@ window.TRLE = window.TRLE || {};
         const L = wangCurrentLayout();
         const wrap = $('at-wang-previews');
         wrap.style.gridTemplateColumns = `repeat(${L.width || 4},1fr)`;
+        wrap.style.gap = '6px';
         wrap.innerHTML = '';
         const org = wangOrgParams();
         for (const bits of L.bits) {
@@ -11904,7 +14024,9 @@ window.TRLE = window.TRLE || {};
                 wangOrgSchedule();
             });
         });
+        if ($('at-wang-org-style')) attachTilePicker($('at-wang-org-style'), { text: true, title: 'Edge style', ...orgStylePreview('at-wang-org', wangPreview) });
         if ($('at-wang-org-style')) $('at-wang-org-style').addEventListener('change', function () {
+            orgHover = null;
             const st = ORG_STYLES[this.value] || ORG_STYLES.blobs;
             for (const [k, v] of Object.entries(st.defaults)) {
                 const el = $('at-wang-org-' + k);
@@ -11941,8 +14063,21 @@ window.TRLE = window.TRLE || {};
                 wangPreview();
             });
         });
+        // Catalogue and Terrain (ORGANIC-SETS-PLAN P4 / P5)
+        let wangXTimer = null;
+        const wangXSchedule = () => { clearTimeout(wangXTimer); wangXTimer = setTimeout(wangPreview, 110); };
+        document.querySelectorAll('#at-wangx input[type=range]').forEach(el => el.addEventListener('input', function () {
+            const lab = $(this.id + '-val'); if (lab) lab.textContent = this.value;
+            wangXSchedule();
+        }));
+        document.querySelectorAll('#at-wangx input[type=number], #at-wangx select, #at-wangx input[type=checkbox]').forEach(el =>
+            el.addEventListener('change', () => { wangXVisibility(); wangXSchedule(); }));
+        $('at-wangx-reroll').addEventListener('click', () => { $('at-wangx-seed').value = Math.floor(Math.random() * 1e6); wangPreview(); });
+        $('at-wang-layout').addEventListener('change', wangXVisibility);
+        wangXVisibility();
         $('at-wang-add').addEventListener('click', () => {
             if (wang.baseId === null) return;
+            if (wangXActive()) { wangXAdd(); return; }
             const S = state.tileSize;
             const { method, pivot, hardness } = wangParams();
             const L = wangCurrentLayout();
@@ -11965,6 +14100,262 @@ window.TRLE = window.TRLE || {};
                 showToast(`Added ${els.length}-tile Wang set to the atlas`, 'success');
             });
         });
+    }
+
+    /* ============ BIG WANG SETS: Catalogue and Terrain (ORGANIC-SETS-PLAN P4 / P5) ============
+       Both layouts are a list of CELL SPECS, one per grid cell, each a transition
+       recipe: `wangBits` (Catalogue's plain and patchy Wang tiles) or `mode` (a
+       Terrain cell's corner state), an optional `patch`, and `swap` for B into A.
+       The preview and Add both build a cell through transitionMaskOf, the function
+       refreshOneTransition uses, so the preview IS what Add makes. */
+    const wangXRand = (seed, a, b) => {
+        let h = Math.imul(((seed >>> 0) ^ 0x9e3779b9) >>> 0, 2654435761) ^ Math.imul(a + 1, 40503) ^ Math.imul(b + 7, 2246822519);
+        h ^= h >>> 15; h = Math.imul(h, 2246822519); h ^= h >>> 13; h = Math.imul(h, 3266489917); h ^= h >>> 16;
+        return (h >>> 0) / 4294967296;
+    };
+    const WANGX_REGIONS = ['top', 'right', 'bottom', 'left', 'tl', 'tr', 'br', 'bl'];
+    const wangXActive = () => ['catalogue', 'terrain'].includes($('at-wang-layout').value);
+    function wangXParams() {
+        const iv = (id, lo, hi, d) => { const v = parseInt($(id).value, 10); return Number.isFinite(v) ? Math.max(lo, Math.min(hi, v)) : d; };
+        const pc = id => parseInt($(id).value, 10) / 100;
+        return {
+            layout: $('at-wang-layout').value,
+            cols: iv('at-wangx-cols', 2, 16, 8), rows: iv('at-wangx-rows', 2, 16, 8), seed: iv('at-wangx-seed', 0, 1e9, 1),
+            n: { plain: iv('at-wangx-n-plain', 0, 16, 16), twin: iv('at-wangx-n-twin', 0, 16, 16),
+                 ab: iv('at-wangx-n-ab', 0, 256, 8), ba: iv('at-wangx-n-ba', 0, 256, 8), part: iv('at-wangx-n-part', 0, 256, 16) },
+            cov: pc('at-wangx-cov'), isl: iv('at-wangx-isl', 1, 8, 3), ivol: pc('at-wangx-ivol'), share: pc('at-wangx-share'),
+            edges: { top: $('at-wangx-e-top').value, right: $('at-wangx-e-right').value,
+                     bottom: $('at-wangx-e-bottom').value, left: $('at-wangx-e-left').value },
+            wrap: $('at-wangx-wrap').checked,
+            patch: { aIntoB: pc('at-wangx-ab'), bIntoA: pc('at-wangx-ba'), reach: pc('at-wangx-reach'),
+                     scale: pc('at-wangx-size'), roughness: pc('at-wangx-rough'), volatility: pc('at-wangx-vol') },
+            vary: pc('at-wangx-vary')
+        };
+    }
+    /* One tile's patch recipe: the sliders, each nudged by "Vary per tile". */
+    function wangXPatch(x, k, extra) {
+        const r = i => wangXRand(x.seed, k, i), p = x.patch, v = x.vary;
+        const cl = (a, lo, hi) => Math.max(lo, Math.min(hi, a));
+        return Object.assign({
+            seed: (Math.imul(x.seed + 1, 2654435761) + Math.imul(k + 1, 97)) >>> 0,
+            aIntoB: cl(p.aIntoB * (1 + (r(1) - 0.5) * v), 0, 1),
+            bIntoA: cl(p.bIntoA * (1 + (r(2) - 0.5) * v), 0, 1),
+            reach: cl(p.reach * (1 + (r(3) - 0.5) * 1.2 * v), 0.05, 1),
+            scale: cl(p.scale + (r(4) - 0.5) * 0.8 * v, 0, 1),
+            roughness: p.roughness, volatility: p.volatility, margin: PATCH_DEFAULTS.margin, region: null
+        }, extra);
+    }
+    /* A Wang tile with no boundary at this pivot / hardness (0, 15, N+S at 50%...):
+       0 = all base, 1 = all overlay, null = has a boundary. Its patchy twin is then a
+       whole-tile patch tile, or it would come out identical to the plain one. */
+    function wangSolidOf(bits, pivot, hardness) {
+        const d = buildWangMask(16, bits, pivot, hardness, null).getContext('2d').getImageData(0, 0, 16, 16).data;
+        let hi = 0; for (let i = 0; i < d.length; i += 4) if (d[i] > 127) hi++;
+        return hi === 0 ? 0 : hi === 256 ? 1 : null;
+    }
+    const wangXWhole = (x, k, solid, extra) =>
+        ({ mode: 'patch', swap: solid === 1, patch: wangXPatch(x, k, Object.assign({ region: 'whole', bIntoA: 0 }, extra)) });
+    function wangXCatalogue(x, pivot, hardness) {
+        const N = x.cols * x.rows, gray = WANG_LAYOUTS['4x4'].bits;
+        const plain = gray.slice(0, x.n.plain).map(b => ({ wangBits: b }));
+        const twin = gray.slice(0, x.n.twin).map((b, i) => {
+            const solid = wangSolidOf(b, pivot, hardness);
+            return solid === null ? { wangBits: b, patch: wangXPatch(x, 100 + i) } : wangXWhole(x, 100 + i, solid);
+        });
+        const ab = [...Array(x.n.ab).keys()].map(i => wangXWhole(x, 1000 + i, 0));
+        const ba = [...Array(x.n.ba).keys()].map(i => wangXWhole(x, 2000 + i, 1));
+        const part = [...Array(x.n.part).keys()].map(i => ({ mode: 'patch', swap: Math.floor(i / 8) % 2 === 1,
+            patch: wangXPatch(x, 3000 + i, { region: WANGX_REGIONS[i % 8], bIntoA: 0, reach: Math.max(0.35, x.patch.reach * 1.6) }) }));
+        const grid = new Array(N).fill(null);
+        const put = (list, c0, r0, w) => list.forEach((sp, i) => {
+            const c = c0 + (i % w), r = r0 + Math.floor(i / w);
+            if (c < x.cols && r < x.rows) grid[r * x.cols + c] = sp;
+        });
+        let rest;
+        // The plain and patchy 16 keep their readable 4x4 shape, side by side, when they fit.
+        if (x.cols >= 8 && x.rows >= 4 && plain.length === 16 && twin.length === 16) {
+            put(plain, 0, 0, 4); put(twin, 4, 0, 4); rest = ab.concat(ba, part);
+        } else rest = plain.concat(twin, ab, ba, part);
+        let k = 0, over = 0;
+        for (const sp of rest) { while (k < N && grid[k]) k++; if (k < N) grid[k++] = sp; else over++; }
+        // Spare cells: more patchy variations, cycling through the kinds.
+        let e = 0;
+        for (let i = 0; i < N; i++) {
+            if (grid[i]) continue;
+            const kind = e % 3, j = 5000 + e++;
+            grid[i] = kind === 0 ? wangXWhole(x, j, 0) : kind === 1 ? wangXWhole(x, j, 1)
+                : { mode: 'patch', swap: e % 2 === 0, patch: wangXPatch(x, j, { region: WANGX_REGIONS[e % 8], bIntoA: 0, reach: Math.max(0.35, x.patch.reach * 1.6) }) };
+        }
+        return { cells: grid, over };
+    }
+    /* Terrain: a (cols+1) x (rows+1) grid of vertex states (marching squares), from a
+       seeded noise field thresholded at its own quantile so Overlay share is the
+       share of vertices. Each cell is the corner-state mask of its four vertices,
+       which joins its neighbours exactly (bilinear, validate-transseam), and some
+       cells (Patchy share) also get organic patches, which never reach a border. */
+    function wangXTerrain(x) {
+        const C = x.cols, R = x.rows;
+        const n1 = makeValueNoise((x.seed ^ 0x51ed27) >>> 0), n2 = makeValueNoise((x.seed ^ 0x2545f491) >>> 0);
+        const fbm = (u, v) => (n1(u, v) * 2 + n1(u * 2 + 7.3, v * 2 + 1.1)) / 3;
+        const F = (i, j) => {
+            const base = x.isl;
+            if (!x.ivol) return fbm(i / base, j / base);
+            let t = (n2(i / (base * 3) + 4.1, j / (base * 3) + 2.7) - 0.5) * 4 + 0.5;
+            t = t < 0 ? 0 : t > 1 ? 1 : t; t = t * t * (3 - 2 * t);
+            const big = base * (1 + x.ivol * 1.2), small = base / (1 + x.ivol * 0.8);
+            return fbm(i / small, j / small) * (1 - t) + fbm(i / big + 9.1, j / big + 3.3) * t;
+        };
+        const vals = [];
+        for (let j = 0; j <= R; j++) for (let i = 0; i <= C; i++) vals.push(F(i, j));
+        const sorted = vals.slice().sort((a, b) => a - b);
+        const thr = sorted[Math.max(0, Math.min(sorted.length - 1, Math.round((1 - x.cov) * (sorted.length - 1))))];
+        const V = [];
+        for (let j = 0; j <= R; j++) {
+            V.push([]);
+            for (let i = 0; i <= C; i++) {
+                let st = vals[j * (C + 1) + i] >= thr ? 1 : 0;
+                if (!x.wrap) {
+                    // A side set to Base / Overlay pins every vertex on it; where two
+                    // pinned sides meet, the corner is overlay only if both are.
+                    const pins = [];
+                    if (j === 0 && x.edges.top !== 'free') pins.push(x.edges.top);
+                    if (j === R && x.edges.bottom !== 'free') pins.push(x.edges.bottom);
+                    if (i === 0 && x.edges.left !== 'free') pins.push(x.edges.left);
+                    if (i === C && x.edges.right !== 'free') pins.push(x.edges.right);
+                    if (pins.length) st = pins.every(p => p === 'overlay') ? 1 : 0;
+                }
+                V[j].push(st);
+            }
+        }
+        if (x.wrap) {   // the last row and column ARE the first, so the block tiles
+            for (let j = 0; j <= R; j++) V[j][C] = V[j][0];
+            for (let i = 0; i <= C; i++) V[R][i] = V[0][i];
+        }
+        const cells = [];
+        for (let r = 0; r < R; r++) for (let c = 0; c < C; c++) {
+            const bits = (V[r][c] ? CORNER_NW : 0) | (V[r][c + 1] ? CORNER_NE : 0)
+                       | (V[r + 1][c + 1] ? CORNER_SE : 0) | (V[r + 1][c] ? CORNER_SW : 0);
+            const k = r * C + c, mode = CORNER_NAME_OF[bits];
+            const patchy = wangXRand(x.seed, k, 777) < x.share;
+            if (!patchy) cells.push({ mode });
+            else if (bits === 0 || bits === 15) cells.push(Object.assign(wangXWhole(x, k, bits === 15 ? 1 : 0), { cornerMode: mode }));
+            else cells.push({ mode, patch: wangXPatch(x, k) });
+        }
+        return { cells, over: 0, vertices: V };
+    }
+    function wangXCells() {
+        const x = wangXParams(), { pivot, hardness } = wangParams();
+        return Object.assign(x.layout === 'terrain' ? wangXTerrain(x) : wangXCatalogue(x, pivot, hardness), { x });
+    }
+    /* The transition element a cell spec becomes. Plain shapes take the Wang modal's
+       pivot, hardness and organic edge; whole and partial tiles have no line. */
+    function wangXElement(sp, baseId, overlayId, method, pivot, hardness, org) {
+        const region = sp.patch && sp.patch.region;
+        return {
+            kind: 'transition', original: null, seamless: false, material: null,
+            base: sp.swap ? overlayId : baseId, overlay: sp.swap ? baseId : overlayId,
+            mode: sp.wangBits != null ? 'wang' : sp.mode, wangBits: sp.wangBits != null ? sp.wangBits : undefined,
+            pivot, hardness, blendMethod: method,
+            organic: region ? null : org, patch: sp.patch || null
+        };
+    }
+    function wangXPreview() {
+        const { cells, x, over } = wangXCells();
+        const { method, pivot, hardness } = wangParams();
+        const org = wangOrgParams();
+        const P = Math.max(32, Math.min(128, Math.floor(1100 / Math.max(x.cols, x.rows))));
+        const tex = { [wang.baseId]: resizeCanvas(byId(wang.baseId).canvas, P, P), [wang.overlayId]: resizeCanvas(byId(wang.overlayId).canvas, P, P) };
+        const wrap = $('at-wang-previews');
+        // Size the rail so the whole grid fits the 881 px modal budget (~640 px of it
+        // for the grid), never past 760 px wide.
+        const railW = Math.round(Math.min(760, 640 * x.cols / x.rows));
+        $('at-modal-wang').querySelector('.at-modal-cols').style.setProperty('--at-side-w', Math.max(420, railW) + 'px');
+        wrap.style.gridTemplateColumns = `repeat(${x.cols},1fr)`;
+        wrap.style.gap = x.cols > 8 ? '2px' : '4px';
+        wrap.innerHTML = '';
+        for (const sp of cells) {
+            const el = wangXElement(sp, wang.baseId, wang.overlayId, method, pivot, hardness, org);
+            const mask = transitionMaskOf(el, P);
+            let comp = composeTransitionDiffuse(tex[el.base], tex[el.overlay], mask, P, method, method === 'poisson' ? 120 : undefined);
+            if (el.organic && el.organic.shadow > 0) comp = applyContactShadow(comp, mask, P, el.organic.shadow, shadowOpts(el.organic));
+            const c = document.createElement('canvas');
+            c.width = P; c.height = P;
+            c.style.cssText = 'width:100%;display:block;image-rendering:pixelated;';
+            c.getContext('2d').drawImage(comp, 0, 0);
+            wrap.appendChild(c);
+        }
+        const n = cells.length, S = state.tileSize;
+        $('at-wang-count').textContent = n;
+        $('at-wang-addcount').textContent = n;
+        const notes = [];
+        if (over) notes.push(`${over} tile${over === 1 ? '' : 's'} did not fit in ${x.cols}x${x.rows} and are left out.`);
+        if (wangXBig(n, S)) notes.push(`${n} tiles at ${S} px: the tool may slow down while it builds them, but it has not frozen. Tiles fill in one by one.`);
+        $('at-wangx-warn').textContent = notes.join(' ');
+    }
+    const wangXBig = (n, S) => n > 64 || (S >= 1024 && n > 16);
+    /* A toast whose text can be updated in place (the build progress). */
+    function progressToast(msg) {
+        showToast(msg, 'info', 600000);
+        const item = $('at-msg-log-list') && $('at-msg-log-list').firstChild;
+        const txt = item && item.querySelector('.toast-msg');
+        return {
+            set(m) { if (txt) txt.textContent = m; },
+            done(m, ms) { if (txt) txt.textContent = m; if (item) setTimeout(() => { item.classList.remove('show'); setTimeout(() => item.remove(), 300); }, ms || 4000); }
+        };
+    }
+    /* ORGANIC-SETS-PLAN P6: render new transition tiles one per task, so a big set
+       at 1024 never holds the page for the whole build (measured ~0.25 s a tile at
+       1024 with an organic edge and patches). The tiles are already in the grid,
+       blank, and fill in as they are drawn. `done` runs after the last one. */
+    let wangXBuilding = null;
+    function buildTilesProgressively(els, label, done) {
+        const S = state.tileSize, n = els.length;
+        const prog = wangXBig(n, S)
+            ? progressToast(`Building ${n} tiles at ${S} px. The tool may slow down while it works, but it has not frozen. 0 / ${n}`) : null;
+        let k = 0;
+        const run = { cancelled: false };
+        wangXBuilding = run;
+        const step = () => {
+            if (run.cancelled) return;
+            const t0 = performance.now();
+            do { if (state.elements.includes(els[k])) refreshOneTransition(els[k], S); k++; }
+            while (k < n && performance.now() - t0 < 40);
+            if (prog) prog.set(`Building ${label}: ${k} / ${n} tiles. The tool may be slower until it finishes, it has not frozen.`);
+            if (k < n) { setTimeout(step, 0); return; }
+            if (wangXBuilding === run) wangXBuilding = null;
+            if (prog) prog.done(`Built ${n} tiles.`);
+            done();
+        };
+        step();
+    }
+    function wangXAdd() {
+        const { cells, x } = wangXCells();
+        const { method, pivot, hardness } = wangParams();
+        const org = wangOrgParams();
+        const baseId = wang.baseId, overlayId = wang.overlayId, S = state.tileSize;
+        const els = cells.map(sp => Object.assign(wangXElement(sp, baseId, overlayId, method, pivot, hardness, org), { id: 0, canvas: blankCanvas(S) }));
+        const label = x.layout === 'terrain' ? `${x.cols}x${x.rows} terrain` : `${x.cols}x${x.rows} catalogue`;
+        confirmResizeCols(x.cols, () => {
+            const blk = newBlock(x.cols, label);
+            for (const el of els) { el.id = state.nextId++; el.block = blk; state.elements.push(el); }
+            closeModal();
+            renderGrid();
+            buildTilesProgressively(els, label, () => {
+                pushHistory(`Wang ${label} (${els.length})`);
+                showToast(`Added a ${label}, ${els.length} tiles`, 'success');
+            });
+        });
+    }
+    function wangXVisibility() {
+        const lay = $('at-wang-layout').value, on = wangXActive();
+        $('at-wangx').style.display = on ? '' : 'none';
+        $('at-wangx-cat').style.display = lay === 'catalogue' ? '' : 'none';
+        $('at-wangx-ter').style.display = lay === 'terrain' ? '' : 'none';
+        // a wider preview rail for an 8x8, so a cell stays readable
+        const cols = $('at-modal-wang').querySelector('.at-modal-cols');
+        if (cols && !on) cols.style.setProperty('--at-side-w', '620px');   // wangXPreview sizes it when on
+        const wrapOn = $('at-wangx-wrap').checked;
+        ['top', 'right', 'bottom', 'left'].forEach(sd => { $('at-wangx-e-' + sd).disabled = wrapOn; });
     }
 
     /* ============ BORDER SET — "Add Borders & Corners" ============
@@ -12421,9 +14812,60 @@ window.TRLE = window.TRLE || {};
         return varOf(colMean) >= varOf(rowMean) ? 'v' : 'h';
     }
 
-    /* Fold a texture into a concentric "origami" frame. opts:
+    /* Seeded generator for Irregular pleats (mulberry32). */
+    function origamiRng(seed) {
+        let a = (seed | 0) + 0x6D2B79F5;
+        return () => {
+            a = (a + 0x6D2B79F5) | 0;
+            let t = Math.imul(a ^ (a >>> 15), 1 | a);
+            t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+    }
+    /* Crease positions 0..S of a pleat strip set: n strips (n even), the even-numbered
+       strips summing to S/2 and the odd-numbered ones to S/2. That balance is what lets
+       the zigzag come back to its start at the wrap, so every spacing tiles. */
+    function origamiCreases(n, S, spacing, seed) {
+        const rnd = origamiRng(seed);
+        const w = [];
+        for (let k = 0; k < n; k++) {
+            const idx = k >> 1, per = Math.max(1, n / 2 - 1);
+            w.push(spacing === 'irregular' ? 0.4 + rnd() : spacing === 'graded' ? 1 + 2 * idx / per : 1);
+        }
+        const sum = [0, 0];
+        for (let k = 0; k < n; k++) sum[k & 1] += w[k];
+        const cr = [0];
+        for (let k = 0; k < n; k++) cr.push(cr[k] + w[k] / sum[k & 1] * (S / 2));
+        cr[n] = S;
+        return cr;
+    }
+    /* Zigzag through a crease list (slope ±1, continuous). Returns the folded
+       coordinate and writes the strip parity and the distance to the nearest crease. */
+    function origamiZig(cr, t, out) {
+        const n = cr.length - 1;
+        let k = 0;
+        while (k < n - 1 && t >= cr[k + 1]) k++;
+        let base = 0;
+        for (let j = 0; j < k; j++) base += ((j & 1) ? -1 : 1) * (cr[j + 1] - cr[j]);
+        out.par = k & 1;
+        out.dist = Math.min(t - cr[k], cr[k + 1] - t);
+        return base + ((k & 1) ? -1 : 1) * (t - cr[k]);
+    }
+    /* Mirror-wrap t into [0, n]: continuous, so a fold never opens a seam in the source. */
+    function origamiMir(t, n) {
+        let p = t % (2 * n); if (p < 0) p += 2 * n;
+        return p >= n ? 2 * n - p : p;
+    }
+
+    /* Fold a texture. opts:
+         type    'frame' (default) | 'pleats' | 'kaleido' | 'fan'
+         scale   0.5..2  texture scale inside the folds (1 = the source's own size)
+         shade   0..100  crease shading (facets lit / shaded, creases darkened); 0 = off
+       Frame (concentric rings):
          shape   'square'|'diamond'|'circle' — ring geometry (Chebyshev / Manhattan
                  / Euclidean distance from the centre)
+         size    'fit' (default: the whole source is squeezed into every ring) | 'keep'
+                 (the source keeps its size; Repeats = number of rings)
          repeats 1..N  — mirrored nested copies of the source (seamless, via a
                  triangle wave on the radius so ring boundaries reflect)
          axis    'auto'|'v'|'h' — which source axis carries the detail (radius
@@ -12433,6 +14875,14 @@ window.TRLE = window.TRLE || {};
                  side so the frame still reaches all four edges when off-centre
          shape2  'square'|'diamond'|'circle' — optional outer shape; the inner
                  shape morphs into it over the radius
+       Pleats (parallel creases; a continuous zigzag, so it tiles):
+         dir     'auto'|'v'|'h'|'both'  (v = vertical creases)
+         folds   even 2..16 strips; spacing 'even'|'irregular'|'graded'; seed
+         start   0..1 which part of the source the first strip shows
+       Kaleidoscope: cells (1..8 per side), each the square fold's mirror cell, at
+         texture size; start as above. Tiles.
+       Fan: folds (2..16) wedges of 180/folds degrees mirrored about cx,cy, at texture
+         size. Even folds with a centred origin tile; anything else is a single panel.
        The along-ring coordinate is a symmetric min/max of the folded distances,
        so detail wraps continuously through the corners (no diagonal seam) and the
        result is 8-fold symmetric. Source alpha is preserved.
@@ -12441,9 +14891,13 @@ window.TRLE = window.TRLE || {};
        box-averaged back to S, antialiasing the ring/reflection boundaries that
        nearest-neighbour sampling would otherwise stair-step. It adds no source
        detail (the source is still S) — it only removes the geometric aliasing the
-       fold creates. Preview uses ss=2, commit ss=4. */
+       fold creates. Preview and commit use the same ss, so what you see is what is added. */
     function makeOrigamiFrame(srcCanvas, S, opts = {}) {
+        const type = ['frame', 'pleats', 'kaleido', 'fan'].includes(opts.type) ? opts.type : 'frame';
         const shape = opts.shape || 'square';
+        const keep = opts.size === 'keep';
+        const scale = Math.min(4, Math.max(0.25, opts.scale > 0 ? opts.scale : 1));
+        const shadeK = Math.min(1, Math.max(0, (opts.shade || 0) / 100));
         const repeats = Math.max(1, opts.repeats || 1);
         const gamma = opts.gamma > 0 ? opts.gamma : 1;
         const shape2 = (opts.shape2 && opts.shape2 !== 'same' && opts.shape2 !== shape) ? opts.shape2 : null;
@@ -12461,38 +14915,124 @@ window.TRLE = window.TRLE || {};
         const Cx = (opts.cx == null ? 0.5 : Math.min(1, Math.max(0, opts.cx))) * (SS - 1);
         const Cy = (opts.cy == null ? 0.5 : Math.min(1, Math.max(0, opts.cy))) * (SS - 1);
         const tri = t => { let p = (t * repeats) % 2; if (p < 0) p += 2; return p > 1 ? 2 - p : p; };
-        // (rn, tn) for a shape from per-side-normalized distances a,b ∈ 0..1.
-        const shapeCoords = (sh, a, b) => {
+        // (rn, tn) for a shape from per-side-normalized distances a,b ∈ 0..1, into Q.
+        const Q = [0, 0], K = [0, 0], K2 = [0, 0];
+        const shapeCoords = (sh, a, b, out) => {
             const hi = Math.max(a, b), lo = Math.min(a, b);
-            if (sh === 'diamond') return [(a + b) / 2, Math.abs(a - b) / 2];
-            if (sh === 'circle')  return [Math.hypot(a, b) / Math.SQRT2, (hi ? Math.atan2(lo, hi) : 0) / (Math.PI / 4)];
-            return [hi, lo];   // square
+            if (sh === 'diamond') { out[0] = (a + b) / 2; out[1] = Math.abs(a - b) / 2; }
+            else if (sh === 'circle') { out[0] = Math.hypot(a, b) / Math.SQRT2; out[1] = (hi ? Math.atan2(lo, hi) : 0) / (Math.PI / 4); }
+            else { out[0] = hi; out[1] = lo; }   // square
         };
-        for (let y = 0; y < SS; y++) {
-            for (let x = 0; x < SS; x++) {
+        // Keep size: output px per unit of rn (across the rings) and the along-ring
+        // coordinate in px, so the source lands at scale 1 on a centred origin.
+        const keepUV = (sh, rn, tn, out) => {
+            if (sh === 'diamond') { out[0] = S; out[1] = tn * S; }
+            else if (sh === 'circle') { out[0] = S / Math.SQRT2; out[1] = rn * (S / Math.SQRT2) * tn * (Math.PI / 4); }
+            else { out[0] = S / 2; out[1] = tn * (S / 2); }
+        };
+        const R = { par: 0, dist: 1e9, sx: 0, sy: 0 };   // scratch: facet parity, distance to a crease (S px), source px
+        // Every mapper takes output coords (SS grid indices for Frame, S px otherwise)
+        // and leaves the source px in R.sx / R.sy.
+        let map;
+        if (type === 'frame') {
+            map = (x, y) => {
                 // Normalize each axis against its own side of the origin so
                 // rn hits 1 at every border even when the origin is off-centre.
                 // Fold geometry is computed on the SS grid; source is sampled at S.
                 const a = Math.abs(x - Cx) / Math.max(1, x < Cx ? Cx : (SS - 1 - Cx));
                 const b = Math.abs(y - Cy) / Math.max(1, y < Cy ? Cy : (SS - 1 - Cy));
-                let [rn, tn] = shapeCoords(shape, a, b);
+                shapeCoords(shape, a, b, Q);
+                let rn = Q[0], tn = Q[1];
+                if (keep) keepUV(shape, rn, tn, K);
                 if (shape2) {   // morph inner shape → outer shape over the radius
-                    const [rn2, tn2] = shapeCoords(shape2, a, b);
+                    shapeCoords(shape2, a, b, Q);
+                    const rn2 = Q[0], tn2 = Q[1];
                     let m = Math.min(1, Math.max(0, (rn + rn2) / 2));
                     m = m * m * (3 - 2 * m);
+                    if (keep) {
+                        keepUV(shape2, rn2, tn2, K2);
+                        K[0] += (K2[0] - K[0]) * m; K[1] += (K2[1] - K[1]) * m;
+                    }
                     rn += (rn2 - rn) * m; tn += (tn2 - tn) * m;
                 }
                 if (rn > 1) rn = 1; if (tn > 1) tn = 1;
                 if (gamma !== 1) rn = Math.pow(rn, gamma);
-                let u = Math.round(tri(rn) * (S - 1));   // radius → one source axis
-                let v = Math.round(tn * (S - 1));        // along-ring → the other axis
-                if (u < 0) u = 0; else if (u > S - 1) u = S - 1;
-                if (v < 0) v = 0; else if (v > S - 1) v = S - 1;
-                const sx = axis === 'h' ? v : u;         // 'v' ridges vary by column
-                const sy = axis === 'h' ? u : v;
-                const si = (sy * S + sx) * 4, di = (y * SS + x) * 4;
-                dd[di] = sd[si]; dd[di + 1] = sd[si + 1];
-                dd[di + 2] = sd[si + 2]; dd[di + 3] = sd[si + 3];
+                if (shadeK > 0) {
+                    const t = rn * repeats, band = Math.floor(t), fr = t - band;
+                    const unit = keep ? K[0] : S / 2;
+                    R.par = (band + (a > b ? 1 : 0) + (x < Cx ? 1 : 0) + (y < Cy ? 1 : 0)) & 1;
+                    R.dist = Math.min(Math.min(fr, 1 - fr) * unit / repeats,
+                                      Math.abs(a - b) * (S / 2) * Math.SQRT1_2);
+                }
+                let u, v;
+                if (keep) {
+                    u = origamiMir(tri(rn) * K[0] / repeats / scale, S);
+                    v = origamiMir(K[1] / scale, S);
+                    if (u > S - 1) u = S - 1; if (v > S - 1) v = S - 1;
+                    u = Math.floor(u); v = Math.floor(v);
+                } else {
+                    u = Math.round(tri(rn) * (S - 1));   // radius → one source axis
+                    v = Math.round(tn * (S - 1));        // along-ring → the other axis
+                    if (u < 0) u = 0; else if (u > S - 1) u = S - 1;
+                    if (v < 0) v = 0; else if (v > S - 1) v = S - 1;
+                }
+                if (axis === 'h') { R.sx = v; R.sy = u; } else { R.sx = u; R.sy = v; }   // 'v' ridges vary by column
+            };
+        } else if (type === 'pleats') {
+            const n = Math.max(2, Math.min(16, (opts.folds || 6) & ~1));
+            const dir = opts.dir === 'v' || opts.dir === 'h' || opts.dir === 'both' ? opts.dir
+                : (axis === 'h' ? 'h' : 'v');   // Auto: crease across the way the detail varies
+            const crX = origamiCreases(n, S, opts.spacing || 'even', opts.seed || 1);
+            const crY = origamiCreases(n, S, opts.spacing || 'even', (opts.seed || 1) + 1000);
+            const start = (opts.start || 0) * S, zx = {}, zy = {};
+            map = (x, y) => {
+                const X = (x + 0.5) / ss, Y = (y + 0.5) / ss;
+                let sx = X / scale, sy = Y / scale, par = 0, dist = 1e9;
+                // 'v' = vertical creases (strips side by side), so it folds x
+                if (dir !== 'h') { sx = origamiZig(crX, X, zx) / scale + start; par ^= zx.par; dist = Math.min(dist, zx.dist); }
+                if (dir !== 'v') { sy = origamiZig(crY, Y, zy) / scale + start; par ^= zy.par; dist = Math.min(dist, zy.dist); }
+                R.par = par; R.dist = dist;
+                R.sx = origamiMir(sx, S); R.sy = origamiMir(sy, S);
+            };
+        } else if (type === 'kaleido') {
+            const N = Math.max(1, Math.min(8, opts.cells | 0 || 2)), cell = S / N, c = cell / 2;
+            const start = (opts.start || 0) * S;
+            map = (x, y) => {
+                const X = (x + 0.5) / ss, Y = (y + 0.5) / ss;
+                const lx = X % cell, ly = Y % cell;
+                const a = Math.abs(lx - c), b = Math.abs(ly - c);
+                const hi = Math.max(a, b), lo = Math.min(a, b);
+                R.par = ((lx < c ? 1 : 0) + (ly < c ? 1 : 0) + (a < b ? 1 : 0)) & 1;
+                R.dist = Math.min(c - hi, lo, (hi - lo) * Math.SQRT1_2);
+                R.sx = origamiMir(hi / scale + start, S); R.sy = origamiMir(lo / scale + start, S);
+            };
+        } else {   // fan
+            const n = Math.max(2, Math.min(16, opts.folds | 0 || 6)), w = Math.PI / n;
+            const ox = (opts.cx == null ? 0.5 : Math.min(1, Math.max(0, opts.cx))) * S;
+            const oy = (opts.cy == null ? 0.5 : Math.min(1, Math.max(0, opts.cy))) * S;
+            map = (x, y) => {
+                const dx = (x + 0.5) / ss - ox, dy = (y + 0.5) / ss - oy;
+                const r = Math.hypot(dx, dy) / scale;
+                const q = Math.atan2(dy, dx) + Math.PI, k = Math.floor(q / w), f = q - k * w;
+                const th = (k & 1) ? w - f : f;
+                R.par = k & 1;
+                R.dist = Math.hypot(dx, dy) * Math.sin(Math.min(f, w - f));
+                R.sx = origamiMir(S / 2 + r * Math.cos(th), S); R.sy = origamiMir(S / 2 + r * Math.sin(th), S);
+            };
+        }
+        for (let y = 0; y < SS; y++) {
+            for (let x = 0; x < SS; x++) {
+                map(x, y);
+                const ix = Math.min(S - 1, Math.floor(R.sx)), iy = Math.min(S - 1, Math.floor(R.sy));
+                const si = (iy * S + ix) * 4, di = (y * SS + x) * 4;
+                if (shadeK > 0) {
+                    let f = 1 + (R.par ? 0.15 : -0.15) * shadeK;
+                    if (R.dist < 2) f *= 1 - 0.35 * shadeK * (1 - R.dist / 2);
+                    dd[di] = sd[si] * f; dd[di + 1] = sd[si + 1] * f; dd[di + 2] = sd[si + 2] * f;
+                } else {
+                    dd[di] = sd[si]; dd[di + 1] = sd[si + 1]; dd[di + 2] = sd[si + 2];
+                }
+                dd[di + 3] = sd[si + 3];
             }
         }
         hctx.putImageData(od, 0, 0);
@@ -12726,7 +15266,7 @@ window.TRLE = window.TRLE || {};
     function setupBsetModal() {
         $('at-bset-org-acc').addEventListener('toggle', () => bsetDockOrganic(true));
         accBindSummary($('at-bset-org-acc'), bsetDockOrganic);
-        bsetOrg = wireOrgPanel('at-bset-org', bsetPreviewSoon);
+        bsetOrg = wireOrgPanel('at-bset-org', bsetPreviewSoon, { render: bsetPreview });
         $('at-bset-topo').addEventListener('change', () => { bset.slots = {}; bsetPreview(); });
         $('at-bset-method').addEventListener('change', bsetPreview);
         $('at-bset-follow').addEventListener('change', bsetPreview);
@@ -13003,8 +15543,10 @@ window.TRLE = window.TRLE || {};
         const relief = carveOn || r.field
             ? { reliefPaint: { mask: carveOn ? r.mask : null, depth, base: r.base, field: r.field || undefined } } : {};
         const mark = r.painted ? pushMarkMaterial(p, markEl) : null;
+        // The source's regions as its own maps see them: its own, plus a text or drawing layer's material (LAYERS-PLAN phase 15).
+        const regs = effectiveMatLayers(srcEl);
         let out;
-        if (!mark && !hasMatLayers(srcEl)) {
+        if (!mark && !regs) {
             // Phase 5's route, kept verbatim: material None is byte-identical to it.
             const E = TRLE.Engine, tex = E.createTextureFromImage(diffuse);
             const preset = Object.assign({}, resolvePreset(srcEl),
@@ -13022,12 +15564,14 @@ window.TRLE = window.TRLE || {};
                layer (`extra`), so the relief does not change where the material does.
                A multi-material source takes no height settings, as its own maps do
                not (heightPresetOverrides(null), a known limit left alone). */
-            const layers = (hasMatLayers(srcEl) ? srcEl.matLayers : [{ material: srcEl.material, mask: null }])
+            const layers = (regs || [{ material: srcEl.material, mask: null }])
                 .concat(mark ? [{ material: mark.material, mask: r.mask, feather: 0 }] : []);
-            const extra = Object.assign({}, hasMatLayers(srcEl) ? {} : heightPresetOverrides(srcEl), relief);
+            const extra = Object.assign({}, regs ? {} : heightPresetOverrides(srcEl), relief);
             out = composeLayerMaps(diffuse, layers, enabledMaps, S, extra);
         }
         if (enabledMaps.emissive && srcEl.emissive) out.emissive = cloneCanvas(srcEl.emissive);
+        // A text or drawing layer's "Also glow in game", lightened in as the export does (deriveMaps).
+        if (enabledMaps.emissive && layerGlowOf(srcEl)) out.emissive = withLayerGlow(srcEl, out.emissive || null);
         return out;
     }
 
@@ -13051,7 +15595,31 @@ window.TRLE = window.TRLE || {};
     function pushDefaultSlots() {
         return new Map(pushSheet().map(b => [b, { on: b !== 0 && pushAllowed(b), clones: 1 }]));
     }
+    /* Hover preview (HOVER-PREVIEW-PLAN phase 6): params laid over what the controls say,
+       read by every pushParams() caller and cleared on the end. Nothing is written. */
+    let pushOver = null;
     function pushParams() {
+        const p = pushParamsRaw();
+        return pushOver ? Object.assign(p, pushOver) : p;
+    }
+    /* A surface preset as overrides: exactly what pushWrite would put in the controls
+       (a preset that names no Wobble strength mirrors its own Struggle). */
+    function pushSurfaceOver(key) {
+        const sf = PUSH_SURFACES[key];
+        if (!sf) return null;
+        const o = { surface: key };
+        for (const k of ['width', 'lines', 'lineWidth', 'strength', 'struggle', 'depth', 'styleAmount', 'length', 'footprint', 'corner',
+                         'cap', 'blend', 'style', 'ring', 'color', 'wobbleAmount', 'grain', 'markTexture', 'noisePreset'])
+            if (sf[k] != null) o[k] = sf[k];
+        o.handCarve = sf.handCarve !== false;
+        o.wobbleStrength = sf.wobbleStrength != null ? sf.wobbleStrength : (sf.struggle != null ? sf.struggle : +$('at-push-struggle').value / 100);
+        return o;
+    }
+    const pushPreview = over => ({
+        preview(v) { const o = over(v); if (!o) return; pushOver = o; pushRender(); },
+        previewEnd() { if (!pushOver) return; pushOver = null; pushRender(); },
+    });
+    function pushParamsRaw() {
         return {
             kind: push.kind, length: +$('at-push-length').value / 100,
             surface: $('at-push-surface').value, seed: push.seed,
@@ -13212,6 +15780,7 @@ window.TRLE = window.TRLE || {};
         push.kind = pushKindOf(p);
         pushKindUI();
         pushLabels();
+        ['surface', 'footprint', 'cap', 'blend', 'style', 'noisepreset'].forEach(k => tilePickerSync($('at-push-' + k)));   // bare .value writes above
     }
     /* What the controls say and show for the kind: drips hide what only a pushed
        block has (its shape, corners, dead ends, the floor style) and rename the rest. */
@@ -13519,6 +16088,16 @@ window.TRLE = window.TRLE || {};
         $('at-push-show').addEventListener('change', () => pushRenderLitSoon(0));
         $('at-push-marksrc').addEventListener('change', () => { pushSourceUI(); pushRender(); });
         $('at-push-marktile').addEventListener('change', pushRender);
+        /* Hover previews (phase 6). Surface previews only within its own kind: the other kind
+           has another slot set and sheet layout, which a hover must not re-lay (D5). A style
+           picked at amount 0 starts at 60 on commit, so its preview does the same. */
+        attachTilePicker(surf, { text: true, title: 'Surface', ...pushPreview(k => (PUSH_SURFACES[k] && pushKindOf(PUSH_SURFACES[k]) === push.kind) ? pushSurfaceOver(k) : null) });
+        attachTilePicker($('at-push-footprint'), { text: true, title: 'Shape', ...pushPreview(v => ({ footprint: v })) });
+        attachTilePicker($('at-push-cap'), { text: true, title: 'Dead ends', ...pushPreview(v => ({ cap: v })) });
+        attachTilePicker($('at-push-blend'), { text: true, title: 'Blend', ...pushPreview(v => ({ blend: v })) });
+        attachTilePicker($('at-push-style'), { text: true, title: 'Floor style', ...pushPreview(v =>
+            ({ style: v, styleAmount: (v !== 'none' && +$('at-push-styleamt').value === 0) ? 0.6 : +$('at-push-styleamt').value / 100 })) });
+        attachTilePicker($('at-push-noisepreset'), { text: true, title: 'Noise type', ...pushPreview(v => ({ noisePreset: v })) });
         attachTilePicker($('at-push-marktile'), { title: 'Mark texture' });
         // The material only reaches the maps, so only the lit preview redraws.
         const msel = $('at-push-material');
@@ -13589,18 +16168,69 @@ window.TRLE = window.TRLE || {};
             scale:     parseInt($('at-org-scale').value) / 100,
             roughness: parseInt($('at-org-roughness').value) / 100,
             edgeMargin: parseInt($('at-org-threshold').value) / 100,
-            baseSeed:  Math.max(0, parseInt($('at-org-seed').value) || 0)
+            baseSeed:  Math.max(0, parseInt($('at-org-seed').value) || 0),
+            // ORGANIC-SETS-PLAN P2 / P3: a direction, or patches in one place of a solid tile
+            dir:       orgDirHover || $('at-org-dir').value,
+            region:    $('at-org-region').value,
+            aIntoB:    parseInt($('at-org-ainb').value) / 100,
+            bIntoA:    parseInt($('at-org-bina').value) / 100,
+            dirHard:   parseInt($('at-org-dirhard').value) / 100,
+            dirWobble: parseInt($('at-org-dirwob').value) / 100,
+            volatility: parseInt($('at-org-vol').value) / 100,
+            reach:     parseInt($('at-org-reach').value) / 100,
+            seamCorners: $('at-org-seamcorners').checked
         };
+    }
+    let orgDirHover = null;   // a Direction the pointer rests on (hover preview), never committed
+    /* Today's Organic Transition: Whole tile, patches everywhere. It stays a baked
+       mask exactly as before; everything else is a recipe tile (el.patch). */
+    const orgIsClassic = p => p.dir === 'whole' && p.region === 'whole';
+    const orgDirMode = p => p.seamCorners ? seamlessModeOf(p.dir) : p.dir;
+    /* Boundary wobble: the Wang set's blobs edge on the plain line, so the patches
+       do not sit beside a ruler-straight boundary. Windowed at the border, so free. */
+    const orgDirEdge = (seed, p) => p.dirWobble > 0
+        ? { style: 'blobs', wobble: p.dirWobble, drift: 0, scatter: 0, feather: 0, shadow: 0, scale: 3, seed, driftSeed: 1 } : null;
+    function orgPatchRecipe(seed, p) {
+        const r = { seed, scale: p.scale, roughness: p.roughness, volatility: p.volatility,
+                    reach: p.reach, margin: p.edgeMargin, region: null, aIntoB: p.aIntoB, bIntoA: p.bIntoA };
+        if (p.dir === 'whole') Object.assign(r, { region: p.region, aIntoB: p.coverage, bIntoA: 0 });
+        return r;
     }
     /* Deterministic distinct seed per variation index. */
     const orgSeed = (baseSeed, i) => (Math.imul(baseSeed + 1, 2654435761) + Math.imul(i + 1, 40503)) >>> 0;
 
     function orgMaskFor(seed, W, H, p) {
+        if (!orgIsClassic(p)) {
+            const r = orgPatchRecipe(seed, p);
+            if (org.hasHint) r.hint = org.hint;
+            const plain = p.dir === 'whole' ? null : buildTopologyMask(W, orgDirMode(p), 0.5, p.dirHard, orgDirEdge(seed, p));
+            return patchMask(plain, W, r);
+        }
         return buildOrganicMask(W, H, {
             seed, scale: p.scale, coverage: p.coverage, roughness: p.roughness,
             edgeMargin: p.edgeMargin, seam: orgSeamActive() ? org.seam : null,
-            edgeSafe: false, hint: org.hasHint ? org.hint : null
+            edgeSafe: false, hint: org.hasHint ? org.hint : null, volatility: p.volatility
         });
+    }
+    /* Which controls a Direction / Region uses. Whole tile keeps today's panel. */
+    const ORG_DIR_HINTS = {
+        Slope: 'A slope joins nothing in a set: use it for a one-off sloped floor.',
+        Diagonal: 'Ticked, the corner is the one the Wang and Terrain sets use, and meets their edges exactly.',
+        Full: 'Ticked, the edge meets the corner tiles exactly. Either way it joins a row of itself, and plain tiles above and below.',
+        tapered: 'Tapered edges meet plain base at both sides, so they stand alone or end a row.'
+    };
+    function orgVisibility() {
+        const dir = $('at-org-dir').value, region = $('at-org-region').value, whole = dir === 'whole';
+        const show = (id, on) => { const e = $(id); if (e) e.style.display = on ? '' : 'none'; };
+        show('at-org-dir-opts', !whole);
+        show('at-org-region-row', whole);
+        show('at-org-coverage-group', whole);
+        show('at-org-reach-group', !whole || region !== 'whole');
+        show('at-org-seam-group', whole && region === 'whole');
+        const key = /^Slope/.test(dir) ? 'Slope'
+            : /^Diagonal|^(Top|Bottom)(Left|Right)Full$/.test(dir) ? 'Diagonal'
+            : /Full$/.test(dir) ? 'Full' : 'tapered';
+        $('at-org-dir-hint').textContent = whole ? '' : ORG_DIR_HINTS[key];
     }
 
     /* ---- per-side seamless box model ---- */
@@ -13738,12 +16368,31 @@ window.TRLE = window.TRLE || {};
         orgRenderPreviews();
     }
 
+    /* ORGANIC-SETS-PLAN is parked (author, 2026-10-08): its controls carry
+       `data-orgsets` and stay hidden unless `?organicsets=on`. Script-only, like
+       ?hoverpreview; the code paths are live and validate-organic-sets drives them. */
+    if (new URLSearchParams(location.search).get('organicsets') === 'on') document.documentElement.classList.add('at-orgsets');
+
     function setupOrganicModal() {
         const slider = (id, suffix) => $(id).addEventListener('input', function () {
             $(id + '-val').textContent = this.value + (suffix || '');
             orgScheduleRender();
         });
         slider('at-org-coverage'); slider('at-org-scale'); slider('at-org-roughness'); slider('at-org-threshold');
+        ['at-org-ainb', 'at-org-bina', 'at-org-dirhard', 'at-org-dirwob', 'at-org-vol', 'at-org-reach'].forEach(id => slider(id));
+        ['at-org-dir', 'at-org-region'].forEach(id => $(id).addEventListener('change', () => { orgVisibility(); orgRenderPreviews(); }));
+        $('at-org-seamcorners').addEventListener('change', orgRenderPreviews);
+        attachTilePicker($('at-org-dir'), { text: true, title: 'Direction',
+            preview: v => { orgDirHover = v; orgRenderPreviews(); },
+            previewEnd: () => { orgDirHover = null; orgRenderPreviews(); } });
+        $('at-org-swap').addEventListener('click', () => {
+            if (org.baseId === null) return;
+            [org.baseId, org.overlayId] = [org.overlayId, org.baseId];
+            $('at-org-base-no').textContent    = numberOf(org.baseId);
+            $('at-org-overlay-no').textContent = numberOf(org.overlayId);
+            orgDrawHint(); orgRenderPreviews();
+        });
+        orgVisibility();
         $('at-org-brushsize').addEventListener('input', function () { $('at-org-brushsize-val').textContent = this.value; });
         ['at-org-method', 'at-org-count'].forEach(id =>
             $(id).addEventListener('change', orgScheduleRender));
@@ -13789,6 +16438,21 @@ window.TRLE = window.TRLE || {};
             const S = state.tileSize, p = orgParams();
             const idxs = [...org.sel].sort((a, b) => a - b);
             for (const i of idxs) {
+                if (!orgIsClassic(p)) {
+                    // A recipe tile: rebuilt from the plain shape on every refresh, so
+                    // its border stays exact (a baked mask is softened on the way in).
+                    state.elements.push({
+                        id: state.nextId++, kind: 'transition', canvas: blankCanvas(S),
+                        original: null, seamless: false, material: null,
+                        base: org.baseId, overlay: org.overlayId,
+                        mode: p.dir === 'whole' ? 'patch' : orgDirMode(p), pivot: 0.5,
+                        hardness: p.dirHard, blendMethod: p.method,
+                        organic: p.dir === 'whole' ? null : orgDirEdge(orgSeed(p.baseSeed, i), p),
+                        patch: orgPatchRecipe(orgSeed(p.baseSeed, i), p),
+                        patchHint: org.hasHint ? cloneCanvas(org.hint) : null
+                    });
+                    continue;
+                }
                 const mask = orgMaskFor(orgSeed(p.baseSeed, i), S, S, p);
                 state.elements.push({
                     id: state.nextId++, kind: 'transition', canvas: blankCanvas(S),
@@ -13808,7 +16472,7 @@ window.TRLE = window.TRLE || {};
     }
 
     /* ============ MATERIAL MODAL ============ */
-    // [key, label, min, max, step?]  — step defaults to 1 (integer). Float params
+    // [key, label, min, max, step?, suffix?]  — step defaults to 1 (integer). Float params
     // (0–1 with a 0.05 step) drive the Materialize-derived normal/AO extras.
     const MAT_PARAMS = [
         ['normalStrength',         'Normal Strength',      1, 50],
@@ -13829,7 +16493,25 @@ window.TRLE = window.TRLE || {};
         ['heightStrength',         'Height Strength',      1, 50],
         ['heightBlur',             'Height Blur',          0, 10],
         ['emissiveStrength',       'Emissive Strength',    0, 100],
-        ['emissiveThreshold',      'Emissive Threshold',   0, 255]
+        ['emissiveThreshold',      'Emissive Threshold',   0, 255],
+        /* Cavity and edges (CAVITY-PLAN.md): curvature of the relief folded into AO,
+           roughness and specular. Amounts at 0 skip the pass (byte-identical); the
+           slider grid puts their heading in front of `cavityAO`. */
+        ['cavityAO',               'Crevice Shadow',       0, 100, 1, '%'],
+        ['cavityRough',            'Crevice Roughness',    0, 100, 1, '%'],
+        ['edgeSpec',               'Edge Shine',           0, 100, 1, '%'],
+        ['cavitySize',             'Crevice Size',         1, 16,  1, ' px'],
+        /* Relief detail bands (HEIGHT-BANDS-PLAN.md): a gain per octave on the relief
+           that normal, AO and height all read. 100 leaves a band as it is, and all six
+           at 100 skips the pass, so a material that never touched them is
+           byte-identical. Must stay LAST and in order: the slider grid puts their
+           heading and band-preset picker in front of `reliefBand1`. */
+        ['reliefBand1',            'Detail 1 px',          0, 300, 1, '%'],
+        ['reliefBand2',            'Detail 2 px',          0, 300, 1, '%'],
+        ['reliefBand3',            'Detail 4 px',          0, 300, 1, '%'],
+        ['reliefBand4',            'Detail 8 px',          0, 300, 1, '%'],
+        ['reliefBand5',            'Detail 16 px',         0, 300, 1, '%'],
+        ['reliefBand6',            'Detail 32 px',         0, 300, 1, '%']
     ];
     // Params measured on a 0–1 float scale (need parseFloat, not parseInt).
     const MAT_FLOAT_PARAMS = new Set(['normalAngularity', 'normalAngularIntensity', 'aoNormalBlend',
@@ -13839,7 +16521,24 @@ window.TRLE = window.TRLE || {};
        fallback; these two mean "the engine's default", and falling back to min would
        silently set AO Depth to 0 (no AO at all) the moment anyone touched a slider on
        a preset that doesn't declare them. Must match the ?? defaults in engine.js. */
-    const MAT_PARAM_DEFAULTS = { aoDepth: 0.5, aoCurve: 0.85 };
+    const MAT_PARAM_DEFAULTS = { aoDepth: 0.5, aoCurve: 0.85,
+        cavitySize: 4,   // must match engine.js's fallback; the amounts' 0 IS their minimum
+        // The bands' "absent" value is neutral, 100: the slider minimum, 0, would
+        // strip that band from every old custom material the moment it was opened.
+        reliefBand1: 100, reliefBand2: 100, reliefBand3: 100,
+        reliefBand4: 100, reliefBand5: 100, reliefBand6: 100 };
+    const MAT_BAND_KEYS = ['reliefBand1', 'reliefBand2', 'reliefBand3', 'reliefBand4', 'reliefBand5', 'reliefBand6'];
+    /* Named band settings, finest to coarsest. SHORTCUTS that set the six sliders,
+       never stored: a material keeps the six numbers. Options, not decisions; the
+       picker reads "Custom" whenever the sliders match none of them. */
+    const MAT_BAND_PRESETS = TRLE.BandPresets;   // js/presets.js: presets carry bands (PRESET-RELIEF-PLAN)
+    function matSyncBandPreset() {
+        const sel = $('at-mat-bandpreset');
+        if (!sel) return;
+        const cur = MAT_BAND_KEYS.map(k => parseInt($(`at-mat-p-${k}`).value, 10));
+        const hit = Object.keys(MAT_BAND_PRESETS).find(n => MAT_BAND_PRESETS[n].every((v, i) => v === cur[i]));
+        sel.value = hit || '';
+    }
     const MAT_PREVIEW_MAPS = ['normal', 'ao', 'specular', 'roughness', 'emissive', 'height'];
 
     const mat = { id: null, batchIds: null, dirty: false, previewTimer: null,
@@ -13949,6 +16648,16 @@ window.TRLE = window.TRLE || {};
                          : (MAT_PARAM_DEFAULTS[key] != null ? MAT_PARAM_DEFAULTS[key] : slider.min);
             $(`at-mat-p-${key}-val`).textContent = slider.value;
         });
+        matSyncBandPreset();
+    }
+
+    /* The preset's description, plus a note when this tile's maps come from its
+       pre-Classic-Look texture: otherwise nothing on screen says why the relief
+       is detailed under blocky pixels. */
+    function matDescText(p) {
+        const d = (p && p.description) || '';
+        const el = mat.id != null ? byId(mat.id) : null;
+        return hasMapSource(el) ? (d ? d + ' ' : '') + 'Maps on this tile come from its texture before Classic Look.' : d;
     }
 
     function matCollectParams() {
@@ -13974,7 +16683,7 @@ window.TRLE = window.TRLE || {};
         const p = matCurrentPresetObjBase();
         if (p) {
             matLoadParams(p);
-            $('at-mat-desc').textContent = p.description || '';
+            $('at-mat-desc').textContent = matDescText(p);
         }
         mat.dirty = false;
         matRenderContrastAdvice();
@@ -14296,10 +17005,11 @@ window.TRLE = window.TRLE || {};
         const wrap = $('at-mat-previews');
 
         let composed;
-        if (matMulti.enabled) {
+        const previewLayers = mmPreviewLayers(el);
+        if (previewLayers) {
             // Composite all layers (WYSIWYG with the export). Upload each composited
             // map canvas into an FBO so the lit preview can light it.
-            composed = composeLayerMaps(el.canvas, matMulti.layers, enabled, S);
+            composed = composeLayerMaps(mapSourceOf(el), previewLayers, enabled, S, textReliefExtra(el, mapSourceOf(el)));
             const E = TRLE.Engine;
             const tex = E.createTextureFromImage(el.canvas);
             const maps = {};
@@ -14312,20 +17022,33 @@ window.TRLE = window.TRLE || {};
                 wrap.innerHTML = '<p class="sm-hint" style="margin:6px 0;">Pick or save a preset to preview its maps.</p>';
                 return;
             }
-            const preset = Object.assign({}, matCurrentPresetObj(), Object.assign({ flipNormalY: state.flipNormalY, alphaFlatten: canvasHasAlpha(el.canvas) }, heightPresetOverrides(el)));
+            const preset = Object.assign({}, matCurrentPresetObj(), Object.assign({ flipNormalY: state.flipNormalY, alphaFlatten: canvasHasAlpha(mapSourceOf(el)) }, heightPresetOverrides(el)), textReliefExtra(el, mapSourceOf(el)));
+            // `tex` is also the lit preview's diffuse, so it stays the tile's own
+            // pixels; the maps come from mapSourceOf (Classic Look's original).
             const tex = TRLE.Engine.createTextureFromImage(el.canvas);
-            const maps = TRLE.Engine.generateMaps(tex, S, S, preset, enabled);
+            const genTex = hasMapSource(el) ? TRLE.Engine.createTextureFromImage(mapSourceOf(el)) : tex;
+            const maps = TRLE.Engine.generateMaps(genTex, S, S, preset, enabled);
+            if (genTex !== tex) TRLE.Engine.deleteTexture(genTex);
             mat.gl = { tex, maps };
             composed = {};
             for (const m of MAT_PREVIEW_MAPS) if (maps[m]) composed[m] = TRLE.Engine.fboToCanvas(maps[m]);
         }
 
+        // A sticker's own maps, laid over as deriveMaps does on export (STICKERS-PLAN D7).
+        if (el.emissive && composed.emissive) composed.emissive = el.emissive;   // the patches go over the authored glow, as on export
+        const patched = withMapPatches(el, composed);
+        for (const mt of patched) {
+            if (mat.gl.maps[mt]) TRLE.Engine.deleteFBO(mat.gl.maps[mt]);
+            mat.gl.maps[mt] = matCanvasToFBO(composed[mt], S);
+        }
+        const emPatched = patched.includes('emissive');
         // Authored glow (Emissive modal) overrides the preset-derived emissive,
         // exactly as deriveMaps does on export — so what you see here is shipped.
-        if (el.emissive) {
-            composed.emissive = el.emissive;
+        const emTop = withLayerGlow(el, emPatched ? composed.emissive : el.emissive || composed.emissive || null);
+        if (emTop && (el.emissive || layerGlowOf(el) || emPatched)) {
+            composed.emissive = emTop;
             if (mat.gl.maps.emissive) TRLE.Engine.deleteFBO(mat.gl.maps.emissive);
-            mat.gl.maps.emissive = matCanvasToFBO(el.emissive, S);
+            mat.gl.maps.emissive = matCanvasToFBO(emTop, S);
         }
 
         wrap.innerHTML = '';
@@ -14453,12 +17176,13 @@ window.TRLE = window.TRLE || {};
         const S = state.tileSize;
         const enabled = { normal: true, ao: true, roughness: true, emissive: true, height: true };
         let canv;
-        if (matMulti.enabled) {
-            const c = composeLayerMaps(el.canvas, matMulti.layers, enabled, S);
+        const previewLayers = mmPreviewLayers(el);
+        if (previewLayers) {
+            const c = composeLayerMaps(mapSourceOf(el), previewLayers, enabled, S, textReliefExtra(el, mapSourceOf(el)));
             canv = { diffuse: el.canvas, normal: c.normal, ao: c.ao, roughness: c.roughness, emissive: c.emissive, height: c.height };
         } else {
-            const preset = Object.assign({}, matCurrentPresetObj(), Object.assign({ flipNormalY: state.flipNormalY, alphaFlatten: canvasHasAlpha(el.canvas) }, heightPresetOverrides(el)));
-            const tex  = TRLE.Engine.createTextureFromImage(el.canvas);
+            const preset = Object.assign({}, matCurrentPresetObj(), Object.assign({ flipNormalY: state.flipNormalY, alphaFlatten: canvasHasAlpha(mapSourceOf(el)) }, heightPresetOverrides(el)), textReliefExtra(el, mapSourceOf(el)));
+            const tex  = TRLE.Engine.createTextureFromImage(mapSourceOf(el));
             const maps = TRLE.Engine.generateMaps(tex, S, S, preset, enabled);
             const toCanvas = k => maps[k] ? TRLE.Engine.fboToCanvas(maps[k]) : null;
             canv = {
@@ -14469,6 +17193,8 @@ window.TRLE = window.TRLE || {};
             TRLE.Engine.deleteTexture(tex);
         }
         if (el.emissive) canv.emissive = el.emissive;   // authored glow wins (matches deriveMaps)
+        withMapPatches(el, canv);                        // a sticker's own maps (STICKERS-PLAN D7)
+        if (layerGlowOf(el)) canv.emissive = withLayerGlow(el, canv.emissive || null);
         // …and PSD-imported maps win over both (again, matching deriveMaps), so
         // the 3D preview shows what will actually be exported.
         if (el.importedMaps) {
@@ -14520,7 +17246,7 @@ window.TRLE = window.TRLE || {};
             if (p) matLoadParams(p);
             $('at-mat-adv').open = false;
         }
-        $('at-mat-desc').textContent = (matCurrentPresetObjBase() || {}).description || '';
+        $('at-mat-desc').textContent = matDescText(matCurrentPresetObjBase());
     }
     /* Read the editor controls back into a material descriptor. */
     function currentMaterialDescriptor() {
@@ -14639,7 +17365,7 @@ window.TRLE = window.TRLE || {};
         const S = state.tileSize;
         const idx = matMulti.layers.length;
         matMulti.layers.push({
-            name: idx === 0 ? 'Base' : `Layer ${idx}`,
+            name: idx === 0 ? 'Base' : `Material Layer ${idx}`,
             color: MM_COLORS[idx % MM_COLORS.length],
             feather: 2,
             material: currentMaterialDescriptor(),
@@ -14684,8 +17410,8 @@ window.TRLE = window.TRLE || {};
         mmRenderCanvas();
         const base = i === 0;
         $('at-mm-selhint').textContent = base
-            ? 'Base layer, its material fills the whole tile. Add a layer to paint a region on top.'
-            : `Paint where “${L.name}” applies. It draws over the layers beneath it.`;
+            ? 'Base layer, its material fills the whole tile. Add a Material Layer to paint a region on top.'
+            : `Paint where “${L.name}” applies. It draws over the Material Layers beneath it.`;
     }
 
     /* Write the editor controls into the active layer's material. */
@@ -14695,10 +17421,29 @@ window.TRLE = window.TRLE || {};
         if (L) { L.material = currentMaterialDescriptor(); mmRenderList(); }
     }
 
+    /* The layers the Material previews compose: the editor's own, plus the regions of the
+       tile's text layers (read-only here, D7). null: a plain single-material tile. */
+    function mmPreviewLayers(el) {
+        const T = textRegions(el);
+        if (matMulti.enabled) {
+            if (!T.length) return matMulti.layers;
+            const L = cloneMatLayers(matMulti.layers);
+            T.forEach(t => mergeRegion(L, t.mask, t.value, t.label));
+            return L;
+        }
+        if (!T.length) return null;
+        const L = [{ name: 'Base', color: MM_COLORS[0], feather: 0, material: currentMaterialDescriptor(), mask: null }];
+        T.forEach(t => mergeRegion(L, t.mask, t.value, t.label));
+        return L;
+    }
     function mmRenderList() {
         const ul = $('at-mm-list');
         if (!ul) return;
         ul.innerHTML = '';
+        // Regions that belong to a layer (Text): shown so a painter can see what already
+        // claims an area, but edited in their own tool.
+        const own = mat.id !== null ? byId(mat.id) : null;
+        const ro = own ? textRegions(own) : [];
         matMulti.layers.forEach((L, i) => {
             const li = document.createElement('li');
             li.className = 'at-mm-item' + (i === matMulti.active ? ' active' : '');
@@ -14709,7 +17454,7 @@ window.TRLE = window.TRLE || {};
             matLbl.textContent = (presetFromMaterial(L.material).label || L.material.key || 'material');
             const up = document.createElement('button'); up.textContent = '▲'; up.title = 'Move up'; up.disabled = i <= 1;
             const dn = document.createElement('button'); dn.textContent = '▼'; dn.title = 'Move down'; dn.disabled = i === 0 || i === matMulti.layers.length - 1;
-            const del = document.createElement('button'); del.textContent = '🗑'; del.title = 'Delete layer'; del.disabled = i === 0;
+            const del = document.createElement('button'); del.textContent = '🗑'; del.title = 'Delete Material Layer'; del.disabled = i === 0;
             li.append(sw, name, matLbl, up, dn, del);
             li.addEventListener('click', e => { if (e.target.tagName !== 'BUTTON') mmSelect(i); });
             name.addEventListener('dblclick', e => { e.stopPropagation(); mmRenameLayer(i); });
@@ -14718,11 +17463,20 @@ window.TRLE = window.TRLE || {};
             del.addEventListener('click', e => { e.stopPropagation(); mmDeleteLayer(i); });
             ul.appendChild(li);
         });
+        ro.forEach(t => {
+            const li = document.createElement('li');
+            li.className = 'at-mm-item at-mm-ro';
+            li.title = 'Belongs to a Text or Drawing layer: change it there, not here';
+            const name = document.createElement('span'); name.className = 'at-mm-name'; name.textContent = `from ${t.name}`;
+            const lbl = document.createElement('span'); lbl.className = 'at-mm-mat'; lbl.textContent = (presetFromMaterial({ type: t.value.split(':')[0], key: t.value.split(':')[1] }).label || t.value);
+            li.append(name, lbl);
+            ul.appendChild(li);
+        });
     }
 
     function mmRenameLayer(i) {
         const L = matMulti.layers[i]; if (!L) return;
-        const name = prompt('Layer name', L.name);
+        const name = prompt('Material Layer name', L.name);
         if (name && name.trim()) { L.name = name.trim().slice(0, 24); mmRenderList(); mmRenderCanvas(); }
     }
 
@@ -14791,7 +17545,7 @@ window.TRLE = window.TRLE || {};
         // of the shared editor, where every other surface would inherit a control that
         // means nothing to it.
         buildMaskToolbar($('at-mm-tools'), 'at-mm', {
-            extraHTML: '<label class="at-mm-feather" title="Soften this layer\'s selection edge (px)">Feather<input type="range" id="at-mm-feather" min="0" max="24" value="2"></label>'
+            extraHTML: '<label class="at-mm-feather" title="Soften this Material Layer\'s selection edge (px)">Feather<input type="range" id="at-mm-feather" min="0" max="24" value="2"></label>'
         });
         mmEditor = createMaskEditor('at-mm', {
             canvas: $('at-mat-select'),
@@ -14802,7 +17556,7 @@ window.TRLE = window.TRLE || {};
             onTool: mmSetTool,
             onChange: mmRenderCanvas,
             onStrokeEnd: matSchedulePreview,
-            onNoMask: () => showToast('Select a layer above the Base to paint its region', 'info')
+            onNoMask: () => showToast('Select a Material Layer above the Base to paint its region', 'info')
         });
 
         $('at-mm-enable').addEventListener('change', e => mmEnable(e.target.checked));
@@ -14828,16 +17582,57 @@ window.TRLE = window.TRLE || {};
 
         // Build the advanced slider grid once
         const wrap = $('at-mat-sliders');
-        MAT_PARAMS.forEach(([key, label, min, max, step]) => {
+        MAT_PARAMS.forEach(([key, label, min, max, step, suffix]) => {
+            if (key === 'cavityAO') {
+                const h = document.createElement('div');
+                h.className = 'at-slider-head';
+                h.textContent = 'Cavity and edges';
+                wrap.appendChild(h);
+                /* TEN multiplies the WHOLE lit colour by AO (docs/engine-facts.md), so a
+                   strong crevice shadow also kills highlights and glow in the cracks. */
+                const hint = document.createElement('div');
+                hint.className = 'sm-hint at-slider-wide at-band-hint';
+                hint.id = 'at-mat-cavity-hint';
+                hint.textContent = 'Tomb Engine dims highlights and glow with AO too, so keep Crevice Shadow gentle (20 to 40%).';
+                wrap.appendChild(hint);
+            }
+            if (key === 'reliefBand1') {
+                /* The picker sits IN the heading row, not under it: a row of its own
+                   pushed the advanced column 46 px past the 881 px budget at 1920. */
+                const h = document.createElement('div');
+                h.className = 'at-slider-head at-band-head';
+                h.innerHTML = `<label for="at-mat-bandpreset">Relief detail bands</label>
+ <select id="at-mat-bandpreset" title="Named band settings. Picking one sets the six sliders below.">
+ ${Object.keys(MAT_BAND_PRESETS).map(n => `<option value="${n}">${n}</option>`).join('')}
+ <option value="" disabled>Custom</option>
+ </select>`;
+                wrap.appendChild(h);
+                const hint = document.createElement('div');
+                hint.className = 'sm-hint at-slider-wide at-band-hint';
+                hint.id = 'at-mat-band-hint';
+                hint.textContent = '100% leaves a band as it is. Moves normal, AO and height together.';
+                wrap.appendChild(hint);
+                h.querySelector('select').addEventListener('change', function () {
+                    const w = MAT_BAND_PRESETS[this.value];
+                    if (!w) return;
+                    MAT_BAND_KEYS.forEach((k, i) => {
+                        $(`at-mat-p-${k}`).value = w[i];
+                        $(`at-mat-p-${k}-val`).textContent = w[i];
+                    });
+                    mat.dirty = true;
+                    matSchedulePreview();
+                });
+            }
             const g = document.createElement('div');
             g.className = 'form-group';
             g.innerHTML = `
- <label>${label}: <span id="at-mat-p-${key}-val">${min}</span></label>
+ <label>${label}: <span id="at-mat-p-${key}-val">${min}</span>${suffix || ''}</label>
  <input type="range" id="at-mat-p-${key}" min="${min}" max="${max}" step="${step || 1}" value="${min}" style="width:100%;">`;
             wrap.appendChild(g);
             g.querySelector('input').addEventListener('input', function () {
                 $(`at-mat-p-${key}-val`).textContent = this.value;
                 mat.dirty = true;
+                if (MAT_BAND_KEYS.includes(key)) matSyncBandPreset();
                 matSchedulePreview();
             });
         });
@@ -14931,7 +17726,7 @@ window.TRLE = window.TRLE || {};
                 closeModal();
                 renderGrid();
                 pushHistory(`Material: ${materialLabel(el)}`);
-                showToast(el.matLayers ? `Multi-material assigned (${el.matLayers.length} layers) 🎭` : `Material assigned: ${materialLabel(el)}`, 'success');
+                showToast(el.matLayers ? `Multi-material assigned (${el.matLayers.length} Material Layers) 🎭` : `Material assigned: ${materialLabel(el)}`, 'success');
                 return;
             }
 
@@ -14968,12 +17763,13 @@ window.TRLE = window.TRLE || {};
        capped (HEAL_PREVIEW_MAX) so painting stays responsive on big tiles, so Save
        must not blindly reuse it -- it recomputes unless the cache is already
        full-resolution. */
-    const heal = { id: null, maskCanvas: null, resultCanvas: null, resultRes: 0, timer: null };
+    const heal = { id: null, maskCanvas: null, resultCanvas: null, resultRes: 0, timer: null, input: null, edit: null };
+    const healSrc = () => heal.input || (byId(heal.id) || {}).canvas || null;
     let healEditor = null;
     const HEAL_PREVIEW_MAX = 256;
 
     function healCleanup() {
-        heal.id = null;
+        heal.id = null; heal.input = null; heal.edit = null;
         clearTimeout(heal.timer);
         heal.resultRes = 0;
         heal.resultCanvas = null;
@@ -14991,7 +17787,7 @@ window.TRLE = window.TRLE || {};
         const P = disp.width;
         const ctx = disp.getContext('2d');
         ctx.clearRect(0, 0, P, P);
-        ctx.drawImage(el.canvas, 0, 0, P, P);
+        ctx.drawImage(healSrc(), 0, 0, P, P);
         const md = heal.maskCanvas.getContext('2d').getImageData(0, 0, P, P).data;
         const od = ctx.getImageData(0, 0, P, P);
         for (let i = 0; i < od.data.length; i += 4) {
@@ -15046,7 +17842,7 @@ window.TRLE = window.TRLE || {};
         const c = $('at-heal-before');
         const ctx = c.getContext('2d');
         ctx.clearRect(0, 0, c.width, c.height);
-        if (el) ctx.drawImage(el.canvas, 0, 0, c.width, c.height);
+        if (el) ctx.drawImage(healSrc(), 0, 0, c.width, c.height);
     }
 
     function healRenderResult() {
@@ -15353,19 +18149,16 @@ window.TRLE = window.TRLE || {};
         return res;
     }
 
-    function healComputeFill(size) {
-        const el = byId(heal.id);
-        const S = size || state.tileSize;
+    function healComputeFill(size) { return healFill(healSrc(), heal.maskCanvas, $('at-heal-method').value, size || state.tileSize); }
+    /* The fill as a pure function of (input, mask, method): what the layer runs on a rebuild. */
+    function healFill(src, mask, method, S) {
         const E = TRLE.Engine;
-        const method = $('at-heal-method').value;
-        if (method === 'brush') return healBrushFill(el.canvas, heal.maskCanvas, S);
-        if (method === 'patch') {
-            return healPatchFill(el.canvas, heal.maskCanvas, S);
-        }
-        const origTex = E.createTextureFromImage(el.canvas);
+        if (method === 'brush') return healBrushFill(src, mask, S);
+        if (method === 'patch') return healPatchFill(src, mask, S);
+        const origTex = E.createTextureFromImage(src);
         let out;
         if (method === 'texture') {
-            const maskTex = E.createTextureFromImage(softenMask(heal.maskCanvas, S));
+            const maskTex = E.createTextureFromImage(softenMask(mask, S));
             const grayFBO = E.createFBO(S, S);
             E.blit('desaturate', { u_texture: origTex, u_gamma: 1.0 }, grayFBO);
             const synthFBO = E.createFBO(S, S);
@@ -15382,7 +18175,7 @@ window.TRLE = window.TRLE || {};
             E.deleteFBO(grayFBO); E.deleteFBO(synthFBO); E.deleteFBO(outFBO);
             E.deleteTexture(maskTex);
         } else { // diffusion
-            const maskTex = E.createTextureFromImage(resizeCanvas(heal.maskCanvas, S, S));
+            const maskTex = E.createTextureFromImage(resizeCanvas(mask, S, S));
             const fbo = E.inpaintDiffusion(origTex, maskTex, S);
             out = E.fboToCanvas(fbo);
             E.deleteFBO(fbo);
@@ -15392,13 +18185,27 @@ window.TRLE = window.TRLE || {};
         return out;
     }
 
-    function openHealModal(id) {
+    /* Heal as a layer (LAYERS-PLAN phase 7): any number, in the Texture zone. The mask is the piece's (a 256 px
+       luma copy), the method is the recipe, and the fill re-runs on whatever is below it NOW, so a Heal over a
+       recoloured layer heals from the recoloured pixels. */
+    TRLE.Layers.register('heal', { zone: 'texture', mode: 'adjust', cost: (def, S) => (def.recipe.method === 'brush' ? 120 : 300) * (S / 1024) ** 2,
+        apply: (input, def, piece) => healFill(input, piece.mask, def.recipe.method, input.width),
+        edit: (el, def) => openHealModal(el.id, { def, piece: el.layers.find(p => p.lid === def.lid) }) });
+    function openHealModal(id, editing) {
+        const tile = byId(id), L = TRLE.Layers;
         heal.id = id;
+        heal.edit = editing ? { lid: editing.def.lid } : null;
+        heal.input = !hasLayers(tile) ? null : editing ? L.inputOf(tile, state.layerDefs, editing.def.lid) : L.inputFor(tile, state.layerDefs, { kind: 'heal', zone: 'texture' });
         heal.resultCanvas = null;
         $('at-heal-tileno').textContent = numberOf(id);
         const mc = heal.maskCanvas.getContext('2d');
         mc.fillStyle = '#000'; mc.fillRect(0, 0, 256, 256);
         if (healEditor) { healEditor.setErase(false); healEditor.resetHistory(); }
+        if (editing) {
+            $('at-heal-method').value = editing.def.recipe.method; tilePickerSync($('at-heal-method'));
+            if (editing.piece && editing.piece.mask) { mc.clearRect(0, 0, 256, 256); mc.drawImage(editing.piece.mask, 0, 0, 256, 256); }
+        }
+        setEditNote('at-modal-heal', editing ? '✏️ Editing this tile\'s Heal layer: Apply replaces it.' : '');
         updateHealHint();
         heal.resultCanvas = null;
         heal.resultRes = 0;
@@ -15484,7 +18291,7 @@ window.TRLE = window.TRLE || {};
             canvas: $('at-heal-canvas'),
             mode: 'luma',
             getMask: () => heal.maskCanvas,
-            getSource: () => { const el = byId(heal.id); return el ? el.canvas : null; },
+            getSource: () => healSrc(),
             active: () => heal.id !== null && $('at-modal-heal').style.display !== 'none',
             onChange: () => { heal.resultCanvas = null; heal.resultRes = 0; healRenderPaint(); },
             onStrokeEnd: healSchedulePreview
@@ -15495,19 +18302,24 @@ window.TRLE = window.TRLE || {};
             healRenderPaint();
             healSchedulePreview();
         });
-        $('at-heal-save').addEventListener('click', () => {
+        $('at-heal-save').addEventListener('click', async () => {
             if (heal.id === null) return;
-            const el = byId(heal.id);
-            // The live preview may be a capped-resolution render, so only reuse it
-            // when it happens to already be full size.
-            const result = (heal.resultCanvas && heal.resultRes === state.tileSize)
-                ? heal.resultCanvas : healComputeFill(state.tileSize);
-            drawReplace(el.canvas, result);
-            el.edited = true;   // canvas now diverges from original → must be snapshotted
+            const el = byId(heal.id), L = TRLE.Layers, editing = heal.edit;
+            if (!editing && healMaskIsEmpty()) { closeModal(); showToast('Nothing painted, so nothing to heal', 'info'); return; }
+            const recipe = { method: $('at-heal-method').value }, mask = L.imm(cloneCanvas(heal.maskCanvas));
             closeModal();
+            if (editing && state.layerDefs[editing.lid]) {
+                const old = el.layers.find(p => p.lid === editing.lid);
+                L.update(state.layerDefs, editing.lid, { recipe });
+                el.layers = el.layers.map(p => p === old ? Object.assign({}, old, { mask }) : p);
+                refreshTransitions();
+                await layersCommit([el], 'Edit heal');
+                showToast('Heal updated', 'success');
+                return;
+            }
+            L.add(state.layerDefs, [el], { kind: 'heal', name: 'Heal', recipe }, [{ mask }]);
             refreshTransitions();
-            renderGrid();
-            pushHistory('Heal');
+            await layersCommit([el], 'Heal');
             showToast('Tile healed', 'success');
         });
     }
@@ -15518,27 +18330,51 @@ window.TRLE = window.TRLE || {};
     /* Owns the organic panel's reroll seed; readOrgPanel takes it back. */
     let fadeOrg = null;
 
-    function fadeCleanup() { fade.id = null; }
+    function fadeCleanup() { fade.id = null; fade.input = null; fade.edit = null; }
 
-    function fadeBuildMask(P) {
-        const amount = parseInt($('at-fade-amount').value) / 100;
-        const hardness = parseInt($('at-fade-edgehard').value) / 100;
-        const shape = $('at-fade-shape').value;
-        if (shape === 'custom') return softenMask(fade.maskCanvas, P);
-        /* Same recipe object both builders take, read through the shared panel.
-           `dir` goes through buildTopologyMask, which has honoured `org` on its
+    /* The mask for a fade recipe: the same recipe object both builders take. A painted shape is
+       the layer's own mask (a 256 px luma canvas), softened up to the tile size. */
+    function fadeMaskFrom(r, P, custom) {
+        if (r.shape === 'custom') return softenMask(custom, P);
+        /* `dir` goes through buildTopologyMask, which has honoured `org` on its
            ratio branch since the single-tile organic fix, so that shape needed no
            new maths at all. */
-        const org = readOrgPanel('at-fadeorg', fadeOrg ? fadeOrg.seed : 1);
-        if (shape === 'dir') return buildTopologyMask(P, $('at-fade-dir').value, 1 - amount, hardness, org);
-        return buildEdgeVignetteMask(P, amount, hardness, org);   // 'edges'
+        if (r.shape === 'dir') return buildTopologyMask(P, r.dir, 1 - r.amount, r.hardness, r.org);
+        return buildEdgeVignetteMask(P, r.amount, r.hardness, r.org);   // 'edges'
+    }
+    const FADE_IDS = ['at-fade-shape', 'at-fade-dir', 'at-fade-amount', 'at-fade-edgehard', 'at-fade-include'];
+    const fadeCtlIds = () => FADE_IDS.concat([...document.querySelectorAll('#at-modal-fade [id^="at-fadeorg-"]')]
+        .filter(e => /^(INPUT|SELECT)$/.test(e.tagName)).map(e => e.id));
+    function fadeRecipeNow() {
+        return {
+            shape: $('at-fade-shape').value, dir: $('at-fade-dir').value,
+            amount: parseInt($('at-fade-amount').value) / 100, hardness: parseInt($('at-fade-edgehard').value) / 100,
+            org: readOrgPanel('at-fadeorg', fadeOrg ? fadeOrg.seed : 1),
+            seed: fadeOrg ? fadeOrg.seed : 1, include: $('at-fade-include').checked, controls: ctlSnap(fadeCtlIds())
+        };
+    }
+    function fadeBuildMask(P) { return fadeMaskFrom(fadeRecipeNow(), P, fade.maskCanvas); }
+    TRLE.Layers.register('fade', { zone: 'finish', mode: 'adjust', cost: (def, S) => (def.recipe.shape === 'dir' && def.recipe.org ? 210 : def.recipe.org ? 50 : 40) * (S / 1024) ** 2,   // measured at 1024: edges 37 ms, organic 49, slope + organic 207
+        apply: (input, def, piece) => applyAlphaFade(input, fadeMaskFrom(def.recipe, input.width, piece.mask)),
+        edit: (el, def) => openFadeModal(el.id, { def, piece: el.layers.find(p => p.lid === def.lid) }) });
+    const fadeZone = () => ($('at-fade-include').checked ? 'finish' : 'texture');
+    /* What the fade is shown on: a layer being edited sees the composite below it; a new one, the composite below
+       where it would sit (so a Fade over text covers the text, a Fade under it does not). */
+    function fadeInput(el) {
+        const L = TRLE.Layers;
+        if (!hasLayers(el)) return el.canvas;
+        if (fade.edit) {
+            if (L.zoneOf(state.layerDefs[fade.edit.lid]) === fadeZone()) return L.inputOf(el, state.layerDefs, fade.edit.lid);
+            const rest = el.layers.filter(q => q.lid !== fade.edit.lid);
+            return rest.length ? L.inputFor(Object.assign({}, el, { layers: rest }), state.layerDefs, { kind: 'fade', zone: fadeZone() }) : el.under;
+        }
+        return L.inputFor(el, state.layerDefs, { kind: 'fade', zone: fadeZone() });
     }
 
     function fadePreview() {
         if (fade.id === null) return;
         const P = 256;
-        const el = byId(fade.id);
-        const tile = resizeCanvas(el.canvas, P, P);
+        const tile = resizeCanvas(fade.input || byId(fade.id).canvas, P, P);
         const faded = applyAlphaFade(tile, fadeBuildMask(P));
         const cv = $('at-fade-preview');
         const ctx = cv.getContext('2d');
@@ -15557,12 +18393,27 @@ window.TRLE = window.TRLE || {};
         fadePreview();
     }
 
-    function openFadeModal(id) {
+    /* `editing` ({ def, piece }) reopens a Fade layer: its controls and its painted mask come back, and Apply
+       replaces it. Fades stack, so a plain open always adds a new one. */
+    function openFadeModal(id, editing) {
+        const el = byId(id);
         fade.id = id;
+        fade.edit = editing ? { lid: editing.def.lid } : null;
         $('at-fade-tileno').textContent = numberOf(id);
         const mc = fade.maskCanvas.getContext('2d');
         mc.fillStyle = '#000'; mc.fillRect(0, 0, fade.maskCanvas.width, fade.maskCanvas.height);
         if (fadeEditor) { fadeEditor.setErase(false); fadeEditor.resetHistory(); }
+        $('at-fade-include').checked = true;
+        if (editing) {
+            ctlRestore(editing.def.recipe.controls);
+            if (fadeOrg) fadeOrg.seed = editing.def.recipe.seed || 1;
+            if (editing.piece && editing.piece.mask) { mc.clearRect(0, 0, 256, 256); mc.drawImage(editing.piece.mask, 0, 0, 256, 256); }
+            // The tick follows where the layer sits now: a panel move may have changed it (LAYERS-PLAN phase 14).
+            $('at-fade-include').checked = TRLE.Layers.zoneOf(editing.def) === 'finish';
+        }
+        $('at-fade-include-row').style.display = hasContentLayers(el) ? '' : 'none';
+        fade.input = fadeInput(el);
+        setEditNote('at-modal-fade', editing ? '✏️ Editing this tile\'s Fade layer: Apply replaces it.' : '');
         fadeSetShape();
         openModal('fade');
         fadePreview();
@@ -15581,30 +18432,41 @@ window.TRLE = window.TRLE || {};
         $('at-fade-dir').addEventListener('change', fadePreview);
         $('at-fade-amount').addEventListener('input', function () { $('at-fade-amount-val').textContent = this.value; fadePreview(); });
         $('at-fade-edgehard').addEventListener('input', function () { $('at-fade-edgehard-val').textContent = this.value; fadePreview(); });
+        $('at-fade-include').addEventListener('change', () => { const el = byId(fade.id); if (el) fade.input = fadeInput(el); fadePreview(); });
         buildMaskToolbar($('at-fade-tools'), 'at-fade', { brushMax: 96 });
         fadeEditor = createMaskEditor('at-fade', {
             canvas: $('at-fade-preview'),
             mode: 'luma',
             getMask: () => fade.maskCanvas,
-            getSource: () => { const el = byId(fade.id); return el ? el.canvas : null; },
+            getSource: () => fade.input || (byId(fade.id) || {}).canvas || null,
             active: () => fade.id !== null && $('at-fade-shape').value === 'custom'
                           && $('at-modal-fade').style.display !== 'none',
             onChange: fadePreview
         });
-        $('at-fade-apply').addEventListener('click', () => {
+        $('at-fade-apply').addEventListener('click', async () => {
             if (fade.id === null) return;
-            const el = byId(fade.id);
-            const S = state.tileSize;
-            const faded = applyAlphaFade(el.canvas, fadeBuildMask(S));
-            const ctx = el.canvas.getContext('2d');
-            ctx.clearRect(0, 0, S, S);
-            ctx.drawImage(faded, 0, 0);
-            el.edited = true;
+            const el = byId(fade.id), L = TRLE.Layers;
+            const recipe = fadeRecipeNow(), zone = fadeZone(), editing = fade.edit;
+            const mask = recipe.shape === 'custom' ? L.imm(cloneCanvas(fade.maskCanvas)) : null;
             closeModal();
+            if (editing && state.layerDefs[editing.lid]) {
+                // Edit in place: a new definition (never mutated) and a new piece; a changed zone moves the piece.
+                const old = el.layers.find(p => p.lid === editing.lid), moved = L.zoneOf(state.layerDefs[editing.lid]) !== zone;
+                const def = L.update(state.layerDefs, editing.lid, { recipe, zone });
+                const piece = Object.assign({}, old, { mask });
+                if (!mask) delete piece.mask;
+                if (moved) { el.layers = el.layers.filter(p => p !== old); L.insertPiece(el, def, piece, state.layerDefs); }
+                else el.layers = el.layers.map(p => p === old ? piece : p);
+                refreshTransitions();
+                await layersCommit([el], 'Edit fade');
+                showToast('Fade updated', 'success');
+                return;
+            }
+            const lid = L.add(state.layerDefs, [el], { kind: 'fade', name: 'Fade to Transparent', recipe, zone }, [mask ? { mask } : {}]);
             refreshTransitions();
-            renderGrid();
-            pushHistory('Fade to transparent');
+            await layersCommit([el], 'Fade to transparent');
             showToast('Faded to transparent', 'success');
+            return lid;
         });
     }
 
@@ -15982,7 +18844,7 @@ window.TRLE = window.TRLE || {};
         $('at-hg-huewidth').value = src.hueWidth != null ? src.hueWidth : 30;
         hgSyncSource();
         const e = p.edge || {};
-        $('at-hg-profile').value = String(e.profile ?? 0);
+        $('at-hg-profile').value = String(e.profile ?? 0); tilePickerSync($('at-hg-profile'));
         $('at-hg-band').value = Math.round((e.band ?? TRLE.Engine.heightEdgeBandFor(state.tileSize)) * 100);
         $('at-hg-amount').value = Math.round((e.amount ?? 1) * 100);
         $('at-hg-lift').value = Math.round((p.lift ?? -0.4) * 100);
@@ -16054,10 +18916,10 @@ window.TRLE = window.TRLE || {};
         const preset = Object.assign({}, resolvePreset(el), {
             heightStrength: p.strength, heightBlur: p.blur, heightInvert: p.invert,
             heightSource: hgSourceOpts(p.source),
-            heightEdge: p.edge, alphaFlatten: canvasHasAlpha(el.canvas),
+            heightEdge: p.edge, alphaFlatten: canvasHasAlpha(mapSourceOf(el)),
             heightPaint: p.lift != null ? { mask: hg.mask, lift: p.lift } : null
-        });
-        const tex = TRLE.Engine.createTextureFromImage(el.canvas);
+        }, textReliefExtra(el, mapSourceOf(el)));
+        const tex = TRLE.Engine.createTextureFromImage(mapSourceOf(el));
         const maps = TRLE.Engine.generateMaps(tex, S, S, preset, { height: true });
         const out = maps.height ? TRLE.Engine.fboToCanvas(maps.height) : null;
         Object.values(maps).forEach(f => f && TRLE.Engine.deleteFBO(f));
@@ -16233,6 +19095,7 @@ window.TRLE = window.TRLE || {};
         ['at-hg-strength', 'at-hg-blur', 'at-hg-band', 'at-hg-amount', 'at-hg-lift']
             .forEach(k => $(k).addEventListener('input', hgSchedulePreview));
         $('at-hg-profile').addEventListener('change', hgSchedulePreview);
+        attachTilePicker($('at-hg-profile'), { text: true, title: 'Profile', ...previewByValue($('at-hg-profile'), hgPreview) });
         $('at-hg-source').addEventListener('change', () => { hgSyncSource(); hgSchedulePreview(); });
         $('at-hg-target').addEventListener('input', () => { hgSideNote(); hgSchedulePreview(); });
         ['at-hg-srctol', 'at-hg-hue', 'at-hg-huewidth'].forEach(k =>
@@ -16759,6 +19622,20 @@ window.TRLE = window.TRLE || {};
 
     function setupAnchorModal() {
         $('at-anchor-preset').addEventListener('change', function () { anchorSeed(this.value); });
+        /* A preset seeds the boundary (axis, swap, anchors). Preview: save those, seed,
+           render; the end puts them back (HOVER-PREVIEW-PLAN phase 3, D4.3). */
+        {
+            let saved = null;
+            attachTilePicker($('at-anchor-preset'), { text: true, title: 'Boundary', preview(v) {
+                if (!saved) saved = { axis: anchorTr.axis, swap: anchorTr.swap, anchors: JSON.parse(JSON.stringify(anchorTr.anchors)), sel: $('at-anchor-axis').value };
+                anchorSeed(v);
+            }, previewEnd() {
+                if (!saved) return;
+                Object.assign(anchorTr, { axis: saved.axis, swap: saved.swap, anchors: saved.anchors });
+                $('at-anchor-axis').value = saved.sel; saved = null;
+                anchorRender();
+            } });
+        }
         $('at-anchor-axis').addEventListener('change', function () {
             anchorTr.axis = this.value;
             anchorTr.anchors = this.value === 'h' ? [{ x: 0, y: 0.5 }, { x: 1, y: 0.5 }] : [{ x: 0.5, y: 0 }, { x: 0.5, y: 1 }];
@@ -16847,6 +19724,26 @@ window.TRLE = window.TRLE || {};
         heightTr.hkey = null;   // detail/contrast changed → force a height regen
     }
 
+    /* Hover preview of a PRESET (HOVER-PREVIEW-PLAN D4.2, the item phase 3 left for later, done 2026-10-07):
+       a preset writes seven controls, so the preview saves the whole recipe and the height cache, applies
+       the preset, renders, and puts everything back. Curve and drift are untouched by a preset; the
+       snapshot carries them anyway because htLoadParams restores the recipe as one piece. "Custom" (no
+       values of its own) previews the committed controls. The assign label follows on commit only. */
+    let htHover = null;
+    const htPresetPreview = {
+        preview(v) {
+            if (!htHover) htHover = { p: htCollectParams(), hcache: heightTr.hcache, hkey: heightTr.hkey };
+            if (HEIGHT_TRANS_PRESETS[v]) htApplyPreset(v); else htLoadParams(htHover.p);
+            htRender();
+        },
+        previewEnd() {
+            if (!htHover) return;
+            const sn = htHover; htHover = null;
+            htLoadParams(sn.p); heightTr.hcache = sn.hcache; heightTr.hkey = sn.hkey;
+            htUpdateAssign(); htCurveRender(); htDriftRender(); htRender();
+        },
+    };
+
     /* Refresh the "Assign … material" label/state for the selected preset. */
     function htUpdateAssign() {
         const pr = HEIGHT_TRANS_PRESETS[$('at-ht-preset').value];
@@ -16857,7 +19754,7 @@ window.TRLE = window.TRLE || {};
     }
 
     /* A manual tweak detaches from the named preset. */
-    function htMarkCustom() { if ($('at-ht-preset').value !== 'custom') { $('at-ht-preset').value = 'custom'; htUpdateAssign(); } }
+    function htMarkCustom() { if ($('at-ht-preset').value !== 'custom') { $('at-ht-preset').value = 'custom'; tilePickerSync($('at-ht-preset')); htUpdateAssign(); } }
 
     /* Generate a height field (0..1 grayscale) from a diffuse canvas — the same
        desaturate → blur → simpleHeight path the engine uses for material maps, but
@@ -17066,6 +19963,7 @@ window.TRLE = window.TRLE || {};
         $('at-ht-drift-mode').value = 'off'; $('at-ht-drift-axis').value = 'h';
         $('at-ht-assign').checked = true;
         $('at-ht-preset').value = 'sand_joints';   // headline use case as the starting point
+        tilePickerSync($('at-ht-preset'));
         htApplyPreset('sand_joints'); htUpdateAssign();
         $('at-ht-add').textContent = '➕ Add Transition Tile';
         openModal('heighttrans');
@@ -17108,7 +20006,7 @@ window.TRLE = window.TRLE || {};
     /* Restore the controls + layer state from a stored recipe. */
     function htLoadParams(hp) {
         const set = (id, v) => { $(id).value = v; const l = $(id + '-val'); if (l) l.textContent = v; };
-        $('at-ht-preset').value = hp.preset || 'custom';
+        $('at-ht-preset').value = hp.preset || 'custom'; tilePickerSync($('at-ht-preset'));
         $('at-ht-source').value = hp.source; $('at-ht-fill').value = hp.fill;
         set('at-ht-level', hp.level); set('at-ht-hardness', hp.hardness);
         set('at-ht-detail', hp.detail); set('at-ht-contrast', hp.contrast);
@@ -17132,6 +20030,7 @@ window.TRLE = window.TRLE || {};
             const o = document.createElement('option'); o.value = k; o.textContent = HEIGHT_TRANS_PRESETS[k].label; presetSel.appendChild(o);
         });
         presetSel.addEventListener('change', function () { htApplyPreset(this.value); htUpdateAssign(); htRender(); });
+        attachTilePicker(presetSel, { text: true, title: 'Preset', ...htPresetPreview });
 
         // Core knobs mark the recipe "custom"; organic/curve/drift are separate layers.
         [['at-ht-level', 'at-ht-level-val'], ['at-ht-hardness', 'at-ht-hardness-val'],
@@ -17367,7 +20266,7 @@ window.TRLE = window.TRLE || {};
         const d = $('at-ov-mode');
         d.value = 'all';
         $('at-ov-sample').value = 'overlay';
-        $('at-ov-blend').value = 'normal';
+        $('at-ov-blend').value = 'normal'; tilePickerSync($('at-ov-blend'));
         $('at-ov-target').value = '#ffffff';
         $('at-ov-selinvert').checked = false;
         [['tolerance', 25], ['hue', 30], ['huewidth', 30], ['satmin', 30], ['valmin', 20],
@@ -17408,6 +20307,7 @@ window.TRLE = window.TRLE || {};
         $('at-ov-mode').addEventListener('change', ovSetMode);
         $('at-ov-sample').addEventListener('change', ovSetMode);
         $('at-ov-blend').addEventListener('change', ovPreview);
+        attachTilePicker($('at-ov-blend'), { text: true, title: 'Blend', ...previewByValue($('at-ov-blend'), ovPreview) });
         $('at-ov-target').addEventListener('input', ovPreview);
         $('at-ov-selinvert').addEventListener('change', ovPreview);
         ['tolerance', 'hue', 'huewidth', 'satmin', 'valmin', 'threshold',
@@ -17610,6 +20510,18 @@ window.TRLE = window.TRLE || {};
             tgRender();
         }));
         $('at-tg-preset').addEventListener('change', function () { tgSeed(this.value); tgRender(); });
+        {
+            let saved = null;
+            attachTilePicker($('at-tg-preset'), { text: true, title: 'Boundary', preview(v) {
+                if (!saved) saved = { axis: tg.axis, swap: tg.swap, anchors: JSON.parse(JSON.stringify(tg.anchors)), sel: $('at-tg-axis').value };
+                tgSeed(v); tgRender();
+            }, previewEnd() {
+                if (!saved) return;
+                Object.assign(tg, { axis: saved.axis, swap: saved.swap, anchors: saved.anchors });
+                $('at-tg-axis').value = saved.sel; saved = null;
+                tgRender();
+            } });
+        }
         $('at-tg-axis').addEventListener('change', function () {
             tg.axis = this.value;
             tg.anchors = this.value === 'h' ? [{ x: 0, y: 0.5 }, { x: 1, y: 0.5 }] : [{ x: 0.5, y: 0 }, { x: 0.5, y: 1 }];
@@ -17809,21 +20721,329 @@ window.TRLE = window.TRLE || {};
         return t;
     }
 
+    /* ============ MOVING A TILE'S PIXELS (TRANSFORMS-PLAN D2) ============
+       A tile carries more than el.canvas: every canvas below is registered to
+       its pixels, so any edit that MOVES pixels moves all of them, or the glow,
+       the metal region or a PSD's relief is left where the pixels used to be.
+       Until 2026-10-02 Rotate / Flip / Offset moved only the canvas and
+       mapSource. `move.image` moves a picture, `move.mask` a region mask
+       (defaults to image), `move.normal` an encoded normal map, whose VECTORS
+       have to turn as well (defaults to image). New pixel-registered fields go
+       here. Every reference is replaced, never drawn into: undo snapshots and
+       duplicates hold their own clones, but a bag may be shared mid-call. */
+    function moveTileLayers(el, move, defer) {
+        const img = move.image, mask = move.mask || img, nrm = move.normal || img;
+        // A tile with layers moves its STACK and rebuilds, so the composite stays derived
+        // (LAYERS-PLAN D5; the xf composition for re-edited content comes with Text, phase 3).
+        // `defer`: the caller rebuilds with layersSettle, dimmed when slow (LAYERS-PLAN phase 15).
+        if (hasLayers(el)) TRLE.Layers.move(el, state.layerDefs, move, defer);
+        else drawReplace(el.canvas, img(el.canvas));
+        if (el.mapSource) el.mapSource = img(el.mapSource);
+        if (el.importedMaps) {
+            const bag = {};
+            for (const [mt, c] of Object.entries(el.importedMaps)) bag[mt] = c ? (mt === 'normal' ? nrm : img)(c) : c;
+            el.importedMaps = bag;
+        }
+        if (el.emissive) el.emissive = img(el.emissive);
+        if (Array.isArray(el.matLayers)) el.matLayers = el.matLayers.map(L => L.mask ? Object.assign({}, L, { mask: mask(L.mask) }) : L);
+        if (el.hgParams && el.hgParams.mask) el.hgParams = Object.assign({}, el.hgParams, { mask: mask(el.hgParams.mask) });
+        if (el.textRelief) {
+            const r = el.textRelief, m = c => c ? mask(c) : null;
+            el.textRelief = { up: m(r.up), down: m(r.down), hole: m(r.hole), floors: r.floors };
+        }
+        if (el.mapPatches) {   // a coverage-carrying map per type: moved as an image, a normal map's vectors turned
+            const bag = {};
+            for (const [mt, c] of Object.entries(el.mapPatches)) bag[mt] = c ? (mt === 'normal' ? nrm : img)(c) : c;
+            el.mapPatches = bag;
+        }
+    }
+
+    /* Turn an encoded normal map's vectors by an orthogonal 2x2 `m` (image
+       space, y down; rows [[a, b], [c, d]]), in place on a fresh canvas. The
+       green channel runs against image y in the tool's own convention (Flip
+       Normal Y off), hence the sign. Entries are 0 / ±1, so this is a byte
+       permutation: negating an encoded value is exactly 255 - v. */
+    const NORMAL_Y_SIGN = -1;
+    function turnNormals(c, m) {
+        const ctx = c.getContext('2d');
+        const id = ctx.getImageData(0, 0, c.width, c.height), d = id.data, s = NORMAL_Y_SIGN;
+        const enc = v => Math.round((v + 1) * 127.5);
+        for (let i = 0; i < d.length; i += 4) {
+            const x = d[i] / 127.5 - 1, y = s * (d[i + 1] / 127.5 - 1);
+            d[i] = enc(m[0][0] * x + m[0][1] * y);
+            d[i + 1] = enc(s * (m[1][0] * x + m[1][1] * y));
+        }
+        ctx.putImageData(id, 0, 0);
+        return c;
+    }
+    /* The moves a content layer can follow, by name: `piece.xf` is the list applied to a tile
+       since the layer was made, so re-editing renders the recipe, crops the cell, and turns
+       it the way the tile was turned. A move with no name (Free Transform, Perspective,
+       Distort) leaves the piece's pixels moved and marks it `xfLost`: re-editing redraws
+       that tile unturned (LAYERS-PLAN D5, phase 9 decides for Distort). */
+    const XF_OPS = { rot: c => rotateTile90(c), fh: c => flipTile(c, true), fv: c => flipTile(c, false), off: c => offsetTileHalf(c) };
+    /* A resampled move (Free Transform, Perspective, Distort wave and ripple) is a descriptor `{ w: { inv, S, filter, edge, ss, disp? } }`:
+       the inverse map, the tile size it was written for, and Engine.warp's settings, which replay exactly (LAYERS-PLAN phase 9). A
+       ripple names its seed and size, not its map. Distort driven by another TILE has no descriptor (its map is that tile's pixels). */
+    const XF_FILTERS = ['nearest', 'bilinear', 'bicubic', 'lanczos'], XF_EDGES = ['wrap', 'clamp', 'transparent', 'mirror'];
+    function warpFromDesc(c, w, normal) {
+        const o = { filter: w.filter, edge: w.edge, ss: w.ss };
+        if (normal) Object.assign(o, { normal: true, nflip: NORMAL_Y_SIGN });
+        if (w.disp) {
+            const base = w.disp.mode === 'ripple' ? { mode: 'map', map: dsNoiseMapFor(w.disp.rsize, w.disp.seed), strength: w.disp.strength }
+                : w.disp.mode === 'field' ? { mode: 'field', field: TRLE.Liquify.decodeGrid(w.disp), fieldN: w.disp.n } : w.disp;
+            o.disp = Object.assign({}, base, { period: c.width, ampScale: c.width / w.S });
+        }
+        return warpCanvas(c, c.width, c.height, invForSize(w.inv, w.S, c.width), o);
+    }
+    function applyXf(canvas, xf) {
+        let c = canvas;
+        for (const op of xf || []) c = typeof op === 'string' ? XF_OPS[op](c) : warpFromDesc(c, op.w);
+        return c;
+    }
+    /* The same moves over an encoded NORMAL map (a sticker's own, STICKERS-PLAN D7): the vectors turn with the pixels,
+       by the move's matrix for a right angle or a flip and by the map's own Jacobian for a resampled move. */
+    const XF_TURNS = { rot: () => TURN_ROT90, fh: () => TURN_FLIPH, fv: () => TURN_FLIPV };
+    function applyXfNormal(canvas, xf) {
+        let c = canvas;
+        for (const op of xf || []) c = typeof op === 'string' ? (XF_TURNS[op] ? turnNormals(XF_OPS[op](c), XF_TURNS[op]()) : XF_OPS[op](c)) : warpFromDesc(c, op.w, true);
+        return c;
+    }
+    /* A saved descriptor is untrusted input: only well-formed numbers and known names get through. */
+    function xfEntryClean(o) {
+        if (typeof o === 'string') return XF_OPS[o] ? o : null;
+        const w = o && o.w;
+        if (!w || typeof w !== 'object') return null;
+        const num = v => typeof v === 'number' && isFinite(v) && Math.abs(v) < 1e7;
+        const row = (r, n) => Array.isArray(r) && r.length === n && r.every(num);
+        const inv = w.inv;
+        if (!inv || !row(inv.m0, 3) || !row(inv.m1, 3) || (inv.m2 != null && !row(inv.m2, 3))) return null;
+        if (!Number.isInteger(w.S) || w.S < 1 || w.S > 8192 || !XF_FILTERS.includes(w.filter) || !XF_EDGES.includes(w.edge) || !Number.isInteger(w.ss) || w.ss < 1 || w.ss > 4) return null;
+        const out = { inv: { m0: inv.m0.slice(), m1: inv.m1.slice() }, S: w.S, filter: w.filter, edge: w.edge, ss: w.ss };
+        if (inv.m2) out.inv.m2 = inv.m2.slice();
+        const d = w.disp;
+        if (d != null) {
+            if (d.mode === 'wave' && ['sine', 'triangle', 'square'].includes(d.shape) && num(d.phase) && row(d.amp, 2) && row(d.cycles, 2))
+                out.disp = { mode: 'wave', shape: d.shape, phase: d.phase, amp: d.amp.slice(), cycles: d.cycles.slice() };
+            else if (d.mode === 'radial' && DS_RADIAL_TYPES.includes(d.type) && Number.isInteger(d.sub) && d.sub >= 0 && d.sub <= 2
+                     && [d.amount, d.ridges, d.cx, d.cy, d.radius].every(num) && d.radius > 0 && d.radius <= 1)
+                out.disp = { mode: 'radial', type: d.type, sub: d.sub, amount: d.amount, ridges: d.ridges, cx: d.cx, cy: d.cy, radius: d.radius };
+            else if (d.mode === 'field' && TRLE.Liquify.decodeGrid(d)) out.disp = { mode: 'field', n: d.n, data: d.data };
+            else if (d.mode === 'ripple' && ['large', 'medium', 'small'].includes(d.rsize) && Number.isInteger(d.seed) && num(d.strength))
+                out.disp = { mode: 'ripple', rsize: d.rsize, seed: d.seed, strength: d.strength };
+            else return null;
+        }
+        return { w: out };
+    }
+    const warpDesc = (inv, S, opts, disp) => ({ w: Object.assign({ inv: JSON.parse(JSON.stringify(inv)), S, filter: opts.filter, edge: opts.edge, ss: opts.ss }, disp ? { disp } : {}) });
+    const TURN_ROT90 = [[0, -1], [1, 0]], TURN_FLIPH = [[-1, 0], [0, 1]], TURN_FLIPV = [[1, 0], [0, -1]];
+
+    /* The GPU resampler over a canvas (Engine.warp): `inv` maps an output pixel
+       to a source pixel. Returns a new outW x outH canvas. */
+    function warpCanvas(src, outW, outH, inv, opts) {
+        const E = TRLE.Engine;
+        const tex = E.createTexture(src.width, src.height, src);
+        // Distort's map is a canvas here and a texture for the engine.
+        const mapTex = opts && opts.disp && opts.disp.map ? E.createTexture(opts.disp.map.width, opts.disp.map.height, opts.disp.map) : null;
+        // Liquify's field: RGBA32F texels (fractions of the tile) and its side, from the modal or a saved grid.
+        const fldTex = opts && opts.disp && opts.disp.mode === 'field' && opts.disp.field ? E.createFieldTexture(opts.disp.fieldN, opts.disp.field) : null;
+        const o = mapTex || fldTex ? Object.assign({}, opts, { disp: Object.assign({}, opts.disp, mapTex ? { mapTexture: mapTex } : {}, fldTex ? { fieldTexture: fldTex } : {}) }) : opts;
+        const fbo = E.warp(tex, src.width, src.height, outW, outH, inv, o);
+        const out = E.fboToCanvas(fbo);
+        E.deleteFBO(fbo); E.deleteTexture(tex);
+        if (mapTex) E.deleteTexture(mapTex);
+        if (fldTex) E.deleteTexture(fldTex);
+        return out;
+    }
+    /* Slope Blur (WEATHERING-PLAN phase 1) on canvases. `driver` is any canvas,
+       read through its red channel and drawn to the source's size when it
+       differs; opts are Engine.slopeBlur's. */
+    function slopeBlurCanvas(src, driver, opts) {
+        const E = TRLE.Engine, w = src.width, h = src.height;
+        let d = driver;
+        if (d.width !== w || d.height !== h) {
+            d = document.createElement('canvas'); d.width = w; d.height = h;
+            d.getContext('2d').drawImage(driver, 0, 0, w, h);
+        }
+        const st = E.createTexture(w, h, src), dt = E.createTexture(w, h, d);
+        const fbo = E.slopeBlur(st, dt, w, h, opts);
+        const out = E.fboToCanvas(fbo);
+        E.deleteFBO(fbo); E.deleteTexture(st); E.deleteTexture(dt);
+        return out;
+    }
+    /* ============ SCATTER (WEATHERING-PLAN phase 3) ============
+       Soft patches cut from one texture and stamped over another (or over the
+       same one): moss, dirt, plaster, chips. CPU and Canvas2D like Text: a stamp
+       is a drawImage with a transform and a blend operation, so it is exactly
+       repeatable in a given browser.
+       scatterPlan(S, o) is the SEEDED, pure part: where each stamp goes, how
+       big, how it is turned, where its patch is cut from, and the random shape of
+       its edge. Drawing never calls the generator, so a plan can be written by
+       hand (the validator does) or replayed. Positions are tile px in [0, S).
+       With Wrap a stamp that crosses an edge is drawn again on the far side, so
+       the result tiles when the base does. The patch itself is cut with wrap
+       too, so a patch near the source's edge is not a hole.
+       o: { count, size (% of S), sizeVar 0..100, rot (+- degrees), soft 0..100,
+            rough 0..100, opacity 0..100, blend, seed, wrap }. */
+    function scatterPlan(S, srcW, srcH, o) {
+        const rng = mulberry32((o.seed >>> 0) || 1), plan = [];
+        const n = Math.max(0, Math.min(1000, Math.round(o.count || 0)));
+        const D0 = Math.max(4, (o.size || 10) / 100 * S), v = Math.max(0, Math.min(1, (o.sizeVar || 0) / 100));
+        for (let i = 0; i < n; i++) {
+            plan.push({
+                x: rng() * S, y: rng() * S,
+                sx: rng() * srcW, sy: rng() * srcH,
+                d: Math.max(4, Math.round(D0 * (1 - v * rng()))),
+                rot: (rng() * 2 - 1) * (o.rot || 0) * Math.PI / 180,
+                k1: 2 + Math.floor(rng() * 3), k2: 5 + Math.floor(rng() * 5),
+                p1: rng() * 6.2832, p2: rng() * 6.2832, h1: rng(), h2: rng()
+            });
+        }
+        return plan;
+    }
+    /* One stamp's pixels: a d x d crop of `src` centred on (sx, sy), wrapped, with
+       an alpha that is 1 in the middle and falls to 0 at a wobbly edge. */
+    function scatterPatch(src, st, soft, rough) {
+        const d = st.d, c = document.createElement('canvas');
+        c.width = c.height = d;
+        const x = c.getContext('2d'), W = src.width, H = src.height;
+        const ox = Math.round(st.sx - d / 2), oy = Math.round(st.sy - d / 2);
+        for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) {
+            const dx = -ox + i * W, dy = -oy + j * H;
+            if (dx > d || dy > d || dx + W < 0 || dy + H < 0) continue;
+            x.drawImage(src, dx, dy);
+        }
+        const id = x.getImageData(0, 0, d, d), px = id.data;
+        const sf = Math.max(0, Math.min(1, soft / 100)), rg = Math.max(0, Math.min(1, rough / 100));
+        for (let y = 0; y < d; y++) for (let X = 0; X < d; X++) {
+            const u = (X + 0.5) / d * 2 - 1, w = (y + 0.5) / d * 2 - 1, r = Math.hypot(u, w), a = Math.atan2(w, u);
+            const R = 1 - rg * 0.4 * (st.h1 * Math.cos(a * st.k1 + st.p1) * 0.6 + st.h2 * Math.cos(a * st.k2 + st.p2) * 0.4 + 0.3);
+            const inner = R * (1 - sf);
+            let m = r >= R ? 0 : r <= inner ? 1 : 1 - (r - inner) / Math.max(1e-6, R - inner);
+            if (m > 0 && m < 1) m = m * m * (3 - 2 * m);
+            const i = (y * d + X) * 4 + 3;
+            px[i] = Math.round(px[i] * m);
+        }
+        x.putImageData(id, 0, 0);
+        return c;
+    }
+    const SCATTER_BLENDS = { normal: 'source-over', multiply: 'multiply', overlay: 'overlay', lighten: 'lighten', darken: 'darken' };
+    /* `base` is cloned, never touched, so `src` may be `base` itself (patches of
+       the tile over the tile): the stamps read the untouched base, never one an
+       earlier stamp has drawn on. */
+    function scatterCanvas(base, src, o, plan) {
+        const S = base.width, out = cloneCanvas(base);
+        const alpha = Math.max(0, Math.min(1, (o.opacity == null ? 100 : o.opacity) / 100));
+        if (alpha <= 0) return out;
+        const from = src;
+        const stamps = plan || scatterPlan(S, from.width, from.height, o);
+        if (!stamps.length) return out;
+        const ctx = out.getContext('2d');
+        ctx.globalAlpha = alpha;
+        ctx.globalCompositeOperation = SCATTER_BLENDS[o.blend] || 'source-over';
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        for (const st of stamps) {
+            const patch = scatterPatch(from, st, o.soft == null ? 60 : o.soft, o.rough == null ? 40 : o.rough);
+            const r = st.d * 0.72;     // the rotated square's reach
+            const xs = [0], ys = [0];
+            if (o.wrap !== false) {
+                if (st.x - r < 0) xs.push(S); if (st.x + r > S) xs.push(-S);
+                if (st.y - r < 0) ys.push(S); if (st.y + r > S) ys.push(-S);
+            }
+            for (const dy of ys) for (const dx of xs) {
+                ctx.save();
+                ctx.translate(st.x + dx, st.y + dy);
+                ctx.rotate(st.rot);
+                ctx.drawImage(patch, -st.d / 2, -st.d / 2);
+                ctx.restore();
+            }
+        }
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = 'source-over';
+        return out;
+    }
+
+    /* `inv` is written for an S px tile; a layer stored at another size s (a
+       mask kept at 256 under a 512 tile) needs the same map in ITS pixels:
+       G_s(y) = G_S(k y) / k with k = S / s, so the translation column scales. */
+    function invForSize(inv, S, s) {
+        if (s === S) return inv;
+        const k = S / s, r = m => m && [m[0], m[1], m[2] / k];
+        return inv.m2 ? { m0: [inv.m0[0], inv.m0[1], inv.m0[2] / k], m1: [inv.m1[0], inv.m1[1], inv.m1[2] / k], m2: [inv.m2[0] * k, inv.m2[1] * k, inv.m2[2]] }
+                      : { m0: r(inv.m0), m1: r(inv.m1) };
+    }
+    /* A preview: the S px map drawn into P px, still sampling the S px source:
+       G_P(y) = G_S(k y), k = S / P. */
+    function invForPreview(inv, S, P) {
+        const k = S / P, r = m => m && [m[0] * k, m[1] * k, m[2]];
+        return { m0: r(inv.m0), m1: r(inv.m1), m2: inv.m2 ? r(inv.m2) : undefined };
+    }
+    /* A `move` for moveTileLayers from one resampler setting, `inv` written for
+       an S px tile: masks never take bicubic or Lanczos (their ringing would
+       leak a region past its edge), and the normal map turns its vectors by the
+       map's own Jacobian. */
+    function warpMove(inv, S, opts, desc) {
+        // A displacement is written in tile px over the tile: restate both for a
+        // layer stored at another size.
+        const go = (c, o) => warpCanvas(c, c.width, c.height, invForSize(inv, S, c.width),
+            o.disp ? Object.assign({}, o, { disp: Object.assign({}, o.disp, { period: c.width, ampScale: c.width / S }) }) : o);
+        const maskFilter = opts.filter === 'nearest' ? 'nearest' : 'bilinear';
+        return {
+            image: c => go(c, opts),
+            mask: c => go(c, Object.assign({}, opts, { filter: maskFilter })),
+            normal: c => go(c, Object.assign({}, opts, { normal: true, nflip: NORMAL_Y_SIGN })),
+            desc,   // what a content layer's xf records (undefined: the piece is marked xfLost)
+        };
+    }
+
+    /* Make Seamless's multi-band method at its defaults, on a canvas: the
+       "Make seamless afterwards" step of the transforms. seamlessMultiBand
+       works in float, which cannot be read back as bytes, hence the copy. */
+    function seamlessCanvas(c) {
+        const E = TRLE.Engine, S = c.width;
+        const tex = E.createTexture(S, c.height, c);
+        const mb = E.seamlessMultiBand(tex, S, { height: c.height, overlapX: 0.25, overlapY: 0.25, falloff: 0.5 });
+        const out = E.createFBO(S, c.height);
+        E.blit('copy', { u_texture: mb.texture }, out);
+        const res = E.fboToCanvas(out);
+        E.deleteFBO(out); E.deleteFBO(mb); E.deleteTexture(tex);
+        return res;
+    }
+
+    /* "Make seamless afterwards" on a tile a transform has just moved. A tile with layers gets (or edits) a Make Seamless
+       layer at the multi-band defaults, so the composite stays derived; a plain tile is written as before. */
+    function seamAfterMove(el, defer) {
+        if (!hasLayers(el)) { drawReplace(el.canvas, seamlessCanvas(el.canvas)); return; }
+        const L = TRLE.Layers, old = kindLayerOf(el, 'seamless');
+        const recipe = { method: 'multiband', falloff: 0.5, overlapX: 0.25, overlapY: 0.25,
+                         splat: { rotation: 0, rotRandom: 0, scale: 1, wobble: 0, randomize: 0 },
+                         controls: { 'at-sm-method': 'multiband', 'at-sm-falloff': '50', 'at-sm-overlapx': '25', 'at-sm-overlapy': '25' } };
+        const lid = L.add(state.layerDefs, [], { kind: 'seamless', name: 'Make Seamless', recipe, zone: old ? L.zoneOf(old.def) : undefined });   // a layer moved over the text stays there
+        const piece = { lid, data: { was: old ? old.piece.data.was : undefined } };
+        if (old) el.layers = el.layers.map(q => q === old.piece ? piece : q);
+        else L.insertPiece(el, state.layerDefs[lid], piece, state.layerDefs);
+        if (!defer) L.rebuild(el, state.layerDefs);
+        L.prune(state.layerDefs, state.elements);
+        syncSeamless([el]);
+    }
     /* Apply a canvas→canvas transform to a tile, then refresh dependents + undo. */
     /* Rotate / flip / offset over one tile or a whole selection. `ids` is what
        ctxTargets handed back, so a lone right-click is just the 1-element case —
        and one pushHistory covers the lot, which is what makes Ctrl+Z undo a
        32-tile flip in one step. */
-    function applyTileTransform(ids, fn, label) {
+    /* `turn` is the move's 2x2 matrix in image space (y down), for the normal
+       map's vectors: Rotate and Flip are orthogonal, so the slope turns by the
+       same matrix as the pixels. Offset leaves it out (a roll turns nothing). */
+    async function applyTileTransform(ids, fn, label, turn, desc) {
         const targets = (Array.isArray(ids) ? ids : [ids]).map(byId).filter(el => el && el.kind === 'tile');
         if (!targets.length) return;
         targets.forEach(el => {
-            const out = fn(el.canvas);
-            const ctx = el.canvas.getContext('2d');
-            ctx.clearRect(0, 0, el.canvas.width, el.canvas.height);
-            ctx.drawImage(out, 0, 0);
+            moveTileLayers(el, { image: fn, normal: turn ? c => turnNormals(fn(c), turn) : fn, desc }, true);
             el.edited = true;
         });
+        syncSeamless(targets);   // a 90 degree turn, a flip or a half roll keeps tiling; derived again all the same
+        await layersSettle(targets);
         refreshTransitions();
         renderGrid();
         const n = targets.length;
@@ -17832,6 +21052,33 @@ window.TRLE = window.TRLE || {};
     }
 
     /* Replace a tile's source image (keeps its position, material + transitions). */
+    function replaceTileAsset(el, img, maps) {
+        withImportAdvice([{ img }], state.tileSize, async plan => {
+                const S = state.tileSize;
+                const ctx = el.canvas.getContext('2d');
+                ctx.clearRect(0, 0, S, S);
+                importToTile(ctx, img, S);
+                const seamed = importBakeEl(el, { img }, S, plan);
+                el.original = cloneCanvas(el.canvas);
+                el.seamless = false;
+                el.edited = false;
+                el.mapSource = null;   // a new image: Classic Look's old source no longer applies
+                el.textRelief = null;  // nor does its lettering
+                el.mapPatches = null;  // nor its flattened stickers' maps
+                // Replacing the pixels replaces the maps that described them:
+                // a PSD brings its own, anything else drops whatever was there
+                // so stale maps never outlive the texture they belonged to.
+                el.importedMaps = scaleImportedMaps(maps, S);
+                // Layers stay over the new picture (LAYERS-PLAN D5, F4): it becomes the bottom.
+                rebaseLayers(el, true);
+                setBaseSeamless(el, seamed);   // a Make Seamless layer over it still makes the tile seamless
+                await layersSettle([el]);
+                refreshTransitions();
+                renderGrid();
+                pushHistory('Replace image');
+                showToast('Tile image replaced', 'success');
+        });
+    }
     function replaceTileImage(id) {
         const el = byId(id);
         if (!el || el.kind !== 'tile') return;
@@ -17841,23 +21088,7 @@ window.TRLE = window.TRLE || {};
         input.addEventListener('change', e => {
             const file = e.target.files[0];
             if (!file) return;
-            readImageAsset(file).then(({ img, maps }) => {
-                const S = state.tileSize;
-                const ctx = el.canvas.getContext('2d');
-                ctx.clearRect(0, 0, S, S);
-                ctx.drawImage(img, 0, 0, S, S);
-                el.original = cloneCanvas(el.canvas);
-                el.seamless = false;
-                el.edited = false;
-                // Replacing the pixels replaces the maps that described them:
-                // a PSD brings its own, anything else drops whatever was there
-                // so stale maps never outlive the texture they belonged to.
-                el.importedMaps = scaleImportedMaps(maps, S);
-                refreshTransitions();
-                renderGrid();
-                pushHistory('Replace image');
-                showToast('Tile image replaced', 'success');
-            }).catch(err => showToast(err.message, 'error'));
+            readImageAsset(file).then(({ img, maps }) => replaceTileAsset(el, img, maps)).catch(err => showToast(err.message, 'error'));
         });
         input.click();
     }
@@ -17973,12 +21204,13 @@ window.TRLE = window.TRLE || {};
         grade: 'The sliders below apply inside the painted region only. Everything outside it comes out byte for byte unchanged. Hit Apply when it looks right.',
         match: 'The region keeps its light and shade and takes the HUE of the texture around it. Good for a patch that came out the wrong colour, a green cast on one part of a wall, a stain an upscaler invented. Paint the patch rather than a box around it: one shift is applied everywhere you painted, so clean texture caught in the selection comes back over-corrected.'
     };
-    const ca = { id: null, tex: null, batchIds: [], maskCanvas: null };
+    const ca = { id: null, tex: null, batchIds: [], maskCanvas: null, inputs: null, edit: null };
     let caEditor = null;
     function caCleanup() {
         if (ca.tex) { TRLE.Engine.deleteTexture(ca.tex); ca.tex = null; }
         ca.id = null;
         ca.batchIds = [];
+        ca.inputs = null; ca.edit = null;
     }
     function caMode() { const e = $('at-ca-mode'); return e ? e.value : 'simple'; }
     function caPaintMode() {
@@ -18116,8 +21348,8 @@ window.TRLE = window.TRLE || {};
             return t;
         });
     }
-    function caCurveTexture() {
-        const T = caCurveTable();
+    function caCurveTexture() { return caCurveTextureFrom(caCurveTable()); }
+    function caCurveTextureFrom(T) {
         if (!T) return null;
         const c = document.createElement('canvas'); c.width = 256; c.height = 1;
         const g = c.getContext('2d'), im = g.createImageData(256, 1);
@@ -18131,10 +21363,11 @@ window.TRLE = window.TRLE || {};
     }
     /* Every colorAdjust blit in this modal goes through here, so the curve texture
        is built, bound and freed in one place. */
-    function caBlit(tex, fbo) {
+    function caBlit(tex, fbo) { caBlitWith(tex, fbo, caUniforms(), caCurveTable()); }
+    function caBlitWith(tex, fbo, uniforms, table) {
         const E = TRLE.Engine;
-        const u = Object.assign({ u_texture: tex }, caUniforms());
-        const ct = caCurveTexture();
+        const u = Object.assign({ u_texture: tex }, uniforms);
+        const ct = caCurveTextureFrom(table);
         /* u_curveTex is bound on EVERY call, to the source when there is no curve.
            A sampler in a branch that never runs still counts: WebGL rejects the draw
            as a feedback loop if its unit holds the render target's texture, and
@@ -18172,22 +21405,49 @@ window.TRLE = window.TRLE || {};
     }
 
     /* The whole-tile grade, before any mask is considered. */
-    function caGradeTo(srcCanvas, S) {
+    function caGradeTo(srcCanvas, S, r) {
         const E = TRLE.Engine;
         const tex = E.createTextureFromImage(srcCanvas);
         const fbo = E.createFBO(S, S);
-        caBlit(tex, fbo);
+        caBlitWith(tex, fbo, r.uniforms, r.curve);
         const out = E.fboToCanvas(fbo);
         E.deleteFBO(fbo); E.deleteTexture(tex);
         return out;
     }
     /* What Apply and the preview both produce, for whichever mode is selected. */
-    function caApplyTo(srcCanvas, S) {
-        if (caMode() !== 'mask') return caGradeTo(srcCanvas, S);
-        const edit = caPaintMode() === 'match'
-            ? caMatchSurroundings(srcCanvas, ca.maskCanvas, S, parseInt($('at-ca-matchstr').value) / 100)
-            : caGradeTo(srcCanvas, S);
-        return caMaskComposite(srcCanvas, edit, ca.maskCanvas, S);
+    function caApplyTo(srcCanvas, S) { return caApplyRecipe(srcCanvas, caRecipeNow(), ca.maskCanvas, S); }
+    /* The pure form (a layer's apply): the recipe is everything the modal's controls said. */
+    function caApplyRecipe(srcCanvas, r, maskCanvas, S) {
+        if (r.mode !== 'mask') return caGradeTo(srcCanvas, S, r);
+        const edit = r.paint === 'match' ? caMatchSurroundings(srcCanvas, maskCanvas, S, r.matchStr) : caGradeTo(srcCanvas, S, r);
+        return caMaskComposite(srcCanvas, edit, maskCanvas, S);
+    }
+    /* What the controls say now, plus a snapshot of them for reopening the layer later. */
+    function caRecipeNow() {
+        const sliders = {};
+        document.querySelectorAll('#at-modal-coloradj input[type="range"][id^="at-ca-"]').forEach(e => { if (!/-val$/.test(e.id)) sliders[e.id] = e.value; });
+        return { mode: caMode(), paint: caPaintMode(), matchStr: parseInt($('at-ca-matchstr').value) / 100,
+                 uniforms: caUniforms(), curve: caCurveTable(),
+                 controls: { sliders, curves: ca.curves ? JSON.parse(JSON.stringify(Object.fromEntries(CA_CURVE_CHANNELS.map(k => [k, ca.curves[k].anchors])))) : null } };
+    }
+    function caRestoreControls(r) {
+        $('at-ca-mode').value = r.mode;
+        caResetControls();
+        for (const [id, v] of Object.entries((r.controls && r.controls.sliders) || {})) {
+            const e = $(id); if (!e) continue;
+            e.value = v; const lab = $(id + '-val'); if (lab) lab.textContent = e.value;
+        }
+        const pm = document.querySelector(`input[name="at-ca-paintmode"][value="${r.paint}"]`); if (pm) pm.checked = true;
+        if (r.controls && r.controls.curves) for (const k of CA_CURVE_CHANNELS) if (r.controls.curves[k]) ca.curves[k] = { anchors: JSON.parse(JSON.stringify(r.controls.curves[k])), axis: 'h', dragIdx: -1 };
+        caSyncMode();
+    }
+    TRLE.Layers.register('coloradj', { zone: 'texture', mode: 'adjust', cost: (def, S) => 4 * (S / 256) ** 2,
+        apply: (input, def, piece) => caApplyRecipe(input, def.recipe, piece.mask, input.width),
+        edit: (el, def) => caEditLayer(el, def) });
+    function caEditLayer(el, def) {
+        const ids = TRLE.Layers.tilesOf(def.lid, state.elements).map(e => e.id);
+        ids.sort((a, b) => (a === el.id ? -1 : b === el.id ? 1 : 0));
+        openColorAdjModal(ids, { def, piece: el.layers.find(p => p.lid === def.lid) });
     }
     function caRender() {
         if (ca.id === null) return;
@@ -18199,7 +21459,7 @@ window.TRLE = window.TRLE || {};
                to keep in step and you judge the grade on the pixels you are painting.
                drawReplace, never a bare drawImage: this canvas is reused by every
                tile and a cutout would show the previous one through its holes. */
-            const out = caApplyTo(el.canvas, state.tileSize);
+            const out = caApplyTo(xin(ca.inputs, el), state.tileSize);
             drawReplace(disp, out, P, P);
             const ctx = disp.getContext('2d');
             caTintMask(ctx, P);
@@ -18234,14 +21494,16 @@ window.TRLE = window.TRLE || {};
        preview shows ids[0] (the tile that was right-clicked, since selectedIds
        are in atlas order and ctxTargets puts it in the list); the same slider
        values are blitted over every target on Apply. */
-    function openColorAdjModal(ids) {
+    function openColorAdjModal(ids, editing) {
         const list = Array.isArray(ids) ? ids : [ids];
         const id = list[0];
         const el = byId(id);
         if (!el) return;
         ca.id = id;
         ca.batchIds = list.slice();
-        ca.tex = TRLE.Engine.createTextureFromImage(el.canvas);
+        ca.inputs = modalInputs(list, 'coloradj');
+        ca.edit = editing ? { lid: editing.def.lid } : null;
+        ca.tex = TRLE.Engine.createTextureFromImage(xin(ca.inputs, el));
         $('at-ca-tileno').textContent = numberOf(id);
         setBatchNote('at-modal-coloradj', list.length, numberOf(id));
         /* PAINT MODE CANNOT BATCH. A mask is coordinates on one specific texture, so
@@ -18261,6 +21523,12 @@ window.TRLE = window.TRLE || {};
         $('at-ca-mode').value = 'simple';
         caResetControls();
         caSyncMode();
+        if (editing) {
+            caRestoreControls(editing.def.recipe);
+            if (editing.piece && editing.piece.mask) { const g = ca.maskCanvas.getContext('2d'); g.clearRect(0, 0, 256, 256); g.drawImage(editing.piece.mask, 0, 0, 256, 256); }
+        }
+        const replacing = list.filter(i => kindLayerOf(byId(i), 'coloradj')).length;
+        setEditNote('at-modal-coloradj', replacing ? `✏️ Editing ${list.length > 1 && replacing === list.length ? 'the' : 'this tile\'s'} Adjust Colours layer: Apply replaces it${list.length > 1 ? ` on ${replacing} tile${replacing > 1 ? 's' : ''}` : ''}.` : '');
         openModal('coloradj');
         caRender();
     }
@@ -18313,6 +21581,1960 @@ window.TRLE = window.TRLE || {};
         ca.maskCanvas.getContext('2d').clearRect(0, 0, ca.maskCanvas.width, ca.maskCanvas.height);
         if (caEditor) caEditor.resetHistory();
     }
+    /* ============ 🕹️ CLASSIC LOOK MODAL (CLASSIC-LOOK-PLAN phase 3) ============
+       The filter is `classicLook` (pure, beside drawImported). Settings are TOOL
+       settings and survive between opens, like Draw's brush: making a run of HD
+       tiles classic means the same settings each time, and every control is on
+       screen, so nothing hidden carries over (the reason Adjust Colours resets).
+       "Material maps from: the original" keeps the pre-filter diffuse in
+       `el.mapSource`, which every map generator reads through mapSourceOf(). */
+    const CL_IDS = ['at-cl-factor', 'at-cl-shrink', 'at-cl-show', 'at-cl-colours', 'at-cl-dither', 'at-cl-palscope', 'at-cl-alpha', 'at-cl-maps', 'at-cl-wrap', 'at-cl-include'];
+    const cl = { ids: [], timer: 0, inputs: null, edit: null };
+    function clOpts() {
+        return {
+            factor: parseInt($('at-cl-factor').value, 10) || 2,
+            shrink: $('at-cl-shrink').value, show: $('at-cl-show').value,
+            colours: parseInt($('at-cl-colours').value, 10) || 0,
+            dither: $('at-cl-dither').value, alpha: $('at-cl-alpha').value,
+            wrap: $('at-cl-wrap').checked
+        };
+    }
+    function clSync() {
+        const colours = parseInt($('at-cl-colours').value, 10) > 0;
+        $('at-cl-dither-row').style.display = colours ? '' : 'none';
+        $('at-cl-palscope-row').style.display = (colours && cl.ids.length > 1) ? '' : 'none';
+    }
+    /* The palette for a run of tiles: shared when asked and there is a selection. */
+    function clPaletteFor(els, o) {
+        if (!(o.colours > 0) || els.length < 2 || $('at-cl-palscope').value !== 'selection') return null;
+        return classicSharedPalette(els.map(e => xin(cl.inputs, e)), o);
+    }
+    /* "Include the text and drawings" (decision 18, F5): on, the layer sits in the Finish zone and sees
+       them; off, it sits under them in the Texture zone. */
+    const clZone = () => ($('at-cl-include').checked ? 'finish' : 'texture');
+    function clRender() {
+        const el = byId(cl.ids[0]);
+        if (!el) return;
+        const o = clOpts(), src = xin(cl.inputs, el);
+        o.palette = clPaletteFor(cl.ids.map(byId).filter(Boolean), o);
+        const out = classicLook(src, o);
+        const P = $('at-cl-after').width;
+        drawReplace($('at-cl-after'), out, P, P);
+        drawReplace($('at-cl-before'), src, P, P);
+    }
+    function clSchedule() { clearTimeout(cl.timer); cl.timer = setTimeout(clRender, 60); }
+    TRLE.Layers.register('classic', { zone: 'finish', mode: 'adjust', cost: (def, S) => (def.recipe.opts.colours > 0 || def.recipe.opts.show !== 'blocky' ? 340 : 30) * (S / 1024) ** 2,   // measured at 1024: Blocky 25 ms, Soft 39, Smooth + 256 colours 331
+        apply: (input, def) => classicLook(input, def.recipe.opts),
+        edit: (el, def) => clEditLayer(el, def) });
+    function clEditLayer(el, def) {
+        const ids = TRLE.Layers.tilesOf(def.lid, state.elements).map(e => e.id);
+        ids.sort((a, b) => (a === el.id ? -1 : b === el.id ? 1 : 0));
+        openClassicModal(ids, { def });
+    }
+    function openClassicModal(ids, editing) {
+        const list = (Array.isArray(ids) ? ids : [ids]).filter(i => { const e = byId(i); return e && e.kind === 'tile'; });
+        if (!list.length) return;
+        cl.ids = list;
+        cl.edit = editing ? { lid: editing.def.lid } : null;
+        const S = state.tileSize, sel = $('at-cl-factor'), keep = sel.value;
+        const part = { 2: 'half size', 4: 'quarter size', 8: 'eighth size' };
+        sel.innerHTML = [2, 4, 8].map(f => `<option value="${f}">${Math.max(1, Math.round(S / f))} px · ${part[f]}</option>`).join('');
+        sel.value = [...sel.options].some(o => o.value === keep) ? keep : '2';
+        const anyContent = list.some(i => hasContentLayers(byId(i)));
+        $('at-cl-include').checked = true;
+        if (editing) ctlRestore(editing.def.recipe.controls);
+        /* The tick follows where the layer SITS, which a move in the Layers panel may have changed since the
+           recipe was saved (LAYERS-PLAN phase 14); from the menu, a tile's existing Classic Look layer decides. */
+        const old = list.map(i => kindLayerOf(byId(i), 'classic')).find(Boolean);
+        const placed = editing ? editing.def : old && old.def;
+        if (placed) $('at-cl-include').checked = TRLE.Layers.zoneOf(placed) === 'finish';
+        $('at-cl-include-row').style.display = anyContent ? '' : 'none';
+        if (!anyContent && !placed) $('at-cl-include').checked = true;
+        cl.inputs = modalInputs(list, 'classic', clZone());
+        $('at-cl-tileno').textContent = numberOf(list[0]);
+        setBatchNote('at-modal-classic', list.length, numberOf(list[0]));
+        const replacing = list.filter(i => kindLayerOf(byId(i), 'classic')).length;
+        setEditNote('at-modal-classic', replacing ? `✏️ Editing ${list.length === 1 ? 'this tile\'s' : 'the'} Classic Look layer: Apply replaces it${list.length > 1 ? ` on ${replacing} tile${replacing > 1 ? 's' : ''}` : ''}.` : '');
+        clSync();
+        openModal('classic');
+        clRender();
+    }
+    function clCleanup() { clearTimeout(cl.timer); cl.ids = []; cl.inputs = null; cl.edit = null; }
+    function setupClassicModal() {
+        ['at-cl-factor', 'at-cl-shrink', 'at-cl-show', 'at-cl-colours', 'at-cl-dither', 'at-cl-palscope', 'at-cl-alpha', 'at-cl-wrap']
+            .forEach(idn => $(idn).addEventListener('change', () => { clSync(); clSchedule(); }));
+        // The toggle moves the layer to another place in the stack, so what it is shown on changes.
+        $('at-cl-include').addEventListener('change', () => { cl.inputs = modalInputs(cl.ids, 'classic', clZone()); clSchedule(); });
+        attachTilePicker($('at-cl-colours'), { text: true, title: 'Colours', ...previewByValue($('at-cl-colours'), clRender) });
+        $('at-cl-reset').addEventListener('click', () => {
+            $('at-cl-factor').value = '2'; $('at-cl-shrink').value = 'average'; $('at-cl-show').value = 'blocky';
+            $('at-cl-colours').value = '0'; tilePickerSync($('at-cl-colours')); $('at-cl-dither').value = 'none'; $('at-cl-palscope').value = 'tile';
+            $('at-cl-alpha').value = 'soft'; $('at-cl-maps').value = 'result'; $('at-cl-wrap').checked = true;
+            clSync(); clRender();
+        });
+        $('at-cl-apply').addEventListener('click', () => {
+            const targets = cl.ids.map(byId).filter(el => el && el.kind === 'tile');
+            if (!targets.length) return;
+            const o = clOpts();
+            // Measure the shared palette BEFORE writing any tile (the Recolor rule).
+            o.palette = clPaletteFor(targets, o);
+            const recipe = { opts: o, maps: $('at-cl-maps').value, include: $('at-cl-include').checked, controls: ctlSnap(CL_IDS) };
+            /* A project saved before layers may carry a stored original: "this result" retires it, "the original"
+               keeps the EARLIEST one (a second Classic Look should still give the HD relief, not the first pass's blocks). */
+            if (recipe.maps === 'result') targets.forEach(el => { el.mapSource = null; });
+            const zone = clZone(), n = targets.length;
+            closeModal();
+            colourLayerApply('classic', 'Classic Look', targets, recipe, () => ({}), n > 1 ? `Classic Look: ${n} tiles` : 'Classic Look', undefined, zone)
+                .then(() => showToast(n > 1 ? `Classic Look on ${n} tiles` : 'Classic Look applied', 'success'));
+        });
+    }
+
+    /* ============ 🔎 HD LOOK MODAL (HD-LOOK-PLAN phase 3) ============
+       The filter is `hdLook` (pure, beside classicLook). It is a Texture-zone layer, one per tile, run on the
+       layer's input (the composite below it) and NOT movable over the text and drawings (D10): it shrinks its
+       input first, so over lettering it would average the strokes into blocks. Settings are TOOL settings and
+       survive between opens, like Classic Look's. The maps follow the diffuse (P6): there is no maps choice. */
+    const HD_IDS = ['at-hd-factor', 'at-hd-cutout', 'at-hd-wrap', 'at-hd-faith', 'at-hd-faith-num', 'at-hd-sharpen', 'at-hd-sharpen-num', 'at-hd-guided', 'at-hd-contours', 'at-hd-selfex', 'at-hd-selfex-num', 'at-hd-grain', 'at-hd-grain-num', 'at-hd-ref', 'at-hd-seed'];
+    const hd = { ids: [], timer: 0, inputs: null, edit: null, regs: [], active: 0 };
+    const hdFaith = () => Math.min(100, Math.max(0, parseFloat($('at-hd-faith').value)));
+    function hdRecipeNow() {
+        return { factor: parseInt($('at-hd-factor').value, 10) || 4, faithfulness: isFinite(hdFaith()) ? hdFaith() : 100,
+                 wrap: $('at-hd-wrap').checked, cutout: $('at-hd-cutout').value, seed: parseInt($('at-hd-seed').value, 10) || 1,
+                 sharpen: Math.min(100, Math.max(0, parseFloat($('at-hd-sharpen').value) || 0)), guided: $('at-hd-guided').checked, contours: parseInt($('at-hd-contours').value, 10) || 0,
+                 selfex: Math.min(100, Math.max(0, parseFloat($('at-hd-selfex').value) || 0)), grain: Math.min(100, Math.max(0, parseFloat($('at-hd-grain').value) || 0)),
+                 refTile: parseInt($('at-hd-ref').value, 10) || null, controls: ctlSnap(HD_IDS) };
+    }
+    /* The classes (HD-LOOK-PLAN phase 7): detail behaves by KIND, so six bundles of the options beat 53 presets. Each is the five
+       detail settings; a material picks its class by the table below, and the select shows "Custom" once the settings are no
+       class. Self-examples and Smooth contours are never in one class (contours replaces the colour). The author judges these on
+       review sheets (reports/hd-look/), never on a score. */
+    const HD_CLASSES = {
+        built:    { label: 'Built (walls, bricks, tiles)', r: { sharpen: 20, selfex: 10, grain: 0, contours: 0, guided: false } },
+        granular: { label: 'Granular (sand, dirt, concrete)', r: { sharpen: 15, selfex: 60, grain: 0, contours: 0, guided: false } },
+        organic:  { label: 'Organic (wood, grass, skin, cloth)', r: { sharpen: 25, selfex: 70, grain: 0, contours: 0, guided: false } },
+        smooth:   { label: 'Smooth (metal, glass, plastic)', r: { sharpen: 30, selfex: 0, grain: 0, contours: 0, guided: true } },
+        painted:  { label: 'Painted (murals, hieroglyphs)', r: { sharpen: 20, selfex: 0, grain: 0, contours: 32, guided: true } },
+        relief:   { label: 'Relief (embossed, carved)', r: { sharpen: 40, selfex: 0, grain: 0, contours: 0, guided: true } },
+    };
+    // Every key of TRLE.SolidPresets (validate-hdlook fails on a missing one).
+    const HD_MATERIAL_CLASS = {
+        asphalt: 'granular', bark: 'organic', brick: 'built', brushed_metal: 'smooth', cardboard: 'organic', carbon_fiber: 'built', cement: 'granular',
+        ceramic: 'smooth', chrome: 'smooth', concrete: 'granular', cotton: 'organic', denim: 'organic', dirt: 'granular', fabric: 'organic', foam: 'organic',
+        frosted_glass: 'smooth', glass: 'smooth', gold: 'smooth', granite: 'granular', grass: 'organic', ice: 'smooth', iron: 'smooth', leather: 'organic',
+        leaves: 'organic', linen: 'organic', marble: 'smooth', metal: 'smooth', mud: 'organic', paper: 'organic', plastic: 'smooth', porcelain: 'smooth',
+        rubber: 'smooth', rusted_metal: 'granular', sand: 'granular', silk: 'smooth', silver: 'smooth', skin: 'organic', slate: 'built', snow: 'granular',
+        steel: 'smooth', stone: 'built', tile: 'built', wood: 'organic', column_stone: 'relief', column_marble: 'relief', metal_gold: 'smooth',
+        metal_silver: 'smooth', metal_bronze: 'smooth', metal_fence: 'built', floor_stone_smooth: 'smooth', floor_stone_rough: 'granular',
+        marble_decorative: 'relief', marble_surface: 'smooth',
+    };
+    const HD_CLASS_KEYS = ['sharpen', 'selfex', 'grain', 'contours', 'guided'];
+    /* The class the settings in the form amount to ('custom' when none), and the form loaded from a class. */
+    function hdSyncClass() {
+        const r = hdRecipeNow();
+        const hit = Object.entries(HD_CLASSES).find(([, c]) => HD_CLASS_KEYS.every(k => c.r[k] === r[k]));
+        const sel = $('at-hd-class'); sel.value = hit ? hit[0] : 'custom'; tilePickerSync(sel);
+    }
+    function hdLoadClass(key) {
+        const c = HD_CLASSES[key]; if (!c) return;
+        for (const k of ['sharpen', 'selfex', 'grain']) { $(`at-hd-${k}`).value = c.r[k]; $(`at-hd-${k}-num`).value = c.r[k]; }
+        $('at-hd-contours').value = String(c.r.contours); $('at-hd-guided').checked = c.r.guided;
+    }
+    function hdRender(over) {
+        const el = byId(hd.ids[0]);
+        if (!el) return;
+        const src = xin(hd.inputs, el), r = Object.assign(hdRecipeNow(), over || {}), out = hdLookRegions(src, Object.assign({}, r, { ref: hdRefFor(el, r, src) }), hdRegionsNow());
+        const P = $('at-hd-after').width;
+        drawReplace($('at-hd-after'), out, P, P);
+        drawReplace($('at-hd-before'), src, P, P);
+        hdPaintDraw();
+        const t = $('at-hd-tile'), g = t.getContext('2d'), h = t.width / 2;
+        g.clearRect(0, 0, t.width, t.height);
+        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) g.drawImage(out, x * h, y * h, h, h);
+    }
+    function hdSchedule() { clearTimeout(hd.timer); hd.timer = setTimeout(hdRender, 60); }
+    /* The reference for grain: the picked tile's pixels (a copy kept by an Edit that leaves the same tile picked), or the layer's
+       own input when the tile is its own reference. */
+    function hdRefFor(el, r, input) {
+        if (!(r.grain > 0)) return null;
+        const t = byId(r.refTile), e = hd.edit;
+        if (t && t.id === el.id) return input;
+        if (e && e.pixels && e.pixels.ref && e.recipe && e.recipe.refTile === r.refTile) return e.pixels.ref;
+        return t ? t.canvas : null;
+    }
+    /* ---- regions (phase 8, D6) ----
+       The regions a layer uses are COPIED into its piece at Apply: each mask in `piece.aux.r<i>`, its class, feather, the five
+       class options it resolved to (`over`) and where it came from (`mi`, its index in el.matLayers, -1 for one painted here)
+       in `piece.data.regions`. A rebuild never reads el.matLayers, so Set Material repainting a region later changes nothing
+       here, and `Layers.move` turns the masks with the tile because they are aux canvases. */
+    const hdPieceRegions = piece => ((piece && piece.data && piece.data.regions) || []).map((r, i) => ({ mask: piece.aux && piece.aux['r' + i], feather: r.feather, over: r.over }));
+    const hdClassOver = key => { const c = HD_CLASSES[key]; return c ? { sharpen: c.r.sharpen, selfex: c.r.selfex, grain: c.r.grain, contours: c.r.contours, guided: c.r.guided } : {}; };
+    const hdRegionsNow = () => hd.regs.map(r => ({ mask: r.mask, feather: r.feather, over: hdClassOver(r.cls) }));
+    const HD_REG_COLORS = ['#e8852a', '#3aa0e8', '#5cc46b', '#d94f8c', '#b08be8', '#e8d23a'];
+    const hdMaterialClass = m => (m && m.type === 'solid' && HD_MATERIAL_CLASS[m.key]) || 'granular';
+    /* Regions to start from: an Edit shows the layer's own, a new layer the tile's Set Material regions (base excluded). */
+    function hdRegsLoad(el, editing) {
+        hd.regs = []; hd.active = 0;
+        if (hd.ids.length !== 1) return;
+        const found = editing && kindLayerOf(el, 'hdlook');
+        if (found && found.piece.data && found.piece.data.regions) {
+            found.piece.data.regions.forEach((r, i) => hd.regs.push({ name: r.name, color: r.color, cls: r.cls, feather: r.feather, mi: r.mi, mask: cloneCanvas(found.piece.aux['r' + i]) }));
+        } else if (!editing) hdRegsFromTile(el);
+    }
+    function hdRegsFromTile(el) {
+        if (!hasMatLayers(el)) return;
+        hd.regs = hd.regs.filter(r => r.mi < 0);
+        el.matLayers.forEach((L, i) => { if (i > 0 && L.mask) hd.regs.push({ name: L.name, color: L.color, cls: hdMaterialClass(L.material), feather: L.feather || 0, mi: i, mask: cloneCanvas(L.mask) }); });
+        hd.active = 0;
+    }
+    function hdRegsRows() {
+        const wrap = $('at-hd-regwrap'), list = $('at-hd-reglist'), one = hd.ids.length === 1;
+        wrap.style.display = one ? '' : 'none';
+        const el = byId(hd.ids[0]);
+        $('at-hd-regtile').style.display = one && el && hasMatLayers(el) ? '' : 'none';
+        list.innerHTML = '';
+        hd.regs.forEach((r, i) => {
+            const row = document.createElement('div');
+            row.className = 'form-row at-hd-reg'; row.style.cssText = 'gap:6px;align-items:center;margin:3px 0;';
+            row.innerHTML = `<input type="radio" name="at-hd-regsel" value="${i}" ${i === hd.active ? 'checked' : ''} aria-label="Paint ${r.name}">
+ <span style="width:10px;height:10px;border-radius:2px;background:${r.color};flex:none;"></span>
+ <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${r.name}">${r.name}</span>
+ <select data-hd-regcls aria-label="Class of ${r.name}">${Object.entries(HD_CLASSES).map(([k, c]) => `<option value="${k}" ${k === r.cls ? 'selected' : ''}>${c.label.split(' (')[0]}</option>`).join('')}</select>
+ <input type="number" data-hd-regfeather min="0" max="64" step="1" value="${r.feather}" style="width:54px;" title="Feather (px)" aria-label="Feather of ${r.name}">
+ <button class="btn btn-secondary btn-sm" data-hd-regdel aria-label="Remove ${r.name}">✕</button>`;
+            row.querySelector('input[type=radio]').addEventListener('change', () => { hd.active = i; hdPaintDraw(); });
+            row.querySelector('[data-hd-regcls]').addEventListener('change', e => { r.cls = e.target.value; hdSchedule(); });
+            row.querySelector('[data-hd-regfeather]').addEventListener('input', e => { r.feather = Math.max(0, Math.min(64, parseFloat(e.target.value) || 0)); hdSchedule(); });
+            row.querySelector('[data-hd-regdel]').addEventListener('click', () => { hd.regs.splice(i, 1); hd.active = Math.min(hd.active, hd.regs.length - 1); hdRegsRows(); hdSchedule(); });
+            list.appendChild(row);
+        });
+        const on = one && hd.regs.length > 0;
+        $('at-hd-tools').style.display = on ? '' : 'none';
+        $('at-hd-paint').style.display = on ? 'block' : 'none'; $('at-hd-paint-label').style.display = on ? '' : 'none';
+        $('at-hd-before').style.display = on ? 'none' : 'block'; $('at-hd-before-label').style.display = on ? 'none' : '';
+        hdPaintDraw();
+    }
+    function hdPaintDraw() {
+        const cv = $('at-hd-paint'), el = byId(hd.ids[0]);
+        if (!cv || cv.style.display === 'none' || !el) return;
+        const P = cv.width, g = cv.getContext('2d'), S = state.tileSize;
+        g.clearRect(0, 0, P, P);
+        g.drawImage(xin(hd.inputs, el), 0, 0, P, P);
+        hd.regs.forEach((r, i) => { g.globalAlpha = i === hd.active ? 0.55 : 0.25; g.drawImage(mmTintMask(r.mask, r.color, S), 0, 0, P, P); });
+        g.globalAlpha = 1;
+        if (hdEditor) hdEditor.drawOverlay(g);
+    }
+    let hdEditor = null;
+    /* Does the tile's material region stack differ from these regions? (the offer's trigger) */
+    function hdRegsDiffer(el) {
+        if (!hasMatLayers(el)) return false;
+        const L = TRLE.Layers;
+        for (let i = 1; i < el.matLayers.length; i++) {
+            const r = hd.regs.find(q => q.mi === i), m = el.matLayers[i];
+            if (!r) return true;
+            if (r.feather !== (m.feather || 0) || (m.mask && L.hash(m.mask) !== L.hash(r.mask))) return true;
+        }
+        return false;
+    }
+    TRLE.Layers.register('hdlook', { zone: 'texture', mode: 'adjust', movable: false,
+        // measured at 1024: 143 to 191 ms for factors 8 to 2, plus about 55 ms for the shock filter, 90 for guided colour, 215 for smooth contours, 360 for self-examples and 200 for grain (356 ms the first time, 157 once its field is cached)
+        cost: (def, S) => (200 + (def.recipe.sharpen > 0 ? 60 : 0) + (def.recipe.guided ? 100 : 0) + (def.recipe.contours > 0 ? 220 : 0) + (def.recipe.selfex > 0 ? 360 : 0) + (def.recipe.grain > 0 ? 200 : 0)) * (S / 1024) ** 2 * (1 + (def.recipe.nreg || 0)),
+        apply: (input, def, piece) => hdLookRegions(input, Object.assign({}, def.recipe, { ref: def.recipe.grain > 0 ? (piece && piece.data && piece.data.self ? input : def.pixels && def.pixels.ref) : null }), hdPieceRegions(piece)),
+        edit: (el, def) => layerEditOpen(el, def, ids => openHdModal(ids, { def })) });
+    function openHdModal(ids, editing) {
+        const list = (Array.isArray(ids) ? ids : [ids]).filter(i => { const e = byId(i); return e && e.kind === 'tile'; });
+        if (!list.length) return;
+        hd.ids = list;
+        hd.edit = editing ? { lid: editing.def.lid, recipe: editing.def.recipe, pixels: editing.def.pixels } : null;
+        const S = state.tileSize, sel = $('at-hd-factor'), keep = sel.value;
+        const part = { 1: 'full size, edges only', 2: 'half size', 4: 'quarter size', 8: 'eighth size' };
+        hd.inputs = modalInputs(list, 'hdlook', 'texture');
+        const first = xin(hd.inputs, byId(list[0])), est = hdEstimate(first);
+        sel.innerHTML = [1, 2, 4, 8].filter(f => S % f === 0 && (f === 1 || S / f >= 4)).map(f => `<option value="${f}">${S / f} px · ${part[f]}</option>`).join('');
+        sel.value = [...sel.options].some(o => o.value === keep) ? keep : '4';
+        if (![...sel.options].some(o => o.value === sel.value) && sel.options.length) sel.selectedIndex = 0;
+        // A new layer starts at the estimated source size; Edit restores what was set.
+        if (!editing) sel.value = String(est || 1);
+        $('at-hd-est').textContent = est ? `Reads as ${S / est} px upscaled to ${S} px.` : 'Reads as full resolution, so it starts at full size: only the edge options act. Pick a smaller size if it was upscaled.';
+        const rs = $('at-hd-ref'), rkeep = rs.value;
+        rs.innerHTML = state.elements.filter(e => e.kind === 'tile').map(e => `<option value="${e.id}">Tile ${numberOf(e.id)}${list.includes(e.id) ? ' (this tile)' : ''}</option>`).join('');
+        const other = state.elements.find(e => e.kind === 'tile' && !list.includes(e.id));
+        rs.value = [...rs.options].some(o => o.value === rkeep) ? rkeep : String(other ? other.id : list[0]);
+        if (editing) ctlRestore(editing.def.recipe.controls);
+        tilePickerSync(rs);
+        // A new layer opens on the class its material says (a Brick tile on Built); an Edit shows the layer's own settings.
+        if (!editing) { const m = byId(list[0]).material, key = m && m.type === 'solid' && HD_MATERIAL_CLASS[m.key]; if (key) hdLoadClass(key); }
+        hdSyncClass();
+        $('at-hd-tileno').textContent = numberOf(list[0]);
+        hdRegsLoad(byId(list[0]), editing);
+        hdRegsRows();
+        setBatchNote('at-modal-hdlook', list.length, numberOf(list[0]));
+        const replacing = list.filter(i => kindLayerOf(byId(i), 'hdlook')).length;
+        setEditNote('at-modal-hdlook', replacing ? `✏️ Editing ${list.length === 1 ? 'this tile\'s' : 'the'} HD Look layer: Apply replaces it${list.length > 1 ? ` on ${replacing} tile${replacing > 1 ? 's' : ''}` : ''}.` : '');
+        openModal('hdlook');
+        hdRender();
+    }
+    function hdCleanup() { clearTimeout(hd.timer); hd.ids = []; hd.inputs = null; hd.edit = null; hd.regs = []; hd.active = 0; }
+    function setupHdModal() {
+        const hdTouch = () => { hdSyncClass(); hdSchedule(); };   // a hand-set option may no longer be a class
+        sbNumRow($('at-hd-rows'), ['faith', 'Faithfulness', 0, 100, 1, 100, '%'], 'hd', hdSchedule);
+        sbNumRow($('at-hd-rows'), ['sharpen', 'Edge sharpening', 0, 100, 1, 0, '%'], 'hd', hdTouch);
+        sbNumRow($('at-hd-rows'), ['selfex', 'Detail from the tile itself', 0, 100, 1, 0, '%'], 'hd', hdTouch);
+        sbNumRow($('at-hd-grain-rows'), ['grain', 'Grain', 0, 100, 1, 0, '%'], 'hd', hdTouch);
+        $('at-hd-class').innerHTML = '<option value="custom">Custom</option>' + Object.entries(HD_CLASSES).map(([k, c]) => `<option value="${k}">${c.label}</option>`).join('');
+        /* A select whose commit loads other controls previews with OVERRIDES (HOVER-PREVIEW-PLAN): resting on a class renders it over
+           the current settings and writes nothing, so leaving puts every control back untouched. */
+        attachTilePicker($('at-hd-class'), { text: true, title: 'Class',
+            preview: v => hdRender(HD_CLASSES[v] && HD_CLASSES[v].r), previewEnd: () => hdRender() });
+        $('at-hd-class').addEventListener('change', () => { if ($('at-hd-class').value !== 'custom') { hdLoadClass($('at-hd-class').value); hdSchedule(); } });
+        ['at-hd-contours', 'at-hd-guided'].forEach(idn => $(idn).addEventListener('change', hdSyncClass));
+        buildMaskToolbar($('at-hd-tools'), 'at-hdmask', { brushMax: 96 });
+        hdEditor = createMaskEditor('at-hdmask', {
+            canvas: $('at-hd-paint'), mode: 'alpha',
+            getMask: () => (hd.regs[hd.active] ? hd.regs[hd.active].mask : null),
+            getSource: () => { const el = byId(hd.ids[0]); return el ? xin(hd.inputs, el) : null; },
+            active: () => hd.ids.length === 1 && hd.regs.length > 0 && $('at-modal-hdlook').style.display !== 'none',
+            onChange: hdPaintDraw, onStrokeEnd: hdSchedule,
+            onNoMask: () => showToast('Add a region first', 'info')
+        });
+        $('at-hd-regadd').addEventListener('click', () => {
+            const n = hd.regs.length + 1, cur = $('at-hd-class').value;
+            hd.regs.push({ name: `Region ${n}`, color: HD_REG_COLORS[hd.regs.length % HD_REG_COLORS.length], cls: HD_CLASSES[cur] ? cur : 'granular', feather: 0, mi: -1, mask: mmBlankMask(state.tileSize) });
+            hd.active = hd.regs.length - 1;
+            hdRegsRows(); hdSchedule();
+        });
+        $('at-hd-regtile').addEventListener('click', () => { const el = byId(hd.ids[0]); if (el) { hdRegsFromTile(el); hdRegsRows(); hdSchedule(); } });
+        attachTilePicker($('at-hd-ref'), {});
+        $('at-hd-ref').addEventListener('change', hdSchedule);
+        $('at-hd-seed').addEventListener('input', hdSchedule);
+        $('at-hd-reseed').addEventListener('click', () => { $('at-hd-seed').value = 1 + Math.floor(Math.random() * 99999); hdSchedule(); });
+        ['at-hd-factor', 'at-hd-cutout', 'at-hd-wrap', 'at-hd-guided', 'at-hd-contours'].forEach(idn => $(idn).addEventListener('change', hdSchedule));
+        $('at-hd-reset').addEventListener('click', () => {
+            $('at-hd-factor').value = '4'; $('at-hd-cutout').value = 'auto'; $('at-hd-wrap').checked = true;
+            $('at-hd-faith').value = 100; $('at-hd-faith-num').value = 100; $('at-hd-sharpen').value = 0; $('at-hd-sharpen-num').value = 0; $('at-hd-guided').checked = false; $('at-hd-contours').value = '0';
+            $('at-hd-selfex').value = 0; $('at-hd-selfex-num').value = 0; $('at-hd-grain').value = 0; $('at-hd-grain-num').value = 0; $('at-hd-seed').value = 1;
+            hdSyncClass(); hdRender();
+        });
+        $('at-hd-apply').addEventListener('click', () => {
+            const targets = hd.ids.map(byId).filter(el => el && el.kind === 'tile');
+            if (!targets.length) return;
+            const recipe = hdRecipeNow(), n = targets.length, L = TRLE.Layers;
+            /* One seed per definition (P7): frames of one group applied separately must not flicker, so the seed comes from the
+               group's key (the tiles' own group), and from the field otherwise. It is stored; a rebuild never reads the group. */
+            const gk = groupKeyOf(targets[0]);
+            if (gk) { let h = 2166136261; for (const ch of gk) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619); } recipe.seed = (h >>> 0) % 100000 + 1; }
+            // The reference is COPIED into the definition (layers rule 4): painting over the tile later changes nothing.
+            const refTile = recipe.grain > 0 ? byId(recipe.refTile) : null;
+            const edit = hd.edit, keep = edit && edit.pixels && edit.pixels.ref && edit.recipe && edit.recipe.refTile === recipe.refTile;
+            const pixels = refTile ? { ref: L.imm(keep ? edit.pixels.ref : cloneCanvas(refTile.canvas)) } : undefined;
+            // The regions are copied too (phase 8): the piece keeps its own masks, never a reference to el.matLayers.
+            const regs = n === 1 ? hd.regs.map(r => ({ name: r.name, color: r.color, cls: r.cls, feather: r.feather, mi: r.mi, over: hdClassOver(r.cls), mask: cloneCanvas(r.mask) })) : [];
+            recipe.nreg = regs.length;
+            const piece = el => {
+                const p = { data: { self: !!refTile && refTile.id === el.id } };
+                if (regs.length) {
+                    p.data.regions = regs.map(r => ({ name: r.name, color: r.color, cls: r.cls, feather: r.feather, mi: r.mi, over: r.over }));
+                    p.aux = {}; regs.forEach((r, i) => { p.aux['r' + i] = L.imm(cloneCanvas(r.mask)); });
+                }
+                return p;
+            };
+            const el0 = targets[0], differs = regs.length > 0 && hdRegsDiffer(el0);
+            const regsSnap = hd.regs.map(r => ({ name: r.name, color: r.color, feather: r.feather, mi: r.mi, mask: cloneCanvas(r.mask) }));
+            const go = writeMaps => {
+                if (writeMaps && hasMatLayers(el0)) {
+                    const base = cloneMatLayers([el0.matLayers[0]])[0];
+                    const next = regsSnap.filter(r => r.mi > 0 && el0.matLayers[r.mi]).map(r => ({ name: r.name, color: r.color, feather: r.feather,
+                        material: deepCopyMaterial(el0.matLayers[r.mi].material), mask: cloneCanvas(r.mask) }));
+                    el0.matLayers = next.length ? [base].concat(next) : null;   // the same undo step: colourLayerApply pushes the history below
+                }
+                colourLayerApply('hdlook', 'HD Look', targets, recipe, piece, n > 1 ? `HD Look: ${n} tiles` : 'HD Look', pixels)
+                    .then(() => showToast(n > 1 ? `HD Look on ${n} tiles` : 'HD Look applied', 'success'));
+            };
+            closeModal();
+            if (differs) openConfirm('Material maps', 'Also update the material maps with these regions?', 'Yes, update them', () => go(true), { danger: false, cancelLabel: 'No, keep the maps', onNo: () => go(false) });
+            else go(false);
+        });
+    }
+
+    /* ============ 💧 SLOPE BLUR MODAL (WEATHERING-PLAN phase 2) ============
+       The filter is Engine.slopeBlur (via slopeBlurCanvas). This modal picks its
+       DRIVER, a grey canvas whose slope sets the direction: the tile's relief (an
+       imported height map when it has one, else its brightness), its brightness,
+       a Surface Noise field, or another tile. Lengths are a percentage of the
+       tile, so a preview at 256 px and the apply at 1024 px look the same.
+       Settings are TOOL settings and survive between opens, like Classic Look.
+       A driver is read for EVERY target before any is written (the Recolor
+       rule): a tile that is its own slope, or another batch tile's, must not be
+       read back half-weathered. */
+    const SB_ROWS = [
+        ['len',      'Length',              0, 30,  0.5, 6,  ' % of tile'],
+        ['smooth',   'Smooth the slope',    0, 12.5, 0.1, 1.2, ' % of tile'],
+        ['strength', 'Strength',            0, 100, 1,  100, '%'],
+        ['steps',    'Steps',               4, 48,  1,  24,  ''],
+    ];
+    const SB_GAIN = [['gain', 'Slope sensitivity', 1, 100, 1, 20, '']];
+    const SB_NOISE = [['nscale', 'Noise size', 0, 100, 1, 50, '%']];
+    const sb = { ids: [], raf: 0, inputs: null, edit: null };
+    /* A slider with a number box under `at-<prefix>-<key>`; Scatter's rows use it too. */
+    function sbNumRow(wrap, row, prefix = 'sb', onChange = sbSchedule) {
+        const [key, label, min, max, step, def, suffix] = row;
+        const g = document.createElement('div');
+        g.className = 'form-group';
+        g.innerHTML = `<label for="at-${prefix}-${key}-num">${label}${suffix.trim() ? ' (' + suffix.trim() + ')' : ''}</label>
+ <div class="at-numslider"><input type="range" id="at-${prefix}-${key}" min="${min}" max="${max}" step="${step}" value="${def}" aria-label="${label}">
+ <input type="number" id="at-${prefix}-${key}-num" min="${min}" max="${max}" step="${step}" value="${def}"></div>`;
+        wrap.appendChild(g);
+        const range = g.querySelector('input[type=range]'), num = g.querySelector('input[type=number]');
+        range.addEventListener('input', () => { num.value = range.value; onChange(); });
+        num.addEventListener('input', () => { const v = parseFloat(num.value); if (!isFinite(v)) return; range.value = Math.max(+range.min, Math.min(+range.max, v)); onChange(); });
+        num.addEventListener('change', () => { num.value = range.value; });
+    }
+    const sbVal = key => parseFloat($(`at-sb-${key}`).value) || 0;
+    function sbSet(key, v) { $(`at-sb-${key}`).value = v; $(`at-sb-${key}-num`).value = $(`at-sb-${key}`).value; }
+    /* A W x W grey canvas of `src`'s luminance (R = G = B, opaque): the driver. */
+    function sbGrey(src, W) {
+        const c = document.createElement('canvas');
+        c.width = c.height = W;
+        const x = c.getContext('2d');
+        if (src.width === W && src.height === W) x.drawImage(src, 0, 0);
+        else drawImported(x, src, W);
+        const id = x.getImageData(0, 0, W, W), d = id.data;
+        for (let i = 0; i < d.length; i += 4) {
+            const v = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
+            d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255;
+        }
+        x.putImageData(id, 0, 0);
+        return c;
+    }
+    const SB_IDS = ['at-sb-mode', 'at-sb-dir', 'at-sb-driver', 'at-sb-ntype', 'at-sb-seed', 'at-sb-tile', 'at-sb-follow', 'at-sb-edge', 'at-sb-maps', 'at-sb-tiled']
+        .concat(SB_ROWS.concat(SB_GAIN, SB_NOISE).flatMap(r => [`at-sb-${r[0]}`, `at-sb-${r[0]}-num`]));
+    /* The modal's settings as a recipe (numbers), which the preview, Apply and a rebuild all run. */
+    function sbRecipeNow() {
+        return {
+            len: sbVal('len'), smooth: sbVal('smooth'), steps: Math.round(sbVal('steps')), strength: sbVal('strength'),
+            mode: $('at-sb-mode').value, dir: $('at-sb-dir').value, follow: $('at-sb-follow').checked, gain: sbVal('gain'), edge: $('at-sb-edge').value,
+            driver: $('at-sb-driver').value, ntype: $('at-sb-ntype').value, nscale: sbVal('nscale'), seed: parseInt($('at-sb-seed').value, 10) || 1,
+            tileId: parseInt($('at-sb-tile').value, 10) || (sb.edit && sb.edit.recipe.tileId) || null, maps: $('at-sb-maps').value, controls: ctlSnap(SB_IDS)
+        };
+    }
+    /* The driver for a canvas of W px. `src` = what the driver reads from: { tile } the picked tile's copy,
+       { self } the layer's own input is the slope, { height } the tile's imported height map when it has one. */
+    function sbDriverFrom(r, input, W, src) {
+        if (r.driver === 'noise') return buildNoiseField(W, { type: r.ntype, scale: r.nscale, contrast: 60, dir: 'v', seed: r.seed });
+        if (r.driver === 'tile') return sbGrey(src.self || !src.tile ? input : src.tile, W);
+        if (r.driver === 'relief' && src.height) return sbGrey(src.height, W);
+        return sbGrey(input, W);
+    }
+    /* Engine options for a W px canvas. */
+    function sbOptsFrom(r, W) {
+        return { amount: r.len / 100 * W, smooth: r.smooth / 100 * W, samples: r.steps, mode: r.mode, dir: r.dir === 'up' ? -1 : 1,
+                 follow: r.follow, gain: r.gain, strength: r.strength / 100, edge: r.edge };
+    }
+    /* Slope Blur as a layer (LAYERS-PLAN phase 8): any number per tile, Texture zone. A picked driver TILE is copied
+       into the definition at Apply (def.pixels.drv), a tile's imported height map into its piece (aux.drv), so
+       editing or deleting that tile afterwards changes nothing. `piece.data.self`: the tile was its own slope. */
+    TRLE.Layers.register('slope', { zone: 'texture', mode: 'adjust', cost: (def, S) => 40 * (S / 1024) ** 2 + (def.recipe.driver === 'noise' ? 30 * (S / 1024) ** 2 : 0),
+        // The driver TILE is read in register with this one, so a Rotate / Flip / Offset / warp of this tile turns its copy too
+        // (Layers.move keeps the turned copy per piece, `aux.tcopy`). Not for the tile's own pixels (`self`): those turn anyway.
+        tileCopy: (def, piece) => def.recipe.driver === 'tile' && !(piece.data && piece.data.self) && def.pixels ? def.pixels.drv : null,
+        apply: (input, def, piece) => {
+            const W = input.width, r = def.recipe;
+            const tile = (piece.aux && piece.aux.tcopy) || (def.pixels && def.pixels.drv);
+            const drv = sbDriverFrom(r, input, W, { tile, self: piece.data && piece.data.self, height: piece.aux && piece.aux.drv });
+            return slopeBlurCanvas(input, drv, sbOptsFrom(r, W));
+        },
+        edit: (el, def) => layerEditOpen(el, def, ids => openSlopeModal(ids, { def })) });
+    /* Open a multi-tile layer's modal with the tile that was clicked first. */
+    function layerEditOpen(el, def, open) {
+        const ids = TRLE.Layers.tilesOf(def.lid, state.elements).map(e => e.id);
+        ids.sort((a, b) => (a === el.id ? -1 : b === el.id ? 1 : 0));
+        open(ids);
+    }
+    /* What the picked driver tile contributes for `el`: a copy of its pixels (the stored copy while an edit keeps the
+       same tile), and whether the tile is its own slope. */
+    function sbSourceFor(el, r, W) {
+        const t = byId(r.tileId), e = sb.edit && sb.edit.recipe;
+        const keep = e && sb.edit.pixels && sb.edit.pixels.drv && e.driver === 'tile' && e.tileId === r.tileId;
+        const own = keep && el.layers && (el.layers.find(p => p.lid === sb.edit.lid) || {}).aux;   // the copy as this tile was turned
+        return { tile: keep ? (own && own.tcopy) || sb.edit.pixels.drv : t ? t.canvas : null, self: !!t && t.id === el.id, height: el.importedMaps && el.importedMaps.height };
+    }
+    function sbRun(el, src, W) { const r = sbRecipeNow(); return slopeBlurCanvas(src, sbDriverFrom(r, src, W, sbSourceFor(el, r, W)), sbOptsFrom(r, W)); }
+    function sbSync() {
+        const d = $('at-sb-driver').value;
+        $('at-sb-noisebox').style.display = d === 'noise' ? '' : 'none';
+        $('at-sb-tilebox').style.display = d === 'tile' ? '' : 'none';
+        $('at-sb-gain-rows').style.display = $('at-sb-follow').checked ? '' : 'none';
+    }
+    function sbRender() {
+        sb.raf = 0;
+        const el = byId(sb.ids[0]);
+        if (!el) return;
+        const inp = xin(sb.inputs, el);
+        const P = $('at-sb-after').width, W = Math.min(inp.width, P);
+        const src = W === inp.width ? inp : (() => { const c = document.createElement('canvas'); c.width = c.height = W; drawImported(c.getContext('2d'), inp, W); return c; })();
+        const out = sbRun(el, src, W);
+        const after = $('at-sb-after'), ctx = after.getContext('2d');
+        ctx.clearRect(0, 0, P, P);
+        if ($('at-sb-tiled').checked) {
+            for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) ctx.drawImage(out, x * P / 2, y * P / 2, P / 2, P / 2);
+        } else ctx.drawImage(out, 0, 0, P, P);
+        drawReplace($('at-sb-before'), inp, P, P);
+        $('at-sb-readout').textContent = $('at-sb-edge').value === 'wrap' ? '· tiles if the texture and the slope do' : '· does not tile';
+    }
+    function sbSchedule() { if (!sb.raf) sb.raf = requestAnimationFrame(sbRender); }
+    function openSlopeModal(ids, editing) {
+        const list = (Array.isArray(ids) ? ids : [ids]).filter(i => { const e = byId(i); return e && e.kind === 'tile'; });
+        if (!list.length) return;
+        sb.ids = list;
+        sb.edit = editing ? { lid: editing.def.lid, recipe: editing.def.recipe, pixels: editing.def.pixels } : null;
+        sb.inputs = layerInputsMany(list, 'slope', editing);
+        const sel = $('at-sb-tile'), keep = sel.value;
+        sel.innerHTML = state.elements.filter(e => e.kind === 'tile').map(e => `<option value="${e.id}">Tile ${numberOf(e.id)}</option>`).join('');
+        sel.value = [...sel.options].some(o => o.value === keep) ? keep : String(list[0]);
+        tilePickerSync(sel);
+        $('at-sb-tileno').textContent = numberOf(list[0]);
+        setBatchNote('at-modal-slope', list.length, numberOf(list[0]));
+        if (editing) { ctlRestore(editing.def.recipe.controls); tilePickerSync($('at-sb-tile')); }
+        setEditNote('at-modal-slope', editing ? '✏️ Editing this Slope Blur layer: Apply replaces it.' : '');
+        sbSync();
+        openModal('slope');
+        sbRender();
+    }
+    function sbCleanup() { if (sb.raf) cancelAnimationFrame(sb.raf); sb.raf = 0; sb.ids = []; sb.inputs = null; sb.edit = null; }
+    function sbReset() {
+        SB_ROWS.concat(SB_GAIN, SB_NOISE).forEach(r => sbSet(r[0], r[5]));
+        $('at-sb-mode').value = 'blur'; $('at-sb-dir').value = 'down'; $('at-sb-driver').value = 'relief'; tilePickerSync($('at-sb-driver'));
+        $('at-sb-follow').checked = false; $('at-sb-edge').value = 'wrap'; $('at-sb-maps').value = 'result';
+        $('at-sb-seed').value = '1'; $('at-sb-tiled').checked = false;
+        sbSync(); sbRender();
+    }
+    function setupSlopeModal() {
+        SB_ROWS.forEach(r => sbNumRow($('at-sb-rows'), r));
+        SB_GAIN.forEach(r => sbNumRow($('at-sb-gain-rows'), r));
+        SB_NOISE.forEach(r => sbNumRow($('at-sb-noise-rows'), r));
+        const nt = $('at-sb-ntype');
+        for (const [k, label] of NOISE_TYPES) nt.add(new Option(label, k));
+        nt.value = 'clouds';
+        attachTilePicker($('at-sb-tile'), {});
+        ['at-sb-mode', 'at-sb-dir', 'at-sb-driver', 'at-sb-ntype', 'at-sb-seed', 'at-sb-tile', 'at-sb-follow', 'at-sb-edge', 'at-sb-tiled']
+            .forEach(idn => $(idn).addEventListener('change', () => { sbSync(); sbSchedule(); }));
+        attachTilePicker($('at-sb-driver'), { text: true, title: 'Driver', ...previewByValue($('at-sb-driver'), sbRender) });
+        $('at-sb-seed').addEventListener('input', sbSchedule);
+        $('at-sb-reseed').addEventListener('click', () => { $('at-sb-seed').value = Math.floor(Math.random() * 100000); sbSchedule(); });
+        $('at-sb-reset').addEventListener('click', sbReset);
+        $('at-sb-apply').addEventListener('click', () => {
+            const targets = sb.ids.map(byId).filter(el => el && el.kind === 'tile');
+            if (!targets.length) return;
+            const r = sbRecipeNow(), L = TRLE.Layers, editing = sb.edit, n = targets.length, S = state.tileSize;
+            // Every copy is taken before any tile is written (the Recolor rule), here and again in the rebuild: a layer only reads its own input and its copies.
+            const t = r.driver === 'tile' ? byId(r.tileId) : null, dsrc = r.driver === 'tile' ? sbSourceFor(targets[0], r, S).tile : null;
+            const drv = dsrc ? L.imm(cloneCanvas(dsrc)) : null;
+            const pieceFor = el => {
+                const h = r.driver === 'relief' && el.importedMaps && el.importedMaps.height;
+                return { data: { self: !!t && t.id === el.id }, aux: h ? { drv: L.imm(cloneCanvas(h)) } : undefined };
+            };
+            const pieces = targets.map(pieceFor), pixels = drv ? { drv } : undefined;
+            if (r.maps === 'result') targets.forEach(el => { el.mapSource = null; });   // retires a stored original (a project from before layers)
+            closeModal();
+            (async () => {
+                if (editing && state.layerDefs[editing.lid]) {
+                    const er = editing.recipe, sameTile = er && er.driver === 'tile' && r.driver === 'tile' && er.tileId === r.tileId;
+                    L.update(state.layerDefs, editing.lid, { recipe: r, pixels });
+                    L.tilesOf(editing.lid, state.elements).forEach(el => {
+                        const old = el.layers.find(p => p.lid === editing.lid), np = pieceFor(el);
+                        const tc = sameTile && old.aux && old.aux.tcopy;   // this tile's turned copy of the same driver tile
+                        if (tc) np.aux = Object.assign({}, np.aux, { tcopy: tc });
+                        const merged = Object.assign({}, old, np);
+                        if (!np.aux) delete merged.aux;   // a driver change drops the old copies (relief height, turned tile)
+                        el.layers = el.layers.map(p => p === old ? merged : p);
+                    });
+                    await layersCommit(L.tilesOf(editing.lid, state.elements), 'Edit slope blur');
+                } else {
+                    L.add(state.layerDefs, targets, { kind: 'slope', name: 'Slope Blur', recipe: r, pixels }, pieces.map(p => { if (!p.aux) delete p.aux; return p; }));
+                    refreshTransitions();
+                    await layersCommit(targets, n > 1 ? `Slope Blur: ${n} tiles` : 'Slope Blur');
+                }
+                showToast(n > 1 ? `Slope Blur on ${n} tiles` : 'Slope Blur applied', 'success');
+            })();
+        });
+    }
+
+    /* ============ 🍂 SCATTER MODAL (WEATHERING-PLAN phase 4) ============
+       The stamping is scatterCanvas (beside slopeBlurCanvas). Sizes are a
+       percentage of the tile, so a 256 px preview and a 1024 px apply agree.
+       The preview shows the first tile with the seed as typed; each further tile
+       of a batch gets its own layout (the seed mixed with its place in the
+       batch), so a selection is not the same stamp pattern repeated. Every
+       target's result is made before any tile is written (the Recolor rule): a
+       patch tile that is itself in the batch must not be read back stamped. */
+    const SC_ROWS = [
+        ['count',   'Amount',         0, 300, 1,   40,  ''],
+        ['size',    'Patch size',     2, 50,  0.5, 14,  ' % of tile'],
+        ['sizevar', 'Size variation', 0, 100, 1,   50,  '%'],
+        ['rot',     'Rotation (±)',   0, 180, 1,   180, '°'],
+        ['soft',    'Edge softness',  0, 100, 1,   60,  '%'],
+        ['rough',   'Edge roughness', 0, 100, 1,   40,  '%'],
+        ['opacity', 'Opacity',        0, 100, 1,   80,  '%'],
+    ];
+    const sc = { ids: [], raf: 0, inputs: null, edit: null };
+    const scVal = key => parseFloat($(`at-sc-${key}`).value) || 0;
+    function scSet(key, v) { $(`at-sc-${key}`).value = v; $(`at-sc-${key}-num`).value = $(`at-sc-${key}`).value; }
+    const SC_IDS = ['at-sc-from', 'at-sc-tile', 'at-sc-blend', 'at-sc-seed', 'at-sc-edge', 'at-sc-maps', 'at-sc-tiled']
+        .concat(SC_ROWS.flatMap(r => [`at-sc-${r[0]}`, `at-sc-${r[0]}-num`]));
+    /* The modal's settings as a recipe (numbers); the seed is mixed with a tile's place in the batch at run time. */
+    function scRecipeNow() {
+        return { count: scVal('count'), size: scVal('size'), sizeVar: scVal('sizevar'), rot: scVal('rot'), soft: scVal('soft'), rough: scVal('rough'),
+                 opacity: scVal('opacity'), blend: $('at-sc-blend').value, edge: $('at-sc-edge').value, seed: (parseInt($('at-sc-seed').value, 10) || 0) >>> 0,
+                 from: $('at-sc-from').value, tileId: parseInt($('at-sc-tile').value, 10) || (sc.edit && sc.edit.recipe.tileId) || null, maps: $('at-sc-maps').value, controls: ctlSnap(SC_IDS) };
+    }
+    function scOptsFrom(r, seedMix) {
+        return { count: r.count, size: r.size, sizeVar: r.sizeVar, rot: r.rot, soft: r.soft, rough: r.rough, opacity: r.opacity,
+                 blend: r.blend, wrap: r.edge === 'wrap', seed: (r.seed ^ Math.imul(seedMix || 0, 0x9e3779b1)) >>> 0 || 1 };
+    }
+    /* The patch source for a canvas of W px: a copy of the picked tile (null = the base itself). */
+    function scPatchAt(patch, W) {
+        if (!patch) return null;
+        if (patch.width === W) return patch;
+        const c = document.createElement('canvas'); c.width = c.height = W;
+        drawImported(c.getContext('2d'), patch, W);
+        return c;
+    }
+    /* Scatter as a layer (LAYERS-PLAN phase 8): any number per tile, Texture zone. The patch TILE is copied into the
+       definition at Apply (def.pixels.patch), so editing or deleting it afterwards changes nothing; `piece.data.mix`
+       is the tile's place in the batch (each tile its own layout) and `piece.data.self` that the patch was the tile itself. */
+    TRLE.Layers.register('scatter', { zone: 'texture', mode: 'adjust', cost: (def, S) => 60 * (S / 1024) ** 2,
+        apply: (input, def, piece) => {
+            const W = input.width, d = piece.data || {};
+            const patch = def.recipe.from === 'tile' && !d.self && def.pixels ? scPatchAt(def.pixels.patch, W) : null;
+            return scatterCanvas(input, patch || input, scOptsFrom(def.recipe, d.mix || 0));
+        },
+        edit: (el, def) => layerEditOpen(el, def, ids => openScatterModal(ids, { def })) });
+    /* The patch the modal uses for `el`: the stored copy while an edit keeps the same tile, else the tile's pixels now. */
+    function scPatchFor(el, r) {
+        if (r.from !== 'tile') return null;
+        const t = byId(r.tileId), e = sc.edit && sc.edit.recipe;
+        if (e && sc.edit.pixels && sc.edit.pixels.patch && e.from === 'tile' && e.tileId === r.tileId) return sc.edit.pixels.patch;
+        return !t || t === el ? null : t.canvas;
+    }
+    function scSync() { $('at-sc-tilebox').style.display = $('at-sc-from').value === 'tile' ? '' : 'none'; }
+    function scRender() {
+        sc.raf = 0;
+        const el = byId(sc.ids[0]);
+        if (!el) return;
+        const inp = xin(sc.inputs, el), r = scRecipeNow();
+        const P = $('at-sc-after').width, W = Math.min(inp.width, P);
+        let base = inp;
+        if (W !== base.width) { base = document.createElement('canvas'); base.width = base.height = W; drawImported(base.getContext('2d'), inp, W); }
+        const out = scatterCanvas(base, scPatchAt(scPatchFor(el, r), W) || base, scOptsFrom(r, 0));
+        const after = $('at-sc-after'), ctx = after.getContext('2d');
+        ctx.clearRect(0, 0, P, P);
+        if ($('at-sc-tiled').checked) {
+            for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) ctx.drawImage(out, x * P / 2, y * P / 2, P / 2, P / 2);
+        } else ctx.drawImage(out, 0, 0, P, P);
+        drawReplace($('at-sc-before'), inp, P, P);
+        $('at-sc-readout').textContent = $('at-sc-edge').value === 'wrap' ? '· tiles if the texture does' : '· does not tile';
+    }
+    function scSchedule() { if (!sc.raf) sc.raf = requestAnimationFrame(scRender); }
+    function openScatterModal(ids, editing) {
+        const list = (Array.isArray(ids) ? ids : [ids]).filter(i => { const e = byId(i); return e && e.kind === 'tile'; });
+        if (!list.length) return;
+        sc.ids = list;
+        sc.edit = editing ? { lid: editing.def.lid, recipe: editing.def.recipe, pixels: editing.def.pixels } : null;
+        sc.inputs = layerInputsMany(list, 'scatter', editing);
+        const sel = $('at-sc-tile'), keep = sel.value;
+        sel.innerHTML = state.elements.filter(e => e.kind === 'tile').map(e => `<option value="${e.id}">Tile ${numberOf(e.id)}</option>`).join('');
+        sel.value = [...sel.options].some(o => o.value === keep) ? keep : String(list[0]);
+        tilePickerSync(sel);
+        $('at-sc-tileno').textContent = numberOf(list[0]);
+        setBatchNote('at-modal-scatter', list.length, numberOf(list[0]));
+        if (editing) { ctlRestore(editing.def.recipe.controls); tilePickerSync(sel); }
+        setEditNote('at-modal-scatter', editing ? '✏️ Editing this Scatter layer: Apply replaces it.' : '');
+        scSync();
+        openModal('scatter');
+        scRender();
+    }
+    function scCleanup() { if (sc.raf) cancelAnimationFrame(sc.raf); sc.raf = 0; sc.ids = []; sc.inputs = null; sc.edit = null; }
+    function scReset() {
+        SC_ROWS.forEach(r => scSet(r[0], r[5]));
+        $('at-sc-from').value = 'self'; $('at-sc-blend').value = 'normal'; tilePickerSync($('at-sc-blend')); $('at-sc-edge').value = 'wrap';
+        $('at-sc-maps').value = 'result'; $('at-sc-seed').value = '1'; $('at-sc-tiled').checked = false;
+        scSync(); scRender();
+    }
+    function setupScatterModal() {
+        SC_ROWS.forEach(r => sbNumRow($('at-sc-rows'), r, 'sc', scSchedule));
+        attachTilePicker($('at-sc-tile'), {});
+        ['at-sc-from', 'at-sc-tile', 'at-sc-blend', 'at-sc-seed', 'at-sc-edge', 'at-sc-tiled']
+            .forEach(idn => $(idn).addEventListener('change', () => { scSync(); scSchedule(); }));
+        attachTilePicker($('at-sc-blend'), { text: true, title: 'Blend', ...previewByValue($('at-sc-blend'), scRender) });
+        $('at-sc-seed').addEventListener('input', scSchedule);
+        $('at-sc-reseed').addEventListener('click', () => { $('at-sc-seed').value = Math.floor(Math.random() * 100000); scSchedule(); });
+        $('at-sc-reset').addEventListener('click', scReset);
+        $('at-sc-apply').addEventListener('click', () => {
+            const targets = sc.ids.map(byId).filter(el => el && el.kind === 'tile');
+            if (!targets.length) return;
+            const r = scRecipeNow(), L = TRLE.Layers, editing = sc.edit, n = targets.length;
+            // The patch is copied before any tile is written; a tile that IS the patch uses its own input instead (the old rule).
+            const t = r.from === 'tile' ? byId(r.tileId) : null;
+            const patchSrc = r.from === 'tile' ? (scPatchFor(null, r) || (t && t.canvas)) : null;
+            const pixels = patchSrc ? { patch: L.imm(cloneCanvas(patchSrc)) } : undefined;
+            const pieceFor = (el, i) => ({ data: { mix: i, self: !!t && t.id === el.id } });
+            if (r.maps === 'result') targets.forEach(el => { el.mapSource = null; });   // retires a stored original (a project from before layers)
+            closeModal();
+            (async () => {
+                if (editing && state.layerDefs[editing.lid]) {
+                    L.update(state.layerDefs, editing.lid, { recipe: r, pixels });
+                    L.tilesOf(editing.lid, state.elements).forEach(el => {
+                        const old = el.layers.find(p => p.lid === editing.lid);
+                        el.layers = el.layers.map(p => p === old ? Object.assign({}, old, { data: Object.assign({}, old.data, { self: !!t && t.id === el.id }) }) : p);
+                    });
+                    await layersCommit(L.tilesOf(editing.lid, state.elements), 'Edit scatter');
+                } else {
+                    L.add(state.layerDefs, targets, { kind: 'scatter', name: 'Scatter', recipe: r, pixels }, targets.map(pieceFor));
+                    refreshTransitions();
+                    await layersCommit(targets, n > 1 ? `Scatter: ${n} tiles` : 'Scatter');
+                }
+                showToast(n > 1 ? `Scatter on ${n} tiles` : 'Scatter applied', 'success');
+            })();
+        });
+    }
+
+    /* ============ FREE TRANSFORM (TRANSFORMS-PLAN phase 2) ============
+       Rotate / scale / skew / move about the tile centre through the shared
+       resampler. Forward M = R(rot) . ShX . ShY . diag(sx, sy) in image space (y
+       down, so a positive angle turns clockwise, as in Photoshop); the shader
+       wants the INVERSE, G(y) = L (y - c - T) + c with L = M^-1.
+       Keep tileable swaps the sliders for lattice choices: the result tiles
+       exactly when L is an integer matrix (the research's rule), so a rotation
+       is a pair (p, q) with L = n . Sh^-1 . [[p, q], [-q, p]], turning by
+       atan2(q, p) and showing the texture at 1 / |(p, q)|. */
+    const XF_FREE = [
+        ['rot',    'Rotate',          -180, 180, 0.1,   0, '°'],
+        ['scale',  'Scale',              5, 400, 0.1, 100, '%'],
+        ['scaley', 'Scale Y',            5, 400, 0.1, 100, '%'],
+        ['skewx',  'Skew horizontal',  -60,  60, 0.1,   0, '°'],
+        ['skewy',  'Skew vertical',    -60,  60, 0.1,   0, '°'],
+    ];
+    const XF_MOVE = [
+        ['movex', 'Move X', -256, 256, 1, 0, ' px'],
+        ['movey', 'Move Y', -256, 256, 1, 0, ' px'],
+    ];
+    /* The lattice rotations, smallest first: 90 degree turns, then the
+       Pythagorean ones (26.6 and 63.4 at 1/sqrt 5, 36.9 and 53.1 at 1/5). */
+    const XF_LATTICE = [[1, 0], [2, 1], [4, 3], [1, 1], [3, 4], [1, 2], [0, 1]];
+    const xf = { ids: [], raf: 0, drag: null };
+
+    function xfNumRow(wrap, [key, label, min, max, step, def, suffix]) {
+        const g = document.createElement('div');
+        g.className = 'form-group';
+        g.id = `at-xf-${key}-row`;
+        g.innerHTML = `<label for="at-xf-${key}-num">${label}${suffix.trim() ? ' (' + suffix.trim() + ')' : ''}</label>
+ <div class="at-numslider"><input type="range" id="at-xf-${key}" min="${min}" max="${max}" step="${step}" value="${def}" aria-label="${label}">
+ <input type="number" id="at-xf-${key}-num" min="${min}" max="${max}" step="${step}" value="${def}"></div>`;
+        wrap.appendChild(g);
+        const range = g.querySelector('input[type=range]'), num = g.querySelector('input[type=number]');
+        range.addEventListener('input', () => { num.value = range.value; xfSchedule(); });
+        num.addEventListener('input', () => {
+            const v = parseFloat(num.value);
+            if (!isFinite(v)) return;
+            range.value = Math.max(+range.min, Math.min(+range.max, v));
+            xfSchedule();
+        });
+        num.addEventListener('change', () => { num.value = range.value; });
+    }
+    function xfSet(key, v) { $(`at-xf-${key}`).value = v; $(`at-xf-${key}-num`).value = $(`at-xf-${key}`).value; }
+    const xfVal = key => parseFloat($(`at-xf-${key}`).value) || 0;
+
+    /* The inverse linear part L, a 2x2 [[a, b], [c, d]]. Entries within 1e-9
+       of an integer are snapped to it, so 90 degrees is exactly [[0, 1], [-1, 0]]
+       and not cos(90) = 6e-17, which is what makes Auto's Nearest exact. */
+    function xfLinear() {
+        let L;
+        if ($('at-xf-tile').checked) {
+            const [p, q] = $('at-xf-langle').value.split(',').map(Number);
+            const n = parseInt($('at-xf-lrep').value, 10) || 1;
+            const [a, b] = $('at-xf-lskew').value.split(',').map(Number);
+            // n . ShY(b)^-1 . ShX(a)^-1 . [[p, q], [-q, p]]
+            const R = [[p, q], [-q, p]];
+            const X = [[R[0][0] - a * R[1][0], R[0][1] - a * R[1][1]], [R[1][0], R[1][1]]];
+            L = [[n * X[0][0], n * X[0][1]], [n * (X[1][0] - b * X[0][0]), n * (X[1][1] - b * X[0][1])]];
+        } else {
+            const t = xfVal('rot') * Math.PI / 180, cs = Math.cos(t), sn = Math.sin(t);
+            const sx = xfVal('scale') / 100, sy = ($('at-xf-lock').checked ? xfVal('scale') : xfVal('scaley')) / 100;
+            const tx = Math.tan(xfVal('skewx') * Math.PI / 180), ty = Math.tan(xfVal('skewy') * Math.PI / 180);
+            // M = R . [[1 + tx ty, tx], [ty, 1]] . diag(sx, sy)
+            const H = [[(1 + tx * ty) * sx, tx * sy], [ty * sx, sy]];
+            const M = [[cs * H[0][0] - sn * H[1][0], cs * H[0][1] - sn * H[1][1]],
+                       [sn * H[0][0] + cs * H[1][0], sn * H[0][1] + cs * H[1][1]]];
+            const det = M[0][0] * M[1][1] - M[0][1] * M[1][0];
+            L = [[M[1][1] / det, -M[0][1] / det], [-M[1][0] / det, M[0][0] / det]];
+        }
+        return L.map(r => r.map(v => Math.abs(v - Math.round(v)) < 1e-9 ? Math.round(v) : v));
+    }
+    function xfInverse(S) {
+        const L = xfLinear(), c = S / 2, Tx = xfVal('movex'), Ty = xfVal('movey');
+        return {
+            m0: [L[0][0], L[0][1], c - L[0][0] * (c + Tx) - L[0][1] * (c + Ty)],
+            m1: [L[1][0], L[1][1], c - L[1][0] * (c + Tx) - L[1][1] * (c + Ty)],
+        };
+    }
+    /* Does every output pixel centre land on a source pixel centre? Then no
+       pixel is in between and Nearest is exact (Auto picks it). */
+    function xfExact(inv) {
+        const frac = v => Math.abs(v - Math.floor(v) - 0.5) < 1e-6;
+        const intg = v => Math.abs(v - Math.round(v)) < 1e-9;
+        return [inv.m0, inv.m1].every(m => intg(m[0]) && intg(m[1]) && frac(m[0] * 0.5 + m[1] * 0.5 + m[2]));
+    }
+    /* The resampler setting for `inv` drawn at `k` source px per output px:
+       a supersample sized by how much the map shrinks (the largest singular
+       value of its linear part), never for Nearest (it would blur hard pixels). */
+    function xfResample(inv, k) {
+        let filter = $('at-xf-filter').value;
+        if (filter === 'auto') filter = xfExact(inv) ? 'nearest' : 'bicubic';
+        const a = inv.m0[0], b = inv.m0[1], c = inv.m1[0], d = inv.m1[1];
+        const t = a * a + b * b + c * c + d * d, det = a * d - b * c;
+        const smax = Math.sqrt(Math.max(0, (t + Math.sqrt(Math.max(0, t * t - 4 * det * det))) / 2)) * k;
+        const ss = filter === 'nearest' ? 1 : Math.max(1, Math.min(4, Math.ceil(smax - 1e-6)));
+        const edge = $('at-xf-tile').checked ? 'wrap' : $('at-xf-edge').value;
+        return { filter, edge, ss };
+    }
+    /* Whether the result still tiles: the lattice rule, with Wrap. */
+    function xfTiles() {
+        if ($('at-xf-tile').checked) return true;
+        const L = xfLinear();
+        return $('at-xf-edge').value === 'wrap' && L.flat().every(v => v === Math.round(v));
+    }
+    function xfSync() {
+        const tile = $('at-xf-tile').checked;
+        $('at-xf-free').style.display = tile ? 'none' : '';
+        $('at-xf-lattice').style.display = tile ? '' : 'none';
+        $('at-xf-edge-row').style.display = tile ? 'none' : '';
+        $('at-xf-seam-row').style.display = tile ? 'none' : '';
+        $('at-xf-scaley-row').style.display = $('at-xf-lock').checked ? 'none' : '';
+        $('at-xf-scale-row').querySelector('label').firstChild.textContent = $('at-xf-lock').checked ? 'Scale (%)' : 'Scale X (%)';
+    }
+    function xfRender() {
+        xf.raf = 0;
+        const el = byId(xf.ids[0]);
+        if (!el) return;
+        const S = el.canvas.width, P = $('at-xf-after').width;
+        const inv = xfInverse(S);
+        const opts = xfResample(inv, S / P);
+        let out = warpCanvas(el.canvas, P, P, invForPreview(inv, S, P), opts);
+        const tiles = xfTiles();
+        if (!$('at-xf-tile').checked && $('at-xf-seam').checked) out = seamlessCanvas(out);
+        const after = $('at-xf-after'), ctx = after.getContext('2d');
+        ctx.clearRect(0, 0, P, P);
+        if ($('at-xf-tiled').checked) {
+            for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) ctx.drawImage(out, x * P / 2, y * P / 2, P / 2, P / 2);
+        } else ctx.drawImage(out, 0, 0);
+        drawReplace($('at-xf-before'), el.canvas, P, P);
+        const seam = !$('at-xf-tile').checked && $('at-xf-seam').checked;
+        $('at-xf-readout').textContent = '· ' + opts.filter + (opts.ss > 1 ? ` ×${opts.ss * opts.ss} samples` : '')
+            + (tiles || seam ? ' · tiles' : ' · does not tile');
+    }
+    function xfSchedule() { if (!xf.raf) xf.raf = requestAnimationFrame(xfRender); }
+    function xfResetGeometry() {
+        XF_FREE.concat(XF_MOVE).forEach(([key, , , , , def]) => xfSet(key, def));
+        $('at-xf-lock').checked = true;
+        $('at-xf-langle').value = '1,0'; $('at-xf-lrep').value = '1'; $('at-xf-lskew').value = '0,0';
+    }
+    function openXformModal(ids) {
+        const list = (Array.isArray(ids) ? ids : [ids]).filter(i => { const e = byId(i); return e && e.kind === 'tile'; });
+        if (!list.length) return;
+        xf.ids = list;
+        const S = state.tileSize;
+        ['movex', 'movey'].forEach(k => { const r = $(`at-xf-${k}`), n = $(`at-xf-${k}-num`); r.min = n.min = -S; r.max = n.max = S; });
+        xfResetGeometry();
+        $('at-xf-tileno').textContent = numberOf(list[0]);
+        setBatchNote('at-modal-xform', list.length, numberOf(list[0]));
+        xfSync();
+        openModal('xform');
+        xfRender();
+    }
+    function xfCleanup() { if (xf.raf) cancelAnimationFrame(xf.raf); xf.raf = 0; xf.ids = []; xf.drag = null; }
+    function setupXformModal() {
+        // Two columns: Rotate | Scale, Skew H | Skew V, then the scale lock and,
+        // when it is off, Scale Y.
+        const free = $('at-xf-free');
+        [0, 1, 3, 4].forEach(i => xfNumRow(free, XF_FREE[i]));
+        const lock = document.createElement('label');
+        lock.className = 'checkbox-row at-xf-span';
+        lock.innerHTML = '<input type="checkbox" id="at-xf-lock" checked> Same scale both ways';
+        free.appendChild(lock);
+        xfNumRow(free, XF_FREE[2]);
+        XF_MOVE.forEach(r => xfNumRow($('at-xf-move'), r));
+        $('at-xf-langle').innerHTML = XF_LATTICE.flatMap(([p, q]) => q === 0 ? [[p, q]] : p === 0 ? [[p, q], [p, -q]] : [[p, q], [p, -q]])
+            .concat([[-1, 0]])
+            .map(([p, q]) => ({ p, q, deg: Math.atan2(q, p) * 180 / Math.PI, shows: 1 / Math.hypot(p, q) }))
+            .sort((a, b) => a.deg - b.deg)
+            .map(o => `<option value="${o.p},${o.q}">${+o.deg.toFixed(1)}°${o.shows < 1 ? ` · shows it at ${Math.round(o.shows * 100)}%` : ''}</option>`).join('');
+        $('at-xf-langle').value = '1,0';
+        ['at-xf-tile', 'at-xf-lock', 'at-xf-langle', 'at-xf-lrep', 'at-xf-lskew', 'at-xf-filter', 'at-xf-edge', 'at-xf-seam', 'at-xf-tiled']
+            .forEach(idn => $(idn).addEventListener('change', () => { xfSync(); xfSchedule(); }));
+        $('at-xf-reset').addEventListener('click', () => { xfResetGeometry(); xfSync(); xfRender(); });
+        // Drag the After preview to move the texture (whole pixels, in tile px).
+        const after = $('at-xf-after');
+        after.addEventListener('pointerdown', e => {
+            after.setPointerCapture(e.pointerId);
+            xf.drag = { x: e.clientX, y: e.clientY, mx: xfVal('movex'), my: xfVal('movey') };
+        });
+        after.addEventListener('pointermove', e => {
+            if (!xf.drag) return;
+            const r = after.getBoundingClientRect(), k = state.tileSize / r.width * ($('at-xf-tiled').checked ? 2 : 1);
+            xfSet('movex', Math.round(xf.drag.mx + (e.clientX - xf.drag.x) * k));
+            xfSet('movey', Math.round(xf.drag.my + (e.clientY - xf.drag.y) * k));
+            xfSchedule();
+        });
+        const end = () => { xf.drag = null; };
+        after.addEventListener('pointerup', end);
+        after.addEventListener('pointercancel', end);
+        $('at-xf-apply').addEventListener('click', async () => {
+            const targets = xf.ids.map(byId).filter(el => el && el.kind === 'tile');
+            if (!targets.length) return;
+            const S = state.tileSize, inv = xfInverse(S), opts = xfResample(inv, 1);
+            const tiles = xfTiles(), seam = !$('at-xf-tile').checked && $('at-xf-seam').checked;
+            targets.forEach(el => {
+                moveTileLayers(el, warpMove(inv, S, opts, warpDesc(inv, S, opts)), true);
+                if (seam) seamAfterMove(el, true);
+                // A plain tile made seamless is seamless; under layers the move broke the picture's tiling and a Make Seamless layer mends it.
+                if (seam || !tiles) setBaseSeamless(el, seam && !hasLayers(el));
+                el.edited = true;
+            });
+            const n = targets.length;
+            closeModal();
+            await layersSettle(targets);
+            refreshTransitions();
+            renderGrid();
+            pushHistory(n > 1 ? `Free Transform: ${n} tiles` : 'Free Transform');
+            showToast(n > 1 ? `Free Transform on ${n} tiles` : 'Free Transform applied', 'success');
+        });
+    }
+
+    /* ============ PERSPECTIVE (TRANSFORMS-PLAN phase 3) ============
+       Four corners, one homography. Straighten: the quad marked on the source
+       (this tile, or a photo at full size) becomes the whole tile, so G maps the
+       tile's corners onto the quad. Distort: the tile's own corners move to the
+       quad, so G maps the quad back onto the tile's corners. Both are the same
+       8x8 solve, `homography(from, to)`, with H . from = to. */
+    function homography(from, to) {
+        const A = [], b = [];
+        for (let i = 0; i < 4; i++) {
+            const [x, y] = from[i], [u, v] = to[i];
+            A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); b.push(u);
+            A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); b.push(v);
+        }
+        for (let c = 0; c < 8; c++) {           // Gaussian elimination, partial pivot
+            let p = c;
+            for (let r = c + 1; r < 8; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+            if (Math.abs(A[p][c]) < 1e-12) return null;   // three corners in a line
+            [A[c], A[p]] = [A[p], A[c]]; [b[c], b[p]] = [b[p], b[c]];
+            for (let r = 0; r < 8; r++) {
+                if (r === c) continue;
+                const f = A[r][c] / A[c][c];
+                if (!f) continue;
+                for (let k = c; k < 8; k++) A[r][k] -= f * A[c][k];
+                b[r] -= f * b[c];
+            }
+        }
+        const h = b.map((v, i) => v / A[i][i]);
+        const snap = v => Math.abs(v - Math.round(v)) < 1e-9 ? Math.round(v) : v;
+        const inv = { m0: [h[0], h[1], h[2]].map(snap), m1: [h[3], h[4], h[5]].map(snap) };
+        // An exactly affine result stays affine, so an untouched Distort is the
+        // identity and Auto can pick an exact Nearest.
+        if (Math.abs(h[6]) > 1e-12 || Math.abs(h[7]) > 1e-12) inv.m2 = [h[6], h[7], 1];
+        return inv;
+    }
+    /* How much a map shrinks, at its worst: the largest singular value of its
+       Jacobian (numeric, at the centre and the four corners of an S px output). */
+    function warpShrink(inv, S) {
+        const G = (x, y) => { const w = inv.m2 ? inv.m2[0] * x + inv.m2[1] * y + inv.m2[2] : 1;
+            return [(inv.m0[0] * x + inv.m0[1] * y + inv.m0[2]) / w, (inv.m1[0] * x + inv.m1[1] * y + inv.m1[2]) / w]; };
+        let worst = 0;
+        for (const [x, y] of [[S / 2, S / 2], [0.5, 0.5], [S - 0.5, 0.5], [0.5, S - 0.5], [S - 0.5, S - 0.5]]) {
+            const [ax, ay] = G(x + 0.5, y), [bx, by] = G(x - 0.5, y), [cx, cy] = G(x, y + 0.5), [dx, dy] = G(x, y - 0.5);
+            const a = ax - bx, c = ay - by, b = cx - dx, d = cy - dy;
+            const t = a * a + b * b + c * c + d * d, det = a * d - b * c;
+            worst = Math.max(worst, Math.sqrt(Math.max(0, (t + Math.sqrt(Math.max(0, t * t - 4 * det * det))) / 2)));
+        }
+        return worst;
+    }
+    /* A photo shrunk by whole halvings (each an exact 2x2 average), cached per
+       factor, so a 4000 px wall straightened into 256 px is sampled at most ~2x
+       per output pixel instead of aliasing. */
+    function halvedPhoto(ph, f) {
+        ph.mips = ph.mips || { 1: ph.canvas };
+        if (ph.mips[f]) return ph.mips[f];
+        const prev = halvedPhoto(ph, f / 2);
+        const c = document.createElement('canvas');
+        c.width = Math.max(1, Math.round(prev.width / 2)); c.height = Math.max(1, Math.round(prev.height / 2));
+        const x = c.getContext('2d'); x.imageSmoothingEnabled = true; x.imageSmoothingQuality = 'high';
+        x.drawImage(prev, 0, 0, c.width, c.height);
+        return (ph.mips[f] = c);
+    }
+
+    const ps = { id: null, corners: null, photo: null, raf: 0, drag: -1, view: null };
+    const psMode = () => $('at-ps-mode').value;
+    const psFromPhoto = () => psMode() === 'straighten' && $('at-ps-source').value === 'photo' && !!ps.photo;
+    function psSource() { return psFromPhoto() ? ps.photo.canvas : byId(ps.id).canvas; }
+    function psDefaultCorners() {
+        const src = psSource(), W = src.width, H = src.height;
+        if (psMode() === 'distort') return [[0, 0], [W, 0], [W, H], [0, H]];
+        const ix = W * 0.1, iy = H * 0.1;
+        return [[ix, iy], [W - ix, iy], [W - ix, H - iy], [ix, H - iy]];
+    }
+    /* The map for an S px output: { inv, src } with the source already chosen
+       (and shrunk, for a photo), or null while the corners are degenerate. */
+    function psInverse(S) {
+        const out = [[0, 0], [S, 0], [S, S], [0, S]];
+        const k = psSource().width;   // corners are in source px
+        const C = ps.corners;
+        if (psMode() === 'distort') {
+            const sc = S / k;   // tile px at the tile's own size: same thing, kept general
+            const inv = homography(C.map(([x, y]) => [x * sc, y * sc]), out);
+            return inv && { inv, src: psSource() };
+        }
+        let inv = homography(out, C);
+        if (!inv) return null;
+        if (!psFromPhoto()) return { inv, src: psSource() };
+        let f = 1;
+        while (warpShrink(inv, S) / f > 2 && f < 64 && ps.photo.canvas.width / (f * 2) >= 16) f *= 2;
+        if (f > 1) inv = { m0: inv.m0.map(v => v / f), m1: inv.m1.map(v => v / f), m2: inv.m2 };
+        return { inv, src: halvedPhoto(ps.photo, f) };
+    }
+    function psResample(inv, k, S) {
+        let filter = $('at-ps-filter').value;
+        if (filter === 'auto') filter = !inv.m2 && xfExact(inv) ? 'nearest' : 'bicubic';
+        const ss = filter === 'nearest' ? 1 : Math.max(1, Math.min(4, Math.ceil(warpShrink(inv, S) * k - 1e-6)));
+        return { filter, edge: $('at-ps-edge').value, ss };
+    }
+    function psDrawWork() {
+        const cv = $('at-ps-work'), ctx = cv.getContext('2d'), src = psSource();
+        const W = cv.width, m = psMode() === 'distort' ? 0.22 : 0.06;
+        const scale = W * (1 - 2 * m) / Math.max(src.width, src.height);
+        const ox = (W - src.width * scale) / 2, oy = (cv.height - src.height * scale) / 2;
+        ps.view = { scale, ox, oy };
+        ctx.clearRect(0, 0, W, cv.height);
+        ctx.imageSmoothingEnabled = true;
+        ctx.drawImage(src, ox, oy, src.width * scale, src.height * scale);
+        const P = ps.corners.map(([x, y]) => [ox + x * scale, oy + y * scale]);
+        ctx.lineWidth = 2; ctx.strokeStyle = '#e8852a';
+        ctx.beginPath(); P.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.closePath(); ctx.stroke();
+        ctx.font = '600 11px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        P.forEach(([x, y], i) => {
+            ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2);
+            ctx.fillStyle = i === ps.drag ? '#e8852a' : 'rgba(20,20,20,0.85)'; ctx.fill();
+            ctx.strokeStyle = '#e8852a'; ctx.stroke();
+            ctx.fillStyle = i === ps.drag ? '#111' : '#e8852a'; ctx.fillText(String(i + 1), x, y + 0.5);
+        });
+    }
+    function psRender() {
+        ps.raf = 0;
+        const el = byId(ps.id);
+        if (!el) return;
+        psDrawWork();
+        const S = el.canvas.width, P = $('at-ps-after').width;
+        const m = psInverse(S), after = $('at-ps-after'), ctx = after.getContext('2d');
+        ctx.clearRect(0, 0, P, P);
+        if (!m) { $('at-ps-readout').textContent = '· three corners in a line'; return; }
+        const opts = psResample(m.inv, S / P, S);
+        let out = warpCanvas(m.src, P, P, invForPreview(m.inv, S, P), opts);
+        if ($('at-ps-seam').checked) out = seamlessCanvas(out);
+        if ($('at-ps-tiled').checked) {
+            for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) ctx.drawImage(out, x * P / 2, y * P / 2, P / 2, P / 2);
+        } else ctx.drawImage(out, 0, 0);
+        $('at-ps-readout').textContent = '· ' + opts.filter + (opts.ss > 1 ? ` ×${opts.ss * opts.ss} samples` : '');
+    }
+    function psSchedule() { if (!ps.raf) ps.raf = requestAnimationFrame(psRender); }
+    function psSync() {
+        const straighten = psMode() === 'straighten';
+        $('at-ps-source-row').style.display = straighten ? '' : 'none';
+        const opt = $('at-ps-source').querySelector('option[value="photo"]');
+        opt.disabled = !ps.photo;
+        opt.textContent = ps.photo ? `Photo: ${ps.photo.name} (${ps.photo.canvas.width} × ${ps.photo.canvas.height})` : 'A photo (load one first)';
+    }
+    function openPerspModal(id) {
+        const el = byId(id);
+        if (!el || el.kind !== 'tile') return;
+        ps.id = id;
+        ps.drag = -1;
+        if ($('at-ps-source').value === 'photo' && !ps.photo) $('at-ps-source').value = 'tile';
+        $('at-ps-seam').checked = !!el.seamless;
+        ps.corners = psDefaultCorners();
+        $('at-ps-tileno').textContent = numberOf(id);
+        psSync();
+        openModal('persp');
+        psRender();
+    }
+    function psCleanup() { if (ps.raf) cancelAnimationFrame(ps.raf); ps.raf = 0; ps.id = null; ps.drag = -1; }
+    /* A photo picked for straightening: kept at full size (capped at what the GPU
+       takes as one texture), for this session only; nothing is saved with it. */
+    function psLoadPhoto(file) {
+        return readImageAsset(file).then(({ img }) => {
+            const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+            const cap = Math.min(8192, TRLE.Engine.gl().getParameter(TRLE.Engine.gl().MAX_TEXTURE_SIZE));
+            const k = Math.min(1, cap / Math.max(w, h));
+            const c = document.createElement('canvas');
+            c.width = Math.round(w * k); c.height = Math.round(h * k);
+            const x = c.getContext('2d'); x.imageSmoothingEnabled = true; x.imageSmoothingQuality = 'high';
+            x.drawImage(img, 0, 0, c.width, c.height);
+            ps.photo = { canvas: c, name: file.name };
+            $('at-ps-mode').value = 'straighten';
+            $('at-ps-source').value = 'photo';
+            ps.corners = psDefaultCorners();
+            psSync(); psRender();
+        }).catch(err => showToast(err.message, 'error'));
+    }
+    function setupPerspModal() {
+        $('at-ps-mode').addEventListener('change', () => { ps.corners = psDefaultCorners(); psSync(); psSchedule(); });
+        $('at-ps-source').addEventListener('change', () => { ps.corners = psDefaultCorners(); psSync(); psSchedule(); });
+        ['at-ps-filter', 'at-ps-edge', 'at-ps-seam', 'at-ps-tiled'].forEach(idn => $(idn).addEventListener('change', psSchedule));
+        $('at-ps-reset').addEventListener('click', () => { ps.corners = psDefaultCorners(); psRender(); });
+        $('at-ps-photo').addEventListener('click', () => {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = 'image/*,.tga,.psd,.psb';
+            input.addEventListener('change', e => { const f = e.target.files[0]; if (f) psLoadPhoto(f); });
+            input.click();
+        });
+        const work = $('at-ps-work');
+        const toCanvas = e => { const r = work.getBoundingClientRect(); return [(e.clientX - r.left) * work.width / r.width, (e.clientY - r.top) * work.height / r.height]; };
+        work.addEventListener('pointerdown', e => {
+            if (!ps.view) return;
+            const [x, y] = toCanvas(e), { scale, ox, oy } = ps.view;
+            let best = -1, bd = 22 * work.width / work.getBoundingClientRect().width;
+            ps.corners.forEach(([cx, cy], i) => { const d = Math.hypot(ox + cx * scale - x, oy + cy * scale - y); if (d < bd) { bd = d; best = i; } });
+            if (best < 0) return;
+            ps.drag = best;
+            work.setPointerCapture(e.pointerId);
+            psSchedule();
+        });
+        work.addEventListener('pointermove', e => {
+            if (ps.drag < 0) return;
+            const [x, y] = toCanvas(e), { scale, ox, oy } = ps.view;
+            ps.corners[ps.drag] = [(x - ox) / scale, (y - oy) / scale];
+            psSchedule();
+        });
+        const end = () => { if (ps.drag >= 0) { ps.drag = -1; psSchedule(); } };
+        work.addEventListener('pointerup', end);
+        work.addEventListener('pointercancel', end);
+        $('at-ps-apply').addEventListener('click', async () => {
+            const el = byId(ps.id);
+            if (!el || el.kind !== 'tile') return;
+            const S = state.tileSize, m = psInverse(S);
+            if (!m) { showToast('Three of the corners are in a line; move one', 'info'); return; }
+            const opts = psResample(m.inv, 1, S), seam = $('at-ps-seam').checked, photo = psFromPhoto();
+            const label = photo ? 'Straighten photo' : (psMode() === 'distort' ? 'Perspective distort' : 'Straighten');
+            if (photo) {
+                /* A new picture for the tile, like Replace Image: it becomes the
+                   original, and maps and sources that described the old one go. */
+                let out = warpCanvas(m.src, S, S, m.inv, opts);
+                if (seam) out = seamlessCanvas(out);
+                drawReplace(el.canvas, out);
+                el.original = cloneCanvas(el.canvas);
+                el.seamless = seam;
+                el.edited = false;
+                el.mapSource = null;
+                el.importedMaps = null;
+                el.textRelief = null;
+                el.mapPatches = null;
+                rebaseLayers(el, true);   // a new picture is the new bottom; the layers rebuild over it (D5, F4)
+                setBaseSeamless(el, seam);   // the seam was made in the picture itself
+            } else {
+                moveTileLayers(el, warpMove(m.inv, S, opts, warpDesc(m.inv, S, opts)), true);
+                if (seam) seamAfterMove(el, true);
+                setBaseSeamless(el, seam && !hasLayers(el));
+                el.edited = true;
+            }
+            closeModal();
+            await layersSettle([el]);
+            refreshTransitions();
+            renderGrid();
+            pushHistory(label);
+            showToast(label + ' applied', 'success');
+        });
+    }
+
+    /* ============ DISTORT (TRANSFORMS-PLAN phase 4) ============
+       Wave, Ripple and Displace by a tile, all one displacement added to the
+       identity map inside warpResample, so the layers, masks and a normal
+       map's vectors move with the pixels exactly as for any other transform.
+       Wave cycles are whole numbers, so the wave itself always repeats across
+       the tile; Ripple's noise is built on a periodic lattice; a tile used as a
+       map repeats if that tile does. With Wrap edges the result then tiles. */
+    const DS_WAVE = [
+        ['amp',    'Amplitude', 0, 64, 1, 6, ' px'],
+        ['cycles', 'Cycles across the tile', 1, 32, 1, 4, ''],
+        ['phase',  'Phase', 0, 360, 1, 0, '°'],
+    ];
+    const DS_RIPPLE = [
+        ['ramount', 'Amount', 0, 32, 0.5, 4, ' px'],
+    ];
+    const DS_MAP = [
+        ['strength', 'Strength', 0, 64, 0.5, 8, ' px'],
+    ];
+    /* FILTERS-PLAN phase 2: the radial types. Centre and Radius are a % of the tile (Radius of
+       HALF the tile, so 100 is Photoshop's inscribed circle and the most that keeps the border
+       still); the centre wraps, so it can sit over an edge. */
+    const DS_RADIAL = [
+        ['angle',  'Angle', -720, 720, 1, 90, '°'],
+        ['amount', 'Amount', -100, 100, 1, 50, '%'],
+        ['ridges', 'Ridges', 1, 20, 1, 6, ''],
+        ['cx',     'Centre X', 0, 100, 1, 50, '%'],
+        ['cy',     'Centre Y', 0, 100, 1, 50, '%'],
+        ['radius', 'Radius', 5, 100, 1, 100, '%'],
+    ];
+    const DS_RADIAL_TYPES = ['twirl', 'pinch', 'spherize', 'zigzag', 'polar'];
+    const DS_VARIANTS = {
+        spherize: ['Normal', 'Horizontal only', 'Vertical only'],
+        zigzag: ['Around centre', 'Out from centre', 'Pond ripples'],
+        polar: ['Rectangular to polar', 'Polar to rectangular'],
+    };
+    /* Which of the radial rows each type shows. */
+    const DS_RADIAL_ROWS = {
+        twirl: ['angle', 'cx', 'cy', 'radius'], pinch: ['amount', 'cx', 'cy', 'radius'],
+        spherize: ['amount', 'cx', 'cy', 'radius'], zigzag: ['amount', 'ridges', 'cx', 'cy', 'radius'], polar: [],
+    };
+    const ds = { ids: [], raf: 0, noise: null, noiseKey: '' };
+
+    function dsNumRow(wrap, row) {
+        // Free Transform's slider + number box, under this modal's prefix.
+        const [key, label, min, max, step, def, suffix] = row;
+        const g = document.createElement('div');
+        g.className = 'form-group';
+        g.innerHTML = `<label for="at-ds-${key}-num">${label}${suffix.trim() ? ' (' + suffix.trim() + ')' : ''}</label>
+ <div class="at-numslider"><input type="range" id="at-ds-${key}" min="${min}" max="${max}" step="${step}" value="${def}" aria-label="${label}">
+ <input type="number" id="at-ds-${key}-num" min="${min}" max="${max}" step="${step}" value="${def}"></div>`;
+        wrap.appendChild(g);
+        const range = g.querySelector('input[type=range]'), num = g.querySelector('input[type=number]');
+        range.addEventListener('input', () => { num.value = range.value; dsSchedule(); });
+        num.addEventListener('input', () => { const v = parseFloat(num.value); if (!isFinite(v)) return; range.value = Math.max(+range.min, Math.min(+range.max, v)); dsSchedule(); });
+        num.addEventListener('change', () => { num.value = range.value; });
+    }
+    const dsVal = key => parseFloat($(`at-ds-${key}`).value) || 0;
+    /* Ripple's map: two periodic fBm fields (x and y shift) at 256 px, cached
+       per size and seed. 128 is no shift, as for a displacement tile. */
+    function dsNoiseMap() { return dsNoiseMapFor($('at-ds-rsize').value, parseInt($('at-ds-seed').value, 10) || 0); }
+    function dsNoiseMapFor(rsize, seed0) {
+        const f = { large: 3, medium: 6, small: 12 }[rsize] || 6;
+        const seed = seed0 >>> 0;
+        const key = f + ':' + seed;
+        if (ds.noise && ds.noiseKey === key) return ds.noise;
+        const N = 256, a = periodicFbm(seed, f, 3), b = periodicFbm((seed ^ 0x5bd1e995) >>> 0, f, 3);
+        const c = document.createElement('canvas'); c.width = c.height = N;
+        const ctx = c.getContext('2d'), id = ctx.createImageData(N, N);
+        // fBm sits in a narrow band round 0.5; stretch it so Amount means about
+        // that many pixels at the peaks.
+        for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+            const i = (y * N + x) * 4, u = x / N, v = y / N;
+            id.data[i] = Math.max(0, Math.min(255, Math.round(128 + (a(u, v) - 0.5) * 2.5 * 255)));
+            id.data[i + 1] = Math.max(0, Math.min(255, Math.round(128 + (b(u, v) - 0.5) * 2.5 * 255)));
+            id.data[i + 2] = 128; id.data[i + 3] = 255;
+        }
+        ctx.putImageData(id, 0, 0);
+        ds.noise = c; ds.noiseKey = key;
+        return c;
+    }
+    /* The displacement for Engine.warp, in TILE px (warpCanvas scales it to the
+       canvas it is drawing). */
+    function dsDisp() {
+        const mode = $('at-ds-mode').value;
+        if (mode === 'wave') {
+            const dir = $('at-ds-dir').value, A = dsVal('amp'), n = dsVal('cycles');
+            return { mode: 'wave', shape: $('at-ds-shape').value, phase: dsVal('phase') * Math.PI / 180,
+                     amp: [dir === 'v' ? 0 : A, dir === 'h' ? 0 : A], cycles: [n, n] };
+        }
+        if (mode === 'ripple') return { mode: 'map', map: dsNoiseMap(), strength: dsVal('ramount') };
+        if (DS_RADIAL_TYPES.includes(mode)) {
+            const sub = Math.max(0, parseInt($('at-ds-variant').value, 10) || 0);
+            return { mode: 'radial', type: mode, sub: DS_VARIANTS[mode] ? sub : 0,
+                     amount: mode === 'twirl' ? dsVal('angle') * Math.PI / 180 : mode === 'polar' ? 0 : dsVal('amount') / 100,
+                     ridges: dsVal('ridges'), cx: dsVal('cx') / 100, cy: dsVal('cy') / 100, radius: dsVal('radius') / 100 };
+        }
+        const t = byId(parseInt($('at-ds-map').value, 10));
+        return t ? { mode: 'map', map: t.canvas, strength: dsVal('strength') } : { mode: 'none' };
+    }
+    const DS_IDENTITY = { m0: [1, 0, 0], m1: [0, 1, 0] };
+    function dsOpts(k) {
+        let filter = $('at-ds-filter').value;
+        if (filter === 'auto') filter = 'bicubic';
+        return { filter, edge: $('at-ds-edge').value, ss: filter === 'nearest' ? 1 : Math.max(1, Math.min(4, Math.ceil(k - 1e-6))), disp: dsDisp() };
+    }
+    function dsTiles() { return $('at-ds-edge').value === 'wrap' && $('at-ds-mode').value !== 'polar'; }
+    function dsSync() {
+        const mode = $('at-ds-mode').value;
+        const radial = DS_RADIAL_TYPES.includes(mode), variants = DS_VARIANTS[mode];
+        $('at-ds-radial').style.display = radial ? '' : 'none';
+        if (radial) {
+            $('at-ds-variant-row').style.display = variants ? '' : 'none';
+            const sel = $('at-ds-variant'), key = sel.dataset.for;
+            if (variants && key !== mode) {
+                sel.innerHTML = variants.map((v, i) => `<option value="${i}">${v}</option>`).join('');
+                sel.dataset.for = mode;
+            }
+            const shown = DS_RADIAL_ROWS[mode];
+            for (const r of DS_RADIAL) $(`at-ds-${r[0]}`).closest('.form-group').style.display = shown.includes(r[0]) ? '' : 'none';
+            $('at-ds-radial-hint').style.display = mode === 'polar' ? 'none' : '';
+            $('at-ds-radial-hint').textContent = mode === 'spherize'
+                ? 'The centre wraps round the tile, so a spherize over an edge still tiles. At 100% the pixels at the border are squeezed hard; keep the radius at 90% or less if the tile must tile cleanly.'
+                : 'The effect fades to nothing at the edge of its circle, and the centre wraps round the tile, so a twirl over an edge still tiles. Keep the radius at 100% or less.';
+        }
+        $('at-ds-wave').style.display = mode === 'wave' ? '' : 'none';
+        $('at-ds-ripple').style.display = mode === 'ripple' ? '' : 'none';
+        $('at-ds-mapbox').style.display = mode === 'map' ? '' : 'none';
+        $('at-ds-seam-row').style.display = dsTiles() ? 'none' : '';
+    }
+    function dsRender() {
+        ds.raf = 0;
+        const el = byId(ds.ids[0]);
+        if (!el) return;
+        const S = el.canvas.width, P = $('at-ds-after').width;
+        const opts = dsOpts(S / P);
+        let out = warpCanvas(el.canvas, P, P, invForPreview(DS_IDENTITY, S, P), Object.assign({}, opts, { disp: Object.assign({}, opts.disp, { period: P, ampScale: 1 }) }));
+        const seam = !dsTiles() && $('at-ds-seam').checked;
+        if (seam) out = seamlessCanvas(out);
+        const after = $('at-ds-after'), ctx = after.getContext('2d');
+        ctx.clearRect(0, 0, P, P);
+        if ($('at-ds-tiled').checked) {
+            for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) ctx.drawImage(out, x * P / 2, y * P / 2, P / 2, P / 2);
+        } else ctx.drawImage(out, 0, 0);
+        drawReplace($('at-ds-before'), el.canvas, P, P);
+        const mapNote = $('at-ds-mode').value === 'map' ? ' if the map tile tiles' : '';
+        $('at-ds-readout').textContent = '· ' + opts.filter + (dsTiles() || seam ? ' · tiles' + mapNote : ' · does not tile');
+    }
+    function dsSchedule() { if (!ds.raf) ds.raf = requestAnimationFrame(dsRender); }
+    function openDistortModal(ids) {
+        const list = (Array.isArray(ids) ? ids : [ids]).filter(i => { const e = byId(i); return e && e.kind === 'tile'; });
+        if (!list.length) return;
+        ds.ids = list;
+        // Any tile can be the map, the one being distorted included.
+        const sel = $('at-ds-map'), keep = sel.value;
+        sel.innerHTML = state.elements.filter(e => e.kind === 'tile').map(e => `<option value="${e.id}">Tile ${numberOf(e.id)}</option>`).join('');
+        sel.value = [...sel.options].some(o => o.value === keep) ? keep : String(list[0]);
+        tilePickerSync(sel);
+        $('at-ds-tileno').textContent = numberOf(list[0]);
+        setBatchNote('at-modal-distort', list.length, numberOf(list[0]));
+        dsSync();
+        openModal('distort');
+        dsRender();
+    }
+    function dsCleanup() { if (ds.raf) cancelAnimationFrame(ds.raf); ds.raf = 0; ds.ids = []; }
+    function setupDistortModal() {
+        DS_WAVE.forEach(r => dsNumRow($('at-ds-wave-rows'), r));
+        DS_RIPPLE.forEach(r => dsNumRow($('at-ds-ripple-rows'), r));
+        DS_MAP.forEach(r => dsNumRow($('at-ds-map-rows'), r));
+        DS_RADIAL.forEach(r => dsNumRow($('at-ds-radial-rows'), r));
+        attachTilePicker($('at-ds-map'), {});
+        ['at-ds-mode', 'at-ds-variant', 'at-ds-shape', 'at-ds-dir', 'at-ds-rsize', 'at-ds-seed', 'at-ds-map', 'at-ds-filter', 'at-ds-edge', 'at-ds-seam', 'at-ds-tiled']
+            .forEach(idn => $(idn).addEventListener('change', () => { dsSync(); dsSchedule(); }));
+        $('at-ds-seed').addEventListener('input', dsSchedule);
+        $('at-ds-reseed').addEventListener('click', () => { $('at-ds-seed').value = Math.floor(Math.random() * 100000); dsSchedule(); });
+        $('at-ds-apply').addEventListener('click', async () => {
+            const targets = ds.ids.map(byId).filter(el => el && el.kind === 'tile');
+            if (!targets.length) return;
+            const S = state.tileSize, opts = dsOpts(1), tiles = dsTiles(), seam = !tiles && $('at-ds-seam').checked;
+            // The wave and the ripple replay from numbers; a displacement TILE has no descriptor (the layers it moves are marked as paint).
+            const mode = $('at-ds-mode').value;
+            const dDesc = mode === 'wave' || DS_RADIAL_TYPES.includes(mode) ? warpDesc(DS_IDENTITY, S, opts, dsDisp())
+                : mode === 'ripple' ? warpDesc(DS_IDENTITY, S, opts, { mode: 'ripple', rsize: $('at-ds-rsize').value, seed: parseInt($('at-ds-seed').value, 10) || 0, strength: dsVal('ramount') }) : undefined;
+            /* The map is read once, before any tile is written: a tile displaced
+               by itself (or by another tile in the batch) must not be read back
+               half-distorted. */
+            if (opts.disp.map) opts.disp.map = cloneCanvas(opts.disp.map);
+            targets.forEach(el => {
+                moveTileLayers(el, warpMove(DS_IDENTITY, S, opts, dDesc), true);
+                if (seam) seamAfterMove(el, true);
+                if (seam || !tiles) setBaseSeamless(el, seam && !hasLayers(el));
+                el.edited = true;
+            });
+            const n = targets.length;
+            closeModal();
+            await layersSettle(targets);
+            refreshTransitions();
+            renderGrid();
+            pushHistory(n > 1 ? `Distort: ${n} tiles` : 'Distort');
+            showToast(n > 1 ? `Distort on ${n} tiles` : 'Distort applied', 'success');
+        });
+    }
+
+    /* ============ 🌗 DODGE & BURN (FILTERS-PLAN phase 7) ============
+       The brush is Draw's engine (TRLE.Stroke): a stroke paints COVERAGE into a mask, and TRLE.ToneBrush applies the tool
+       through it. A separate modal, not Draw's: Draw paints a new picture over the tile, these tools rewrite the pixels
+       BELOW. Each distinct tool setting painted in a session becomes one layer (kind `tone`, Texture zone, several per
+       tile) holding its recipe and its mask, which is a piece mask like Heal's, so a Rotate or a warp moves it with the tile.
+       Strokes add to the mask (`lighter`); the Eraser paints it back to black. Exposure scales with coverage. */
+    const TN_TOOLS = [['dodge', 'Dodge'], ['burn', 'Burn'], ['sponge', 'Sponge'], ['blur', 'Blur'], ['sharpen', 'Sharpen'], ['erase', 'Eraser']];
+    const TN_NAMES = { dodge: 'Dodge', burn: 'Burn', sponge: 'Sponge', blur: 'Blur (brush)', sharpen: 'Sharpen (brush)' };
+    const TN_SLIDERS = [['exposure', 'Exposure', 1, 100, 50, '%'], ['radius', 'Radius', 1, 12, 3, 'px at 256']];
+    const TN_BRUSH = [['size', 'Size', 1, 50, 12, '% of the tile'], ['hardness', 'Hardness', 0, 100, 0, ''], ['opacity', 'Opacity', 1, 100, 100, ''], ['flow', 'Flow', 1, 100, 100, '']];
+    const TN_UNDO_BYTES = 96 * 1024 * 1024;
+    const tn = { id: null, M: 256, groups: [], undo: [], redo: [], tool: 'dodge', stroke: null, brush: null, cur: null, seed: 1, ring: null, edit: null, raf: 0, inputs: null, touched: false, pointer: null };
+    const tnVal = k => parseFloat($(`at-tn-${k}`).value) || 0;
+    /* The recipe for the current controls: only the fields the tool uses, so two strokes with the same settings share a layer. */
+    function tnRecipe(tool) {
+        tool = tool || tn.tool;
+        if (tool === 'dodge' || tool === 'burn') return { op: tool, range: $('at-tn-range').value, exposure: tnVal('exposure'), protect: $('at-tn-protect').checked };
+        if (tool === 'sponge') return { op: 'sponge', saturate: $('at-tn-spongemode').value === 'saturate', exposure: tnVal('exposure'), vibrance: $('at-tn-vibrance').checked };
+        if (tool === 'blur') return { op: 'blur', exposure: tnVal('exposure'), radius: tnVal('radius') };
+        return { op: 'sharpen', exposure: tnVal('exposure'), radius: tnVal('radius'), protectDetail: $('at-tn-detail').checked };
+    }
+    const tnKey = r => JSON.stringify(r);
+    function tnBlankMask(M) { const c = document.createElement('canvas'); c.width = c.height = M; const g = c.getContext('2d'); g.fillStyle = '#000'; g.fillRect(0, 0, M, M); return c; }
+    const tnSizePx = () => Math.max(1, Math.round(tn.M * tnVal('size') / 100));
+    function tnBrush() {
+        const erase = tn.tool === 'erase', P = TRLE.Stroke.preset($('at-tn-preset').value) || {};
+        const b = TRLE.Stroke.scaleBrush(Object.assign({}, P, { hardness: tnVal('hardness') / 100 }), tn.M / 256);
+        return Object.assign(b, { size: tnSizePx(), opacity: tnVal('opacity') / 100, flow: tnVal('flow') / 100,
+            color: erase ? [0, 0, 0] : [255, 255, 255], blend: erase ? 'source-over' : 'lighter', erase: false });
+    }
+    function tnGroupFor(recipe) {
+        const key = tnKey(recipe);
+        let g = tn.groups.find(x => x.key === key);
+        if (!g) { g = { recipe, key, mask: tnBlankMask(tn.M) }; tn.groups.push(g); }
+        return g;
+    }
+    function tnSnapshot() {
+        tn.undo.push({ groups: tn.groups.map(g => ({ recipe: g.recipe, key: g.key, mask: cloneCanvas(g.mask) })), touched: tn.touched }); tn.redo = [];
+        let total = tn.undo.reduce((n, s) => n + s.groups.length * tn.M * tn.M * 4, 0);
+        while (tn.undo.length > 1 && total > TN_UNDO_BYTES) total -= tn.undo.shift().groups.length * tn.M * tn.M * 4;
+        tnSyncButtons();
+    }
+    function tnRestore(s) { tn.groups = s.groups.map(g => ({ recipe: g.recipe, key: g.key, mask: cloneCanvas(g.mask) })); tn.touched = s.touched; }
+    function tnUndo() {
+        if (!tn.undo.length) return;
+        tn.redo.push({ groups: tn.groups.map(g => ({ recipe: g.recipe, key: g.key, mask: cloneCanvas(g.mask) })), touched: tn.touched });
+        tnRestore(tn.undo.pop()); tnSyncButtons(); tnSchedule();
+    }
+    function tnRedo() {
+        if (!tn.redo.length) return;
+        tn.undo.push({ groups: tn.groups.map(g => ({ recipe: g.recipe, key: g.key, mask: cloneCanvas(g.mask) })), touched: tn.touched });
+        tnRestore(tn.redo.pop()); tnSyncButtons(); tnSchedule();
+    }
+    function tnSyncButtons() { $('at-tn-undo').disabled = !tn.undo.length; $('at-tn-redo').disabled = !tn.redo.length; }
+    function tnSync() {
+        const t = tn.tool, dt = t === 'dodge' || t === 'burn', bs = t === 'blur' || t === 'sharpen';
+        $('at-tn-range-row').style.display = dt ? '' : 'none';
+        $('at-tn-protect-row').style.display = dt ? '' : 'none';
+        $('at-tn-sponge-row').style.display = t === 'sponge' ? '' : 'none';
+        $('at-tn-vibrance-row').style.display = t === 'sponge' ? '' : 'none';
+        $('at-tn-detail-row').style.display = t === 'sharpen' ? '' : 'none';
+        $('at-tn-exposure').closest('.form-group').style.display = t === 'erase' ? 'none' : '';
+        $('at-tn-radius').closest('.form-group').style.display = bs ? '' : 'none';
+        const lab = $('at-tn-exposure').closest('.form-group').querySelector('label');
+        lab.textContent = (t === 'blur' ? 'Strength' : t === 'sharpen' ? 'Amount' : 'Exposure') + ' (%)';
+        $('at-tn-tools').querySelectorAll('button').forEach(b => b.setAttribute('aria-checked', b.dataset.tool === t ? 'true' : 'false'));
+    }
+    function tnSetTool(id) {
+        tn.tool = id; tnSync();
+        // A layer opened for editing follows the controls until the first stroke (changing Exposure changes THAT layer).
+        tnFollowEdit(); tnSchedule();
+    }
+    function tnFollowEdit() {
+        if (!tn.edit || tn.touched || tn.tool === 'erase' || !tn.groups[0]) return;
+        const r = tnRecipe(); tn.groups[0].recipe = r; tn.groups[0].key = tnKey(r);
+    }
+    /* The picture with every group's tool applied through its mask (the stroke in progress included). */
+    function tnResult(base, masks) {
+        let out = base;
+        tn.groups.forEach((g, i) => { out = TRLE.ToneBrush.renderCanvas(out, masks[i] || g.mask, g.recipe); });
+        return out;
+    }
+    function tnRender() {
+        tn.raf = 0;
+        const el = byId(tn.id);
+        if (!el) return;
+        const inp = xin(tn.inputs, el), P = $('at-tn-surface').width, W = Math.min(inp.width, P);
+        const base = W === inp.width ? inp : (() => { const c = document.createElement('canvas'); c.width = c.height = W; drawImported(c.getContext('2d'), inp, W); return c; })();
+        const masks = [];
+        if (tn.stroke && tn.cur) {   // the stroke in progress, on a copy of its group's mask
+            const i = tn.groups.indexOf(tn.cur), m = cloneCanvas(tn.cur.mask);
+            TRLE.Stroke.composite(m.getContext('2d'), tn.stroke.preview(), tn.brush);
+            masks[i] = m;
+        }
+        const out = tnResult(base, masks);
+        const sf = $('at-tn-surface'), ctx = sf.getContext('2d');
+        ctx.clearRect(0, 0, P, P); ctx.drawImage(out, 0, 0, P, P);
+        const tl = $('at-tn-tiled').getContext('2d');
+        tl.clearRect(0, 0, P, P);
+        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) tl.drawImage(out, x * P / 2, y * P / 2, P / 2, P / 2);
+        drawReplace($('at-tn-before'), inp, P, P);
+        $('at-tn-readout').textContent = tn.groups.some(g => !TRLE.ToneBrush.maskIsEmpty(g.mask)) ? '· painted' : '· nothing painted yet';
+    }
+    function tnSchedule() { if (!tn.raf) tn.raf = requestAnimationFrame(tnRender); }
+    function tnRingDraw() {
+        const rc = $('at-tn-ring'), g = rc.getContext('2d'), P = rc.width;
+        g.clearRect(0, 0, P, P);
+        if (!tn.ring) return;
+        const r = tnSizePx() / 2 * P / tn.M, h = tnVal('hardness') / 100;
+        for (const [ox, oy] of [[0, 0], [P, 0], [-P, 0], [0, P], [0, -P], [P, P], [-P, -P], [P, -P], [-P, P]]) {
+            const x = tn.ring[0] + ox, y = tn.ring[1] + oy;
+            if (x < -r || y < -r || x > P + r || y > P + r) continue;
+            g.beginPath(); g.arc(x, y, r, 0, 6.2832); g.strokeStyle = 'rgba(0,0,0,0.75)'; g.lineWidth = 3; g.stroke();
+            g.strokeStyle = 'rgba(255,255,255,0.95)'; g.lineWidth = 1.2; g.stroke();
+            if (h < 0.98) { g.beginPath(); g.arc(x, y, r * Math.max(0.05, h), 0, 6.2832); g.strokeStyle = 'rgba(255,255,255,0.35)'; g.lineWidth = 1; g.setLineDash([3, 3]); g.stroke(); g.setLineDash([]); }
+        }
+    }
+    function tnPt(e) { const r = $('at-tn-surface').getBoundingClientRect(); return [(e.clientX - r.left) / r.width * tn.M, (e.clientY - r.top) / r.height * tn.M]; }
+    function tnDown(e) {
+        if (e.button !== 0 || tn.id === null) return;
+        if ($('at-tn-discard').style.display !== 'none') $('at-tn-discard').style.display = 'none';
+        e.preventDefault();
+        $('at-tn-surface').setPointerCapture(e.pointerId);
+        tn.pointer = e.pointerId; tnSnapshot();
+        const erase = tn.tool === 'erase';
+        if (erase) {
+            // The Eraser works on the group(s) that have paint; with one group it is that one, else the most recent.
+            tn.cur = tn.groups.length ? tn.groups[tn.groups.length - 1] : tnGroupFor(tnRecipe('dodge'));
+        } else {
+            tnFollowEdit();
+            tn.cur = tnGroupFor(tnRecipe());
+        }
+        tn.touched = true;
+        tn.brush = tnBrush();
+        tn.stroke = TRLE.Stroke.begin(tn.brush, { width: tn.M, height: tn.M, seed: tn.seed++, wrap: true });
+        const p = tnPt(e); tn.stroke.add(p[0], p[1], e.timeStamp);
+        tnSchedule();
+    }
+    function tnMove(e) {
+        const sf = $('at-tn-surface'), r = sf.getBoundingClientRect(), P = sf.width;
+        tn.ring = [(e.clientX - r.left) / r.width * P, (e.clientY - r.top) / r.height * P];
+        tnRingDraw();
+        if (tn.pointer !== e.pointerId || !tn.stroke) return;
+        const evs = e.getCoalescedEvents && e.getCoalescedEvents().length ? e.getCoalescedEvents() : [e];
+        for (const ev of evs) { const p = tnPt(ev); tn.stroke.add(p[0], p[1], ev.timeStamp); }
+        tnSchedule();
+    }
+    function tnUp(e) {
+        if (tn.pointer !== e.pointerId || !tn.stroke) return;
+        const buf = tn.stroke.end();
+        TRLE.Stroke.composite(tn.cur.mask.getContext('2d'), buf, tn.brush);
+        tn.stroke = null; tn.cur = null; tn.pointer = null;
+        tnSyncButtons(); tnSchedule();
+    }
+    function tnAskDiscard() {
+        if ($('at-modal-tone').style.display === 'none') return false;
+        if ($('at-tn-discard').style.display !== 'none') { $('at-tn-discard').style.display = 'none'; return true; }
+        if (!tn.undo.length) return false;
+        $('at-tn-discard').style.display = 'flex';
+        return true;
+    }
+    /* The tone tools as a layer: a pure function of the picture below, the recipe and the layer's own mask. */
+    TRLE.Layers.register('tone', { zone: 'texture', mode: 'adjust', cost: (def, S) => (def.recipe.op === 'blur' || def.recipe.op === 'sharpen' ? 260 : 70) * (S / 1024) ** 2,
+        apply: (input, def, piece) => TRLE.ToneBrush.renderCanvas(input, piece.mask, def.recipe),
+        edit: (el, def) => openToneModal(el.id, { def, piece: el.layers.find(p => p.lid === def.lid) }) });
+    function openToneModal(id, editing) {
+        const el = byId(id);
+        if (!el || el.kind !== 'tile') return;
+        const L = TRLE.Layers;
+        tn.id = id; tn.M = Math.min(512, el.canvas.width); tn.groups = []; tn.undo = []; tn.redo = []; tn.stroke = null; tn.cur = null; tn.ring = null; tn.touched = false;
+        tn.edit = editing ? { lid: editing.def.lid } : null;
+        tn.inputs = layerInputsMany([id], 'tone', editing);
+        if (editing && editing.piece && editing.piece.mask) {
+            const m = tnBlankMask(tn.M); m.getContext('2d').drawImage(editing.piece.mask, 0, 0, tn.M, tn.M);
+            tn.groups.push({ recipe: Object.assign({}, editing.def.recipe), key: tnKey(editing.def.recipe), mask: m });
+            const r = editing.def.recipe;
+            tn.tool = r.op;
+            $('at-tn-exposure').value = r.exposure; $('at-tn-exposure-num').value = r.exposure;
+            if (r.radius != null) { $('at-tn-radius').value = r.radius; $('at-tn-radius-num').value = r.radius; }
+            if (r.range) $('at-tn-range').value = r.range;
+            if (r.protect != null) $('at-tn-protect').checked = !!r.protect;
+            if (r.op === 'sponge') { $('at-tn-spongemode').value = r.saturate ? 'saturate' : 'desaturate'; $('at-tn-vibrance').checked = !!r.vibrance; }
+            if (r.protectDetail != null) $('at-tn-detail').checked = !!r.protectDetail;
+        }
+        $('at-tn-tileno').textContent = numberOf(id);
+        $('at-tn-discard').style.display = 'none';
+        setEditNote('at-modal-tone', editing ? '✏️ Editing this layer: change its settings, or paint to add to it. Apply replaces it.' : '');
+        tnSync(); tnSyncButtons();
+        openModal('tone');
+        tnRender(); tnRingDraw();
+    }
+    function tnCleanup() { if (tn.raf) cancelAnimationFrame(tn.raf); tn.raf = 0; tn.id = null; tn.groups = []; tn.undo = []; tn.redo = []; tn.stroke = null; tn.cur = null; tn.inputs = null; tn.edit = null; tn.pointer = null; }
+    function tnSlider(wrap, row, onChange) {
+        const [key, label, min, max, def, suffix] = row;
+        const g = document.createElement('div');
+        g.className = 'form-group';
+        g.innerHTML = `<label for="at-tn-${key}-num">${label}${suffix ? ' (' + suffix + ')' : ''}</label>
+ <div class="at-numslider"><input type="range" id="at-tn-${key}" min="${min}" max="${max}" step="1" value="${def}" aria-label="${label}">
+ <input type="number" id="at-tn-${key}-num" min="${min}" max="${max}" step="1" value="${def}"></div>`;
+        wrap.appendChild(g);
+        const range = g.querySelector('input[type=range]'), num = g.querySelector('input[type=number]');
+        range.addEventListener('input', () => { num.value = range.value; onChange(); });
+        num.addEventListener('input', () => { const v = parseFloat(num.value); if (!isFinite(v)) return; range.value = Math.max(+range.min, Math.min(+range.max, v)); onChange(); });
+        num.addEventListener('change', () => { num.value = range.value; });
+    }
+    function setupToneModal() {
+        const tools = $('at-tn-tools');
+        for (const [id, label] of TN_TOOLS) {
+            const b = document.createElement('button');
+            b.type = 'button'; b.className = 'btn btn-secondary'; b.dataset.tool = id; b.textContent = label;
+            b.setAttribute('role', 'radio'); b.setAttribute('aria-checked', 'false');
+            b.addEventListener('click', () => tnSetTool(id));
+            tools.appendChild(b);
+        }
+        TN_SLIDERS.forEach(r => tnSlider($('at-tn-sliders'), r, () => { tnFollowEdit(); tnSchedule(); }));
+        TN_BRUSH.forEach(r => tnSlider($('at-tn-brush-sliders'), r, tnRingDraw));
+        const psel = $('at-tn-preset'), groups = new Map();
+        for (const p of TRLE.Stroke.PRESETS) {
+            if (!groups.has(p.group)) { const g = document.createElement('optgroup'); g.label = p.group; groups.set(p.group, g); psel.appendChild(g); }
+            const o = document.createElement('option'); o.value = p.id; o.textContent = p.label; groups.get(p.group).appendChild(o);
+        }
+        psel.value = 'soft-round';
+        attachTilePicker(psel, { rows: true, title: 'Brush', thumb: opt => drawPresetThumb(opt.value) });
+        ['at-tn-range', 'at-tn-protect', 'at-tn-spongemode', 'at-tn-vibrance', 'at-tn-detail'].forEach(idn => $(idn).addEventListener('change', () => { tnFollowEdit(); tnSchedule(); }));
+        const sf = $('at-tn-surface');
+        sf.addEventListener('pointerdown', tnDown);
+        sf.addEventListener('pointermove', tnMove);
+        sf.addEventListener('pointerup', tnUp);
+        sf.addEventListener('pointercancel', tnUp);
+        sf.addEventListener('pointerleave', () => { if (tn.pointer === null) { tn.ring = null; tnRingDraw(); } });
+        $('at-tn-undo').addEventListener('click', tnUndo);
+        $('at-tn-redo').addEventListener('click', tnRedo);
+        $('at-tn-keep').addEventListener('click', () => { $('at-tn-discard').style.display = 'none'; });
+        $('at-tn-discard-ok').addEventListener('click', () => closeModal());
+        document.addEventListener('keydown', e => {
+            if ($('at-modal-tone').style.display === 'none' || tn.id === null) return;
+            const t = e.target;
+            if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA') && !(t.type === 'range' || t.type === 'checkbox')) return;
+            if (t && t.tagName === 'SELECT') return;
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); e.stopPropagation(); (e.shiftKey ? tnRedo : tnUndo)(); }
+            else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') { e.preventDefault(); e.stopPropagation(); tnRedo(); }
+            else if (e.key === '[' || e.key === ']') {
+                const num = $('at-tn-size-num'), v = Math.max(1, Math.min(50, (parseFloat(num.value) || 12) + (e.key === ']' ? 2 : -2)));
+                num.value = v; $('at-tn-size').value = v; tnRingDraw();
+            }
+        }, true);
+        $('at-tn-apply').addEventListener('click', async () => {
+            const el = byId(tn.id);
+            if (!el || el.kind !== 'tile') return;
+            const L = TRLE.Layers, editing = tn.edit;
+            const painted = tn.groups.map((g, i) => ({ g, i })).filter(({ g }) => !TRLE.ToneBrush.maskIsEmpty(g.mask));
+            if (!painted.length && !editing) { closeModal(); showToast('Nothing painted', 'info'); return; }
+            const edGroup = editing ? tn.groups[0] : null;
+            const add = painted.filter(({ g }) => g !== edGroup), keepEdit = editing && state.layerDefs[editing.lid];
+            const masks = new Map(painted.map(({ g }) => [g, L.imm(cloneCanvas(g.mask))]));
+            const edMask = keepEdit ? L.imm(cloneCanvas(edGroup.mask)) : null, edRecipe = keepEdit ? edGroup.recipe : null;
+            closeModal();
+            if (keepEdit) {
+                const old = el.layers.find(p => p.lid === editing.lid);
+                L.update(state.layerDefs, editing.lid, { recipe: edRecipe });
+                el.layers = el.layers.map(p => p === old ? Object.assign({}, old, { mask: edMask }) : p);
+            }
+            for (const { g } of add) L.add(state.layerDefs, [el], { kind: 'tone', name: TN_NAMES[g.recipe.op] || 'Dodge', recipe: g.recipe }, [{ mask: masks.get(g) }]);
+            refreshTransitions();
+            await layersCommit([el], keepEdit ? 'Edit dodge and burn' : 'Dodge & Burn');
+            showToast(keepEdit ? 'Layer updated' : (add.length > 1 ? `${add.length} layers added` : 'Painted'), 'success');
+        });
+    }
+
+    /* ============ 🖼 OIL PAINT (FILTERS-PLAN phase 6) ============
+       The smearing is TRLE.OilPaint (js/oilpaint.js, a pure function from pixels to pixels). Lengths are written for a
+       256 px tile and scale with the tile (`k`), so the 256 px preview and a 1024 px Apply agree. A layer: Texture zone, any
+       number per tile, nothing copied from another tile. Lighting is OFF unless ticked (baked shading is what De-light removes). */
+    const OIL_ROWS = [
+        ['stylization', 'Stylization', 0.1, 10, 0.1, 4.2, ''],
+        ['cleanliness', 'Cleanliness', 0, 10, 0.1, 5, ''],
+        ['scale', 'Scale', 0.1, 10, 0.1, 0.8, ''],
+        ['bristle', 'Bristle detail', 0, 10, 0.1, 4, ''],
+    ];
+    const OIL_LIGHT = [
+        ['angle', 'Angle', -180, 180, 1, 120, '°'],
+        ['shine', 'Shine', 0, 10, 0.1, 4, ''],
+    ];
+    const oil = { ids: [], raf: 0, inputs: null, edit: null };
+    const oilVal = key => parseFloat($(`at-oil-${key}`).value) || 0;
+    function oilSet(key, v) { $(`at-oil-${key}`).value = v; $(`at-oil-${key}-num`).value = $(`at-oil-${key}`).value; }
+    const OIL_IDS = ['at-oil-lighting', 'at-oil-edge', 'at-oil-maps', 'at-oil-tiled']
+        .concat(OIL_ROWS.concat(OIL_LIGHT).flatMap(r => [`at-oil-${r[0]}`, `at-oil-${r[0]}-num`]));
+    function oilRecipeNow() {
+        return { stylization: oilVal('stylization'), cleanliness: oilVal('cleanliness'), scale: oilVal('scale'), bristle: oilVal('bristle'),
+                 lighting: $('at-oil-lighting').checked, angle: oilVal('angle'), shine: oilVal('shine'), edge: $('at-oil-edge').value,
+                 maps: $('at-oil-maps').value, controls: ctlSnap(OIL_IDS) };
+    }
+    /* A canvas through Oil Paint at the recipe (numbers); `W` is its size, so its lengths follow the tile. */
+    function oilCanvas(src, r) {
+        const W = src.width, H = src.height, id = src.getContext('2d').getImageData(0, 0, W, H);
+        const px = TRLE.OilPaint.render(id, { stylization: r.stylization, cleanliness: r.cleanliness, scale: r.scale, bristle: r.bristle,
+            lighting: !!r.lighting, angle: r.angle, shine: r.shine, edge: r.edge === 'clamp' ? 'clamp' : 'wrap', k: Math.max(1, W / 256) });
+        const out = document.createElement('canvas'); out.width = W; out.height = H;
+        out.getContext('2d').putImageData(new ImageData(px, W, H), 0, 0);
+        return out;
+    }
+    TRLE.Layers.register('oil', { zone: 'texture', mode: 'adjust', cost: (def, S) => 2400 * (S / 1024) ** 2,   // measured: 105 ms at 256, 2.4 s at 1024
+        apply: (input, def) => oilCanvas(input, def.recipe),
+        edit: (el, def) => layerEditOpen(el, def, ids => openOilModal(ids, { def })) });
+    function oilSync() { $('at-oil-light-rows').style.display = $('at-oil-lighting').checked ? '' : 'none'; }
+    function oilRender() {
+        oil.raf = 0;
+        const el = byId(oil.ids[0]);
+        if (!el) return;
+        const inp = xin(oil.inputs, el), r = oilRecipeNow();
+        const P = $('at-oil-after').width, W = Math.min(inp.width, P);
+        const src = W === inp.width ? inp : (() => { const c = document.createElement('canvas'); c.width = c.height = W; drawImported(c.getContext('2d'), inp, W); return c; })();
+        const out = oilCanvas(src, r);
+        const after = $('at-oil-after'), ctx = after.getContext('2d');
+        ctx.clearRect(0, 0, P, P);
+        if ($('at-oil-tiled').checked) {
+            for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) ctx.drawImage(out, x * P / 2, y * P / 2, P / 2, P / 2);
+        } else ctx.drawImage(out, 0, 0, P, P);
+        drawReplace($('at-oil-before'), inp, P, P);
+        $('at-oil-readout').textContent = r.edge === 'wrap' ? '· tiles if the texture does' : '· does not tile';
+    }
+    function oilSchedule() { if (!oil.raf) oil.raf = requestAnimationFrame(oilRender); }
+    function openOilModal(ids, editing) {
+        const list = (Array.isArray(ids) ? ids : [ids]).filter(i => { const e = byId(i); return e && e.kind === 'tile'; });
+        if (!list.length) return;
+        oil.ids = list;
+        oil.edit = editing ? { lid: editing.def.lid, recipe: editing.def.recipe } : null;
+        oil.inputs = layerInputsMany(list, 'oil', editing);
+        $('at-oil-tileno').textContent = numberOf(list[0]);
+        setBatchNote('at-modal-oil', list.length, numberOf(list[0]));
+        if (editing) ctlRestore(editing.def.recipe.controls);
+        setEditNote('at-modal-oil', editing ? '✏️ Editing this Oil Paint layer: Apply replaces it.' : '');
+        oilSync();
+        openModal('oil');
+        oilRender();
+    }
+    function oilCleanup() { if (oil.raf) cancelAnimationFrame(oil.raf); oil.raf = 0; oil.ids = []; oil.inputs = null; oil.edit = null; }
+    function setupOilModal() {
+        OIL_ROWS.forEach(r => sbNumRow($('at-oil-rows'), r, 'oil', oilSchedule));
+        OIL_LIGHT.forEach(r => sbNumRow($('at-oil-light-rows'), r, 'oil', oilSchedule));
+        ['at-oil-lighting', 'at-oil-edge', 'at-oil-tiled'].forEach(idn => $(idn).addEventListener('change', () => { oilSync(); oilSchedule(); }));
+        $('at-oil-reset').addEventListener('click', () => {
+            OIL_ROWS.concat(OIL_LIGHT).forEach(r => oilSet(r[0], r[5]));
+            $('at-oil-lighting').checked = false; $('at-oil-edge').value = 'wrap'; $('at-oil-maps').value = 'result'; $('at-oil-tiled').checked = false;
+            oilSync(); oilRender();
+        });
+        $('at-oil-apply').addEventListener('click', () => {
+            const targets = oil.ids.map(byId).filter(el => el && el.kind === 'tile');
+            if (!targets.length) return;
+            const r = oilRecipeNow(), L = TRLE.Layers, editing = oil.edit, n = targets.length;
+            if (r.maps === 'result') targets.forEach(el => { el.mapSource = null; });   // retires a stored original (a project from before layers)
+            closeModal();
+            (async () => {
+                if (editing && state.layerDefs[editing.lid]) {
+                    L.update(state.layerDefs, editing.lid, { recipe: r });
+                    await layersCommit(L.tilesOf(editing.lid, state.elements), 'Edit oil paint');
+                } else {
+                    L.add(state.layerDefs, targets, { kind: 'oil', name: 'Oil Paint', recipe: r }, targets.map(() => ({ data: {} })));
+                    refreshTransitions();
+                    await layersCommit(targets, n > 1 ? `Oil Paint: ${n} tiles` : 'Oil Paint');
+                }
+                showToast(n > 1 ? `Oil Paint on ${n} tiles` : 'Oil Paint applied', 'success');
+            })();
+        });
+    }
+
+    /* ============ LIQUIFY (FILTERS-PLAN phases 3 to 5) ============
+       A brush-painted displacement field (TRLE.Liquify, js/liquify.js), shown through
+       warpResample's field mode and applied once on Apply, through moveTileLayers like
+       any transform: the layers, masks, glow, imported maps (their normal vectors turned
+       by the field's own Jacobian) and a PSD's relief all move with the pixels. It is a
+       Transform, not a Filter, for that reason. Single tile: the strokes are coordinates
+       on one texture.
+
+       - The field lives on the CPU at the tile's size (px at S); the modal previews at 256.
+       - Brush points are px at S; the ring is drawn on its own canvas over the surface.
+       - Undo is the field itself (a snapshot per stroke), capped by bytes like Draw's.
+       - What a content layer (Text, Draw, Stickers) keeps on Apply is the saved grid
+         (`encodeGrid`), restated into its xf descriptor, so Edit Text still lines up. */
+    const LQ_UNDO_BYTES = 64 * 1024 * 1024;
+    const LQ_SLIDERS = [   // key, label, min, max, default, suffix
+        ['size',     'Size',     1, 100, 25, '% of the tile'],
+        ['density',  'Density',  0, 100, 50, ''],
+        ['pressure', 'Pressure', 1, 100, 100, ''],
+        ['rate',     'Rate',     1, 100, 80, ''],
+    ];
+    const lq = { id: null, field: null, undo: [], redo: [], tool: 'forward', raf: 0, pointer: null, last: null, hold: 0, ring: null, mask: null };
+    const lqVal = k => parseFloat($(`at-lq-${k}`).value) || 0;
+    /* Brush diameter in px at the tile's size; the slider is a share of the tile so it means the same at 256 and 1024. */
+    const lqSizePx = () => Math.max(1, Math.min(TRLE.Liquify.maxSize(lq.field.S), Math.round(lq.field.S * lqVal('size') / 100)));
+    const lqBrush = () => ({ tool: lq.tool, size: lqSizePx(), density: lqVal('density'), pressure: lqVal('pressure'), rate: lqVal('rate') });
+    function lqOpts(k) {
+        let filter = $('at-lq-filter').value;
+        if (filter === 'auto') filter = 'bicubic';
+        return { filter, edge: $('at-lq-edge').value, ss: filter === 'nearest' ? 1 : Math.max(1, Math.min(4, Math.ceil(k - 1e-6))) };
+    }
+    const lqDisp = f => ({ mode: 'field', field: TRLE.Liquify.toTexData(f), fieldN: f.N });
+    const lqTiles = () => $('at-lq-edge').value === 'wrap';
+    function lqBytes(f) { return f.d.byteLength + f.freeze.byteLength; }
+    function lqPushUndo() {
+        lq.undo.push(TRLE.Liquify.clone(lq.field)); lq.redo = [];
+        let total = lq.undo.reduce((n, f) => n + lqBytes(f), 0);
+        while (lq.undo.length > 1 && total > LQ_UNDO_BYTES) total -= lqBytes(lq.undo.shift());
+        lqSyncButtons();
+    }
+    function lqSyncButtons() {
+        $('at-lq-undo').disabled = !lq.undo.length; $('at-lq-redo').disabled = !lq.redo.length;
+        $('at-lq-readout').textContent = TRLE.Liquify.isIdentity(lq.field) ? '· nothing moved yet' : '· ' + (lqTiles() ? 'tiles' : 'does not tile');
+        $('at-lq-seam-row').style.display = lqTiles() ? 'none' : '';
+    }
+    function lqUndo() { if (!lq.undo.length) return; lq.redo.push(lq.field); lq.field = lq.undo.pop(); lqSyncButtons(); lqSchedule(); }
+    function lqRedo() { if (!lq.redo.length) return; lq.undo.push(lq.field); lq.field = lq.redo.pop(); lqSyncButtons(); lqSchedule(); }
+    function lqRender() {
+        lq.raf = 0;
+        const el = byId(lq.id);
+        if (!el || !lq.field) return;
+        const S = el.canvas.width, P = $('at-lq-surface').width;
+        const opts = lqOpts(S / P);
+        let out = warpCanvas(el.canvas, P, P, invForPreview(DS_IDENTITY, S, P), Object.assign({}, opts, { disp: lqDisp(lq.field) }));
+        const seam = !lqTiles() && $('at-lq-seam').checked;
+        if (seam) out = seamlessCanvas(out);
+        const sf = $('at-lq-surface'), ctx = sf.getContext('2d');
+        ctx.clearRect(0, 0, P, P);
+        ctx.drawImage(out, 0, 0);
+        if ($('at-lq-showmask').checked) {   // the frozen area, tinted; the field's own nodes scaled up
+            const N = lq.field.N;
+            if (!lq.mask || lq.mask.width !== N) { lq.mask = document.createElement('canvas'); lq.mask.width = lq.mask.height = N; }
+            const mctx = lq.mask.getContext('2d'), id = mctx.createImageData(N, N);
+            let any = false;
+            for (let n = 0; n < N * N; n++) { const a = Math.round(lq.field.freeze[n] * 120); if (a) any = true; id.data[n * 4] = 232; id.data[n * 4 + 1] = 40; id.data[n * 4 + 2] = 40; id.data[n * 4 + 3] = a; }
+            if (any) { mctx.putImageData(id, 0, 0); ctx.imageSmoothingEnabled = true; ctx.drawImage(lq.mask, 0, 0, P, P); }
+        }
+        const tl = $('at-lq-tiled').getContext('2d');
+        tl.clearRect(0, 0, P, P);
+        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) tl.drawImage(out, x * P / 2, y * P / 2, P / 2, P / 2);
+        drawReplace($('at-lq-before'), el.canvas, P, P);
+        lqSyncButtons();
+    }
+    function lqSchedule() { if (!lq.raf) lq.raf = requestAnimationFrame(lqRender); }
+    function lqRingDraw() {
+        const rc = $('at-lq-ring'), g = rc.getContext('2d'), P = rc.width;
+        g.clearRect(0, 0, P, P);
+        if (!lq.ring || !lq.field) return;
+        const r = lqSizePx() / 2 * P / lq.field.S, d = lqVal('density') / 100;
+        for (const [ox, oy] of [[0, 0], [P, 0], [-P, 0], [0, P], [0, -P], [P, P], [-P, -P], [P, -P], [-P, P]]) {
+            const x = lq.ring[0] + ox, y = lq.ring[1] + oy;
+            if (x < -r || y < -r || x > P + r || y > P + r) continue;
+            g.beginPath(); g.arc(x, y, r, 0, 6.2832); g.strokeStyle = 'rgba(0,0,0,0.75)'; g.lineWidth = 3; g.stroke();
+            g.strokeStyle = 'rgba(255,255,255,0.95)'; g.lineWidth = 1.2; g.stroke();
+            if (d > 0.02) { g.beginPath(); g.arc(x, y, r * (1 - d * 0.7), 0, 6.2832); g.strokeStyle = 'rgba(255,255,255,0.35)'; g.lineWidth = 1; g.setLineDash([3, 3]); g.stroke(); g.setLineDash([]); }
+        }
+    }
+    /* A pointer event as px at the tile's size, y down. */
+    function lqPt(e) {
+        const sf = $('at-lq-surface'), r = sf.getBoundingClientRect(), S = lq.field.S;
+        const p = e.pointerType === 'pen' && e.pressure > 0 ? e.pressure : 1;
+        return [(e.clientX - r.left) / r.width * S, (e.clientY - r.top) / r.height * S, p];
+    }
+    function lqDown(e) {
+        if (e.button !== 0 || !lq.field) return;
+        e.preventDefault();
+        $('at-lq-surface').setPointerCapture(e.pointerId);
+        lq.pointer = e.pointerId; lqPushUndo();
+        const p = lqPt(e), b = lqBrush();
+        TRLE.Liquify.strokeBegin(lq.field, b, p);
+        lq.last = p;
+        if (TRLE.Liquify.STATIONARY.has(b.tool)) lq.hold = setInterval(() => { if (lq.last) { TRLE.Liquify.strokeSegment(lq.field, lqBrush(), lq.last, lq.last); lqSchedule(); } }, 45);
+        lqSchedule();
+    }
+    function lqMove(e) {
+        const sf = $('at-lq-surface'), r = sf.getBoundingClientRect(), P = sf.width;
+        lq.ring = [(e.clientX - r.left) / r.width * P, (e.clientY - r.top) / r.height * P];
+        lqRingDraw();
+        if (lq.pointer !== e.pointerId || !lq.field) return;
+        const evs = e.getCoalescedEvents && e.getCoalescedEvents().length ? e.getCoalescedEvents() : [e], b = lqBrush();
+        for (const ev of evs) { const p = lqPt(ev); TRLE.Liquify.strokeSegment(lq.field, b, lq.last, p); lq.last = p; }
+        lqSchedule();
+    }
+    function lqUp(e) {
+        if (lq.pointer !== e.pointerId) return;
+        lq.pointer = null; lq.last = null;
+        if (lq.hold) { clearInterval(lq.hold); lq.hold = 0; }
+        lqSyncButtons(); lqSchedule();
+    }
+    function lqSetTool(id) {
+        lq.tool = id;
+        $('at-lq-tools').querySelectorAll('button').forEach(b => b.setAttribute('aria-checked', b.dataset.tool === id ? 'true' : 'false'));
+    }
+    function lqAskDiscard() {
+        if ($('at-modal-liquify').style.display === 'none') return false;
+        if ($('at-lq-discard').style.display !== 'none') { $('at-lq-discard').style.display = 'none'; return true; }
+        if (!lq.undo.length) return false;
+        $('at-lq-discard').style.display = 'flex';
+        return true;
+    }
+    function openLiquifyModal(id) {
+        const el = byId(id);
+        if (!el || el.kind !== 'tile') return;
+        lq.id = id; lq.field = TRLE.Liquify.create(el.canvas.width); lq.undo = []; lq.redo = []; lq.ring = null;
+        $('at-lq-tileno').textContent = numberOf(id);
+        $('at-lq-discard').style.display = 'none';
+        lqSetTool(lq.tool);
+        openModal('liquify');
+        lqRender(); lqRingDraw();
+    }
+    function lqCleanup() {
+        if (lq.raf) cancelAnimationFrame(lq.raf);
+        if (lq.hold) clearInterval(lq.hold);
+        lq.raf = 0; lq.hold = 0; lq.pointer = null; lq.last = null; lq.id = null; lq.field = null; lq.undo = []; lq.redo = [];
+    }
+    function setupLiquifyModal() {
+        const tools = $('at-lq-tools');
+        for (const t of TRLE.Liquify.TOOLS) {
+            const b = document.createElement('button');
+            b.type = 'button'; b.className = 'btn btn-secondary'; b.dataset.tool = t.id; b.textContent = t.label;
+            b.setAttribute('role', 'radio'); b.setAttribute('aria-checked', 'false');
+            b.addEventListener('click', () => lqSetTool(t.id));
+            tools.appendChild(b);
+        }
+        for (const [key, label, min, max, def, suffix] of LQ_SLIDERS) {
+            const g = document.createElement('div');
+            g.className = 'form-group';
+            g.innerHTML = `<label for="at-lq-${key}-num">${label}${suffix ? ' (' + suffix + ')' : ''}</label>
+ <div class="at-numslider"><input type="range" id="at-lq-${key}" min="${min}" max="${max}" step="1" value="${def}" aria-label="${label}">
+ <input type="number" id="at-lq-${key}-num" min="${min}" max="${max}" step="1" value="${def}"></div>`;
+            $('at-lq-sliders').appendChild(g);
+            const range = g.querySelector('input[type=range]'), num = g.querySelector('input[type=number]');
+            range.addEventListener('input', () => { num.value = range.value; lqRingDraw(); });
+            num.addEventListener('input', () => { const v = parseFloat(num.value); if (!isFinite(v)) return; range.value = Math.max(+range.min, Math.min(+range.max, v)); lqRingDraw(); });
+            num.addEventListener('change', () => { num.value = range.value; });
+        }
+        const sf = $('at-lq-surface');
+        sf.addEventListener('pointerdown', lqDown);
+        sf.addEventListener('pointermove', lqMove);
+        sf.addEventListener('pointerup', lqUp);
+        sf.addEventListener('pointercancel', lqUp);
+        sf.addEventListener('pointerleave', () => { if (lq.pointer === null) { lq.ring = null; lqRingDraw(); } });
+        ['at-lq-filter', 'at-lq-edge', 'at-lq-seam', 'at-lq-showmask'].forEach(idn => $(idn).addEventListener('change', lqSchedule));
+        $('at-lq-undo').addEventListener('click', lqUndo);
+        $('at-lq-redo').addEventListener('click', lqRedo);
+        const whole = fn => () => { if (!lq.field) return; lqPushUndo(); fn(lq.field); lqSchedule(); };
+        $('at-lq-freezeall').addEventListener('click', whole(f => TRLE.Liquify.freezeAll(f)));
+        $('at-lq-thawall').addEventListener('click', whole(f => TRLE.Liquify.thawAll(f)));
+        $('at-lq-invertmask').addEventListener('click', whole(f => TRLE.Liquify.invertFreeze(f)));
+        $('at-lq-reconall').addEventListener('click', whole(f => TRLE.Liquify.reconstructAll(f, 1)));
+        $('at-lq-keep').addEventListener('click', () => { $('at-lq-discard').style.display = 'none'; });
+        $('at-lq-discard-ok').addEventListener('click', () => closeModal());
+        document.addEventListener('keydown', e => {
+            if ($('at-modal-liquify').style.display === 'none' || !lq.field) return;
+            const t = e.target;
+            if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA') && !(t.type === 'range' || t.type === 'checkbox')) return;
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); e.stopPropagation(); (e.shiftKey ? lqRedo : lqUndo)(); }
+            else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') { e.preventDefault(); e.stopPropagation(); lqRedo(); }
+            else if (e.key === '[' || e.key === ']') {
+                const num = $('at-lq-size-num'), v = Math.max(1, Math.min(100, (parseFloat(num.value) || 25) + (e.key === ']' ? 3 : -3)));
+                num.value = v; $('at-lq-size').value = v; lqRingDraw();
+            }
+        }, true);
+        $('at-lq-apply').addEventListener('click', async () => {
+            const el = byId(lq.id);
+            if (!el || el.kind !== 'tile' || !lq.field) return;
+            if (TRLE.Liquify.isIdentity(lq.field)) { closeModal(); showToast('Liquify: nothing was moved', 'info'); return; }
+            const S = el.canvas.width, opts = Object.assign(lqOpts(1), { disp: lqDisp(lq.field) });
+            const saved = TRLE.Liquify.encodeGrid(lq.field);
+            const desc = warpDesc(DS_IDENTITY, S, opts, { mode: 'field', n: saved.n, data: saved.data });
+            const tiles = lqTiles(), seam = !tiles && $('at-lq-seam').checked;
+            moveTileLayers(el, warpMove(DS_IDENTITY, S, opts, desc), true);
+            if (seam) seamAfterMove(el, true);
+            if (seam || !tiles) setBaseSeamless(el, seam && !hasLayers(el));
+            el.edited = true;
+            closeModal();
+            await layersSettle([el]);
+            refreshTransitions();
+            renderGrid();
+            pushHistory('Liquify');
+            showToast('Liquify applied', 'success');
+        });
+    }
+
     function setupColorAdjModal() {
         buildSliderGrid('at-ca-sliders', CA_PARAMS, 'ca', caRender);
         buildSliderGrid('at-ca-levels', CA_LEVELS_PARAMS, 'ca', caRender);
@@ -18338,7 +23560,7 @@ window.TRLE = window.TRLE || {};
             canvas: $('at-ca-preview'),
             mode: 'alpha',
             getMask: () => ca.maskCanvas,
-            getSource: () => { const el = byId(ca.id); return el ? el.canvas : null; },
+            getSource: () => { const el = byId(ca.id); return el ? xin(ca.inputs, el) : null; },
             active: () => ca.id !== null && caMode() === 'mask'
                           && $('at-modal-coloradj').style.display !== 'none',
             onChange: caRender
@@ -18361,17 +23583,12 @@ window.TRLE = window.TRLE || {};
             const ids = caMode() === 'mask' ? [ca.id] : ca.batchIds;
             const targets = ids.map(byId).filter(el => el && el.kind === 'tile');
             if (!targets.length) return;
-            targets.forEach(el => {
-                const out = caApplyTo(el.canvas, state.tileSize);
-                drawReplace(el.canvas, out);
-                el.edited = true;
-            });
+            const recipe = caRecipeNow(), maskCopy = recipe.mode === 'mask' ? cloneCanvas(ca.maskCanvas) : null;
             const n = targets.length;
             closeModal();
-            refreshTransitions();
-            renderGrid();
-            pushHistory(n > 1 ? `Adjust colours: ${n} tiles` : 'Adjust colours');
-            showToast(n > 1 ? `Colours adjusted on ${n} tiles` : 'Colours adjusted', 'success');
+            colourLayerApply('coloradj', 'Adjust Colours', targets, recipe, () => (maskCopy ? { mask: maskCopy } : {}),
+                n > 1 ? `Adjust colours: ${n} tiles` : 'Adjust colours')
+                .then(() => showToast(n > 1 ? `Colours adjusted on ${n} tiles` : 'Colours adjusted', 'success'));
         });
     }
 
@@ -18728,7 +23945,13 @@ window.TRLE = window.TRLE || {};
     function drawRegisterTiles(b) {
         // Keyed by kind as well: one tile can be a tip AND a pattern, two registries.
         const reg = (kind, id, fn) => {
-            if (!id || !id.startsWith('tile:') || draw.regd.has(kind + id)) return;
+            if (!id || draw.regd.has(kind + id)) return;
+            if (id.startsWith('lp:')) {   // a tile copied into a drawing layer at its first Apply
+                const [, lid, key] = id.split(':'), c = state.layerDefs[lid] && state.layerDefs[lid].pixels && state.layerDefs[lid].pixels[key];
+                if (c) { fn(id, c); draw.regd.add(kind + id); }
+                return;
+            }
+            if (!id.startsWith('tile:')) return;
             const el = byId(parseInt(id.slice(5), 10));
             if (el) { fn(id, el.canvas); draw.regd.add(kind + id); }
         };
@@ -18788,7 +24011,7 @@ window.TRLE = window.TRLE || {};
         Object.assign(draw, { id: null, cells: [], mask: null, multi: false,
                               layer: null, tmp: null, comp: null, undo: [], redo: [], sUndo: [], sRedo: [],
                               stroke: null, brush: null, lastPt: null, pan: null, raf: 0, fitted: false,
-                              setMode: null, strokes: null });
+                              setMode: null, strokes: null, edit: null });
     }
     function drawBrush() {
         const erase = draw.tool === 'eraser';
@@ -18815,40 +24038,74 @@ window.TRLE = window.TRLE || {};
        is simply not part of the job. Those show dimmed, and the layer is clipped to
        the paintable mask, so paint never appears where Apply will not put it. */
     const DRAW_MAX_PX = 4096;   // per side; a 16x16 selection of 256 px tiles
-    function openDrawModal(ids) {
+    /* A selection as the area it covers in the grid (Draw 2b; Text shares it):
+       the bounding rectangle of its slots, one cell per slot, `editable` for a
+       selected source tile and locked for anything else, plus a white mask of
+       the editable cells. Null, after saying why, when there is nothing to work
+       on or the area is over DRAW_MAX_PX a side. */
+    /* `opts.derived` (Stickers, STICKERS-PLAN D9): transitions and animation frames are editable too; of an
+       animation, only its FIRST frame in the area is, because one sticker sits on every frame of the group. */
+    function selectionArea(ids, S, what, opts) {
         const list = (Array.isArray(ids) ? ids : [ids]).filter(i => byId(i));
-        if (!list.length) return;
-        const S = state.tileSize;
+        if (!list.length) return null;
         syncLayout();
         const cols = Math.max(1, state.cols);
         const slots = list.map(i => state.layout.indexOf(i)).filter(i => i >= 0);
-        if (!slots.length) return;
+        if (!slots.length) return null;
         const cs = slots.map(i => i % cols), rs = slots.map(i => Math.floor(i / cols));
         const c0 = Math.min(...cs), c1 = Math.max(...cs), r0 = Math.min(...rs), r1 = Math.max(...rs);
         const W = (c1 - c0 + 1) * S, H = (r1 - r0 + 1) * S;
         if (W > DRAW_MAX_PX || H > DRAW_MAX_PX) {
             const n = Math.floor(DRAW_MAX_PX / S);
-            showToast(`Draw works on up to ${n} × ${n} tiles at ${S} px. Select a smaller area.`, 'info', 4000);
-            return;
+            if (!(opts && opts.quiet)) showToast(`${what} works on up to ${n} × ${n} tiles at ${S} px. Select a smaller area.`, 'info', 4000);
+            return null;
         }
-        const chosen = new Set(list), cells = [];
+        const chosen = new Set(list), cells = [], groupsSeen = new Set();
+        const derived = !!(opts && opts.derived);
+        const kindOk = el => el.kind === 'tile' || (derived && (el.kind === 'transition' || (el.kind === 'anim' && el.anim)));
         for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
             const id = state.layout[r * cols + c] ?? null, el = id != null ? byId(id) : null;
-            cells.push({ id, x: (c - c0) * S, y: (r - r0) * S,
-                         editable: !!el && chosen.has(id) && el.kind === 'tile' });
+            let editable = !!el && chosen.has(id) && kindOk(el);
+            if (editable && el.kind === 'anim') { if (groupsSeen.has(el.anim.group)) editable = false; else groupsSeen.add(el.anim.group); }
+            const cell = { id, x: (c - c0) * S, y: (r - r0) * S, editable };
+            /* A new Text or Draw layer sits BELOW the Finish zone (Fade, Classic Look), so it is shown on the
+               composite below that, not on the tile's finished canvas. */
+            if (cell.editable && hasLayers(el) && el.layers.some(p => TRLE.Layers.zoneOf(state.layerDefs[p.lid]) === 'finish'))
+                cell.canvas = TRLE.Layers.inputFor(el, state.layerDefs, { kind: 'text', zone: 'content' });
+            cells.push(cell);
         }
         const editable = cells.filter(c => c.editable);
-        if (!editable.length) { showToast('Draw works on source tiles only', 'info'); return; }
-        const mk = () => { const c = document.createElement('canvas'); c.width = W; c.height = H; return c; };
-        const mask = mk(), mctx = mask.getContext('2d');
+        if (!editable.length) { showToast(derived ? `Nothing in that selection can take ${what.toLowerCase()}` : `${what} works on source tiles only`, 'info'); return null; }
+        const mask = document.createElement('canvas'); mask.width = W; mask.height = H;
+        const mctx = mask.getContext('2d');
         mctx.fillStyle = '#fff';
         editable.forEach(c => mctx.fillRect(c.x, c.y, S, S));
+        return { cells, W, H, mask };
+    }
+    function openDrawModal(ids, init) {
+        const S = state.tileSize, area = init ? init.area : selectionArea(ids, S, 'Draw');
+        if (!area) return;
+        const { cells, W, H, mask } = area, editable = cells.filter(c => c.editable);
+        const mk = () => { const c = document.createElement('canvas'); c.width = W; c.height = H; return c; };
         Object.assign(draw, { id: editable[0].id, S, W, H, cells, mask, multi: cells.length > 1,
-                              layer: mk(), tmp: mk(), comp: mk(), undo: [], redo: [],
+                              layer: mk(), tmp: mk(), comp: mk(), undo: [], redo: [], sUndo: [], sRedo: [],
                               stroke: null, lastPt: null, fitted: false, pan: null,
-                              regd: new Set(), matTouched: false });
+                              regd: new Set(), matTouched: !!init,
+                              strokes: init ? init.strokes.slice() : [], edit: init ? init.edit : null });
+        if (init) {
+            // Edit Drawing…: the layer's own pixels back on the surface, and its settings back in the controls.
+            draw.layer.getContext('2d').drawImage(init.paint, 0, 0);
+            $('at-draw-lblend').value = init.blend || 'source-over'; tilePickerSync($('at-draw-lblend'));
+            $('at-draw-lopacity').value = Math.round(init.opacity * 100); $('at-draw-lopacity-val').textContent = $('at-draw-lopacity').value;
+            $('at-draw-material').value = init.material || '';
+            for (const [k, c] of Object.entries(init.pixels || {})) draw.regd.add('lp:' + init.edit.lid + ':' + k);
+            if (draw.fxp) draw.fxp.write(init.effects);
+        }
+        draw.fxCache = null;
+        $('at-draw-fxacc').style.display = '';
+        $('at-draw-title').textContent = init ? '🖌 Edit Drawing' : '🖌 Draw';
         drawFillTileSelects();
-        drawSuggestMaterial();
+        if (!init) drawSuggestMaterial();
         const nums = editable.map(c => numberOf(c.id));
         $('at-draw-tileno').textContent = nums.length === 1 ? `Tile ${nums[0]}`
             : nums.length <= 4 ? `Tiles ${nums.slice(0, -1).join(', ')} and ${nums[nums.length - 1]}` : `${nums.length} tiles`;
@@ -18891,8 +24148,10 @@ window.TRLE = window.TRLE || {};
         (o.strokes || []).forEach(st => drawRegisterTiles(st.brush));
         drawFillTileSelects();
         $('at-draw-tileno').textContent = o.title;
+        $('at-draw-title').textContent = '🖌 Draw';
         $('at-draw-material').closest('label').style.display = 'none';   // the set's own material applies
-        $('at-draw-lblend').value = o.blend || 'source-over';
+        $('at-draw-fxacc').style.display = 'none';                       // a sheet slot is not a layer: no effects
+        $('at-draw-lblend').value = o.blend || 'source-over'; tilePickerSync($('at-draw-lblend'));
         $('at-draw-lopacity').value = Math.round((o.opacity == null ? 1 : o.opacity) * 100);
         $('at-draw-lopacity-val').textContent = $('at-draw-lopacity').value;
         setBatchNote('at-modal-draw', 2, null, o.note);
@@ -18962,6 +24221,20 @@ window.TRLE = window.TRLE || {};
     }
 
     /* ---- composing: tile + layer (+ the live stroke) ---------------------- */
+    /* The effects over a painted layer (null when none is on or this is a Pushable Markings sheet). `full` skips the cache: Apply. */
+    function drawFx(paint, full) {
+        if (!draw.fxp || draw.setMode || !draw.fxp.any()) return null;
+        const bag = draw.fxp.read(), key = JSON.stringify(bag) + `/${draw.undo.length}/${draw.redo.length}/${draw.strokes ? draw.strokes.length : 0}/${draw.sUndo.length}/${draw.sRedo.length}/${paint.width}`;
+        if (!full && draw.fxCache && draw.fxCache.key === key) return draw.fxCache.out;
+        const E = TRLE.Effects;
+        const out = full || E.previewFactor(paint.width, paint.height) === 1 ? E.render(paint, bag, { wrap: false }) : (() => {
+            const r = E.renderPreview(paint, bag, { wrap: false });
+            const up = c => { if (!c) return c; const u = document.createElement('canvas'); u.width = paint.width; u.height = paint.height; u.getContext('2d').drawImage(c, 0, 0, paint.width, paint.height); return u; };
+            return { image: up(r.image), body: up(r.body), behind: up(r.behind), glow: up(r.glow), emit: up(r.emit) };
+        })();
+        if (!full) draw.fxCache = { key, out };
+        return out;
+    }
     function drawCompose() {
         if (!draw.comp) return;
         const W = draw.W, H = draw.H, tctx = draw.tmp.getContext('2d');
@@ -18972,6 +24245,15 @@ window.TRLE = window.TRLE || {};
         tctx.globalCompositeOperation = 'destination-in';
         tctx.drawImage(draw.mask, 0, 0);
         tctx.globalCompositeOperation = 'source-over';
+        // Layer effects (phase 11): only while no stroke is being drawn, and cached until the paint or a setting changes.
+        const fxo = draw.stroke ? null : drawFx(draw.tmp, false);
+        if (fxo) {
+            tctx.clearRect(0, 0, W, H);
+            tctx.drawImage(fxo.image, 0, 0);
+            tctx.globalCompositeOperation = 'destination-in';
+            tctx.drawImage(draw.mask, 0, 0);
+            tctx.globalCompositeOperation = 'source-over';
+        }
         // Cleared first, every frame (the drawReplace rule): a cutout's holes must
         // show nothing, not the last frame's paint.
         const c = draw.comp.getContext('2d');
@@ -19063,12 +24345,12 @@ window.TRLE = window.TRLE || {};
     /* ---- the layer's own undo ------------------------------------------- */
     function drawSnapshot() {
         draw.undo.push(draw.layer.getContext('2d').getImageData(0, 0, draw.W, draw.H));
-        // Set mode: the recorded strokes move with the pixels, entry for entry.
-        if (draw.setMode) { draw.sUndo.push(draw.strokes.slice()); draw.sRedo = []; }
+        // The recorded strokes move with the pixels, entry for entry (a set's, and a layer's).
+        draw.sUndo.push(draw.strokes.slice()); draw.sRedo = [];
         let bytes = draw.undo.reduce((a, im) => a + im.data.length, 0);
         while (draw.undo.length > 1 && bytes > DRAW_UNDO_BYTES) {
             bytes -= draw.undo.shift().data.length;
-            if (draw.setMode) draw.sUndo.shift();
+            draw.sUndo.shift();
         }
         draw.redo = [];
         drawSyncButtons();
@@ -19078,7 +24360,7 @@ window.TRLE = window.TRLE || {};
         const lctx = draw.layer.getContext('2d');
         toStack.push(lctx.getImageData(0, 0, draw.W, draw.H));
         lctx.putImageData(fromStack.pop(), 0, 0);
-        if (draw.setMode) { sTo.push(draw.strokes); draw.strokes = sFrom.pop(); }
+        sTo.push(draw.strokes); draw.strokes = sFrom.pop();
         drawSyncButtons(); drawSchedule();
     }
     const drawUndo = () => drawUndoRedo(draw.undo, draw.redo, draw.sUndo, draw.sRedo);
@@ -19151,8 +24433,8 @@ window.TRLE = window.TRLE || {};
         if (!draw.brush.erase) drawRecentAdd(rgbToHex(draw.brush.color));
         const smp = draw.stroke.samples;
         draw.lastStroke = { samples: smp, brush: draw.brush, opts: draw.strokeOpts };   // what points would keep (Q3)
-        if (draw.setMode) draw.strokes.push({ sid: drawSid(), samples: smp, brush: draw.brush, opts: draw.strokeOpts,
-                                              bounds: draw.stroke.bounds, v: TRLE.Stroke.VERSION });
+        draw.strokes.push({ sid: drawSid(), samples: smp, brush: draw.brush, opts: draw.strokeOpts,
+                            bounds: draw.stroke.bounds, v: TRLE.Stroke.VERSION });
         draw.lastPt = smp.length ? smp[smp.length - 1].slice(0, 2) : draw.lastPt;
         draw.stroke = null;
         drawSyncButtons(); drawSchedule();
@@ -19231,11 +24513,12 @@ window.TRLE = window.TRLE || {};
        layer's coverage times the layer's opacity; a layer with the same material
        takes the union instead of a new layer being added, so twenty strokes of
        blood are one Blood layer. */
-    function drawMaterialMask(cell, lop) {
-        const S = draw.S;
+    /* A layer's coverage over one cell as a region mask (opaque greyscale, read
+       from R) at the layer's opacity. Draw's layer, or Text's letters. */
+    function layerMaterialMask(layer, cell, S, lop) {
         const white = document.createElement('canvas'); white.width = white.height = S;
         const w = white.getContext('2d');
-        w.drawImage(draw.layer, cell.x, cell.y, S, S, 0, 0, S, S);
+        w.drawImage(layer, cell.x, cell.y, S, S, 0, 0, S, S);
         w.globalCompositeOperation = 'source-in';
         w.fillStyle = '#fff'; w.fillRect(0, 0, S, S);
         const m = document.createElement('canvas'); m.width = m.height = S;
@@ -19244,19 +24527,13 @@ window.TRLE = window.TRLE || {};
         g.globalAlpha = lop; g.drawImage(white, 0, 0);
         return m;
     }
-    function drawAddMatLayer(el, cell, value, lop) {
-        const [type, key] = value.split(':');
-        const preset = getPreset(type, key, 'realistic');
-        const mask = drawMaterialMask(cell, lop);
-        if (!hasMatLayers(el))
-            el.matLayers = [{ name: 'Base', color: MM_COLORS[0], feather: 0, material: deepCopyMaterial(el.material), mask: null }];
-        const same = el.matLayers.find((L, i) => i > 0 && L.material && !L.material.custom && L.material.type === type && L.material.key === key);
-        if (same && same.mask) {
-            const g = same.mask.getContext('2d');
-            g.globalCompositeOperation = 'lighten'; g.drawImage(mask, 0, 0); g.globalCompositeOperation = 'source-over';
-        } else {
-            el.matLayers.push({ name: 'Draw: ' + (preset && preset.label ? preset.label : key), color: MM_COLORS[el.matLayers.length % MM_COLORS.length],
-                                feather: 0, material: { type, key, aesthetic: 'realistic' }, mask });
+    /* Every solid and liquid preset as 'type:key' options, grouped (Draw's
+       layer Material and Text's). */
+    function fillMaterialSelect(sel) {
+        for (const [type, label, bag] of [['solid', 'Solid', TRLE.SolidPresets], ['liquid', 'Liquid', TRLE.LiquidPresets]]) {
+            const g = document.createElement('optgroup'); g.label = label;
+            for (const [key, p] of Object.entries(bag)) { const o = document.createElement('option'); o.value = type + ':' + key; o.textContent = p.label; g.appendChild(o); }
+            sel.appendChild(g);
         }
     }
     function setupDrawModal() {
@@ -19265,6 +24542,13 @@ window.TRLE = window.TRLE || {};
             $(sel).innerHTML = TRLE.Stroke.BLEND_MODES.map(m => `<option value="${m.id}">${m.label}</option>`).join('');
             $(sel).addEventListener('change', drawSchedule);
         }
+        /* Hover previews the layer's blend (HOVER-PREVIEW-PLAN phase 1). Stroke blend
+           does not: it mixes a stroke with paint ALREADY ON THE LAYER, so on an empty
+           layer all 17 modes paint exactly like Normal (measured: Δ 0). Its list says
+           so instead (phase 1b, author's option 2); a sample per row is pinned. */
+        attachTilePicker($('at-draw-blend'), { text: true, title: 'Stroke blend',
+            note: "Mixes with paint already on this layer. To blend with the texture, use the layer's Blend." });
+        attachTilePicker($('at-draw-lblend'), { text: true, title: 'Layer blend', ...previewByValue($('at-draw-lblend'), drawSchedule) });
         $('at-draw-lopacity').addEventListener('input', function () { $('at-draw-lopacity-val').textContent = this.value; drawSchedule(); });
         ['brush', 'eraser', 'picker'].forEach(n => $('at-draw-tool-' + n).addEventListener('click', () => drawSetTool(n)));
         $('at-draw-swap').addEventListener('click', drawSwap);
@@ -19311,12 +24595,9 @@ window.TRLE = window.TRLE || {};
         psel.addEventListener('change', () => { if (psel.value) drawLoadPreset(psel.value); });
         // The layer's material (2c.3): None, or any solid or liquid preset.
         const msel = $('at-draw-material');
-        for (const [type, label, bag] of [['solid', 'Solid', TRLE.SolidPresets], ['liquid', 'Liquid', TRLE.LiquidPresets]]) {
-            const g = document.createElement('optgroup'); g.label = label;
-            for (const [key, p] of Object.entries(bag)) { const o = document.createElement('option'); o.value = type + ':' + key; o.textContent = p.label; g.appendChild(o); }
-            msel.appendChild(g);
-        }
+        fillMaterialSelect(msel);
         msel.addEventListener('change', () => { draw.matTouched = true; });
+        draw.fxp = buildEffectsPanel($('at-draw-fx'), 'at-drawfx', drawSchedule);
         $('at-draw-dyn').addEventListener('toggle', () => drawDockDyn(true));
         accBindSummary($('at-draw-dyn'), drawDockDyn);
         $('at-draw-zoomin').addEventListener('click', () => drawZoomAt(draw.zoom * 1.25));
@@ -19329,7 +24610,7 @@ window.TRLE = window.TRLE || {};
             if (draw.id === null) return;
             drawSnapshot();
             draw.layer.getContext('2d').clearRect(0, 0, draw.W, draw.H);
-            if (draw.setMode) draw.strokes = [];
+            draw.strokes = [];   // nothing left on the layer, so nothing to replay
             drawSchedule();
         });
         const cv = $('at-draw-canvas');
@@ -19364,7 +24645,7 @@ window.TRLE = window.TRLE || {};
            touched keeps its pixels and its `edited` flag. */
         $('at-draw-keep').addEventListener('click', () => drawShowDiscard(false));
         $('at-draw-discard-ok').addEventListener('click', () => { if (!drawSetLeave(null)) closeModal(); });
-        $('at-draw-apply').addEventListener('click', () => {
+        $('at-draw-apply').addEventListener('click', async () => {
             if (draw.id === null) return;
             if (draw.stroke) drawPointerUp();
             if (draw.setMode) {
@@ -19373,10 +24654,15 @@ window.TRLE = window.TRLE || {};
                 return;
             }
             drawCompose();
-            const S = draw.S, lctx = draw.layer.getContext('2d');
-            const matV = $('at-draw-material').value, lop = +$('at-draw-lopacity').value / 100;
-            const skipped = [];
-            let n = 0;
+            const S = draw.S, lctx = draw.layer.getContext('2d'), edit = draw.edit;
+            const matV = $('at-draw-material').value, L = TRLE.Layers;
+            const crop = (src, cell) => { const c = document.createElement('canvas'); c.width = c.height = S; c.getContext('2d').drawImage(src, cell.x, cell.y, S, S, 0, 0, S, S); return c; };
+            const skipped = [], pieces = new Map();
+            // The effects over the whole area at full size, clipped to what Apply may write (as the live view is).
+            const fxo = drawFx(draw.layer, true);
+            if (fxo) { const g = fxo.image.getContext('2d'); g.globalCompositeOperation = 'destination-in'; g.drawImage(draw.mask, 0, 0); g.globalCompositeOperation = 'source-over'; }
+            let emitC = null;   // the glows ticked "Also glow in game", clipped like the pixels
+            if (fxo && fxo.emit) { emitC = cloneCanvas(fxo.emit); const g = emitC.getContext('2d'); g.globalCompositeOperation = 'destination-in'; g.drawImage(draw.mask, 0, 0); }
             for (const cell of draw.cells) {
                 const el = cell.editable ? byId(cell.id) : null;
                 if (!el || el.kind !== 'tile') continue;
@@ -19384,25 +24670,1747 @@ window.TRLE = window.TRLE || {};
                 let painted = false;
                 for (let i = 3; i < a.length; i += 4) if (a[i]) { painted = true; break; }
                 if (!painted) continue;
-                const crop = document.createElement('canvas'); crop.width = crop.height = S;
-                crop.getContext('2d').drawImage(draw.comp, cell.x, cell.y, S, S, 0, 0, S, S);
-                drawReplace(el.canvas, crop);
-                el.edited = true;
-                if (matV) { if (el.hgParams) skipped.push(numberOf(el.id)); else drawAddMatLayer(el, cell, matV, lop); }
-                n++;
+                const raw = crop(draw.layer, cell);
+                const px = fxo ? crop(fxo.image, cell) : raw;
+                const piece = { px };
+                // With effects the raw paint is kept beside the finished pixels, so re-editing never paints an effect twice.
+                if (fxo) piece.aux = { raw };
+                if (emitC) piece.aux = Object.assign(piece.aux || {}, { glow: crop(emitC, cell) });
+                if (matV) { if (el.hgParams) skipped.push(numberOf(el.id)); else piece.aux = Object.assign(piece.aux || {}, { cover: fxo ? crop(fxo.body, cell) : px }); }
+                pieces.set(el.id, piece);
+            }
+            const n = pieces.size, touched = [...pieces.keys()].map(byId);
+            if (!n && !edit) { closeModal(); showToast('Nothing was painted', 'info'); return; }
+            const glowedBefore = !!edit && layerPiecesGlow(edit.lid);
+            /* The strokes are kept as points beside the pixels (the pushmarks record). A tile used as a
+               tip or pattern is COPIED into the definition, so editing that tile later changes nothing. */
+            const lid = edit ? edit.lid : L.reserve();
+            const pixels = Object.assign({}, edit && state.layerDefs[edit.lid].pixels);
+            const keep = (id, kind) => {
+                if (!id || !String(id).startsWith('tile:')) return id;
+                const N = parseInt(id.slice(5), 10), key = 't' + N;
+                if (!pixels[key]) { const t = byId(N); if (!t) return id; pixels[key] = L.imm(cloneCanvas(t.canvas)); }
+                return `lp:${lid}:${key}`;
+            };
+            const strokes = draw.strokes.map(st => {
+                const b = st.brush, nb = Object.assign({}, b);
+                if (b.tip) nb.tip = keep(b.tip);
+                if (b.texture && b.texture.id) nb.texture = Object.assign({}, b.texture, { id: keep(b.texture.id) });
+                if (b.dual && b.dual.tip) nb.dual = Object.assign({}, b.dual, { tip: keep(b.dual.tip) });
+                return Object.assign({}, st, { brush: nb });
+            });
+            const fields = { name: 'Drawing', opacity: +$('at-draw-lopacity').value / 100, blend: $('at-draw-lblend').value || 'source-over',
+                recipe: { strokes, material: matV || null, effects: fxo ? draw.fxp.read() : undefined, stale: !!(edit && edit.stale), v: TRLE.Stroke.VERSION },
+                pixels: Object.keys(pixels).length ? pixels : undefined };
+            let label, done;
+            const dropped = [];   // tiles the edited layer no longer reaches: rebuilt once, in the commit
+            if (edit) {
+                const before = L.tilesOf(edit.lid, state.elements);
+                L.update(state.layerDefs, edit.lid, fields);
+                if (!fields.pixels) delete state.layerDefs[edit.lid].pixels;
+                for (const el of before) if (!pieces.has(el.id)) { L.remove(el, edit.lid, state.layerDefs, true); dropped.push(el); }
+                for (const el of touched) {
+                    const p = Object.assign({ lid: edit.lid }, pieces.get(el.id));
+                    L.imm(p.px); if (p.aux) Object.values(p.aux).forEach(L.imm);
+                    // The new pixels are authoritative in the tile's CURRENT orientation: no turn to replay.
+                    if (el.layers && el.layers.some(q => q.lid === edit.lid)) el.layers = el.layers.map(q => q.lid === edit.lid ? p : q);
+                    else L.insertPiece(el, state.layerDefs[edit.lid], p, state.layerDefs);
+                }
+                label = n ? (n > 1 ? `Edit drawing: ${n} tiles` : 'Edit drawing') : 'Remove drawing';
+                done = n ? (n > 1 ? `Drawing edited on ${n} tiles` : 'Drawing edited') : 'Drawing removed';
+            } else {
+                const area = { W: draw.W, H: draw.H, S, cells: draw.cells.map(c => ({ id: c.id, x: c.x, y: c.y, member: pieces.has(c.id) })) };
+                L.add(state.layerDefs, touched, Object.assign({ kind: 'draw', lid, area }, fields), touched.map(el => pieces.get(el.id)));
+                label = n > 1 ? `Draw: ${n} tiles` : 'Draw';
+                done = n > 1 ? `Drawing applied to ${n} tiles` : 'Drawing applied';
             }
             closeModal();
-            if (!n) { showToast('Nothing was painted', 'info'); return; }
             refreshTransitions();
-            renderGrid();
-            pushHistory(n > 1 ? `Draw: ${n} tiles` : 'Draw');
+            await layersCommit([...new Set([...touched, ...dropped, ...(edit ? L.tilesOf(edit.lid, state.elements) : [])])], label);
+            L.prune(state.layerDefs, state.elements);
+            const glowNote = layersGlowExport(!!emitC, glowedBefore);
             /* Make Height Map's settings are not used by a multi-material tile's maps
                (composeLayerMaps passes no element), so adding a layer would silently
                drop them: those tiles keep their own material, and say why. */
-            const done = n > 1 ? `Drawing applied to ${n} tiles` : 'Drawing applied';
-            if (skipped.length) showToast(`${done}. Material not added to tile${skipped.length > 1 ? 's' : ''} ${skipped.join(', ')}: ${skipped.length > 1 ? 'they have' : 'it has'} Make Height Map settings, which a multi-material tile would drop.`, 'info', 8000);
-            else showToast(done, 'success');
+            if (skipped.length) showToast(`${done}${glowNote}. Material not added to tile${skipped.length > 1 ? 's' : ''} ${skipped.join(', ')}: ${skipped.length > 1 ? 'they have' : 'it has'} Make Height Map settings, which a multi-material tile would drop.`, 'info', 8000);
+            else showToast(done + glowNote, 'success');
         });
+    }
+
+    /* Edit Drawing…: a drawing layer back on its ORIGINAL arrangement, its own pixels on the surface
+       and its strokes in the history, previewing on the tiles as the layer sees them. The pixels are
+       authoritative; the points are the record. A tile turned since the drawing was made no longer
+       matches them, so the layer is marked stale (its points are kept for what they are). */
+    function openDrawLayer(el, def) {
+        const a = def.area, S = a.S, L = TRLE.Layers;
+        const members = new Set(a.cells.filter(c => c.member).map(c => c.id));
+        const paint = document.createElement('canvas'); paint.width = a.W; paint.height = a.H;
+        const pg = paint.getContext('2d');
+        let stale = !!(def.recipe && def.recipe.stale);
+        const cells = a.cells.map(c => {
+            const t = c.id != null ? byId(c.id) : null;
+            const editable = !!t && t.kind === 'tile' && members.has(c.id);
+            const cell = { id: t ? c.id : null, x: c.x, y: c.y, editable };
+            if (editable) {
+                cell.canvas = L.inputOf(t, state.layerDefs, def.lid);
+                const p = t.layers.find(q => q.lid === def.lid);
+                if (p && (p.aux && p.aux.raw || p.px)) pg.drawImage(p.aux && p.aux.raw || p.px, c.x, c.y);   // the raw paint when effects were baked over it
+                if (p && ((p.xf && p.xf.length) || p.xfLost)) stale = true;
+            }
+            return cell;
+        });
+        const mask = document.createElement('canvas'); mask.width = a.W; mask.height = a.H;
+        const mc = mask.getContext('2d'); mc.fillStyle = '#fff';
+        cells.filter(c => c.editable).forEach(c => mc.fillRect(c.x, c.y, S, S));
+        if (!cells.some(c => c.editable)) { showToast('Every tile this drawing was on is gone', 'info'); return; }
+        if (stale) showToast('A tile was turned or reshaped since this was drawn, so its stored strokes no longer match the pixels. The pixels are what is kept.', 'info', 6000);
+        openDrawModal(null, { area: { cells, W: a.W, H: a.H, mask }, paint, strokes: (def.recipe && def.recipe.strokes) || [],
+            opacity: def.opacity == null ? 1 : def.opacity, blend: def.blend, material: def.recipe && def.recipe.material,
+            pixels: def.pixels, effects: def.recipe && def.recipe.effects, edit: { lid: def.lid, stale } });
+    }
+    TRLE.Layers.register('draw', { zone: 'content', mode: 'content', apply: (input, def, piece) => piece.px,
+        edit: (el, def) => openDrawLayer(el, def) });
+
+    /* ============ 🔤 TEXT (TEXT-PLAN phase 2) ============
+       Lettering over a tile, or across a selection's area the way Draw shows it
+       (selectionArea): the text is rendered once into its own box (TRLE.Text),
+       stamped onto a W x H layer (wrapping when asked), clipped to the paintable
+       tiles, and composed over them with Draw's opacity and blend. Apply bakes
+       it into each tile it touched, one pushHistory; the Material choice turns
+       the letters' coverage into a region through Draw's own code. Settings are
+       tool settings and survive between opens; the position starts on the first
+       paintable tile each time. */
+    const TX_FONTS = ['Arial', 'Helvetica', 'Verdana', 'Tahoma', 'Trebuchet MS', 'Georgia', 'Times New Roman',
+                      'Palatino', 'Garamond', 'Courier New', 'Impact', 'Copperplate', 'Papyrus',
+                      'serif', 'sans-serif', 'monospace'];
+    const TX_WEIGHTS = [[100, 'Thin'], [200, 'Extra light'], [300, 'Light'], [400, 'Regular'], [500, 'Medium'],
+                        [600, 'Semi bold'], [700, 'Bold'], [800, 'Extra bold'], [900, 'Black']];
+    const TX_ROWS = {
+        text: [
+            ['size',   'Size', 4, 512, 1, 48, ' px'],
+            ['sx',     'Stretch X', 10, 400, 1, 100, '%'],
+            ['sy',     'Stretch Y', 10, 400, 1, 100, '%'],
+            ['rot',    'Rotate', -180, 180, 1, 0, '°'],
+            ['lh',     'Line spacing', 50, 300, 5, 120, '%'],
+            ['ls',     'Letter spacing', -10, 60, 0.5, 0, ' px'],
+            ['x',      'Position X', 0, 256, 1, 128, ' px'],
+            ['y',      'Position Y', 0, 256, 1, 128, ' px'],
+        ],
+        outline: [['ow', 'Width', 0, 32, 0.5, 2, ' px']],
+        shadow: [
+            ['sdx',  'Offset X', -32, 32, 1, 3, ' px'],
+            ['sdy',  'Offset Y', -32, 32, 1, 3, ' px'],
+            ['sblur', 'Blur', 0, 32, 1, 2, ' px'],
+            ['sop',  'Opacity', 0, 100, 1, 60, '%'],
+        ],
+        layer: [['op', 'Text opacity', 0, 100, 1, 100, '%']],
+        relief: [
+            ['depth', 'Depth', 1, 100, 1, 40, '%'],
+            ['bevel', 'Bevel', 0, 16, 0.5, 1, ' px'],
+        ],
+    };
+    const tx = { cells: null, W: 0, H: 0, S: 0, mask: null, layer: null, comp: null, box: null, cover: null, raf: 0, drag: null, fonts: [], pvFamily: null, pvSeq: 0, pvTimer: 0 };
+
+    /* ============ LAYER EFFECTS PANEL (LAYERS-PLAN phase 11) ============
+       One builder for every layer that takes effects (Text, then Draw). Ids are `<prefix>-<effect>-<param>`; the prefix must NOT be a
+       buildMaskToolbar prefix (`at-draw`, `at-fade`...), whose generated ids would collide. read() gives the effects bag
+       TRLE.Effects.render takes (every effect, on or off, with all its values), write() puts one back, so a layer's recipe holds it
+       and Edit shows it. */
+    const FX_LABELS = { dropShadow: 'Drop shadow', innerShadow: 'Inner shadow', outerGlow: 'Outer glow', innerGlow: 'Inner glow', stroke: 'Stroke', colourOverlay: 'Colour overlay' };
+    const FX_ROWS = {
+        dropShadow:    [['opacity', 'Opacity', 0, 100, 1, 75, '%'], ['angle', 'Direction', 0, 359, 1, 45, '°'], ['distance', 'Distance', 0, 60, 1, 6, ' px'], ['size', 'Blur', 0, 40, 1, 4, ' px'], ['spread', 'Spread', 0, 100, 1, 0, '%']],
+        innerShadow:   [['opacity', 'Opacity', 0, 100, 1, 75, '%'], ['angle', 'Direction', 0, 359, 1, 45, '°'], ['distance', 'Distance', 0, 60, 1, 4, ' px'], ['size', 'Blur', 0, 40, 1, 3, ' px']],
+        outerGlow:     [['opacity', 'Opacity', 0, 100, 1, 80, '%'], ['size', 'Size', 1, 40, 1, 8, ' px'], ['spread', 'Spread', 0, 100, 1, 0, '%']],
+        innerGlow:     [['opacity', 'Opacity', 0, 100, 1, 75, '%'], ['size', 'Size', 1, 40, 1, 6, ' px'], ['spread', 'Spread', 0, 100, 1, 0, '%']],
+        stroke:        [['opacity', 'Opacity', 0, 100, 1, 100, '%'], ['width', 'Width', 1, 32, 1, 3, ' px']],
+        colourOverlay: [['opacity', 'Opacity', 0, 100, 1, 100, '%']],
+    };
+    function buildEffectsPanel(host, prefix, onChange) {
+        const E = TRLE.Effects, ids = [];
+        const id = (k, p) => `${prefix}-${k}-${p}`;
+        host.textContent = '';
+        for (const kind of E.KINDS) {
+            const d = E.DEFAULTS[kind], wrap = document.createElement('div');
+            wrap.innerHTML = `<label class="checkbox-row"><input type="checkbox" id="${id(kind, 'on')}"> ${FX_LABELS[kind]}</label>`
+                + `<div id="${id(kind, 'box')}" style="display:none;"><div class="form-group"><label for="${id(kind, 'colour')}">Colour</label><input type="color" id="${id(kind, 'colour')}" value="${d.colour}"></div></div>`;
+            host.appendChild(wrap);
+            const box = wrap.querySelector(`#${id(kind, 'box')}`);
+            ids.push(id(kind, 'on'), id(kind, 'colour'));
+            for (const [key, label, min, max, step, def, suffix] of FX_ROWS[kind]) {
+                const g = document.createElement('div');
+                g.className = 'form-group';
+                g.innerHTML = `<label for="${id(kind, key)}-num">${label}${suffix.trim() ? ' (' + suffix.trim() + ')' : ''}</label>
+ <div class="at-numslider"><input type="range" id="${id(kind, key)}" min="${min}" max="${max}" step="${step}" value="${def}" aria-label="${FX_LABELS[kind]} ${label}">
+ <input type="number" id="${id(kind, key)}-num" min="${min}" max="${max}" step="${step}" value="${def}"></div>`;
+                box.appendChild(g);
+                const range = g.querySelector('input[type=range]'), num = g.querySelector('input[type=number]');
+                range.addEventListener('input', () => { num.value = range.value; onChange(); });
+                num.addEventListener('input', () => { const v = parseFloat(num.value); if (!isFinite(v)) return; range.value = Math.max(+range.min, Math.min(+range.max, v)); onChange(); });
+                num.addEventListener('change', () => { num.value = range.value; });
+                ids.push(id(kind, key));
+            }
+            if (kind === 'outerGlow' || kind === 'innerGlow') {
+                const g = document.createElement('div');
+                g.className = 'form-group';
+                g.innerHTML = `<label class="checkbox-row" title="Adds this glow to the tile's Emissive map, so it glows in the game too"><input type="checkbox" id="${id(kind, 'emit')}"> Also glow in game</label>`;
+                box.appendChild(g);
+                g.querySelector('input').addEventListener('change', onChange);
+                ids.push(id(kind, 'emit'));
+            }
+            if (kind === 'stroke') {
+                const g = document.createElement('div');
+                g.className = 'form-group';
+                g.innerHTML = `<label for="${id(kind, 'position')}">Position</label><select id="${id(kind, 'position')}"><option value="outside">Outside</option><option value="inside">Inside</option><option value="centre">Centre</option></select>`;
+                box.appendChild(g);
+                const sel = g.querySelector('select');
+                sel.addEventListener('change', onChange);
+                attachTilePicker(sel, { text: true, title: 'Stroke position', ...previewByValue(sel, onChange) });
+                ids.push(id(kind, 'position'));
+            }
+            wrap.querySelector(`#${id(kind, 'on')}`).addEventListener('change', () => { sync(); onChange(); });
+            box.querySelector(`#${id(kind, 'colour')}`).addEventListener('input', onChange);
+        }
+        function sync() { for (const kind of E.KINDS) $(id(kind, 'box')).style.display = $(id(kind, 'on')).checked ? '' : 'none'; }
+        function read() {
+            const bag = {};
+            for (const kind of E.KINDS) {
+                const e = { on: $(id(kind, 'on')).checked, colour: $(id(kind, 'colour')).value };
+                for (const [key] of FX_ROWS[kind]) { const v = parseFloat($(id(kind, key)).value); e[key] = key === 'opacity' ? v / 100 : v; }
+                if (kind === 'stroke') e.position = $(id(kind, 'position')).value;
+                if (kind === 'outerGlow' || kind === 'innerGlow') e.emit = $(id(kind, 'emit')).checked;
+                bag[kind] = e;
+            }
+            return bag;
+        }
+        function write(bag) {
+            for (const kind of E.KINDS) {
+                const b = (bag && bag[kind]) || {}, d = E.DEFAULTS[kind];
+                $(id(kind, 'on')).checked = !!b.on;
+                $(id(kind, 'colour')).value = b.colour || d.colour;
+                for (const [key, , , , , def] of FX_ROWS[kind]) {
+                    const v = b[key] != null ? (key === 'opacity' ? Math.round(b[key] * 100) : b[key]) : def;
+                    $(id(kind, key)).value = v; $(id(kind, key) + '-num').value = $(id(kind, key)).value;
+                }
+                if (kind === 'stroke') { $(id(kind, 'position')).value = b.position || d.position; tilePickerSync($(id(kind, 'position'))); }
+                if (kind === 'outerGlow' || kind === 'innerGlow') $(id(kind, 'emit')).checked = !!b.emit;
+            }
+            sync();
+        }
+        sync();
+        return { read, write, sync, ids: () => ids.slice(), any: () => E.KINDS.some(k => $(id(k, 'on')).checked) };
+    }
+
+    function txNumRow(wrap, [key, label, min, max, step, def, suffix]) {
+        const g = document.createElement('div');
+        g.className = 'form-group';
+        g.id = `at-tx-${key}-row`;
+        g.innerHTML = `<label for="at-tx-${key}-num">${label}${suffix.trim() ? ' (' + suffix.trim() + ')' : ''}</label>
+ <div class="at-numslider"><input type="range" id="at-tx-${key}" min="${min}" max="${max}" step="${step}" value="${def}" aria-label="${label}">
+ <input type="number" id="at-tx-${key}-num" min="${min}" max="${max}" step="${step}" value="${def}"></div>`;
+        wrap.appendChild(g);
+        const range = g.querySelector('input[type=range]'), num = g.querySelector('input[type=number]');
+        range.addEventListener('input', () => { num.value = range.value; txSchedule(true); });
+        num.addEventListener('input', () => { const v = parseFloat(num.value); if (!isFinite(v)) return; range.value = Math.max(+range.min, Math.min(+range.max, v)); txSchedule(true); });
+        num.addEventListener('change', () => { num.value = range.value; });
+    }
+    function txSet(key, v) { $(`at-tx-${key}`).value = v; $(`at-tx-${key}-num`).value = $(`at-tx-${key}`).value; }
+    const txVal = key => parseFloat($(`at-tx-${key}`).value) || 0;
+
+    /* The renderer's options from the controls. */
+    function txOpts() {
+        return {
+            text: $('at-tx-text').value, family: tx.pvFamily || $('at-tx-font').value.trim() || 'sans-serif',
+            weight: parseInt($('at-tx-weight').value, 10) || 400, italic: $('at-tx-italic').checked,
+            size: txVal('size'), scaleX: txVal('sx') / 100, scaleY: txVal('sy') / 100, lineHeight: txVal('lh') / 100, letterSpacing: txVal('ls'),
+            kerning: $('at-tx-kern').checked, align: $('at-tx-align').value, rotation: txVal('rot'),
+            aa: $('at-tx-aa').value, fill: $('at-tx-fill').value,
+            outline: $('at-tx-outline').checked ? { width: txVal('ow'), color: $('at-tx-ocolor').value } : null,
+            shadow: $('at-tx-shadow').checked ? { dx: txVal('sdx'), dy: txVal('sdy'), blur: txVal('sblur'), color: $('at-tx-scolor').value, opacity: txVal('sop') / 100 } : null,
+            bevel: $('at-tx-relief').value ? txVal('bevel') : 0,
+        };
+    }
+    /* The text stamped onto the area, clipped to what Apply may write: `what`
+       is the box's colours, or a coverage mask made from it. */
+    function txStampedRaw(what) {
+        const c = document.createElement('canvas'); c.width = tx.W; c.height = tx.H;
+        if (tx.box) TRLE.Text.stamp(c.getContext('2d'), tx.box, what, txVal('x'), txVal('y'), tx.W, tx.H, $('at-tx-wrap').checked);
+        return c;
+    }
+    const txClip = c => { const g = c.getContext('2d'); g.globalCompositeOperation = 'destination-in'; g.drawImage(tx.mask, 0, 0); return c; };
+    const txStamped = what => txClip(txStampedRaw(what));
+    /* The layer effects over the stamped lettering (LAYERS-PLAN phase 11): null when none is on, so the old path is untouched. Above 2048 px the
+       live view renders them at reduced size and Apply (`tx.full`) at full size. */
+    function txFx(raw) {
+        const bag = tx.fxp && tx.fxp.any() ? tx.fxp.read() : null;
+        if (!bag) return null;
+        const E = TRLE.Effects, o = { wrap: $('at-tx-wrap').checked };
+        if (tx.full || E.previewFactor(raw.width, raw.height) === 1) return E.render(raw, bag, o);
+        const r = E.renderPreview(raw, bag, o);
+        const up = c => { if (!c) return c; const u = document.createElement('canvas'); u.width = raw.width; u.height = raw.height; u.getContext('2d').drawImage(c, 0, 0, raw.width, raw.height); return u; };
+        return { image: up(r.image), body: up(r.body), behind: up(r.behind), glow: up(r.glow), emit: up(r.emit) };
+    }
+    /* The material region of the lettering with effects: its own coverage plus what a stroke added to the body (never a shadow or a glow). */
+    function txCoverWithFx(cover) {
+        if (!tx.fxOut) return cover;
+        const W = tx.W, H = tx.H, a = tx.rawLayer.getContext('2d').getImageData(0, 0, W, H).data, b = tx.fxOut.body.getContext('2d').getImageData(0, 0, W, H).data;
+        const m = tx.mask.getContext('2d').getImageData(0, 0, W, H).data, cg = cover.getContext('2d'), im = cg.getImageData(0, 0, W, H), d = im.data;
+        for (let i = 3; i < d.length; i += 4) {
+            const extra = Math.max(0, b[i] - a[i]) * (m[i] / 255);
+            if (extra > 0) { d[i - 3] = d[i - 2] = d[i - 1] = 255; d[i] = Math.min(255, d[i] + extra); }
+        }
+        cg.putImageData(im, 0, 0);
+        return cover;
+    }
+    /* What a cell shows under the text: its tile, or, when a layer is being edited, the tile
+       as that layer sees it (the composite BELOW it), so the layer is never drawn on itself. */
+    function txBase(cell, el) { return (tx.edit && tx.edit.inputs && tx.edit.inputs.get(cell.id)) || cell.canvas || el.canvas; }
+    function txCompose() {
+        const raw = txStampedRaw(tx.box ? tx.box.canvas : null);
+        tx.rawLayer = raw; tx.fxOut = txFx(raw);
+        tx.layer = txClip(tx.fxOut ? tx.fxOut.image : raw);
+        tx.layerX = tx.layer;
+        // A tile turned since the text was made shows its part of the text turned too.
+        const xfs = tx.edit && tx.edit.xf;
+        if (xfs && xfs.size) {
+            tx.layerX = document.createElement('canvas'); tx.layerX.width = tx.W; tx.layerX.height = tx.H;
+            const g = tx.layerX.getContext('2d');
+            for (const cell of tx.cells) {
+                const xf = xfs.get(cell.id);
+                const crop = document.createElement('canvas'); crop.width = crop.height = tx.S;
+                crop.getContext('2d').drawImage(tx.layer, cell.x, cell.y, tx.S, tx.S, 0, 0, tx.S, tx.S);
+                g.drawImage(xf && xf.length ? applyXf(crop, xf) : crop, cell.x, cell.y);
+            }
+        }
+        const c = tx.comp.getContext('2d');
+        c.clearRect(0, 0, tx.W, tx.H);
+        for (const cell of tx.cells) { const el = cell.id != null ? byId(cell.id) : null; if (el) c.drawImage(txBase(cell, el), cell.x, cell.y, tx.S, tx.S); }
+        c.save();
+        c.globalAlpha = txVal('op') / 100;
+        c.globalCompositeOperation = $('at-tx-blend').value || 'source-over';
+        c.drawImage(tx.layerX, 0, 0);
+        c.restore();
+    }
+    /* Outline's and Shadow's rows show only while they are ticked. */
+    function txSync() {
+        const o = $('at-tx-outline').checked, sh = $('at-tx-shadow').checked;
+        $('at-tx-orows').style.display = o ? '' : 'none';
+        $('at-tx-ocolor').closest('.form-group').style.display = o ? '' : 'none';
+        $('at-tx-srows').style.display = sh ? '' : 'none';
+        $('at-tx-scolor').closest('.form-group').style.display = sh ? '' : 'none';
+        $('at-tx-reliefbox').style.display = $('at-tx-relief').value ? '' : 'none';
+    }
+    /* The relief this text would add, as area-sized white-coverage canvases:
+       `relief` (letters + outline, blurred by Bevel) and `hole` (everything the
+       text changes: its own pixels, shadow included, and the bevel's reach). */
+    function txReliefAreas() {
+        const b = tx.box, sign = $('at-tx-relief').value;
+        if (!b || !sign) return null;
+        const rel = TRLE.Text.blurAlpha(b.cover, b.w, b.h, txVal('bevel'));
+        const vis = b.canvas.getContext('2d').getImageData(0, 0, b.w, b.h).data, hole = new Uint8ClampedArray(rel.length);
+        for (let i = 0; i < hole.length; i++) hole[i] = (vis[i * 4 + 3] || rel[i]) ? 255 : 0;
+        return { sign: sign === 'raise' ? 'up' : 'down', depth: txVal('depth') / 100, floors: $('at-tx-floors').value,
+                 relief: txStamped(TRLE.Text.maskCanvas(b, rel)), hole: txStamped(TRLE.Text.maskCanvas(b, hole)) };
+    }
+    /* `old` (an el.textRelief, or null) with this text's relief over `cell` merged
+       in: a new object, max-merged per sign, so text applied twice never digs
+       twice as deep. */
+    function txMergedRelief(old, areas, cell, S) {
+        const grey = (src, a) => {
+            const m = document.createElement('canvas'); m.width = m.height = S;
+            const g = m.getContext('2d');
+            g.fillStyle = '#000'; g.fillRect(0, 0, S, S);
+            g.globalAlpha = a; g.drawImage(src, cell.x, cell.y, S, S, 0, 0, S, S);
+            return m;
+        };
+        const merge = (prev, add) => {
+            if (!prev) return add;
+            const m = cloneCanvas(prev), g = m.getContext('2d');
+            g.globalCompositeOperation = 'lighten'; g.drawImage(add, 0, 0);
+            return m;
+        };
+        const r = cloneTextRelief(old) || { up: null, down: null, hole: null, floors: areas.floors };
+        r[areas.sign] = merge(r[areas.sign], grey(areas.relief, areas.depth));
+        r.hole = merge(r.hole, grey(areas.hole, 1));
+        r.floors = areas.floors;
+        return r;
+    }
+    /* Show: Normal map. The normal map export would produce for each tile the
+       text touches, with the pixels and relief as Apply would leave them,
+       through the real deriveMaps on a stand-in element. Drawn a moment after
+       the last change, so dragging stays smooth. */
+    function txDrawNormals() {
+        tx.normTimer = 0;
+        if (!tx.cells || $('at-tx-show').value !== 'normal' || !tx.viewFit) return;
+        const S = tx.S, areas = txReliefAreas(), v = $('at-tx-view').getContext('2d'), f = tx.viewFit;
+        for (const cell of tx.cells) {
+            const el = cell.editable ? byId(cell.id) : null;
+            if (!el) continue;
+            const crop = document.createElement('canvas'); crop.width = crop.height = S;
+            crop.getContext('2d').drawImage(tx.comp, cell.x, cell.y, S, S, 0, 0, S, S);
+            const stand = Object.assign({}, el, { id: '__txprev' + el.id, canvas: crop,
+                layers: tx.edit && el.layers ? el.layers.filter(p => p.lid !== tx.edit.lid) : el.layers });
+            stand.textRelief = areas ? txMergedRelief(effectiveTextRelief(stand), areas, cell, S) : effectiveTextRelief(stand);
+            const n = deriveMaps(stand, { normal: true }, {}).normal;
+            if (n) v.drawImage(n, f.ox + cell.x * f.scale, f.oy + cell.y * f.scale, S * f.scale, S * f.scale);
+        }
+    }
+    function txRender(rebuild) {
+        tx.raf = 0;
+        if (!tx.cells) return;
+        if (rebuild || !tx.box) {
+            const o = txOpts();
+            tx.box = o.text.trim() ? TRLE.Text.render(o) : null;
+            const ok = TRLE.Text.fontAvailable(o.family, o.weight, o.italic);
+            $('at-tx-fontnote').textContent = ok ? '' : `"${o.family}" is not installed or loaded here, so a fallback font is showing. Load the font file, or pick it from the Online library on the Fonts tab.`;
+        }
+        txCompose();
+        const view = $('at-tx-view'), v = view.getContext('2d');
+        const scale = Math.min(view.width / tx.W, view.height / tx.H);
+        const w = tx.W * scale, h = tx.H * scale, ox = (view.width - w) / 2, oy = (view.height - h) / 2;
+        tx.viewFit = { scale, ox, oy };
+        v.clearRect(0, 0, view.width, view.height);
+        v.imageSmoothingEnabled = scale < 1;
+        v.drawImage(tx.comp, ox, oy, w, h);
+        // Locked tiles dimmed, as Draw shows them.
+        v.fillStyle = 'rgba(0,0,0,0.55)';
+        for (const cell of tx.cells) if (!cell.editable) v.fillRect(ox + cell.x * scale, oy + cell.y * scale, tx.S * scale, tx.S * scale);
+        v.strokeStyle = 'rgba(232,133,42,0.5)'; v.lineWidth = 1;
+        for (const cell of tx.cells) v.strokeRect(ox + cell.x * scale + 0.5, oy + cell.y * scale + 0.5, tx.S * scale - 1, tx.S * scale - 1);
+        TRLE.Handles.draw(v, txHandleBox(), { ratio: txViewRatio() });
+        clearTimeout(tx.normTimer);
+        if ($('at-tx-show').value === 'normal') tx.normTimer = setTimeout(txDrawNormals, 150);
+    }
+    /* The transform frame on the view: the text block (before Stretch's and Rotate's
+       effect on the box's size, the renderer reports its own tw x th), in view px. */
+    function txViewRatio() { const v = $('at-tx-view'), r = v.getBoundingClientRect(); return r.width ? v.width / r.width : 1; }
+    function txHandleBox() {
+        const b = tx.box, f = tx.viewFit;
+        if (!b || !f) return null;
+        return { cx: f.ox + txVal('x') * f.scale, cy: f.oy + txVal('y') * f.scale, w: b.tw * f.scale, h: b.th * f.scale, rot: b.rot };
+    }
+    function txSchedule(rebuild) {
+        tx.rebuild = tx.rebuild || !!rebuild;
+        if (!tx.raf) tx.raf = requestAnimationFrame(() => { const r = tx.rebuild; tx.rebuild = false; txRender(r); });
+    }
+    /* Every control that shapes the lettering, by id: what a text layer remembers (its recipe)
+       and what editing it puts back. */
+    const TX_CTRL_IDS = ['text', 'font', 'weight', 'align', 'italic', 'kern', 'aa', 'fill', 'outline', 'ocolor', 'shadow', 'scolor',
+                         'blend', 'material', 'relief', 'floors', 'wrap',
+                         ...Object.values(TX_ROWS).flat().map(r => r[0])];
+    function txCaptureControls() {
+        const o = {};
+        for (const k of TX_CTRL_IDS) { const e = $('at-tx-' + k); o[k] = e.type === 'checkbox' ? e.checked : e.value; }
+        return o;
+    }
+    function txRestoreControls(o) {
+        for (const k of TX_CTRL_IDS) {
+            if (!(k in o)) continue;
+            const e = $('at-tx-' + k);
+            if (e.type === 'checkbox') e.checked = !!o[k]; else e.value = o[k];
+            const n = $(`at-tx-${k}-num`); if (n) n.value = e.value;
+            if (e.tagName === 'SELECT') tilePickerSync(e);
+        }
+        txSync();
+    }
+    /* Edit Text…: reopen a text layer over its ORIGINAL arrangement, whatever the grid looks like
+       now (a member tile that was deleted is a missing cell). */
+    function openTextLayer(el, def) {
+        const a = def.area, S = a.S;
+        const L = TRLE.Layers;
+        const members = new Set(a.cells.filter(c => c.member).map(c => c.id));
+        const cells = a.cells.map(c => {
+            const t = c.id != null ? byId(c.id) : null;
+            return { id: t ? c.id : null, x: c.x, y: c.y, editable: !!t && t.kind === 'tile' && members.has(c.id) };
+        });
+        const mask = document.createElement('canvas'); mask.width = a.W; mask.height = a.H;
+        const mc = mask.getContext('2d'); mc.fillStyle = '#fff';
+        cells.filter(c => c.editable).forEach(c => mc.fillRect(c.x, c.y, S, S));
+        if (!cells.some(c => c.editable)) { showToast('Every tile this text was on is gone', 'info'); return; }
+        const inputs = new Map(), xf = new Map();
+        let lost = 0;
+        cells.filter(c => c.editable).forEach(c => {
+            const t = byId(c.id);
+            inputs.set(c.id, L.inputOf(t, state.layerDefs, def.lid));
+            const p = t.layers.find(q => q.lid === def.lid);
+            if (p && p.xf && p.xf.length) xf.set(c.id, p.xf);
+            if (p && p.xfLost) lost++;
+        });
+        if (lost) showToast(`${lost === 1 ? 'A tile was' : lost + ' tiles were'} reshaped since this text was made, in a way it cannot follow. Applying redraws ${lost === 1 ? 'it' : 'them'} unturned.`, 'warning', 6000);
+        openTextModal(null, { area: { cells, W: a.W, H: a.H, mask }, edit: { lid: def.lid, inputs, xf }, controls: def.recipe.controls, effects: def.recipe.effects });
+    }
+    function openTextModal(ids, layer) {
+        const S = state.tileSize, area = layer ? layer.area : selectionArea(ids, S, 'Text');
+        if (!area) return;
+        tx.edit = layer ? layer.edit : null;
+        const mk = () => { const c = document.createElement('canvas'); c.width = area.W; c.height = area.H; return c; };
+        Object.assign(tx, { cells: area.cells, W: area.W, H: area.H, S, mask: area.mask, comp: mk(), layer: mk(), box: null, drag: null });
+        for (const k of ['x', 'y']) { const r = $(`at-tx-${k}`), n = $(`at-tx-${k}-num`); r.max = n.max = k === 'x' ? area.W : area.H; }
+        const first = area.cells.find(c => c.editable);
+        if (!layer) { txSet('x', first.x + S / 2); txSet('y', first.y + S / 2); }
+        $('at-tx-size').max = $('at-tx-size-num').max = Math.max(64, 2 * S);
+        const editable = area.cells.filter(c => c.editable), nums = editable.map(c => numberOf(c.id));
+        $('at-tx-tileno').textContent = nums.length === 1 ? `Tile ${nums[0]}`
+            : nums.length <= 4 ? `Tiles ${nums.slice(0, -1).join(', ')} and ${nums[nums.length - 1]}` : `${nums.length} tiles`;
+        const locked = area.cells.filter(c => c.id != null && !c.editable).length;
+        setBatchNote('at-modal-text', editable.length, null,
+            `🎯 Lettering across ${editable.length} tiles as they sit in the grid.` +
+            (locked ? ` ${locked} other tile${locked > 1 ? 's' : ''} in the area ${locked > 1 ? 'are' : 'is'} dimmed and will not change.` : ''));
+        if (layer) { txRestoreControls(layer.controls); tx.fxp.write(layer.effects); }
+        $('at-tx-title').textContent = layer ? '🔤 Edit Text' : '🔤 Text';
+        openModal('text');
+        txRender(true);
+    }
+    function txCleanup() { clearTimeout(tx.pvTimer); tx.pvSeq++; tx.pvFamily = null; if (tx.raf) cancelAnimationFrame(tx.raf); tx.raf = 0; clearTimeout(tx.normTimer); tx.cells = null; tx.box = null; tx.drag = null; tx.edit = null; }
+    /* A font file: loaded from its bytes (FontFace + ArrayBuffer, which the CSP's
+       font-src 'self' allows, where a blob: or data: URL would be refused), for
+       this session. Nothing is saved: the text is baked on Apply. */
+    function txLoadFontFile(file) {
+        const base = file.name.replace(/\.[^.]+$/, '').replace(/[^A-Za-z0-9 _-]/g, ' ').trim() || 'Font';
+        let name = base, n = 2;
+        while (tx.fonts.includes(name)) name = `${base} ${n++}`;
+        return file.arrayBuffer().then(buf => new FontFace(name, buf).load()).then(face => {
+            document.fonts.add(face);
+            tx.fonts.push(name);
+            const o = document.createElement('option'); o.value = name; $('at-tx-fontlist').appendChild(o);
+            $('at-tx-font').value = name;
+            txSchedule(true);
+            showToast(`Font "${name}" loaded for this session`, 'success');
+        }).catch(() => showToast(`${file.name} could not be read as a font`, 'error'));
+    }
+    /* Fonts (TEXT-PLAN D6, phase 4). The online list is a trimmed snapshot of
+       Fontsource's catalogue shipped with the tool (data/), fetched from 'self'
+       the first time the Fonts tab opens. A family's file comes from jsDelivr
+       only on Load (the click is the consent), as bytes into a FontFace, which
+       the CSP's font-src 'self' allows where a URL source would not. The id is
+       checked against the snapshot and a pattern before it reaches a URL. */
+    const TX_FS = 'https://cdn.jsdelivr.net/fontsource/fonts/';
+    const txFonts = { catalogue: null, sprites: null, byFamily: new Map(), loaded: new Set(), pending: null };
+    function txCatalogue() {
+        if (txFonts.pending) return txFonts.pending;
+        /* The sprite map (FONT-PREVIEW-PLAN) is optional: without it the list is names in the
+           UI font, as before, and nothing is hidden. */
+        const sprites = fetch('data/fontsource-sprites.json').then(r => r.ok ? r.json() : null).catch(() => null);
+        txFonts.pending = Promise.all([fetch('data/fontsource-catalogue.json').then(r => { if (!r.ok) throw new Error(r.status); return r.json(); }), sprites])
+            .then(([doc, sp]) => {
+                txFonts.sprites = sp && sp.fonts && sp.cell ? sp : null;
+                txFonts.catalogue = (doc.fonts || []).filter(f => Array.isArray(f) && /^[a-z0-9-]+$/.test(f[0]))
+                    .map(([id, family, cat, weights, italic, subset, licence]) => ({ id, family, cat, weights, italic: !!italic, subset: /^[a-z0-9-]+$/.test(subset) ? subset : 'latin', licence }));
+                txFonts.catalogue.forEach(f => txFonts.byFamily.set(f.family, f));
+                return txFonts.catalogue;
+            }).catch(() => { txFonts.pending = null; $('at-tx-online-note').textContent = 'The online font list could not be read.'; return []; });
+        return txFonts.pending;
+    }
+    /* The Online library list. The hidden <select> stays the source of truth (Load, the
+       validators and recipes read its value); the rows are what the user sees: each family's
+       own name in its own typeface, cut out of a lazily fetched sprite sheet
+       (tools/build-font-sprites.mjs) and tinted with a CSS mask, so no font file is
+       downloaded to browse. Families with no sprite (non-Latin default subset, or a file
+       jsDelivr cannot serve) are not listed. */
+    const TX_SPRITE_DIR = 'data/font-sprites/';
+    let txRowObserver = null;
+    const txListed = f => !txFonts.sprites || f.id in txFonts.sprites.fonts;
+    function txPaintGlyph(g) {
+        const [sheet, x, y, w] = g._sp, u = `url("${TX_SPRITE_DIR}${String(sheet).padStart(2, '0')}.webp")`;
+        g.style.width = w + 'px'; g.style.height = txFonts.sprites.cell.h + 'px';
+        g.style.webkitMask = g.style.mask = `${u} -${x}px -${y}px no-repeat`;
+    }
+    function txSelectRow(id, scroll) {
+        const list = $('at-tx-online-list'), rows = $('at-tx-online-rows');
+        list.value = id;
+        let cur = null;
+        for (const r of rows.children) { const on = r.dataset.id === id; r.classList.toggle('current', on); r.setAttribute('aria-selected', on ? 'true' : 'false'); if (on) cur = r; }
+        if (cur && scroll) {
+            if (cur.offsetTop < rows.scrollTop) rows.scrollTop = cur.offsetTop;
+            else if (cur.offsetTop + cur.offsetHeight > rows.scrollTop + rows.clientHeight) rows.scrollTop = cur.offsetTop + cur.offsetHeight - rows.clientHeight;
+        }
+        const f = txFonts.byFamily.size ? (txFonts.catalogue || []).find(x => x.id === id) : null;
+        if (f) $('at-tx-online-note').textContent = `${f.family} · ${f.cat} · ${f.weights.join(', ')}${f.italic ? ' + italic' : ''} · ${f.licence || 'licence in the catalogue'}`;
+    }
+    function txFillOnline() {
+        const list = $('at-tx-online-list'), rows = $('at-tx-online-rows'), q = $('at-tx-online-q').value.trim().toLowerCase(), cat = $('at-tx-online-cat').value;
+        const listed = (txFonts.catalogue || []).filter(txListed);
+        const hits = listed.filter(f => (!cat || f.cat === cat) && (!q || f.family.toLowerCase().includes(q)));
+        const keep = list.value;
+        list.innerHTML = hits.map(f => `<option value="${f.id}">${f.family.replace(/[<&]/g, '')}</option>`).join('');
+        if (txRowObserver) txRowObserver.disconnect();
+        txRowObserver = 'IntersectionObserver' in window ? new IntersectionObserver(es => es.forEach(e => {
+            if (e.isIntersecting) { txPaintGlyph(e.target); txRowObserver.unobserve(e.target); }
+        }), { root: rows, rootMargin: '160px' }) : null;
+        const frag = document.createDocumentFragment();
+        for (const f of hits) {
+            const r = document.createElement('div');
+            r.className = 'at-tx-frow'; r.setAttribute('role', 'option'); r.setAttribute('aria-selected', 'false');
+            r.dataset.id = f.id; r.title = f.family;
+            const pos = txFonts.sprites && txFonts.sprites.fonts[f.id];
+            if (pos) {
+                const g = document.createElement('span');
+                g.className = 'at-tx-fglyph'; g._sp = pos;
+                g.setAttribute('aria-label', f.family);
+                g.style.width = pos[3] + 'px'; g.style.height = txFonts.sprites.cell.h + 'px';
+                r.appendChild(g);
+                if (txRowObserver) txRowObserver.observe(g); else txPaintGlyph(g);
+            } else r.textContent = f.family;
+            frag.appendChild(r);
+        }
+        rows.textContent = ''; rows.appendChild(frag);
+        rows.scrollTop = 0;
+        if ([...list.options].some(o => o.value === keep)) { txSelectRow(keep, true); }
+        else list.selectedIndex = -1;
+        if (!txFonts.catalogue) $('at-tx-online-note').textContent = '';
+        else if (!(keep && list.value === keep)) $('at-tx-online-note').textContent = `${hits.length} of ${listed.length} families.`;
+    }
+    /* Load one variant of a catalogue family (nearest weight; italic if it has
+       one), once per session. */
+    function txLoadOnline(f, weight, italic, quiet) {
+        const w = f.weights.reduce((a, b) => Math.abs(b - weight) < Math.abs(a - weight) ? b : a, f.weights[0]);
+        const style = italic && f.italic ? 'italic' : 'normal', key = `${f.id}-${w}-${style}`;
+        if (txFonts.loaded.has(key)) return Promise.resolve(f.family);
+        if (!quiet) $('at-tx-online-note').textContent = `Loading ${f.family}…`;
+        return fetch(`${TX_FS}${f.id}@latest/${f.subset}-${w}-${style}.woff2`)
+            .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
+            .then(buf => new FontFace(f.family, buf, { weight: String(w), style }).load())
+            .then(face => {
+                document.fonts.add(face);
+                txFonts.loaded.add(key);
+                if (!quiet) $('at-tx-online-note').textContent = `${f.family} ${w}${style === 'italic' ? ' italic' : ''} loaded (${f.licence || 'licence in the catalogue'}).`;
+                return f.family;
+            })
+            .catch(err => { $('at-tx-online-note').textContent = `${f.family} could not be ${quiet ? 'previewed' : 'loaded'} (${err.message}).`; throw err; });
+    }
+    /* Hover preview of the user's own text in a family (FONT-PREVIEW-PLAN phase 3). A row the
+       pointer or the arrow keys has RESTED on for HoverPreview.ms() is fetched (one file from
+       jsDelivr, the same one Load would fetch, cached for the session) and the Text preview is
+       rendered with it through `tx.pvFamily`, an override read only by txOpts. It never
+       touches the Font field, so Apply bakes the committed font; the end is SYNCHRONOUS
+       (a re-render, not a scheduled one) because the press that ends it can be Apply. A file
+       that arrives after the pointer has moved on is dropped by `tx.pvSeq`. */
+    function txPreviewEnd() {
+        clearTimeout(tx.pvTimer); tx.pvSeq++;
+        if (!tx.pvFamily) return;
+        tx.pvFamily = null;
+        if (tx.cells) txRender(true);
+    }
+    function txPreviewAt(id) {
+        if (!HoverPreview.enabled() || !tx.cells) return;
+        clearTimeout(tx.pvTimer);
+        const f = (txFonts.catalogue || []).find(x => x.id === id);
+        if (!f) return;
+        if (f.family === $('at-tx-font').value.trim()) { txPreviewEnd(); return; }   // resting back on the committed one
+        tx.pvTimer = setTimeout(() => {
+            const seq = ++tx.pvSeq;
+            txLoadOnline(f, parseInt($('at-tx-weight').value, 10) || 400, $('at-tx-italic').checked, true).then(() => {
+                if (seq !== tx.pvSeq || !tx.cells) return;
+                tx.pvFamily = f.family;
+                txRender(true);
+            }).catch(() => {});
+        }, HoverPreview.ms());
+    }
+    function setupTextModal() {
+        TX_ROWS.text.forEach(r => txNumRow($('at-tx-rows'), r));
+        TX_ROWS.outline.forEach(r => txNumRow($('at-tx-orows'), r));
+        TX_ROWS.shadow.forEach(r => txNumRow($('at-tx-srows'), r));
+        TX_ROWS.layer.forEach(r => txNumRow($('at-tx-lrows'), r));
+        TX_ROWS.relief.forEach(r => txNumRow($('at-tx-rrows'), r));
+        tx.fxp = buildEffectsPanel($('at-tx-fx'), 'at-txfx', () => txSchedule(false));
+        $('at-tx-fontlist').innerHTML = TX_FONTS.map(f => `<option value="${f}">`).join('');
+        $('at-tx-weight').innerHTML = TX_WEIGHTS.map(([w, l]) => `<option value="${w}">${l} (${w})</option>`).join('');
+        $('at-tx-weight').value = '700';
+        $('at-tx-blend').innerHTML = TRLE.Stroke.BLEND_MODES.map(m => `<option value="${m.id}">${m.label}</option>`).join('');
+        attachTilePicker($('at-tx-blend'), { text: true, title: 'Blend', ...previewByValue($('at-tx-blend'), () => txSchedule(false)) });
+        fillMaterialSelect($('at-tx-material'));
+        ['at-tx-text', 'at-tx-font'].forEach(i => $(i).addEventListener('input', () => txSchedule(true)));
+        ['at-tx-weight', 'at-tx-italic', 'at-tx-kern', 'at-tx-align', 'at-tx-aa', 'at-tx-fill', 'at-tx-outline', 'at-tx-ocolor', 'at-tx-shadow', 'at-tx-scolor']
+            .forEach(i => { $(i).addEventListener('change', () => { txSync(); txSchedule(true); }); $(i).addEventListener('input', () => txSchedule(true)); });
+        txSync();
+        ['at-tx-blend', 'at-tx-wrap', 'at-tx-show', 'at-tx-floors'].forEach(i => $(i).addEventListener('change', () => txSchedule(false)));
+        $('at-tx-relief').addEventListener('change', () => { txSync(); txSchedule(true); });
+        document.querySelectorAll('[data-tx-tab]').forEach(b => b.addEventListener('click', () => {
+            document.querySelectorAll('[data-tx-tab]').forEach(o => { const on = o === b; o.classList.toggle('active', on); o.setAttribute('aria-selected', String(on)); });
+            document.querySelectorAll('[data-tx-panel]').forEach(p => { p.style.display = p.dataset.txPanel === b.dataset.txTab ? '' : 'none'; });
+            txPreviewEnd();
+            if (b.dataset.txTab === 'fonts') txCatalogue().then(txFillOnline);
+        }));
+        $('at-tx-morefonts').addEventListener('click', () => document.querySelector('[data-tx-tab="fonts"]').click());
+        // Installed fonts: Chromium's Local Font Access, asked for on this click only.
+        if (!('queryLocalFonts' in window)) {
+            $('at-tx-localfonts').style.display = 'none';
+            $('at-tx-localnote').textContent = 'This browser cannot list installed fonts. Type the name instead; it is checked as you type.';
+        }
+        $('at-tx-localfonts').addEventListener('click', () => {
+            window.queryLocalFonts().then(fonts => {
+                const fams = [...new Set(fonts.map(f => f.family))].sort((a, b) => a.localeCompare(b));
+                const dl = $('at-tx-fontlist'), have = new Set([...dl.options].map(o => o.value));
+                for (const f of fams) if (!have.has(f)) { const o = document.createElement('option'); o.value = f; dl.appendChild(o); }
+                $('at-tx-localnote').textContent = `${fams.length} installed families added to the Font field's list.`;
+            }).catch(() => { $('at-tx-localnote').textContent = 'The browser did not allow listing installed fonts.'; });
+        });
+        $('at-tx-online-q').addEventListener('input', txFillOnline);
+        $('at-tx-online-cat').addEventListener('change', txFillOnline);
+        const loadPicked = () => {
+            const f = (txFonts.catalogue || []).find(x => x.id === $('at-tx-online-list').value);
+            if (!f) { $('at-tx-online-note').textContent = 'Pick a family first.'; return; }
+            txLoadOnline(f, parseInt($('at-tx-weight').value, 10) || 400, $('at-tx-italic').checked).then(fam => {
+                clearTimeout(tx.pvTimer); tx.pvSeq++; tx.pvFamily = null;
+                $('at-tx-font').value = fam;
+                const dl = $('at-tx-fontlist');
+                if (![...dl.options].some(o => o.value === fam)) { const o = document.createElement('option'); o.value = fam; dl.appendChild(o); }
+                txSchedule(true);
+            }).catch(() => {});
+        };
+        $('at-tx-online-load').addEventListener('click', loadPicked);
+        $('at-tx-online-list').addEventListener('dblclick', loadPicked);
+        const frows = $('at-tx-online-rows');
+        frows.addEventListener('pointerover', e => { const r = e.target.closest('.at-tx-frow'); if (r) txPreviewAt(r.dataset.id); });
+        frows.addEventListener('pointerleave', txPreviewEnd);
+        frows.addEventListener('blur', txPreviewEnd);
+        frows.addEventListener('click', e => { const r = e.target.closest('.at-tx-frow'); if (r) txSelectRow(r.dataset.id, false); });
+        frows.addEventListener('dblclick', e => { if (e.target.closest('.at-tx-frow')) loadPicked(); });
+        frows.addEventListener('keydown', e => {
+            const rs = [...frows.children], i = rs.findIndex(r => r.classList.contains('current'));
+            const step = { ArrowDown: 1, ArrowUp: -1, PageDown: 6, PageUp: -6 }[e.key];
+            if (e.key === 'Enter') { e.preventDefault(); loadPicked(); return; }
+            if (!rs.length || (step === undefined && e.key !== 'Home' && e.key !== 'End')) return;
+            e.preventDefault();
+            const j = e.key === 'Home' ? 0 : e.key === 'End' ? rs.length - 1 : Math.max(0, Math.min(rs.length - 1, (i < 0 ? (step > 0 ? -1 : rs.length) : i) + step));
+            txSelectRow(rs[j].dataset.id, true);
+            txPreviewAt(rs[j].dataset.id);
+        });
+        /* A loaded online family follows Weight and Italic: their variant is
+           fetched too (Load already said yes for this family this session). */
+        ['at-tx-weight', 'at-tx-italic'].forEach(i => $(i).addEventListener('change', () => {
+            const fam = $('at-tx-font').value.trim(), f = txFonts.byFamily.get(fam);
+            if (f && [...txFonts.loaded].some(k => k.startsWith(f.id + '-')))
+                txLoadOnline(f, parseInt($('at-tx-weight').value, 10) || 400, $('at-tx-italic').checked).then(() => txSchedule(true)).catch(() => {});
+        }));
+        $('at-tx-fontfile').addEventListener('click', () => {
+            const input = document.createElement('input');
+            input.type = 'file'; input.accept = '.ttf,.otf,.woff,.woff2,font/*';
+            input.addEventListener('change', e => { const f = e.target.files[0]; if (f) txLoadFontFile(f); });
+            input.click();
+        });
+        /* Transform handles on the view (TRLE.Handles, the modern Photoshop keys): drag the
+           body to move; a corner keeps the proportions and changes Size (crisp), Shift frees
+           it and a side handle stretches, both through Stretch X / Y; Alt from the centre;
+           just outside a corner to rotate (Shift snaps to 15°). Every change goes through the same controls, so the
+           sliders always say what the handles did. Area px, whole pixels. */
+        const view = $('at-tx-view');
+        let hStart = null;
+        TRLE.Handles.attach(view, {
+            point: e => { const r = view.getBoundingClientRect(); return [(e.clientX - r.left) * view.width / r.width, (e.clientY - r.top) * view.height / r.height]; },
+            ratio: txViewRatio,
+            getBox: () => (tx.cells && tx.viewFit ? txHandleBox() : null),
+            onStart: () => { hStart = { size: txVal('size'), sx: txVal('sx'), sy: txVal('sy'), x: txVal('x'), y: txVal('y') }; tx.drag = true; },
+            onChange: (b, info) => {
+                const f = tx.viewFit;
+                if (!f || !hStart) return;
+                if (info.kind === 'rotate') txSet('rot', Math.round(b.rot));
+                else {
+                    txSet('x', Math.round(hStart.x + (b.cx - info.start.cx) / f.scale));
+                    txSet('y', Math.round(hStart.y + (b.cy - info.start.cy) / f.scale));
+                    if (info.kind === 'resize') {
+                        if (b.keep) { txSet('size', Math.round(hStart.size * b.fx)); txSet('sx', hStart.sx); txSet('sy', hStart.sy); }
+                        else { txSet('size', hStart.size); txSet('sx', Math.round(hStart.sx * b.fx)); txSet('sy', Math.round(hStart.sy * b.fy)); }
+                    }
+                }
+                txSchedule(info.kind === 'resize' || info.kind === 'rotate');
+            },
+            onEnd: () => { tx.drag = null; hStart = null; },
+        });
+        /* Arrow keys nudge the box one area pixel (Shift: ten) while the view has the focus, through the
+           Position sliders like the handles (HANDLES-PLAN, the open "no keyboard nudge", 2026-10-07). A press
+           on the view gives it the focus; Ctrl / Cmd / Alt with an arrow are left alone. */
+        view.tabIndex = 0;
+        view.setAttribute('aria-label', 'Text preview: arrow keys move the text, Shift moves it ten pixels');
+        view.addEventListener('pointerdown', () => view.focus({ preventScroll: true }));
+        view.addEventListener('keydown', e => {
+            const d = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
+            if (!d || !tx.cells || e.ctrlKey || e.metaKey || e.altKey) return;
+            e.preventDefault();
+            const n = e.shiftKey ? 10 : 1;
+            txSet('x', txVal('x') + d[0] * n); txSet('y', txVal('y') + d[1] * n);
+            txSchedule(false);
+        });
+        $('at-tx-apply').addEventListener('click', async () => {
+            if (!tx.cells) return;
+            txPreviewEnd();
+            tx.full = true;
+            try { txRender(true); } finally { tx.full = false; }
+            if (!tx.box) { showToast('Type some text first', 'info'); return; }
+            const S = tx.S, cover = txCoverWithFx(txStamped(TRLE.Text.maskCanvas(tx.box, tx.box.cover))), areas = txReliefAreas();
+            const emitC = tx.fxOut && tx.fxOut.emit ? txClip(cloneCanvas(tx.fxOut.emit)) : null;   // the glows ticked "Also glow in game", clipped like the pixels
+            const matV = $('at-tx-material').value, edit = tx.edit;
+            const xfOf = id => (edit && edit.xf && edit.xf.get(id)) || null;
+            const crop = (src, cell) => { const c = document.createElement('canvas'); c.width = c.height = S; c.getContext('2d').drawImage(src, cell.x, cell.y, S, S, 0, 0, S, S); return applyXf(c, xfOf(cell.id)); };
+            const skipped = [], pieces = new Map();
+            for (const cell of tx.cells) {
+                const el = cell.editable ? byId(cell.id) : null;
+                if (!el || el.kind !== 'tile') continue;
+                const a = tx.layer.getContext('2d').getImageData(cell.x, cell.y, S, S).data;
+                let hit = false;
+                for (let i = 3; i < a.length; i += 4) if (a[i]) { hit = true; break; }
+                if (!hit) continue;
+                const aux = {};
+                if (matV) { if (el.hgParams) skipped.push(numberOf(el.id)); else aux.cover = crop(cover, cell); }
+                if (areas) { aux.rel = crop(areas.relief, cell); aux.hole = crop(areas.hole, cell); }
+                if (emitC) aux.glow = crop(emitC, cell);
+                pieces.set(el.id, { px: crop(tx.layer, cell), aux: Object.keys(aux).length ? aux : undefined });
+            }
+            const n = pieces.size;
+            if (!n) { closeModal(); showToast('The text is outside the tiles that can change', 'info'); return; }
+            const glowedBefore = !!edit && layerPiecesGlow(edit.lid);
+            const L = TRLE.Layers, text = $('at-tx-text').value.trim().replace(/\s+/g, ' ');
+            const recipe = { controls: txCaptureControls(), effects: tx.fxp && tx.fxp.any() ? tx.fxp.read() : undefined, material: matV || null,
+                relief: areas ? { sign: areas.sign, depth: areas.depth, floors: areas.floors } : null };
+            const fields = { name: 'Text: ' + (text.length > 22 ? text.slice(0, 21) + '…' : text), opacity: txVal('op') / 100, blend: $('at-tx-blend').value || 'source-over', recipe };
+            const touched = [...pieces.keys()].map(byId);
+            let label;
+            const dropped = [];   // tiles the edited layer no longer reaches: rebuilt once, in the commit
+            if (edit) {
+                // One definition, edited: its pieces are replaced (never mutated), tiles it no longer
+                // reaches lose theirs, and every tile rebuilds in one undo step.
+                const def = state.layerDefs[edit.lid];
+                const before = L.tilesOf(edit.lid, state.elements);
+                L.update(state.layerDefs, edit.lid, fields);
+                for (const el of before) if (!pieces.has(el.id)) { L.remove(el, edit.lid, state.layerDefs, true); dropped.push(el); }
+                for (const el of touched) {
+                    const p = Object.assign({ lid: edit.lid }, pieces.get(el.id));
+                    for (const k of Object.keys(p)) if (p[k] === undefined) delete p[k];
+                    const xf = edit.xf && edit.xf.get(el.id);
+                    if (xf && xf.length) p.xf = xf.slice();
+                    L.imm(p.px); if (p.aux) Object.values(p.aux).forEach(L.imm);
+                    if (el.layers && el.layers.some(q => q.lid === edit.lid)) el.layers = el.layers.map(q => q.lid === edit.lid ? p : q);
+                    else { // the layer now reaches a tile it did not: it joins the stack in the Content zone
+                        L.insertPiece(el, state.layerDefs[edit.lid], p, state.layerDefs);
+                    }
+                }
+                void def;
+                label = n > 1 ? `Edit text: ${n} tiles` : 'Edit text';
+            } else {
+                const area = { W: tx.W, H: tx.H, S, cells: tx.cells.map(c => ({ id: c.id, x: c.x, y: c.y, member: pieces.has(c.id) })) };
+                L.add(state.layerDefs, touched, Object.assign({ kind: 'text', area }, fields), touched.map(el => pieces.get(el.id)));
+                label = n > 1 ? `Text: ${n} tiles` : 'Text';
+            }
+            closeModal();
+            refreshTransitions();
+            await layersCommit([...new Set([...touched, ...dropped, ...(edit ? L.tilesOf(edit.lid, state.elements) : [])])], label);
+            L.prune(state.layerDefs, state.elements);
+            const glowNote = layersGlowExport(!!emitC, glowedBefore);
+            const done = n > 1 ? `Text ${edit ? 'edited on' : 'applied to'} ${n} tiles` : `Text ${edit ? 'edited' : 'applied'}`;
+            if (skipped.length) showToast(`${done}${glowNote}. Material not added to tile${skipped.length > 1 ? 's' : ''} ${skipped.join(', ')}: ${skipped.length > 1 ? 'they have' : 'it has'} Make Height Map settings, which a multi-material tile would drop.`, 'info', 8000);
+            else showToast(done + glowNote, 'success');
+        });
+    }
+
+    /* ============ 🏷️ STICKERS (STICKERS-PLAN phase 4, D1 to D8) ============
+       Gallery images (TRLE.Stickers) placed over a tile, or over a selection's area as Text
+       shows it (selectionArea), with TRLE.Handles. ONE layer per session (A1): the kind
+       `sticker`, Content zone, several per tile. Its recipe lists the placed stickers
+       (`items`), each with its own blend, opacity, resampling and colour (A2); the pixels it
+       uses are COPIED into the definition (`def.pixels`, Q1), so the gallery can change or
+       empty without touching a tile. A piece keeps one rendered crop per sticker
+       (`aux.k<i>`, D2) and the kind composites them in order, each with its own blend: a
+       rebuild is compositing only, and Layers.move turns the crops like any content.
+       A sticker is drawn into its own bounding box through Engine.warp (the inverse map
+       from its box to its pixels; Auto is Nearest wherever every pixel lands on a pixel,
+       so a sticker at 100 % and a right angle is copied byte for byte), then stamped onto
+       the area, one area apart when Wrap is on (Text's rule). */
+    const ST_ITEM_KEYS = ['pk', 'name', 'cx', 'cy', 'w', 'h', 'rot', 'flipX', 'flipY', 'filter', 'opacity', 'blend',
+                          'hue', 'sat', 'bright', 'tint', 'tintAmt', 'swapFrom', 'swapTo', 'swapTol',
+                          'maps', 'material', 'relief', 'depth', 'floors', 'glow', 'glowAmt', 'effects'];
+    /* What the maps read (phase 7): they never change the sticker's look, so they are left out of its render key. */
+    const ST_MAP_KEYS = ['maps', 'material', 'relief', 'depth', 'floors', 'glow', 'glowAmt'];
+    const ST_LOOK_KEYS = ST_ITEM_KEYS.filter(k => k !== 'name' && k !== 'opacity' && k !== 'blend' && !ST_MAP_KEYS.includes(k));
+    const st = { cells: null, W: 0, H: 0, S: 0, mask: null, items: [], px: new Map(), pxKey: new Map(), sel: -1, mode: 'area', ids: null, area: null, eachIds: null,
+                 undo: [], redo: [], last: null, edit: null, inputs: null, wrap: false, fit: null, cache: new Map(), raf: 0,
+                 comp: null };
+    const stOpen = () => $('at-overlay').style.display !== 'none' && $('at-modal-stickers').style.display !== 'none';
+    const stRound = v => Math.abs(v - Math.round(v)) < 1e-9 ? Math.round(v) : v;
+    /* An item with every field present; colour settings neutral by default (inert, byte for byte). */
+    function stItemClean(o) {
+        const it = {};
+        for (const k of ST_ITEM_KEYS) it[k] = o[k];
+        it.rot = +it.rot || 0; it.flipX = !!it.flipX; it.flipY = !!it.flipY;
+        it.filter = ['auto', 'nearest', 'bilinear', 'bicubic', 'lanczos'].includes(it.filter) ? it.filter : 'auto';
+        it.opacity = it.opacity == null ? 1 : Math.max(0, Math.min(1, +it.opacity));
+        it.blend = TRLE.Stroke.BLEND_MODES.some(m => m.id === it.blend) ? it.blend : 'source-over';
+        for (const k of ['hue', 'sat', 'bright', 'tintAmt', 'swapTol']) it[k] = +it[k] || 0;
+        for (const k of ['tint', 'swapFrom', 'swapTo']) it[k] = projHexColor(it[k], k === 'tint' ? '#b04020' : '#ffffff');
+        it.name = TRLE.Stickers.cleanName(it.name);
+        // Maps (D7), inert by default: Follow the tile, no relief, no glow.
+        it.maps = ['follow', 'preset', 'own'].includes(it.maps) ? it.maps : 'follow';
+        const mk = typeof it.material === 'string' ? it.material.split(':') : [];
+        it.material = mk.length === 2 && getPreset(mk[0], mk[1], 'realistic') ? it.material : '';
+        if (it.maps === 'preset' && !it.material) it.maps = 'follow';
+        it.relief = it.relief === 'raise' || it.relief === 'engrave' ? it.relief : '';
+        it.depth = it.depth == null ? 40 : Math.max(1, Math.min(100, Math.round(+it.depth) || 40));
+        it.floors = it.floors === 'keep' ? 'keep' : 'smooth';
+        it.glow = !!it.glow;
+        it.glowAmt = it.glowAmt == null ? 100 : Math.max(0, Math.min(100, +it.glowAmt || 0));
+        it.effects = stFxClean(it.effects);
+        return it;
+    }
+    /* A sticker's effects (phase 8): only the kinds and fields the panel has, numbers clamped to its ranges (a loaded
+       project is untrusted input, and the sizes set the padded box). null when none is on: effects off is phase 4's path. */
+    function stFxClean(fx) {
+        if (!fx || typeof fx !== 'object') return null;
+        const out = {};
+        for (const kind of TRLE.Effects.KINDS) {
+            const b = fx[kind];
+            if (!b || typeof b !== 'object' || !b.on) continue;
+            const e = { on: true, colour: projHexColor(b.colour, TRLE.Effects.DEFAULTS[kind].colour) };
+            for (const [key, , min, max, , def] of FX_ROWS[kind]) {
+                const lo = key === 'opacity' ? min / 100 : min, hi = key === 'opacity' ? max / 100 : max, d = key === 'opacity' ? def / 100 : def;
+                const v = +b[key];
+                e[key] = isFinite(v) ? Math.max(lo, Math.min(hi, v)) : d;
+            }
+            if (kind === 'stroke') e.position = ['outside', 'inside', 'centre'].includes(b.position) ? b.position : 'outside';
+            if (kind === 'outerGlow' || kind === 'innerGlow') e.emit = !!b.emit;
+            out[kind] = e;
+        }
+        return Object.keys(out).length ? out : null;
+    }
+    /* How far a sticker's effects reach past its box, in px: the box is padded by that before they are drawn. */
+    function stFxReach(fx) {
+        if (!fx) return 0;
+        let r = 0;
+        const ds = fx.dropShadow, og = fx.outerGlow, sk = fx.stroke;
+        if (ds) r = Math.max(r, Math.ceil(ds.distance) + Math.ceil(2 * ds.size + ds.spread / 100 * ds.size) + 2);   // three box blurs reach ~1.5 x size
+        if (og) r = Math.max(r, Math.ceil(og.size) + 2);
+        if (sk && sk.position !== 'inside') r = Math.max(r, Math.ceil(sk.width) + 2);
+        return r;
+    }
+    /* The inverse map of a placed sticker: output box pixel → sticker pixel. */
+    function stItemMap(it, src) {
+        const sw = src.width, sh = src.height, t = it.rot * Math.PI / 180;
+        const c = stRound(Math.cos(t)), s = stRound(Math.sin(t));
+        const sx = it.w / sw * (it.flipX ? -1 : 1), sy = it.h / sh * (it.flipY ? -1 : 1);
+        const xs = [], ys = [];
+        for (const [u, v] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+            const dx = u * it.w / 2, dy = v * it.h / 2;
+            xs.push(it.cx + dx * c - dy * s); ys.push(it.cy + dx * s + dy * c);
+        }
+        const bx = Math.floor(Math.min(...xs) + 1e-6), by = Math.floor(Math.min(...ys) + 1e-6);
+        const bw = Math.max(1, Math.ceil(Math.max(...xs) - 1e-6) - bx), bh = Math.max(1, Math.ceil(Math.max(...ys) - 1e-6) - by);
+        const ox = bx - it.cx, oy = by - it.cy;
+        const inv = {
+            m0: [stRound(c / sx), stRound(s / sx), stRound(sw / 2 + (c * ox + s * oy) / sx)],
+            m1: [stRound(-s / sy), stRound(c / sy), stRound(sh / 2 + (-s * ox + c * oy) / sy)],
+        };
+        return { inv, bx, by, bw, bh };
+    }
+    /* The sticker's own colour settings on its rendered pixels (CPU, straight alpha). Order: replace,
+       then hue / saturation / brightness, then tint. All at 0 is a no-op (nothing is touched). */
+    const stColourOn = it => it.hue || it.sat || it.bright || it.tintAmt > 0 || it.swapTol > 0;
+    function stHex(h) { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
+    function stRgb2Hsl(r, g, b) {
+        r /= 255; g /= 255; b /= 255;
+        const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2;
+        if (mx === mn) return [0, 0, l];
+        const d = mx - mn, s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+        const h = mx === r ? (g - b) / d + (g < b ? 6 : 0) : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+        return [h / 6, s, l];
+    }
+    function stHsl2Rgb(h, s, l) {
+        if (!s) return [l * 255, l * 255, l * 255];
+        const q = l < 0.5 ? l * (1 + s) : l + s - l * s, p = 2 * l - q;
+        const f = t => { t = (t % 1 + 1) % 1; return t < 1 / 6 ? p + (q - p) * 6 * t : t < 1 / 2 ? q : t < 2 / 3 ? p + (q - p) * (2 / 3 - t) * 6 : p; };
+        return [f(h + 1 / 3) * 255, f(h) * 255, f(h - 1 / 3) * 255];
+    }
+    function stColour(c, it) {
+        if (!stColourOn(it)) return c;
+        const g = c.getContext('2d'), im = g.getImageData(0, 0, c.width, c.height), d = im.data;
+        const sf = stHex(it.swapFrom), stt = stHex(it.swapTo), tol = it.swapTol / 100 * 441.673;
+        const tc = stRgb2Hsl(...stHex(it.tint)), ta = it.tintAmt / 100;
+        for (let i = 0; i < d.length; i += 4) {
+            if (!d[i + 3]) continue;
+            let r = d[i], gg = d[i + 1], b = d[i + 2];
+            if (tol > 0) {
+                const dist = Math.hypot(r - sf[0], gg - sf[1], b - sf[2]);
+                if (dist < tol) { const w = 1 - dist / tol, k = w * w * (3 - 2 * w); r += (stt[0] - sf[0]) * k; gg += (stt[1] - sf[1]) * k; b += (stt[2] - sf[2]) * k; }
+            }
+            if (it.hue || it.sat || it.bright) {
+                let [h, s, l] = stRgb2Hsl(Math.max(0, Math.min(255, r)), Math.max(0, Math.min(255, gg)), Math.max(0, Math.min(255, b)));
+                h += it.hue / 360;
+                s = Math.max(0, Math.min(1, s * (1 + it.sat / 100)));
+                l = it.bright >= 0 ? l + (1 - l) * it.bright / 100 : l * (1 + it.bright / 100);
+                [r, gg, b] = stHsl2Rgb(h, s, l);
+            }
+            if (ta > 0) {   // colourise: the tint's hue and saturation, the sticker's own lightness
+                const l = stRgb2Hsl(Math.max(0, Math.min(255, r)), Math.max(0, Math.min(255, gg)), Math.max(0, Math.min(255, b)))[2];
+                const [tr, tg, tb] = stHsl2Rgb(tc[0], tc[1], l);
+                r += (tr - r) * ta; gg += (tg - gg) * ta; b += (tb - b) * ta;
+            }
+            d[i] = Math.round(Math.max(0, Math.min(255, r))); d[i + 1] = Math.round(Math.max(0, Math.min(255, gg))); d[i + 2] = Math.round(Math.max(0, Math.min(255, b)));
+        }
+        g.putImageData(im, 0, 0);
+        return c;
+    }
+    /* One sticker rendered into its own box: { c, bx, by }. Cached per item while the window is open. */
+    function stItemRender(it, src, cache) {
+        const key = JSON.stringify(ST_LOOK_KEYS.map(k => it[k]));
+        const hit = cache && cache.get(it);
+        if (hit && hit.key === key && hit.src === src) return hit;
+        const m = stItemMap(it, src);
+        let filter = it.filter;
+        if (filter === 'auto') filter = xfExact(m.inv) ? 'nearest' : 'bicubic';
+        const a = m.inv.m0[0], b = m.inv.m0[1], cc = m.inv.m1[0], d = m.inv.m1[1];
+        const tt = a * a + b * b + cc * cc + d * d, det = a * d - b * cc;
+        const smax = Math.sqrt(Math.max(0, (tt + Math.sqrt(Math.max(0, tt * tt - 4 * det * det))) / 2));
+        const ss = filter === 'nearest' ? 1 : Math.max(1, Math.min(4, Math.ceil(smax - 1e-6)));
+        let c = stColour(warpCanvas(src, m.bw, m.bh, m.inv, { filter, edge: 'transparent', ss }), it), bx = m.bx, by = m.by, body = null, emit = null;
+        if (it.effects) {
+            /* Effects (phase 8) on the sticker's own box, padded by their reach, so the stamp (and its wrap) carries them.
+               `body` (the sticker with its inner effects and stroke) is what its region and relief are made from; `emit`
+               is the glows ticked "Also glow in game". */
+            const P = stFxReach(it.effects), pc = document.createElement('canvas');
+            pc.width = c.width + 2 * P; pc.height = c.height + 2 * P;
+            pc.getContext('2d').drawImage(c, P, P);
+            const r = TRLE.Effects.render(pc, it.effects);
+            c = r.image; body = r.body; emit = r.emit; bx -= P; by -= P;
+        }
+        const out = { key, src, c, bx, by, body, emit };
+        if (cache) cache.set(it, out);
+        return out;
+    }
+    /* Draw a rendered sticker into `g`, whose origin is area point (ox, oy), at its place and,
+       with wrap, one area apart in every direction that reaches the target (w x h). */
+    function stStamp(g, r, ox, oy, w, h, W, H, wrap) {
+        const bw = r.c.width, bh = r.c.height;
+        if (!wrap) { g.drawImage(r.c, r.bx - ox, r.by - oy); return; }
+        const x0 = ((r.bx % W) + W) % W, y0 = ((r.by % H) + H) % H;
+        for (let x = x0 - Math.ceil((bw + x0) / W) * W; x < ox + w + W; x += W) {
+            for (let y = y0 - Math.ceil((bh + y0) / H) * H; y < oy + h + H; y += H) {
+                if (x + bw <= ox || y + bh <= oy || x >= ox + w || y >= oy + h) continue;
+                g.drawImage(r.c, x - ox, y - oy);
+            }
+        }
+    }
+    /* One of the sticker's OWN maps (D7) drawn exactly as its pixels are: the same box and resampling, no colour
+       settings. A normal map's vectors turn with it: by the sticker's rotation and flips (a byte permutation) when it
+       is drawn Nearest at a right angle, else by the warp's own Jacobian. */
+    function stItemMapRender(it, map, mt) {
+        const m = stItemMap(it, map);
+        let filter = it.filter;
+        if (filter === 'auto') filter = xfExact(m.inv) ? 'nearest' : 'bicubic';
+        const a = m.inv.m0[0], b = m.inv.m0[1], cc = m.inv.m1[0], d = m.inv.m1[1];
+        const tt = a * a + b * b + cc * cc + d * d, det = a * d - b * cc;
+        const ss = filter === 'nearest' ? 1 : Math.max(1, Math.min(4, Math.ceil(Math.sqrt(Math.max(0, (tt + Math.sqrt(Math.max(0, tt * tt - 4 * det * det))) / 2)) - 1e-6)));
+        const o = { filter, edge: 'transparent', ss };
+        const right = Math.abs(((it.rot % 90) + 90) % 90) < 1e-9;
+        let c;
+        if (mt === 'normal' && !(filter === 'nearest' && right)) c = warpCanvas(map, m.bw, m.bh, m.inv, Object.assign(o, { normal: true, nflip: NORMAL_Y_SIGN }));
+        else {
+            c = warpCanvas(map, m.bw, m.bh, m.inv, o);
+            if (mt === 'normal') {
+                const t = it.rot * Math.PI / 180, co = stRound(Math.cos(t)), si = stRound(Math.sin(t)), fx = it.flipX ? -1 : 1, fy = it.flipY ? -1 : 1;
+                turnNormals(c, [[co * fx, -si * fy], [si * fx, co * fy]]);
+            }
+        }
+        return { c, bx: m.bx, by: m.by };
+    }
+    /* A rendered sticker (or one of its maps) stamped into one cell (S x S). */
+    function stCellStamp(r, cell, S, W, H, wrap) {
+        const c = document.createElement('canvas'); c.width = c.height = S;
+        stStamp(c.getContext('2d'), r, cell.x, cell.y, S, S, W, H, wrap);
+        return c;
+    }
+    /* Item i's crop for one cell (S x S), or null when it does not reach the cell. */
+    function stCellCrop(it, src, cell, S, W, H, wrap, cache) {
+        const r = stItemRender(it, src, cache);
+        const c = document.createElement('canvas'); c.width = c.height = S;
+        stStamp(c.getContext('2d'), r, cell.x, cell.y, S, S, W, H, wrap);
+        const a = c.getContext('2d').getImageData(0, 0, S, S).data;
+        for (let i = 3; i < a.length; i += 4) if (a[i]) return c;
+        return null;
+    }
+    /* The kind: the crops on the input, in order, each with its own opacity and blend. */
+    function stickerApply(input, def, piece) {
+        const items = (def.recipe && def.recipe.items) || [];
+        const out = document.createElement('canvas'); out.width = input.width; out.height = input.height;
+        const g = out.getContext('2d');
+        g.drawImage(input, 0, 0);
+        items.forEach((it, i) => {
+            const c = piece.aux && piece.aux['k' + i];
+            if (!c) return;
+            g.globalAlpha = it.opacity == null ? 1 : it.opacity;
+            g.globalCompositeOperation = it.blend || 'source-over';
+            g.drawImage(c, 0, 0, out.width, out.height);
+        });
+        g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
+        return out;
+    }
+    TRLE.Layers.register('sticker', { zone: 'content', mode: 'adjust', crops: true,
+        cost: (def, S) => (0.5 + 0.6 * (((def.recipe && def.recipe.items) || []).length)) * (S / 1024) ** 2,   // measured at 1024: 1 sticker 1.0 ms, 8 5.4, 32 19.3
+        apply: stickerApply,
+        edit: (el, def) => openStickerLayer(el, def) });
+    const hasStickerLayer = el => hasKindLayer(el, 'sticker');
+    /* A frame's glow under its stickers (STICKERS-PLAN D9): each sticker's coverage, at its own and its layer's
+       opacity, darkens the emissive map as it hides the frame. */
+    function stickerCoverGlow(el, em) {
+        const g = em.getContext('2d'), S = em.width;
+        for (const p of el.layers || []) {
+            const def = state.layerDefs[p.lid];
+            if (!def || def.kind !== 'sticker' || def.visible === false || !p.aux) continue;
+            const lo = def.opacity == null ? 1 : def.opacity;
+            ((def.recipe && def.recipe.items) || []).forEach((it, i) => {
+                const c = p.aux['k' + i];
+                if (!c) return;
+                const sil = document.createElement('canvas'); sil.width = sil.height = S;
+                const sx = sil.getContext('2d');
+                sx.drawImage(c, 0, 0, S, S); sx.globalCompositeOperation = 'source-in'; sx.fillStyle = '#000'; sx.fillRect(0, 0, S, S);
+                g.globalAlpha = (it.opacity == null ? 1 : it.opacity) * lo;
+                g.drawImage(sil, 0, 0);
+            });
+        }
+        g.globalAlpha = 1;
+    }
+    /* Edit animation makes NEW frame elements: the group's sticker pieces go onto them (the same crops,
+       every frame alike, Q9d) and each sticker layer's area follows the new ids. */
+    function stickerRepiece(oldEls, newEls) {
+        const src = oldEls.find(derivedLayered);
+        if (!src || !newEls.length) return;
+        const L = TRLE.Layers, pieces = src.layers.filter(p => state.layerDefs[p.lid] && state.layerDefs[p.lid].kind === 'sticker');
+        if (!pieces.length) return;
+        const map = new Map(oldEls.map(o => [o.id, (newEls.find(e => e.anim.index === o.anim.index) || newEls[0]).id]));
+        for (const lid of new Set(pieces.map(p => p.lid))) {
+            const d = state.layerDefs[lid];
+            if (d.area) L.update(state.layerDefs, lid, { area: Object.assign({}, d.area, { cells: d.area.cells.map(c => map.has(c.id) ? Object.assign({}, c, { id: map.get(c.id) }) : c) }) });
+        }
+        for (const el of newEls) { el.layers = pieces.map(p => L.clonePiece(p)); writeDerived(el, el.canvas); }
+    }
+    /* After a rebuild of layered elements: an animation frame's glow is baked, so it follows its stickers. */
+    function afterLayersRebuilt(els) {
+        for (const el of els) if (el && el.kind === 'anim' && el.anim) anBakeMemberGlow(el);
+    }
+
+    /* ---- the window ---- */
+    function stCleanup() {
+        if (st.raf) cancelAnimationFrame(st.raf);
+        stShowDiscard(false);
+        Object.assign(st, { cells: null, items: [], px: new Map(), pxKey: new Map(), sel: -1, mode: 'area', ids: null, area: null, eachIds: null, undo: [], redo: [], last: null,
+                            edit: null, inputs: null, fit: null, cache: new Map(), raf: 0, comp: null, mask: null });
+    }
+    const stDiscardShown = () => $('at-st-discard').style.display !== 'none';
+    function stShowDiscard(on) { $('at-st-discard').style.display = on ? '' : 'none'; if (on) $('at-st-keep').focus(); }
+    function stAskDiscard() {
+        if (!stOpen()) return false;
+        if (stDiscardShown()) { stShowDiscard(false); return true; }
+        if (!st.undo.length) return false;
+        stShowDiscard(true);
+        return true;
+    }
+    const stCur = () => (st.sel >= 0 ? st.items[st.sel] : null);
+    const stSrc = it => st.px.get(it.pk);
+    const stMapsOf = it => TRLE.MapOrder.filter(mt => st.px.has(it.pk + '.' + mt));   // the map files this sticker carries
+    /* One undo step per gesture: a run of changes with the same tag within a second is one step. */
+    function stPush(tag) {
+        const now = performance.now();
+        if (tag && st.last && st.last.tag === tag && now - st.last.t < 1000) { st.last.t = now; return; }
+        st.undo.push(JSON.stringify({ items: st.items, sel: st.sel, mode: st.mode }));
+        if (st.undo.length > 200) st.undo.shift();
+        st.redo = [];
+        st.last = tag ? { tag, t: now } : null;
+    }
+    /* A snapshot's positions are in ITS mode's frame (the area, or the one tile), so a restore switches mode
+       without converting them. */
+    function stRestore(json) { const o = JSON.parse(json); if (o.mode && o.mode !== st.mode) stApplyMode(o.mode); st.items = o.items; st.sel = o.sel; st.cache = new Map(); stSync(); stSchedule(); }
+    const stSnapNow = () => JSON.stringify({ items: st.items, sel: st.sel, mode: st.mode });
+    function stUndo() { if (!st.undo.length) return; st.redo.push(stSnapNow()); stRestore(st.undo.pop()); st.last = null; }
+    function stRedo() { if (!st.redo.length) return; st.undo.push(stSnapNow()); stRestore(st.redo.pop()); st.last = null; }
+    /* Keep a box on whole pixels: integer size, and the top-left corner (of the turned box at a right angle) on a pixel. */
+    function stSnap(it) {
+        it.w = Math.max(1, Math.round(it.w)); it.h = Math.max(1, Math.round(it.h));
+        const q = ((Math.round(it.rot) % 180) + 180) % 180, ex = q === 90 ? it.h : it.w, ey = q === 90 ? it.w : it.h;
+        it.cx = Math.round(it.cx - ex / 2) + ex / 2; it.cy = Math.round(it.cy - ey / 2) + ey / 2;
+    }
+    /* A gallery sticker into the session: its pixels copied by reference once (they never change). */
+    function stPlace(rec, at) {
+        let pk = st.pxKey.get(rec.canvas);
+        if (!pk) {
+            pk = 'p' + (st.px.size + 1); while (st.px.has(pk)) pk += 'x';
+            st.px.set(pk, TRLE.Layers.imm(rec.canvas)); st.pxKey.set(rec.canvas, pk);
+            // Its map files come along (D7, "Its own maps"), keyed `<pk>.<map>`; the gallery's copy may change later.
+            if (rec.maps) for (const mt of TRLE.MapOrder) if (rec.maps[mt]) st.px.set(pk + '.' + mt, TRLE.Layers.imm(rec.maps[mt]));
+        }
+        let w = rec.canvas.width, h = rec.canvas.height;
+        const big = Math.max(w / st.S, h / st.S);
+        if (big > 1) { w = Math.max(1, Math.round(w / big)); h = Math.max(1, Math.round(h / big)); }   // D5: shrunk to fit one tile
+        const first = st.cells.find(c => c.editable);
+        const p = at || [first.x + st.S / 2, first.y + st.S / 2];
+        const it = stItemClean({ pk, name: rec.name, cx: p[0], cy: p[1], w, h });
+        stSnap(it);
+        stPush();
+        st.items.push(it);
+        st.sel = st.items.length - 1;
+        stSync(); stSchedule();
+    }
+    function stFillStrip() {
+        const strip = $('at-st-strip'), list = TRLE.Stickers.list();
+        strip.textContent = '';
+        if (!list.length) {
+            const e = document.createElement('div'); e.className = 'at-stl-empty';
+            e.textContent = 'The gallery is empty. Add images with the button below, or through 📚 Sticker Gallery.';
+            strip.appendChild(e); return;
+        }
+        for (const r of list) {
+            const b = document.createElement('button');
+            b.type = 'button'; b.className = 'at-st-chip'; b.dataset.sid = r.id; b.draggable = true; b.setAttribute('role', 'option');
+            b.title = `${r.name} · ${r.canvas.width} × ${r.canvas.height} px. Click to place, or drag onto the texture.`;
+            const c = document.createElement('canvas'); c.width = c.height = 48; stlFit(c, r.canvas);
+            const n = document.createElement('span'); n.textContent = r.name;
+            b.append(c, n);
+            strip.appendChild(b);
+        }
+    }
+    const ST_FIELDS = [['rot', 'rot', 1], ['op', 'opacity', 100], ['hue', 'hue', 1], ['sat', 'sat', 1], ['bright', 'bright', 1], ['tintamt', 'tintAmt', 1], ['swaptol', 'swapTol', 1],
+                       ['depth', 'depth', 1], ['glowamt', 'glowAmt', 1]];
+    /* The Maps tab: what each choice leaves to set. "Its own maps" only for a sticker that carries map files. */
+    let stFx = null;   // the Effects tab's panel (buildEffectsPanel, prefix at-stfx)
+    function stSyncMaps(it) {
+        const has = stMapsOf(it), own = $('at-st-maps').querySelector('option[value="own"]');
+        own.disabled = !has.length;
+        $('at-st-maps').value = it.maps;
+        $('at-st-mapsnote').textContent = it.maps === 'own' ? `From its map files: ${has.join(', ')}. The other maps follow the tile.`
+            : it.maps === 'preset' ? 'The sticker gets this material as a region of the tile.'
+            : has.length ? 'The maps come from the tile with the sticker on it. This sticker also carries map files (Its own maps).'
+            : 'The maps come from the tile with the sticker on it.';
+        $('at-st-matwrap').hidden = it.maps !== 'preset';
+        $('at-st-material').value = it.material || $('at-st-material').options[0].value;
+        $('at-st-reliefwrap').hidden = it.maps === 'own';
+        $('at-st-relief').value = it.relief;
+        $('at-st-reliefbox').hidden = !it.relief;
+        $('at-st-floors').value = it.floors;
+        $('at-st-glow').checked = it.glow;
+        $('at-st-glowbox').hidden = !it.glow;
+    }
+    /* The controls show the selected sticker. */
+    function stSync() {
+        const it = stCur();
+        $('at-st-none').hidden = !!it;
+        $('at-st-controls').hidden = !it;
+        if (!it) return;
+        $('at-st-selname').textContent = `${it.name}, ${st.sel + 1} of ${st.items.length}`;
+        $('at-st-x').value = Math.round((it.cx - it.w / 2) * 100) / 100; $('at-st-y').value = Math.round((it.cy - it.h / 2) * 100) / 100;
+        $('at-st-w').value = it.w; $('at-st-h').value = it.h;
+        for (const [id, key, k] of ST_FIELDS) { const v = Math.round(it[key] * k); $('at-st-' + id).value = v; $(`at-st-${id}-val`).textContent = v; }
+        $('at-st-blend').value = it.blend; $('at-st-filter').value = it.filter;
+        $('at-st-tint').value = it.tint; $('at-st-swapfrom').value = it.swapFrom; $('at-st-swapto').value = it.swapTo;
+        stSyncMaps(it);
+        if (stFx) stFx.write(it.effects || {});
+        $('at-st-fwd').disabled = $('at-st-front').disabled = st.sel === st.items.length - 1;
+        $('at-st-bwd').disabled = $('at-st-back').disabled = st.sel === 0;
+    }
+    function stSchedule() { if (!st.raf) st.raf = requestAnimationFrame(() => { st.raf = 0; stRender(); }); }
+    const stViewRatio = () => { const v = $('at-st-view'), r = v.getBoundingClientRect(); return r.width ? v.width / r.width : 1; };
+    /* The area as it will be: every cell's input, the stickers clipped to the cells that can change, the
+       layer's own opacity (an edited layer keeps it). Locked cells are drawn as they are and dimmed. */
+    function stCompose() {
+        const W = st.W, H = st.H, S = st.S;
+        if (!st.comp || st.comp.width !== W || st.comp.height !== H) { st.comp = document.createElement('canvas'); st.comp.width = W; st.comp.height = H; }
+        const base = document.createElement('canvas'); base.width = W; base.height = H;
+        const bg = base.getContext('2d');
+        for (const cell of st.cells) {
+            const el = cell.id != null ? byId(cell.id) : null;
+            if (!el) continue;
+            bg.drawImage(cell.editable ? (st.inputs.get(cell.id) || el.canvas) : el.canvas, cell.x, cell.y, S, S);
+        }
+        const top = document.createElement('canvas'); top.width = W; top.height = H;
+        const tg = top.getContext('2d');
+        tg.drawImage(base, 0, 0);
+        tg.save(); tg.beginPath();
+        st.cells.filter(c => c.editable).forEach(c => tg.rect(c.x, c.y, S, S));
+        tg.clip();
+        for (const it of st.items) {
+            const src = stSrc(it);
+            if (!src) continue;
+            const r = stItemRender(it, src, st.cache);
+            tg.globalAlpha = it.opacity; tg.globalCompositeOperation = it.blend;
+            stStamp(tg, r, 0, 0, W, H, W, H, st.wrap);
+        }
+        tg.restore();
+        const g = st.comp.getContext('2d');
+        g.clearRect(0, 0, W, H);
+        g.drawImage(base, 0, 0);
+        const a = st.edit ? (state.layerDefs[st.edit.lid] && state.layerDefs[st.edit.lid].opacity) : 1;
+        g.globalAlpha = a == null ? 1 : a;
+        g.drawImage(top, 0, 0);
+        g.globalAlpha = 1;
+    }
+    function stBox(it) {
+        const f = st.fit;
+        return f && it ? { cx: f.ox + it.cx * f.scale, cy: f.oy + it.cy * f.scale, w: it.w * f.scale, h: it.h * f.scale, rot: it.rot } : null;
+    }
+    function stRender() {
+        if (!st.cells) return;
+        stCompose();
+        const view = $('at-st-view'), v = view.getContext('2d');
+        const scale = Math.min(view.width / st.W, view.height / st.H);
+        const w = st.W * scale, h = st.H * scale, ox = (view.width - w) / 2, oy = (view.height - h) / 2;
+        st.fit = { scale, ox, oy };
+        v.clearRect(0, 0, view.width, view.height);
+        v.imageSmoothingEnabled = scale < 1;
+        v.drawImage(st.comp, ox, oy, w, h);
+        v.fillStyle = 'rgba(0,0,0,0.55)';
+        for (const cell of st.cells) if (!cell.editable) v.fillRect(ox + cell.x * scale, oy + cell.y * scale, st.S * scale, st.S * scale);
+        v.strokeStyle = 'rgba(232,133,42,0.35)'; v.lineWidth = 1;
+        for (const cell of st.cells) v.strokeRect(ox + cell.x * scale + 0.5, oy + cell.y * scale + 0.5, st.S * scale - 1, st.S * scale - 1);
+        // Every other sticker gets a faint outline, so one under another can still be found.
+        v.save(); v.setLineDash([3, 3]); v.strokeStyle = 'rgba(255,255,255,0.35)';
+        st.items.forEach((it, i) => {
+            if (i === st.sel) return;
+            const b = stBox(it); v.save(); v.translate(b.cx, b.cy); v.rotate(b.rot * Math.PI / 180); v.strokeRect(-b.w / 2, -b.h / 2, b.w, b.h); v.restore();
+        });
+        v.restore();
+        TRLE.Handles.draw(v, stBox(stCur()), { ratio: stViewRatio() });
+        // The repeat preview: the area, 2 x 2, nearest-neighbour.
+        const t = $('at-st-tiled'), tgx = t.getContext('2d'), k = Math.min(t.width / (2 * st.W), t.height / (2 * st.H));
+        tgx.clearRect(0, 0, t.width, t.height);
+        tgx.imageSmoothingEnabled = k < 1;
+        for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) tgx.drawImage(st.comp, x * st.W * k, y * st.H * k, st.W * k, st.H * k);
+    }
+    /* The topmost sticker under view point p, or -1. */
+    function stPick(p) {
+        for (let i = st.items.length - 1; i >= 0; i--) {
+            const b = stBox(st.items[i]), [qx, qy] = TRLE.Handles.toLocal(b, p[0], p[1]);
+            if (Math.abs(qx) <= b.w / 2 + 2 && Math.abs(qy) <= b.h / 2 + 2) return i;
+        }
+        return -1;
+    }
+    /* "Same spot on each tile" (D4, Q9b): the surface is ONE tile, the right-clicked one; Apply puts the same
+       crops on every target (an animation frame stands for its group). Area mode is selectionArea, as Text. */
+    function stEachTargets(ids) {
+        const out = [], groups = new Set();
+        for (const id of ids || []) {
+            const el = byId(id);
+            if (!el || !(el.kind === 'tile' || el.kind === 'transition' || (el.kind === 'anim' && el.anim))) continue;
+            if (el.kind === 'anim') { if (groups.has(el.anim.group)) continue; groups.add(el.anim.group); }
+            out.push(id);
+        }
+        return out;
+    }
+    function stEachArea(id) {
+        const S = state.tileSize, el = byId(id);
+        const mask = document.createElement('canvas'); mask.width = mask.height = S;
+        const mc = mask.getContext('2d'); mc.fillStyle = '#fff'; mc.fillRect(0, 0, S, S);
+        return { cells: [{ id, x: 0, y: 0, editable: true, canvas: el && el.kind === 'tile' && hasLayers(el) && el.layers.some(p => TRLE.Layers.zoneOf(state.layerDefs[p.lid]) === 'finish') ? TRLE.Layers.inputFor(el, state.layerDefs, { kind: 'sticker', zone: 'content' }) : null }], W: S, H: S, mask };
+    }
+    function stOpenArea(area, opts) {
+        opts = opts || {};
+        const S = state.tileSize;
+        const keep = { mode: opts.mode || 'area', ids: opts.ids || null, area: opts.area === undefined ? area : opts.area, eachIds: opts.eachIds || null };
+        stCleanup();
+        Object.assign(st, keep, { cells: area.cells, W: area.W, H: area.H, S, mask: area.mask, edit: opts.edit || null, wrap: !!opts.wrap });
+        st.inputs = new Map();
+        for (const cell of area.cells) {
+            if (!cell.editable) continue;
+            const el = byId(cell.id);
+            st.inputs.set(cell.id, opts.edit ? TRLE.Layers.inputOf(el, state.layerDefs, opts.edit.lid) : (cell.canvas || el.canvas));
+        }
+        if (opts.pixels) for (const [k, c] of Object.entries(opts.pixels)) { st.px.set(k, c); st.pxKey.set(c, k); }
+        st.items = (opts.items || []).map(stItemClean).filter(it => st.px.has(it.pk));
+        st.sel = st.items.length ? st.items.length - 1 : -1;
+        $('at-st-wrap').checked = st.wrap;
+        const editable = area.cells.filter(c => c.editable), nums = editable.map(c => numberOf(c.id));
+        $('at-st-tileno').textContent = nums.length === 1 ? `Tile ${nums[0]}`
+            : nums.length <= 4 ? `Tiles ${nums.slice(0, -1).join(', ')} and ${nums[nums.length - 1]}` : `${nums.length} tiles`;
+        stNote();
+        $('at-st-mode').value = st.mode;
+        // Switching is for a NEW placement over a selection; an edited layer keeps the mode it was made in.
+        $('at-st-modewrap').hidden = !!st.edit || !st.area || !(st.ids && stEachTargets(st.ids).length > 1);
+        $('at-st-title').textContent = opts.edit ? '🏷️ Edit Stickers' : '🏷️ Add Stickers';
+        stFillStrip();
+        stSync();
+        openModal('stickers');
+        stRender();
+    }
+    function stNote() {
+        if (st.mode === 'each') {
+            const n = st.eachIds.length;
+            setBatchNote('at-modal-stickers', n, null, `🎯 The same stickers at the same spot on ${n} tiles. Showing tile ${numberOf(st.eachIds[0])}.`);
+            $('at-st-tileno').textContent = n === 1 ? `Tile ${numberOf(st.eachIds[0])}` : `${n} tiles, the same spot`;
+            return;
+        }
+        const editable = st.cells.filter(c => c.editable), locked = st.cells.filter(c => c.id != null && !c.editable).length;
+        setBatchNote('at-modal-stickers', editable.length, null,
+            `🎯 Stickers across ${editable.length} tiles as they sit in the grid.` +
+            (locked ? ` ${locked} other tile${locked > 1 ? 's' : ''} in the area ${locked > 1 ? 'are' : 'is'} dimmed and will not change.` : ''));
+    }
+    function openStickersModal(ids) {
+        const area = selectionArea(ids, state.tileSize, 'Stickers', { derived: true, quiet: true });
+        if (area) { stOpenArea(area, { ids }); return; }
+        // Too far apart for one area (DRAW_MAX_PX): the same spot on each tile is the one way to place them.
+        const eachIds = stEachTargets([ids[0], ...ids.slice(1)]);
+        if (eachIds.length < 2) { selectionArea(ids, state.tileSize, 'Stickers', { derived: true }); return; }   // its own toast says why
+        stOpenArea(stEachArea(eachIds[0]), { ids, mode: 'each', eachIds, area: null });
+    }
+    /* Switch between the area and the same spot on each tile, keeping the stickers where they sit on the
+       right-clicked tile (positions move by that tile's place in the area). */
+    function stSetMode(mode) {
+        if (mode === st.mode || !st.ids) return;
+        const first = st.ids[0], areaCell = st.area.cells.find(c => c.id === first) || st.area.cells.find(c => c.editable);
+        const dx = areaCell ? areaCell.x : 0, dy = areaCell ? areaCell.y : 0, sgn = mode === 'each' ? -1 : 1;
+        stPush();
+        st.items.forEach(it => { it.cx += sgn * dx; it.cy += sgn * dy; });
+        stApplyMode(mode);
+        stSync(); stSchedule();
+    }
+    /* The surface for a mode: its cells and inputs only (the stickers are the caller's business). */
+    function stApplyMode(mode) {
+        if (mode === 'each') {
+            const first = st.ids[0];
+            const eachIds = stEachTargets([first, ...st.ids.filter(i => i !== first)]);
+            const a = stEachArea(eachIds[0]);
+            Object.assign(st, { mode, eachIds, cells: a.cells, W: a.W, H: a.H, mask: a.mask });
+        } else {
+            Object.assign(st, { mode, eachIds: null, cells: st.area.cells, W: st.area.W, H: st.area.H, mask: st.area.mask });
+        }
+        st.inputs = new Map();
+        for (const cell of st.cells) if (cell.editable) st.inputs.set(cell.id, cell.canvas || byId(cell.id).canvas);
+        st.cache = new Map();
+        $('at-st-mode').value = mode;
+        stNote();
+    }
+    /* Edit Stickers…: the session's stickers back over the arrangement they were placed on. */
+    function openStickerLayer(el, def) {
+        if (def.recipe && def.recipe.mode === 'each') { openStickerLayerEach(el, def); return; }
+        const a = def.area, S = a.S;
+        const members = new Set(a.cells.filter(c => c.member).map(c => c.id));
+        const cells = a.cells.map(c => {
+            const t = c.id != null ? byId(c.id) : null;
+            return { id: t ? c.id : null, x: c.x, y: c.y, editable: !!t && members.has(c.id) && (t.kind === 'tile' || t.kind === 'transition' || t.kind === 'anim') };
+        });
+        const mask = document.createElement('canvas'); mask.width = a.W; mask.height = a.H;
+        const mc = mask.getContext('2d'); mc.fillStyle = '#fff';
+        cells.filter(c => c.editable).forEach(c => mc.fillRect(c.x, c.y, S, S));
+        if (!cells.some(c => c.editable)) { showToast('Every tile these stickers were on is gone', 'info'); return; }
+        const xf = new Map();
+        let lost = 0;
+        cells.filter(c => c.editable).forEach(c => {
+            const p = byId(c.id).layers.find(q => q.lid === def.lid);
+            if (p && p.xf && p.xf.length) xf.set(c.id, p.xf);
+            if (p && p.xfLost) lost++;
+        });
+        if (lost) showToast(`${lost === 1 ? 'A tile was' : lost + ' tiles were'} reshaped since these stickers were placed, in a way they cannot follow. Applying redraws ${lost === 1 ? 'it' : 'them'} unturned.`, 'warning', 6000);
+        stOpenArea({ cells, W: a.W, H: a.H, mask }, { edit: { lid: def.lid, xf }, items: def.recipe.items, pixels: def.pixels, wrap: def.recipe.wrap });
+    }
+    /* Edit a "same spot on each tile" layer: the surface is the tile it was opened from; every tile carrying it
+       is a target again (an animation counted once). */
+    function openStickerLayerEach(el, def) {
+        const tiles = TRLE.Layers.tilesOf(def.lid, state.elements);
+        const from = tiles.includes(el) ? el : tiles[0];
+        if (!from) { showToast('Every tile these stickers were on is gone', 'info'); return; }
+        const eachIds = stEachTargets([from.id, ...tiles.filter(t => t !== from).map(t => t.id)]);
+        const xf = new Map();
+        for (const t of tiles) { const p = t.layers.find(q => q.lid === def.lid); if (p && p.xf && p.xf.length) xf.set(t.id, p.xf); }
+        const a = stEachArea(from.id);
+        stOpenArea(a, { edit: { lid: def.lid, xf }, items: def.recipe.items, pixels: def.pixels, wrap: def.recipe.wrap, mode: 'each', eachIds });
+    }
+    async function stApply() {
+        if (!st.cells) return;
+        if (!st.items.length && !st.edit) { showToast('Place a sticker first', 'info'); return; }
+        const S = st.S, edit = st.edit, L = TRLE.Layers;
+        const xfOf = id => (edit && edit.xf && edit.xf.get(id)) || null;
+        const pieces = new Map(), cache = new Map(), mapRenders = new Map();
+        /* A cell's crops: `k<i>`, and with "Its own maps" one `k<i><map>` per map file, drawn as the sticker is. */
+        const cellCrops = cell => {
+            const out = {};
+            st.items.forEach((it, i) => {
+                const src = stSrc(it), c = src && stCellCrop(it, src, cell, S, st.W, st.H, st.wrap, cache);
+                if (!c) return;
+                out['k' + i] = c;
+                const r = stItemRender(it, src, cache);
+                if (r.body) out['b' + i] = stCellStamp({ c: r.body, bx: r.bx, by: r.by }, cell, S, st.W, st.H, st.wrap);
+                if (r.emit) out['e' + i] = stCellStamp({ c: r.emit, bx: r.bx, by: r.by }, cell, S, st.W, st.H, st.wrap);
+                if (it.maps !== 'own') return;
+                for (const mt of stMapsOf(it)) {
+                    const key = i + mt;
+                    if (!mapRenders.has(key)) mapRenders.set(key, stItemMapRender(it, st.px.get(it.pk + '.' + mt), mt));
+                    out['k' + i + mt] = stCellStamp(mapRenders.get(key), cell, S, st.W, st.H, st.wrap);
+                }
+            });
+            return out;
+        };
+        const placed = (crops, xf) => { const aux = {}; for (const [k, c] of Object.entries(crops)) aux[k] = L.imm((/normal$/.test(k) ? applyXfNormal : applyXf)(c, xf)); return aux; };
+        if (st.mode === 'each') {
+            // One set of crops, made on the surface tile, on every target (its own xf replayed on Edit).
+            const base = cellCrops(st.cells[0]);
+            if (Object.keys(base).length) for (const id of st.eachIds) if (byId(id)) pieces.set(id, { aux: placed(base, xfOf(id)) });
+        } else for (const cell of st.cells) {
+            const el = cell.editable ? byId(cell.id) : null;
+            if (!el) continue;
+            const crops = cellCrops(cell);
+            if (Object.keys(crops).length) pieces.set(el.id, { aux: placed(crops, xfOf(cell.id)) });
+        }
+        // An animation frame's crops go on every frame of its group (Q9d): the same canvases, which are immutable.
+        for (const [id, pc] of [...pieces]) for (const m of animGroupOf(byId(id))) if (!pieces.has(m.id)) pieces.set(m.id, { aux: Object.assign({}, pc.aux) });
+        const n = pieces.size;
+        if (!n && !edit) { closeModal(); showToast('The stickers are outside the tiles that can change', 'info'); return; }
+        const used = new Set(st.items.map(it => it.pk)), pixels = {};
+        for (const k of used) { pixels[k] = st.px.get(k); for (const mt of TRLE.MapOrder) if (st.px.has(k + '.' + mt)) pixels[k + '.' + mt] = st.px.get(k + '.' + mt); }
+        const names = [...new Set(st.items.map(it => it.name))];
+        const nm = names.join(', ');
+        const recipe = { items: st.items.map(it => Object.assign({}, it)), wrap: st.wrap, mode: st.mode };
+        const fields = { name: (names.length === 1 && st.items.length === 1 ? 'Sticker: ' : 'Stickers: ') + (nm.length > 26 ? nm.slice(0, 25) + '…' : nm), recipe, pixels };
+        const touched = [...pieces.keys()].map(byId);
+        const dropped = [];
+        const glowedBefore = !!edit && state.elements.some(el => mapParts(el).some(t => t.def.lid === edit.lid && t.glows.length));
+        const glowsNow = st.items.some(it => it.glow && it.glowAmt > 0);   // read before closeModal empties the session
+        let label;
+        if (edit) {
+            const before = L.tilesOf(edit.lid, state.elements);
+            L.update(state.layerDefs, edit.lid, fields);
+            for (const el of before) if (!pieces.has(el.id)) { L.remove(el, edit.lid, state.layerDefs, true); dropped.push(el); }
+            for (const el of touched) {
+                const p = Object.assign({ lid: edit.lid }, pieces.get(el.id));
+                const xf = edit.xf && edit.xf.get(el.id);
+                if (xf && xf.length) p.xf = xf.slice();
+                if (el.layers && el.layers.some(q => q.lid === edit.lid)) el.layers = el.layers.map(q => q.lid === edit.lid ? p : q);
+                else L.insertPiece(el, state.layerDefs[edit.lid], p, state.layerDefs);
+            }
+            label = n > 1 ? `Edit stickers: ${n} tiles` : 'Edit stickers';
+        } else {
+            const area = { W: st.W, H: st.H, S, cells: st.cells.map(c => ({ id: c.id, x: c.x, y: c.y, member: pieces.has(c.id) })) };   // in each mode: the surface tile
+            L.add(state.layerDefs, touched, Object.assign({ kind: 'sticker', area }, fields), touched.map(el => pieces.get(el.id)));
+            label = n > 1 ? `Stickers: ${n} tiles` : 'Stickers';
+        }
+        closeModal();
+        refreshTransitions();
+        await layersCommit([...new Set([...touched, ...dropped, ...(edit ? L.tilesOf(edit.lid, state.elements) : [])])], label);
+        L.prune(state.layerDefs, state.elements);
+        // "Glows in game" ships only with the Emissive export map on: a glowing sticker ticks it (as Text and Draw do).
+        const glowNote = layersGlowExport(glowsNow, glowedBefore);
+        showToast((n > 1 ? `Stickers ${edit ? 'edited on' : 'applied to'} ${n} tiles` : n ? `Stickers ${edit ? 'edited' : 'applied'}` : 'Stickers removed') + glowNote, 'success');
+    }
+    /* ============ ✂️ MAKE STICKER (STICKERS-PLAN phase 9, D13, P8, P14) ============
+       Cuts part of ONE element (P8) out as a gallery sticker with the shared mask editor (prefix at-stc; this
+       window's own ids are at-stcut-, so the toolbar's ids cannot be taken). The mask is at the tile's own size,
+       so a hard cut copies pixels exactly. The element is left alone (D13) unless "Lift it off and heal the
+       hole" is ticked: that adds a Heal layer (Healing brush) over the cut grown by 2 px, on ordinary tiles only
+       (P14: a transition or animation frame is rebuilt from its recipe and takes no Heal layer). Adding to the
+       gallery is not on the undo stack (P7); the lift is one step. "Keep its maps" gives the sticker the
+       element's export maps there, for its Maps tab's "Its own maps". */
+    const stc = { id: null, mask: null };
+    let stcEditor = null;
+    const stcOpen = () => $('at-overlay').style.display !== 'none' && $('at-modal-stickercut').style.display !== 'none';
+    const stcSource = () => { const el = byId(stc.id); return el ? el.canvas : null; };
+    /* The element's pixels at the mask's coverage, and the bounds of what is left, or null when nothing is. */
+    function stcCut() {
+        const src = stcSource();
+        if (!src) return null;
+        const S = src.width, out = document.createElement('canvas'); out.width = out.height = S;
+        const g = out.getContext('2d');
+        g.drawImage(src, 0, 0);
+        const im = g.getImageData(0, 0, S, S), d = im.data, m = stc.mask.getContext('2d').getImageData(0, 0, S, S).data;
+        let x0 = S, y0 = S, x1 = -1, y1 = -1;
+        for (let i = 0; i < d.length; i += 4) {
+            d[i + 3] = Math.round(d[i + 3] * m[i] / 255);
+            if (!d[i + 3]) continue;
+            const p = i >> 2, x = p % S, y = (p / S) | 0;
+            if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+        }
+        if (x1 < 0) return null;
+        g.putImageData(im, 0, 0);
+        return { canvas: out, x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
+    }
+    function stcRenderPaint() {
+        const src = stcSource(), c = $('at-stcut-canvas');
+        if (!src) return;
+        const S = c.width, ctx = c.getContext('2d');
+        ctx.clearRect(0, 0, S, S);
+        ctx.drawImage(src, 0, 0);
+        const md = stc.mask.getContext('2d').getImageData(0, 0, S, S).data, od = ctx.getImageData(0, 0, S, S);
+        for (let i = 0; i < od.data.length; i += 4) {
+            const a = md[i] / 255 * 0.5;
+            if (a > 0) { od.data[i] = Math.round(od.data[i] * (1 - a) + 255 * a); od.data[i + 1] = Math.round(od.data[i + 1] * (1 - a)); od.data[i + 2] = Math.round(od.data[i + 2] * (1 - a)); }
+        }
+        ctx.putImageData(od, 0, 0);
+        if (stcEditor) stcEditor.drawOverlay(ctx);
+    }
+    function stcRenderPreview() {
+        const cut = stcCut(), pv = $('at-stcut-preview'), g = pv.getContext('2d');
+        g.clearRect(0, 0, pv.width, pv.height);
+        $('at-stcut-size').textContent = cut ? `${cut.w} × ${cut.h} px, trimmed to what you selected.` : 'Nothing selected yet.';
+        $('at-stcut-save').disabled = $('at-stcut-place').disabled = !cut;
+        if (!cut) return;
+        const k = Math.min(pv.width / cut.w, pv.height / cut.h), w = cut.w * k, h = cut.h * k;
+        g.imageSmoothingEnabled = k < 1;
+        g.drawImage(cut.canvas, cut.x, cut.y, cut.w, cut.h, (pv.width - w) / 2, (pv.height - h) / 2, w, h);
+    }
+    function openStickerCut(id) {
+        const el = byId(id);
+        if (!el || !el.canvas) return;
+        const S = el.canvas.width;
+        stc.id = id;
+        stc.mask.width = stc.mask.height = S;
+        const mc = stc.mask.getContext('2d'); mc.fillStyle = '#000'; mc.fillRect(0, 0, S, S);
+        $('at-stcut-canvas').width = $('at-stcut-canvas').height = S;
+        if (stcEditor) { stcEditor.setErase(false); stcEditor.resetHistory(); stcEditor.setTool('rect'); }
+        $('at-stcut-tileno').textContent = numberOf(id);
+        $('at-stcut-name').value = TRLE.Stickers.uniqueName(`Cut from tile ${numberOf(id)}`);
+        const tile = el.kind === 'tile';
+        $('at-stcut-lift').checked = false;
+        $('at-stcut-liftwrap').hidden = !tile;
+        $('at-stcut-liftnote').textContent = tile ? '' : `Lift it off is for ordinary tiles: a ${el.kind === 'anim' ? 'animation frame' : 'transition'} is rebuilt from its recipe, so it cannot take a Heal layer. The cut itself works.`;
+        openModal('stickercut');
+        stcRenderPaint();
+        stcRenderPreview();
+    }
+    /* The cut's mask grown by r px (a disc), for the Heal layer that lifts it off. */
+    function stcGrown(r) {
+        const S = stc.mask.width, out = document.createElement('canvas'); out.width = out.height = S;
+        const g = out.getContext('2d');
+        g.fillStyle = '#000'; g.fillRect(0, 0, S, S);
+        g.globalCompositeOperation = 'lighten';
+        for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) if (dx * dx + dy * dy <= r * r) g.drawImage(stc.mask, dx, dy);
+        return out;
+    }
+    async function stcSave(place) {
+        const el = byId(stc.id), cut = stcCut();
+        if (!el) return;
+        if (!cut) { showToast('Select part of the tile to cut first', 'info'); return; }
+        let maps = null;
+        if ($('at-stcut-maps').checked) {
+            const enabled = {}; for (const mt of TRLE.MapOrder) enabled[mt] = true;
+            const all = deriveMaps(el, enabled, {});
+            for (const mt of TRLE.MapOrder) if (all[mt]) (maps = maps || {})[mt] = all[mt];
+        }
+        const res = TRLE.Stickers.add({ canvas: cut.canvas, name: $('at-stcut-name').value.trim() || `Cut from tile ${numberOf(el.id)}`, maps, from: 'cut' });
+        if (!res) { showToast('The gallery is full', 'warning'); return; }
+        const lift = $('at-stcut-lift').checked && el.kind === 'tile', mask = lift ? stcGrown(2) : null, id = el.id;
+        closeModal();
+        if (lift) {
+            const L = TRLE.Layers;
+            L.add(state.layerDefs, [el], { kind: 'heal', name: 'Heal (sticker lifted)', recipe: { method: 'brush' } }, [{ mask: L.imm(mask) }]);
+            refreshTransitions();
+            await layersCommit([el], 'Lift a sticker off');
+        }
+        showToast(`"${res.rec.name}" ${res.dupe ? 'is already in the gallery' : 'added to the gallery'}${lift ? ', and the hole healed' : ''}`, 'success');
+        if (place) {
+            openStickersModal([id]);
+            if (stOpen()) stPlace(res.rec, [cut.x + cut.w / 2, cut.y + cut.h / 2]);   // where it was cut (a one-tile area starts at 0, 0)
+        }
+    }
+    function setupStickerCut() {
+        stc.mask = document.createElement('canvas'); stc.mask.width = stc.mask.height = 256;
+        buildMaskToolbar($('at-stc-tools'), 'at-stc', { brushMax: 96 });
+        stcEditor = createMaskEditor('at-stc', {
+            canvas: $('at-stcut-canvas'),
+            mode: 'luma',
+            getMask: () => stc.mask,
+            getSource: () => stcSource(),
+            active: () => stc.id !== null && stcOpen(),
+            onChange: stcRenderPaint,
+            onStrokeEnd: stcRenderPreview,
+        });
+        $('at-stcut-save').addEventListener('click', () => stcSave(false));
+        $('at-stcut-place').addEventListener('click', () => stcSave(true));
+    }
+
+    function setupStickers() {
+        $('at-st-blend').innerHTML = TRLE.Stroke.BLEND_MODES.map(m => `<option value="${m.id}">${m.label}</option>`).join('');
+        fillMaterialSelect($('at-st-material'));
+        document.querySelectorAll('[data-st-tab]').forEach(b => b.addEventListener('click', () => {
+            document.querySelectorAll('[data-st-tab]').forEach(o => { const on = o === b; o.classList.toggle('active', on); o.setAttribute('aria-selected', String(on)); });
+            document.querySelectorAll('[data-st-panel]').forEach(p => { p.hidden = p.dataset.stPanel !== b.dataset.stTab; });
+        }));
+        TRLE.Stickers.onChange(() => { if (stOpen()) stFillStrip(); });
+        const strip = $('at-st-strip');
+        strip.addEventListener('click', e => { const b = e.target.closest('.at-st-chip'); const r = b && TRLE.Stickers.get(b.dataset.sid); if (r) stPlace(r); });
+        strip.addEventListener('dragstart', e => { const b = e.target.closest('.at-st-chip'); if (b) { e.dataTransfer.setData('text/x-atlas-sticker', b.dataset.sid); e.dataTransfer.effectAllowed = 'copy'; } });
+        $('at-st-addimg').addEventListener('click', () => $('at-stl-files').click());
+        const view = $('at-st-view');
+        const vpt = e => { const r = view.getBoundingClientRect(); return [(e.clientX - r.left) * view.width / r.width, (e.clientY - r.top) * view.height / r.height]; };
+        const toArea = p => [(p[0] - st.fit.ox) / st.fit.scale, (p[1] - st.fit.oy) / st.fit.scale];
+        view.addEventListener('dragover', e => { if ([...e.dataTransfer.types].includes('text/x-atlas-sticker')) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } });
+        view.addEventListener('drop', e => {
+            const sid = e.dataTransfer.getData('text/x-atlas-sticker'), r = sid && TRLE.Stickers.get(sid);
+            if (!r || !st.fit) return;
+            e.preventDefault(); e.stopPropagation();
+            stPlace(r, toArea(vpt(e)));
+        });
+        /* Selection first (registered before the handles, so their pointerdown sees the new box):
+           a press on the selected box's handles is theirs; anywhere else picks the sticker under it. */
+        view.addEventListener('pointerdown', e => {
+            if (!st.cells || !st.fit) return;
+            view.focus({ preventScroll: true });
+            const p = vpt(e), cur = stBox(stCur());
+            const h = cur && TRLE.Handles.hit(cur, p, 4 * stViewRatio());
+            if (h && (h.kind === 'resize' || h.kind === 'rotate' || h.inside)) return;
+            const i = stPick(p);
+            if (i !== st.sel) { st.sel = i; stSync(); stRender(); }
+        });
+        TRLE.Handles.attach(view, {
+            point: vpt, ratio: stViewRatio, moveAnywhere: false,
+            getBox: () => (st.cells && st.fit ? stBox(stCur()) : null),
+            // The duplicate is made BEFORE the drag starts (Handles calls onDuplicate first), so it
+            // takes the undo step itself and the drag that follows adds none: one undo removes the copy.
+            onStart: () => { if (st.dupPushed) st.dupPushed = false; else stPush(); },
+            onDuplicate: () => {
+                const it = stCur(); if (!it) return;
+                stPush(); st.dupPushed = true;
+                st.items.splice(st.sel + 1, 0, Object.assign({}, it));
+                st.sel++;
+            },
+            onChange: (b, info) => {
+                const it = stCur(), f = st.fit;
+                if (!it || !f) return;
+                it.cx = (b.cx - f.ox) / f.scale; it.cy = (b.cy - f.oy) / f.scale;
+                if (info.kind === 'resize') { it.w = b.w / f.scale; it.h = b.h / f.scale; }
+                if (info.kind === 'rotate') it.rot = Math.round(b.rot);
+                stSnap(it);
+                stSync(); stSchedule();
+            },
+        });
+        const edit = (tag, fn) => { const it = stCur(); if (!it) return; stPush(tag); fn(it); stSync(); stSchedule(); };
+        const num = id => parseFloat($(id).value);
+        $('at-st-x').addEventListener('change', () => edit('x', it => { if (isFinite(num('at-st-x'))) { it.cx = num('at-st-x') + it.w / 2; stSnap(it); } }));
+        $('at-st-y').addEventListener('change', () => edit('y', it => { if (isFinite(num('at-st-y'))) { it.cy = num('at-st-y') + it.h / 2; stSnap(it); } }));
+        $('at-st-w').addEventListener('change', () => edit('w', it => { if (num('at-st-w') >= 1) { const l = it.cx - it.w / 2; it.w = num('at-st-w'); it.cx = l + it.w / 2; stSnap(it); } }));
+        $('at-st-h').addEventListener('change', () => edit('h', it => { if (num('at-st-h') >= 1) { const t = it.cy - it.h / 2; it.h = num('at-st-h'); it.cy = t + it.h / 2; stSnap(it); } }));
+        for (const [id, key, k] of ST_FIELDS) $('at-st-' + id).addEventListener('input', () => edit(id, it => { it[key] = num('at-st-' + id) / k; if (key === 'rot') stSnap(it); }));
+        $('at-st-blend').addEventListener('change', () => edit(null, it => { it.blend = $('at-st-blend').value; }));
+        $('at-st-filter').addEventListener('change', () => edit(null, it => { it.filter = $('at-st-filter').value; }));
+        for (const [id, key] of [['tint', 'tint'], ['swapfrom', 'swapFrom'], ['swapto', 'swapTo']]) $('at-st-' + id).addEventListener('input', () => edit(id, it => { it[key] = $('at-st-' + id).value; }));
+        $('at-st-wrap').addEventListener('change', () => { stPush(); st.wrap = $('at-st-wrap').checked; stSchedule(); });
+        $('at-st-maps').addEventListener('change', () => edit(null, it => { it.maps = $('at-st-maps').value; if (it.maps === 'preset' && !it.material) it.material = $('at-st-material').value; }));
+        $('at-st-material').addEventListener('change', () => edit(null, it => { it.material = $('at-st-material').value; }));
+        $('at-st-relief').addEventListener('change', () => edit(null, it => { it.relief = $('at-st-relief').value; }));
+        $('at-st-floors').addEventListener('change', () => edit(null, it => { it.floors = $('at-st-floors').value; }));
+        $('at-st-glow').addEventListener('change', () => edit(null, it => { it.glow = $('at-st-glow').checked; }));
+        stFx = buildEffectsPanel($('at-stfx'), 'at-stfx', () => {
+            const it = stCur(), fx = stFxClean(stFx.read());
+            if (!it || JSON.stringify(fx) === JSON.stringify(it.effects)) return;
+            edit('fx', x => { x.effects = fx; });
+        });
+        $('at-st-mode').addEventListener('change', () => stSetMode($('at-st-mode').value));
+        $('at-st-dup').addEventListener('click', () => edit(null, it => { st.items.splice(st.sel + 1, 0, Object.assign({}, it, { cx: it.cx + Math.max(2, Math.round(st.S / 16)), cy: it.cy + Math.max(2, Math.round(st.S / 16)) })); st.sel++; }));
+        $('at-st-fliph').addEventListener('click', () => edit(null, it => { it.flipX = !it.flipX; }));
+        $('at-st-flipv').addEventListener('click', () => edit(null, it => { it.flipY = !it.flipY; }));
+        $('at-st-remove').addEventListener('click', () => edit(null, () => { st.items.splice(st.sel, 1); st.sel = Math.min(st.sel, st.items.length - 1); }));
+        const order = to => edit(null, it => { st.items.splice(st.sel, 1); const j = Math.max(0, Math.min(st.items.length, to(st.sel))); st.items.splice(j, 0, it); st.sel = j; });
+        $('at-st-front').addEventListener('click', () => order(() => Infinity));
+        $('at-st-fwd').addEventListener('click', () => order(i => i + 1));
+        $('at-st-bwd').addEventListener('click', () => order(i => i - 1));
+        $('at-st-back').addEventListener('click', () => order(() => 0));
+        $('at-st-apply').addEventListener('click', stApply);
+        $('at-st-keep').addEventListener('click', () => stShowDiscard(false));
+        $('at-st-discard-ok').addEventListener('click', () => closeModal());
+        // Keys (P12): undo / redo, Delete, arrow nudge; never while typing in a field.
+        document.addEventListener('keydown', e => {
+            if (!stOpen()) return;
+            const ae = document.activeElement;
+            if (ae && (/^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName) && ae.type !== 'range' && ae.type !== 'checkbox')) return;
+            const mod = e.ctrlKey || e.metaKey;
+            if (mod && (e.key === 'z' || e.key === 'Z')) { e.preventDefault(); e.stopPropagation(); if (e.shiftKey) stRedo(); else stUndo(); return; }
+            if (mod && (e.key === 'y' || e.key === 'Y')) { e.preventDefault(); e.stopPropagation(); stRedo(); return; }
+            if (!stCur() || mod || e.altKey) return;
+            if (e.key === 'Delete' || e.key === 'Backspace') { e.preventDefault(); $('at-st-remove').click(); return; }
+            const d = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
+            if (!d || (ae && ae.type === 'range')) return;
+            e.preventDefault();
+            const n = e.shiftKey ? 10 : 1;
+            edit('nudge', it => { it.cx += d[0] * n; it.cy += d[1] * n; });
+        }, true);
     }
 
     /* ============ RECOLOR FROM TEXTURE MODAL ============
@@ -19414,8 +26422,8 @@ window.TRLE = window.TRLE || {};
         ['contrast', 'Contrast',     0, 200, 100, '%'],
         ['sat',      'Saturation',   0, 200, 100, '%']
     ];
-    const rc = { baseId: null, refId: null, stats: null, batchIds: [] };
-    function rcCleanup() { rc.baseId = null; rc.refId = null; rc.stats = null; rc.batchIds = []; }
+    const rc = { baseId: null, refId: null, stats: null, batchIds: [], inputs: null, edit: null };
+    function rcCleanup() { rc.baseId = null; rc.refId = null; rc.stats = null; rc.batchIds = []; rc.inputs = null; rc.edit = null; }
 
     /* sRGB -> CIELAB (D65). These constants are duplicated in the `colorTransfer`
        shader and MUST stay in step with it: the stats are measured here on the CPU
@@ -19494,14 +26502,17 @@ window.TRLE = window.TRLE || {};
     }
     /* means/stds are LAB axes (L, a, b), not RGB channels — see computeColorStats.
        The 0.2..3 clamp is per axis and is what the transfer was measured with. */
-    function rcTransferUniforms(stats) {
+    function rcTransferUniforms(stats, p) {
         const A = stats.A, B = stats.B;
         const scale = [0, 1, 2].map(c => Math.max(0.2, Math.min(3, B.std[c] / A.std[c])));
         return {
             u_meanA: A.mean, u_meanB: B.mean, u_scale: scale,
-            u_strength: parseInt($('at-rc-strength').value) / 100
+            u_strength: p.strength / 100
         };
     }
+    /* The four sliders, as a recipe fragment (a Recolor layer keeps them). */
+    const rcParamsNow = () => ({ strength: parseInt($('at-rc-strength').value), sat: parseInt($('at-rc-sat').value),
+                                 bright: parseInt($('at-rc-bright').value), contrast: parseInt($('at-rc-contrast').value) });
     function rcMatchMode() { return $('at-rc-match') ? $('at-rc-match').value : 'each'; }
     /* Which mean/std pair a given tile is transferred with.
 
@@ -19515,32 +26526,33 @@ window.TRLE = window.TRLE || {};
        tile that started somewhere else won't actually reach the reference. */
     function rcStatsFor(el) {
         if (rcMatchMode() === 'same' || el.id === rc.baseId) return rc.stats;
-        return { A: computeColorStats(el.canvas), B: rc.stats.B };
+        return { A: computeColorStats(xin(rc.inputs, el)), B: rc.stats.B };
     }
     /* EVERY colorAdjust uniform, including the levels stage this modal never uses.
        `blit()` leaves uniforms set on the program and colorAdjust is shared with
        Adjust Colours, so anything omitted here is silently INHERITED from whatever
        that modal set last -- a Recolor would start applying someone else's channel
        levels. Same trap as simpleHeight's height-only uniforms; see CLAUDE.md. */
-    function rcGradeUniforms() {
+    function rcGradeUniforms(p) {
         return {
-            u_hue: 0, u_sat: parseInt($('at-rc-sat').value) / 100,
-            u_bright: parseInt($('at-rc-bright').value) / 100,
-            u_contrast: parseInt($('at-rc-contrast').value) / 100,
+            u_hue: 0, u_sat: p.sat / 100,
+            u_bright: p.bright / 100,
+            u_contrast: p.contrast / 100,
             u_gamma: 1, u_temp: 0, u_tint: 0, u_vibrance: 0, u_invert: 0,
             u_levOn: 0, u_levBlack: [0, 0, 0], u_levWhite: [1, 1, 1], u_levGamma: [1, 1, 1],
             u_curveOn: 0
         };
     }
     /* Two-pass: colour transfer → light grade. Returns a canvas. */
-    function rcApplyTo(srcCanvas, S, stats) {
+    function rcApplyTo(srcCanvas, S, stats, p) {
         const E = TRLE.Engine;
+        p = p || rcParamsNow();
         const tex = E.createTextureFromImage(srcCanvas);
         const t1 = E.createFBO(S, S);
-        E.blit('colorTransfer', Object.assign({ u_texture: tex }, rcTransferUniforms(stats || rc.stats)), t1);
+        E.blit('colorTransfer', Object.assign({ u_texture: tex }, rcTransferUniforms(stats || rc.stats, p)), t1);
         const t2 = E.createFBO(S, S);
         // u_curveTex bound to the input, never left pointing at a stale unit: see caBlit.
-        E.blit('colorAdjust', Object.assign({ u_texture: t1.texture, u_curveTex: t1.texture }, rcGradeUniforms()), t2);
+        E.blit('colorAdjust', Object.assign({ u_texture: t1.texture, u_curveTex: t1.texture }, rcGradeUniforms(p)), t2);
         const out = E.fboToCanvas(t2);
         E.deleteFBO(t1); E.deleteFBO(t2); E.deleteTexture(tex);
         return out;
@@ -19548,7 +26560,7 @@ window.TRLE = window.TRLE || {};
     function rcRender() {
         if (rc.baseId === null) return;
         const P = $('at-rc-preview').width;
-        const out = rcApplyTo(byId(rc.baseId).canvas, P);
+        const out = rcApplyTo(xin(rc.inputs, byId(rc.baseId)), P);
         drawReplace($('at-rc-preview'), out, P, P);
     }
     /* The selection is read HERE, not when the menu entry was clicked, and that
@@ -19557,24 +26569,48 @@ window.TRLE = window.TRLE || {};
        drops out of the targets if it happens to be selected too — recolouring it
        against itself is an identity transfer, and "make these match that one"
        plainly doesn't include "that one". */
-    function openRecolorModal(baseId, refId) {
-        const targets = ctxTargets(baseId).filter(i => i !== refId);
+    function openRecolorModal(baseId, refId, editing) {
+        const targets = editing ? editing.ids : ctxTargets(baseId).filter(i => i !== refId);
         exitPickMode();
-        rc.baseId = baseId; rc.refId = refId;
+        rc.baseId = baseId; rc.refId = editing ? null : refId;
         rc.batchIds = targets.length ? targets : [baseId];
-        rc.stats = { A: computeColorStats(byId(baseId).canvas), B: computeColorStats(byId(refId).canvas) };
+        rc.inputs = modalInputs(rc.batchIds, 'recolor');
+        rc.edit = editing ? { lid: editing.def.lid } : null;
+        const baseIn = xin(rc.inputs, byId(baseId));
+        // The reference is measured ONCE, here, and kept as numbers: editing the reference tile later
+        // changes nothing (a layer copies what it read from another tile).
+        const B = editing ? editing.def.recipe.B : computeColorStats(byId(refId).canvas);
+        const A = editing && editing.def.recipe.match === 'same' ? editing.def.recipe.A : computeColorStats(baseIn);
+        rc.stats = { A, B };
         $('at-rc-base-no').textContent = numberOf(baseId);
-        $('at-rc-ref-no').textContent = numberOf(refId);
+        $('at-rc-ref-no').textContent = editing ? '(kept)' : numberOf(refId);
         const rp = $('at-rc-ref');
-        rp.getContext('2d').drawImage(byId(refId).canvas, 0, 0, rp.width, rp.height);
+        rp.getContext('2d').clearRect(0, 0, rp.width, rp.height);
+        rp.getContext('2d').drawImage(editing ? editing.def.pixels.ref : byId(refId).canvas, 0, 0, rp.width, rp.height);
         resetSliderGrid(RC_PARAMS, 'rc');
         $('at-rc-batch-mode').style.display = rc.batchIds.length > 1 ? '' : 'none';
         $('at-rc-match').value = 'each';
+        if (editing) {
+            const r = editing.def.recipe;
+            for (const k of ['strength', 'sat', 'bright', 'contrast']) { const e = $('at-rc-' + k); e.value = r[k]; $('at-rc-' + k + '-val').textContent = e.value; }
+            $('at-rc-match').value = r.match;
+        }
         rcSyncMatchHint();
         setBatchNote('at-modal-recolor', rc.batchIds.length, numberOf(baseId));
+        const replacing = rc.batchIds.filter(i => kindLayerOf(byId(i), 'recolor')).length;
+        setEditNote('at-modal-recolor', replacing ? `✏️ Editing ${rc.batchIds.length === 1 ? 'this tile\'s' : 'the'} Recolor layer: Apply replaces it${rc.batchIds.length > 1 ? ` on ${replacing} tile${replacing > 1 ? 's' : ''}` : ''}.` : '');
         openModal('recolor');
         rcRender();
     }
+    /* The layer: the four sliders, the match mode, the reference's numbers (B), and for "same" the base's (A). */
+    TRLE.Layers.register('recolor', { zone: 'texture', mode: 'adjust', cost: (def, S) => 6 * (S / 256) ** 2,
+        apply: (input, def, piece) => rcApplyTo(input, input.width,
+            { A: def.recipe.match === 'same' ? def.recipe.A : piece.data.A, B: def.recipe.B }, def.recipe),
+        edit: (el, def) => {
+            const ids = TRLE.Layers.tilesOf(def.lid, state.elements).map(e => e.id);
+            ids.sort((a, b) => (a === el.id ? -1 : b === el.id ? 1 : 0));
+            openRecolorModal(el.id, null, { def, ids });
+        } });
     function rcSyncMatchHint() {
         const hint = $('at-rc-match-hint');
         if (!hint) return;
@@ -19590,37 +26626,42 @@ window.TRLE = window.TRLE || {};
             if (rc.baseId === null) return;
             const targets = rc.batchIds.map(byId).filter(el => el && el.kind === 'tile');
             if (!targets.length) return;
-            // Stats are read off the live canvases, so measure every tile BEFORE
-            // writing any of them — otherwise a target that is also, say, further
-            // down the list gets measured against its own recoloured self.
-            const stats = targets.map(rcStatsFor);
-            targets.forEach((el, i) => {
-                const out = rcApplyTo(el.canvas, state.tileSize, stats[i]);
-                drawReplace(el.canvas, out);
-                el.edited = true;
-            });
-            const n = targets.length;
+            // Every tile's stats are measured BEFORE any layer is written (they come off the inputs,
+            // which are fixed at open, so a target is never measured against its own recoloured self).
+            const stats = targets.map(rcStatsFor), n = targets.length, p = rcParamsNow(), same = rcMatchMode() === 'same';
+            const recipe = Object.assign({}, p, { match: rcMatchMode(), B: rc.stats.B, A: same ? rc.stats.A : null });
+            const pixels = { ref: TRLE.Layers.imm(cloneCanvas(rc.edit ? state.layerDefs[rc.edit.lid].pixels.ref : byId(rc.refId).canvas)) };
+            const byTile = new Map(targets.map((el, i) => [el.id, stats[i]]));
             closeModal();
-            refreshTransitions();
-            renderGrid();
-            pushHistory(n > 1 ? `Recolor: ${n} tiles` : 'Recolor');
-            showToast(n > 1 ? `Recoloured ${n} tiles from reference` : 'Recoloured from reference', 'success');
+            colourLayerApply('recolor', 'Recolor', targets, recipe, el => ({ data: { A: byTile.get(el.id).A } }),
+                n > 1 ? `Recolor: ${n} tiles` : 'Recolor', pixels)
+                .then(() => showToast(n > 1 ? `Recoloured ${n} tiles from reference` : 'Recoloured from reference', 'success'));
         });
     }
 
     /* ============ DE-LIGHT MODAL ============
        Whole-texture flatten (divide by blur) OR paint a baked shadow and
        inpaint it away (neighbour-aware fill, reusing healPatchFill). */
-    const dl = { id: null, maskCanvas: null, resultCanvas: null, batchIds: [] };
+    const dl = { id: null, maskCanvas: null, resultCanvas: null, batchIds: [], inputs: null, edit: null };
     let dlEditor = null;
-    function dlCleanup() { dl.id = null; dl.resultCanvas = null; dl.batchIds = []; }
+    function dlCleanup() { dl.id = null; dl.resultCanvas = null; dl.batchIds = []; dl.inputs = null; dl.edit = null; }
+    /* The layer: whole-texture flatten (strength), or the painted shadow inpainted (its mask in the piece). */
+    TRLE.Layers.register('delight', { zone: 'texture', mode: 'adjust', cost: (def, S) => (def.recipe.mode === 'inpaint' ? 275 : 8) * (S / 1024) ** 2 + 2,
+        apply: (input, def, piece) => def.recipe.mode === 'whole'
+            ? delightWhole(input, input.width, def.recipe.strength)
+            : healPatchFill(input, piece.mask, input.width),
+        edit: (el, def) => {
+            const ids = TRLE.Layers.tilesOf(def.lid, state.elements).map(e => e.id);
+            ids.sort((a, b) => (a === el.id ? -1 : b === el.id ? 1 : 0));
+            openDelightModal(ids, { def, piece: el.layers.find(p => p.lid === def.lid) });
+        } });
     function dlMode() { return document.querySelector('input[name="at-dl-mode"]:checked').value; }
     function dlRender() {
         const el = byId(dl.id);
         if (!el) return;
         const disp = $('at-dl-canvas'), P = disp.width, ctx = disp.getContext('2d');
         if (dlMode() === 'whole') {
-            const out = delightWhole(el.canvas, state.tileSize, parseInt($('at-dl-strength').value) / 100);
+            const out = delightWhole(xin(dl.inputs, el), state.tileSize, parseInt($('at-dl-strength').value) / 100);
             ctx.clearRect(0, 0, P, P);
             ctx.drawImage(out, 0, 0, P, P);
             $('at-dl-canvas-label').textContent = 'Preview (de-lit)';
@@ -19634,7 +26675,7 @@ window.TRLE = window.TRLE || {};
         }
         // paint view: tile + red overlay where the mask is set
         ctx.clearRect(0, 0, P, P);
-        ctx.drawImage(el.canvas, 0, 0, P, P);
+        ctx.drawImage(xin(dl.inputs, el), 0, 0, P, P);
         const md = dl.maskCanvas.getContext('2d').getImageData(0, 0, P, P).data;
         const od = ctx.getImageData(0, 0, P, P);
         for (let i = 0; i < od.data.length; i += 4) {
@@ -19661,12 +26702,14 @@ window.TRLE = window.TRLE || {};
         dl.resultCanvas = null;
         dlRender();
     }
-    function openDelightModal(ids) {
+    function openDelightModal(ids, editing) {
         const list = Array.isArray(ids) ? ids : [ids];
         const id = list[0];
         if (!byId(id)) return;
         dl.id = id;
         dl.batchIds = list.slice();
+        dl.inputs = modalInputs(list, 'delight');
+        dl.edit = editing ? { lid: editing.def.lid } : null;
         dl.resultCanvas = null;
         $('at-dl-tileno').textContent = numberOf(id);
         const mc = dl.maskCanvas.getContext('2d');
@@ -19674,6 +26717,14 @@ window.TRLE = window.TRLE || {};
         document.querySelector('input[name="at-dl-mode"][value="whole"]').checked = true;
         $('at-dl-strength').value = 85; $('at-dl-strength-val').textContent = '85';
         if (dlEditor) { dlEditor.setErase(false); dlEditor.resetHistory(); }
+        if (editing) {
+            const r = editing.def.recipe;
+            document.querySelector(`input[name="at-dl-mode"][value="${r.mode}"]`).checked = true;
+            $('at-dl-strength').value = Math.round(r.strength * 100); $('at-dl-strength-val').textContent = $('at-dl-strength').value;
+            if (editing.piece && editing.piece.mask) { mc.clearRect(0, 0, 256, 256); mc.drawImage(editing.piece.mask, 0, 0, 256, 256); }
+        }
+        const replacing = list.filter(i => kindLayerOf(byId(i), 'delight')).length;
+        setEditNote('at-modal-delight', replacing ? `✏️ Editing ${list.length === 1 ? 'this tile\'s' : 'the'} De-light layer: Apply replaces it${list.length > 1 ? ` on ${replacing} tile${replacing > 1 ? 's' : ''}` : ''}.` : '');
         openModal('delight');
         dlSyncModeUI();
     }
@@ -19691,14 +26742,14 @@ window.TRLE = window.TRLE || {};
             canvas: $('at-dl-canvas'),
             mode: 'luma',
             getMask: () => dl.maskCanvas,
-            getSource: () => { const el = byId(dl.id); return el ? el.canvas : null; },
+            getSource: () => { const el = byId(dl.id); return el ? xin(dl.inputs, el) : null; },
             active: () => dl.id !== null && dlMode() === 'inpaint'
                           && $('at-modal-delight').style.display !== 'none',
             // Any mask change invalidates the inpaint result that was rendered from it.
             onChange: () => { dl.resultCanvas = null; dlRender(); }
         });
         $('at-dl-preview-btn').addEventListener('click', () => {
-            dl.resultCanvas = healPatchFill(byId(dl.id).canvas, dl.maskCanvas, state.tileSize);
+            dl.resultCanvas = healPatchFill(xin(dl.inputs, byId(dl.id)), dl.maskCanvas, state.tileSize);
             dlRender();
         });
         $('at-dl-apply').addEventListener('click', () => {
@@ -19706,22 +26757,14 @@ window.TRLE = window.TRLE || {};
             const whole = dlMode() === 'whole';
             const targets = dlBatchIds().map(byId).filter(el => el && el.kind === 'tile');
             if (!targets.length) return;
-            const strength = parseInt($('at-dl-strength').value) / 100;
-            targets.forEach(el => {
-                const out = whole
-                    ? delightWhole(el.canvas, state.tileSize, strength)
-                    : (dl.resultCanvas || healPatchFill(el.canvas, dl.maskCanvas, state.tileSize));
-                drawReplace(el.canvas, out);
-                el.edited = true;
-            });
-            const n = targets.length;
+            const strength = parseInt($('at-dl-strength').value) / 100, n = targets.length;
+            const maskCopy = whole ? null : cloneCanvas(dl.maskCanvas);
+            const recipe = { mode: whole ? 'whole' : 'inpaint', strength };
             closeModal();
-            refreshTransitions();
-            renderGrid();
-            pushHistory(n > 1 ? `De-light: ${n} tiles` : 'De-light');
-            showToast(whole
-                ? (n > 1 ? `De-lit ${n} tiles (baked lighting flattened)` : 'De-lit (baked lighting flattened)')
-                : 'Shadow inpainted', 'success');
+            colourLayerApply('delight', 'De-light', targets, recipe, () => (maskCopy ? { mask: maskCopy } : {}), n > 1 ? `De-light: ${n} tiles` : 'De-light')
+                .then(() => showToast(whole
+                    ? (n > 1 ? `De-lit ${n} tiles (baked lighting flattened)` : 'De-lit (baked lighting flattened)')
+                    : 'Shadow inpainted', 'success'));
         });
     }
 
@@ -19819,23 +26862,67 @@ window.TRLE = window.TRLE || {};
        Folds a source tile into a concentric frame (square / diamond / circle
        rings) with a live preview, then appends the result as a new tile. */
     const origamiState = { id: null, canvas: null };
+    const ORIGAMI_RANGES = [   // [id, formatter]
+        ['at-origami-repeats', v => v], ['at-origami-thick', v => (v / 100).toFixed(2)],
+        ['at-origami-cx', v => v + '%'], ['at-origami-cy', v => v + '%'],
+        ['at-origami-folds', v => v], ['at-origami-seed', v => v], ['at-origami-cells', v => v],
+        ['at-origami-fanfolds', v => v], ['at-origami-start', v => v + '%'],
+        ['at-origami-scale', v => v + '%'], ['at-origami-shade', v => v]
+    ];
     function origamiOpts() {
+        const n = id => parseInt($(id).value, 10);
+        const type = $('at-origami-type').value;
         return {
+            type,
             shape: $('at-origami-shape').value,
             shape2: $('at-origami-shape2').value,
+            size: $('at-origami-size').value,
             axis: $('at-origami-axis').value,
-            repeats: parseInt($('at-origami-repeats').value, 10),
-            gamma: parseInt($('at-origami-thick').value, 10) / 100,
-            cx: parseInt($('at-origami-cx').value, 10) / 100,
-            cy: parseInt($('at-origami-cy').value, 10) / 100
+            repeats: n('at-origami-repeats'),
+            gamma: n('at-origami-thick') / 100,
+            cx: n('at-origami-cx') / 100,
+            cy: n('at-origami-cy') / 100,
+            dir: $('at-origami-dir').value,
+            spacing: $('at-origami-spacing').value,
+            folds: type === 'fan' ? n('at-origami-fanfolds') : n('at-origami-folds'),
+            seed: n('at-origami-seed'),
+            cells: n('at-origami-cells'),
+            start: n('at-origami-start') / 100,
+            scale: n('at-origami-scale') / 100,
+            shade: n('at-origami-shade')
         };
     }
+    /* Show only the rows of the chosen fold type; a fan that cannot repeat says so. */
+    function origamiSyncRows() {
+        const type = $('at-origami-type').value;
+        document.querySelectorAll('#at-modal-origami [data-ofold]').forEach(row => {
+            row.style.display = row.dataset.ofold.split(' ').includes(type) ? '' : 'none';
+        });
+        const o = origamiOpts();
+        const single = type === 'fan' && (o.folds % 2 !== 0 || o.cx !== 0.5 || o.cy !== 0.5);
+        $('at-origami-fan-hint').style.display = single ? '' : 'none';
+        // Ring size only matters for Frame; Texture scale is the Keep size control there
+        $('at-origami-scale-row').style.display =
+            (type !== 'frame' || o.size === 'keep') ? '' : 'none';
+    }
+    /* Preview and commit share one supersample so what you see is what is added; only
+       a very large tile drops the preview to 2x to keep a slider move quick. */
+    const origamiSS = S => S <= 512 ? 4 : 2;
     function origamiPreview() {
+        if (!byId(origamiState.id)) return;
+        origamiSyncRows();
+        origamiDraw();
+    }
+    /* The render alone (no rows re-laid): a hover preview calls this (phase 5). */
+    function origamiDraw() {
         const el = byId(origamiState.id);
         if (!el) return;
         const S = state.tileSize;
-        origamiState.canvas = makeOrigamiFrame(el.canvas, S, { ...origamiOpts(), ss: 2 });
-        const cv = $('at-origami-preview');
+        origamiState.canvas = makeOrigamiFrame(el.canvas, S, { ...origamiOpts(), ss: origamiSS(S) });
+        origamiShow();
+    }
+    function origamiShow() {
+        const S = state.tileSize, cv = $('at-origami-preview');
         cv.width = S; cv.height = S;
         cv.getContext('2d').drawImage(origamiState.canvas, 0, 0);
     }
@@ -19848,11 +26935,13 @@ window.TRLE = window.TRLE || {};
         origamiPreview();
     }
     function setupOrigamiModal() {
-        $('at-origami-shape').addEventListener('change', origamiPreview);
-        $('at-origami-shape2').addEventListener('change', origamiPreview);
-        $('at-origami-axis').addEventListener('change', origamiPreview);
-        for (const [id, fmt] of [['at-origami-repeats', v => v], ['at-origami-thick', v => (v / 100).toFixed(2)],
-                                 ['at-origami-cx', v => v + '%'], ['at-origami-cy', v => v + '%']]) {
+        for (const id of ['at-origami-type', 'at-origami-shape', 'at-origami-shape2', 'at-origami-size',
+                          'at-origami-axis', 'at-origami-dir', 'at-origami-spacing']) {
+            $(id).addEventListener('change', origamiPreview);
+        }
+        for (const [id, title] of [['at-origami-type', 'Fold'], ['at-origami-shape2', 'Morph to'], ['at-origami-dir', 'Fold direction']])
+            attachTilePicker($(id), { text: true, title, ...previewSwap($(id), origamiState, ['canvas'], origamiDraw, origamiShow) });
+        for (const [id, fmt] of ORIGAMI_RANGES) {
             $(id).addEventListener('input', function () {
                 $(id + '-val').textContent = fmt(parseInt(this.value, 10));
                 origamiPreview();
@@ -19861,7 +26950,7 @@ window.TRLE = window.TRLE || {};
         $('at-origami-add').addEventListener('click', () => {
             const el = byId(origamiState.id);
             if (!el || !origamiState.canvas) return;
-            // Commit at 4× supersampling (the preview is 2×) for the kept pixels.
+            // Commit at 4× supersampling (the preview matches it up to 512 px).
             const canvas = makeOrigamiFrame(el.canvas, state.tileSize, { ...origamiOpts(), ss: 4 });
             const tile = {
                 id: state.nextId++, kind: 'tile', canvas, original: cloneCanvas(canvas),
@@ -20551,11 +27640,41 @@ window.TRLE = window.TRLE || {};
     function bpGenerate() {
         const el = byId(buildState.id);
         if (!el) return;
-        const src = el.canvas, S = src.width;
         if (!buildState.canvas) buildState.canvas = document.createElement('canvas');
-        const out = buildState.canvas; out.width = S; out.height = S;
+        bpBuildInto(buildState.canvas, el, null);
+        bpShow(buildState.canvas);
+    }
+    function bpShow(cv) {
+        const pv = $('at-bp-preview');
+        pv.getContext('2d').clearRect(0, 0, pv.width, pv.height);
+        if (cv) pv.getContext('2d').drawImage(cv, 0, 0, pv.width, pv.height);
+    }
+    /* Hover preview (HOVER-PREVIEW-PLAN phase 2): build with `over` ({ p, sn, wx },
+       each laid over what the controls say) into a scratch canvas and show it. It
+       writes no control and NOT buildState.canvas, which Apply clones; the end shows
+       that canvas again. Noise and Weather stay off when their box is off. */
+    let bpPrevCanvas = null;
+    function bpPreview(over) {
+        return {
+            preview(v) {
+                const el = byId(buildState.id);
+                if (!el) return;
+                bpPrevCanvas = bpPrevCanvas || document.createElement('canvas');
+                bpBuildInto(bpPrevCanvas, el, over(v));
+                bpShow(bpPrevCanvas);
+            },
+            previewEnd() { bpShow(buildState.canvas); },
+        };
+    }
+    function bpBuildInto(out, el, over) {
+        const src = el.canvas, S = src.width;
+        out.width = S; out.height = S;
         const ctx = out.getContext('2d');
         const p = bpParams();
+        if (over && over.p) {
+            Object.assign(p, over.p);
+            p.bevel = !['pipes', 'cobble', 'shingles', 'planks'].includes(p.pattern);   // as bpParams derives it
+        }
         // Random-tiles pool = every source tile in the atlas (so each brick can pull a
         // different texture); falls back to the source itself when there's only one.
         p.pool = state.elements.filter(e => e.kind === 'tile' && e.canvas).map(e => e.canvas);
@@ -20607,6 +27726,7 @@ window.TRLE = window.TRLE || {};
         // orientation rotation, so a directional grain follows the pattern (pick
         // Vertical and it runs along the planks whichever way they're laid).
         const sn = bpNoiseParams();
+        if (sn && over && over.sn) Object.assign(sn, over.sn);
         if (sn && sn.scope === 'cells') applySurfaceNoise(cellLayer, S, sn, cellLayer);
         ctx.drawImage(cellLayer, 0, 0);
         if (organic && p.joint > 0) bpJointAO(ctx, cellLayer, S, 0.30);
@@ -20620,9 +27740,9 @@ window.TRLE = window.TRLE || {};
             ctx.clearRect(0, 0, S, S); ctx.drawImage(tmp, 0, 0);
         }
 
-        const pv = $('at-bp-preview');
-        pv.getContext('2d').clearRect(0, 0, pv.width, pv.height);
-        pv.getContext('2d').drawImage(out, 0, 0, pv.width, pv.height);
+        const wx = bpWeatherParams();
+        if (wx && over && over.wx) Object.assign(wx, over.wx);
+        if (wx) bpWeather(out, S, wx);
     }
 
     let bpTimer = null;
@@ -20680,19 +27800,63 @@ window.TRLE = window.TRLE || {};
         };
     }
 
+    /* 🌧️ Weather (WEATHERING-PLAN phase 5). Off → bpWeatherParams() is null and
+       nothing runs, so a build is byte-identical to one made before this
+       existed. Runs on the FINISHED pattern (after surface noise and the
+       orientation turn): Slope Blur with the pattern's own brightness as the
+       slope, then Scatter. Both wrap, and both are seeded off the pattern seed,
+       so the same seed gives the same wall. */
+    function bpWeatherParams() {
+        if (!$('at-bp-wx-on').checked) return null;
+        const slope = $('at-bp-wx-slope').checked, scat = $('at-bp-wx-scat').checked;
+        if (!slope && !scat) return null;
+        return {
+            slope, scat,
+            mode: $('at-bp-wx-smode').value, len: parseInt($('at-bp-wx-len').value, 10), str: parseInt($('at-bp-wx-str').value, 10),
+            from: $('at-bp-wx-from').value, tile: parseInt($('at-bp-wx-tile').value, 10), blend: $('at-bp-wx-blend').value,
+            count: parseInt($('at-bp-wx-count').value, 10), size: parseInt($('at-bp-wx-size').value, 10), op: parseInt($('at-bp-wx-op').value, 10),
+            seed: (buildState.seed ^ 0x7a31c5d3) >>> 0
+        };
+    }
+    function bpWeather(out, S, wx) {
+        let cur = out;
+        if (wx.slope && wx.len > 0 && wx.str > 0) {
+            cur = slopeBlurCanvas(cur, sbGrey(cur, S), {
+                amount: wx.len / 100 * S, smooth: 0.012 * S, samples: 24, mode: wx.mode, dir: 1,
+                follow: false, gain: 20, strength: wx.str / 100, edge: 'wrap'
+            });
+        }
+        if (wx.scat && wx.count > 0 && wx.op > 0) {
+            const t = wx.from === 'tile' ? byId(wx.tile) : null;
+            cur = scatterCanvas(cur, (t && t.canvas) || cur, {
+                count: wx.count, size: wx.size, sizeVar: 50, rot: 180, soft: 60, rough: 40,
+                opacity: wx.op, blend: wx.blend, seed: wx.seed, wrap: true
+            });
+        }
+        if (cur !== out) { const c = out.getContext('2d'); c.clearRect(0, 0, S, S); c.drawImage(cur, 0, 0); }
+    }
+    function bpSyncWeatherControls() {
+        const on = $('at-bp-wx-on').checked;
+        $('at-bp-wx-body').style.display = on ? '' : 'none';
+        $('at-bp-wx-tilewrap').style.display = $('at-bp-wx-from').value === 'tile' ? '' : 'none';
+        const parts = [$('at-bp-wx-slope').checked && 'slope blur', $('at-bp-wx-scat').checked && 'scatter'].filter(Boolean);
+        $('at-bp-wx-state').textContent = on && parts.length ? ': ' + parts.join(' + ') : ', off';
+    }
+
     const bpSetSlider = (id, v) => { $(id).value = v; const l = $(id + '-val'); if (l) l.textContent = v; };
 
     /* Load a preset's recipe into the controls, picking the strength band that
        matches whether this tile will also carry material maps. */
     function bpApplyNoisePreset(key) {
-        const p = NOISE_PRESETS[key];
-        if (!p) return;
-        $('at-bp-sn-type').value = p.type;
-        $('at-bp-sn-blend').value = p.blend;
-        $('at-bp-sn-dir').value = p.dir || 'v';
-        bpSetSlider('at-bp-sn-scale', p.scale);
-        bpSetSlider('at-bp-sn-contrast', p.contrast);
-        bpSetSlider('at-bp-sn-strength', noiseDefaultStrength(key, $('at-bp-assign').checked));
+        const v = noisePresetParams(key, $('at-bp-assign').checked);
+        if (!v) return;
+        $('at-bp-sn-type').value = v.type;
+        $('at-bp-sn-blend').value = v.blend;
+        $('at-bp-sn-dir').value = v.dir;
+        bpSetSlider('at-bp-sn-scale', v.scale);
+        bpSetSlider('at-bp-sn-contrast', v.contrast);
+        bpSetSlider('at-bp-sn-strength', v.strength);
+        tilePickerSync($('at-bp-sn-type')); tilePickerSync($('at-bp-sn-blend'));   // a bare .value fires no event
     }
 
     function bpSyncNoiseControls() {
@@ -20717,7 +27881,7 @@ window.TRLE = window.TRLE || {};
         for (const [id, v] of [['at-bp-mh', d.mh], ['at-bp-ms', d.ms], ['at-bp-ml', d.ml], ['at-bp-noise', d.noise]]) {
             $(id).value = v; $(id + '-val').textContent = v;
         }
-        $('at-bp-noisetype').value = d.noisetype;
+        $('at-bp-noisetype').value = d.noisetype; tilePickerSync($('at-bp-noisetype'));
     }
 
     /* Fill the backing-tile picker from the current atlas. Rebuilt on every open
@@ -20741,13 +27905,23 @@ window.TRLE = window.TRLE || {};
         sel.value = keep ? prev : String(selfId);
     }
 
+    function bpPopulateWeatherTiles(selfId) {
+        const sel = $('at-bp-wx-tile'), prev = sel.value, num = tileNumbers();
+        sel.innerHTML = state.elements.filter(e => e.kind === 'tile' && e.canvas)
+            .map(e => `<option value="${e.id}">Tile ${num.get(e.id)}${e.id === selfId ? ' (this one)' : ''}</option>`).join('');
+        sel.value = [...sel.options].some(o => o.value === prev) ? prev : String(selfId);
+        tilePickerSync(sel);
+    }
+
     function openBuildModal(id) {
         buildState.id = id;
         $('at-bp-tileno').textContent = numberOf(id);
         bpPopulateBackings(id);
+        bpPopulateWeatherTiles(id);
         openModal('build');
         bpSyncControls();
         bpSyncNoiseControls();
+        bpSyncWeatherControls();
         bpGenerate();
     }
 
@@ -20808,7 +27982,7 @@ window.TRLE = window.TRLE || {};
             if (w != null) { $('at-bp-warp').value = w; $('at-bp-warp-val').textContent = w; }
             // Suggest a matching noise recipe, but never switch the feature on.
             const np = BP_NOISE_PRESET[this.value];
-            if (np) { $('at-bp-sn-preset').value = np; bpApplyNoisePreset(np); }
+            if (np) { $('at-bp-sn-preset').value = np; tilePickerSync($('at-bp-sn-preset')); bpApplyNoisePreset(np); }
             bpSyncControls();
             bpSyncNoiseControls();
             bpGenerate();
@@ -20819,9 +27993,31 @@ window.TRLE = window.TRLE || {};
             bpGenerate();
         });
         $('at-bp-bg').addEventListener('change', bpGenerate);
+        [['at-bp-wx-len', 'at-bp-wx-len-val'], ['at-bp-wx-str', 'at-bp-wx-str-val'], ['at-bp-wx-count', 'at-bp-wx-count-val'],
+         ['at-bp-wx-size', 'at-bp-wx-size-val'], ['at-bp-wx-op', 'at-bp-wx-op-val']].forEach(([rid, lid]) => {
+            $(rid).addEventListener('input', function () { $(lid).textContent = this.value; bpScheduleRegen(); });
+        });
+        ['at-bp-wx-on', 'at-bp-wx-slope', 'at-bp-wx-scat', 'at-bp-wx-smode', 'at-bp-wx-from', 'at-bp-wx-tile', 'at-bp-wx-blend']
+            .forEach(id => $(id).addEventListener('change', () => { bpSyncWeatherControls(); bpGenerate(); }));
+        attachTilePicker($('at-bp-wx-tile'), { title: 'Patch tile' });
         attachTilePicker($('at-bp-bg'), { title: 'Backing tile' });
         $('at-bp-fill').addEventListener('change', bpGenerate);
         $('at-bp-noisetype').addEventListener('change', bpGenerate);
+        /* Hover previews (HOVER-PREVIEW-PLAN phase 2). A pattern loads its own Edge
+           irregularity and suggests a noise recipe on commit; its preview renders
+           exactly that, without loading either. */
+        const bpSnOver = key => noisePresetParams(key, $('at-bp-assign').checked);
+        attachTilePicker($('at-bp-pattern'), { text: true, title: 'Pattern', ...bpPreview(pat => {
+            const w = BP_WARP_DEF[pat];
+            const np = BP_NOISE_PRESET[pat];
+            return { p: { pattern: pat, warp: (w != null ? w : parseInt($('at-bp-warp').value)) / 100 },
+                     sn: np ? bpSnOver(np) : null };
+        }) });
+        attachTilePicker($('at-bp-noisetype'), { text: true, title: 'Mortar noise', ...bpPreview(t => ({ p: { noiseType: t } })) });
+        attachTilePicker($('at-bp-sn-preset'), { text: true, title: 'Noise preset', ...bpPreview(k => ({ sn: bpSnOver(k) })) });
+        attachTilePicker($('at-bp-sn-type'), { text: true, title: 'Noise type', ...bpPreview(t => ({ sn: { type: t } })) });
+        attachTilePicker($('at-bp-sn-blend'), { text: true, title: 'Noise blend', ...bpPreview(b => ({ sn: { blend: b } })) });
+        attachTilePicker($('at-bp-wx-blend'), { text: true, title: 'Scatter blend', ...bpPreview(b => ({ wx: { blend: b } })) });
         $('at-bp-orient').addEventListener('change', bpGenerate);
         // Seed the mortar HSL sliders from the source texture's average colour (darkened a touch).
         $('at-bp-sample').addEventListener('click', e => {
@@ -21265,6 +28461,9 @@ window.TRLE = window.TRLE || {};
         mctx.putImageData(md, 0, 0);
         ectx.putImageData(em, 0, 0);
 
+        sgShow();
+    }
+    function sgShow() {
         const pv = $('at-sg-preview');
         pv.getContext('2d').clearRect(0, 0, pv.width, pv.height);
         pv.getContext('2d').drawImage(sgState.canvas, 0, 0, pv.width, pv.height);
@@ -21292,13 +28491,13 @@ window.TRLE = window.TRLE || {};
     }
 
     function sgLoadParams(sp) {
-        $('at-sg-pattern').value = sp.pattern;
+        $('at-sg-pattern').value = sp.pattern; tilePickerSync($('at-sg-pattern'));
         for (const [id, v] of [['at-sg-cells', sp.cells], ['at-sg-jitter', sp.jitter], ['at-sg-lead', sp.lead],
                                ['at-sg-mottle', sp.mottle], ['at-sg-detail', sp.detail], ['at-sg-emissive', sp.emissive]]) {
             $(id).value = v; $(id + '-val').textContent = v;
         }
-        $('at-sg-leadtint').value = sp.leadtint;
-        $('at-sg-colorsrc').value = sp.colorsrc;
+        $('at-sg-leadtint').value = sp.leadtint; tilePickerSync($('at-sg-leadtint'));
+        $('at-sg-colorsrc').value = sp.colorsrc; tilePickerSync($('at-sg-colorsrc'));
         $('at-sg-frame').checked = !!sp.frame;
         sgState.seed = (sp.seed || 1) >>> 0;
         $('at-sg-seed').value = sgState.seed;
@@ -21336,6 +28535,10 @@ window.TRLE = window.TRLE || {};
             $(id).addEventListener('input', function () { $(id + '-val').textContent = this.value; sgScheduleRegen(); });
         }
         $('at-sg-pattern').addEventListener('change', () => { sgSyncControls(); sgRender(); });
+        /* Hover previews (HOVER-PREVIEW-PLAN phase 5): render with the value borrowed, swapping
+           the canvases Add bakes for the hover's own, and put them back; rows are not re-laid. */
+        for (const [id, title] of [['at-sg-pattern', 'Pattern'], ['at-sg-leadtint', 'Lead'], ['at-sg-colorsrc', 'Glass colour']])
+            attachTilePicker($(id), { text: true, title, ...previewSwap($(id), sgState, ['canvas', 'leadMask', 'emissiveCv'], sgRender, sgShow) });
         $('at-sg-colorsrc').addEventListener('change', () => { sgSyncControls(); sgRender(); });
         $('at-sg-leadtint').addEventListener('change', sgRender);
         $('at-sg-frame').addEventListener('change', sgRender);
@@ -21348,7 +28551,7 @@ window.TRLE = window.TRLE || {};
             $('at-sg-seed').value = sgState.seed;
             sgRender();
         });
-        $('at-sg-add').addEventListener('click', () => {
+        $('at-sg-add').addEventListener('click', async () => {
             if (sgState.id === null || !sgState.canvas) return;
             const p = sgParams();
             const srcEl = byId(sgState.id);
@@ -21366,12 +28569,15 @@ window.TRLE = window.TRLE || {};
                 if (!el) return;
                 el.canvas = cloneCanvas(sgState.canvas);
                 el.original = cloneCanvas(sgState.canvas);
-                el.seamless = sgSeamless(p, srcEl);
+                rebaseLayers(el, true);   // regenerated pixels are the new bottom of any layers it carries
+                setBaseSeamless(el, sgSeamless(p, srcEl));
                 el.matLayers = matLayers;
                 el.emissive = emissive;
                 el.sgParams = sp;
                 if (emissive) enableEmissiveExport();
-                closeModal(); renderGrid();
+                closeModal();
+                await layersSettle([el]);
+                renderGrid();
                 pushHistory('Edit stained glass');
                 showToast('Stained glass updated', 'success');
                 return;
@@ -21410,8 +28616,12 @@ window.TRLE = window.TRLE || {};
     function elementEmits(el) {
         if (el.emissive) return true;
         if (el.importedMaps && el.importedMaps.emissive) return true;
-        if (el.kind === 'transition') return false;   // inherits — counted on base/overlay
-        const mats = hasMatLayers(el) ? el.matLayers.map(L => L.material) : [el.material];
+        if (layerGlows(el)) return true;              // a text, drawing or sticker layer that glows in game
+        // A text, drawing or sticker layer's own material is a region too (an emitting preset on lettering).
+        const own = mapParts(el).filter(t => t.material).map(t => { const [type, key] = t.material.split(':'); return { type, key, aesthetic: 'realistic' }; });
+        if (el.kind === 'transition') return own.some(m => (presetFromMaterial(m).emissiveStrength || 0) > 0);   // the rest inherits: counted on base / overlay
+        const regs = hasMatLayers(el) ? el.matLayers : null;
+        const mats = (regs ? regs.map(L => L.material) : [el.material]).concat(own);
         return mats.some(m => (presetFromMaterial(m).emissiveStrength || 0) > 0);
     }
 
@@ -21440,7 +28650,8 @@ window.TRLE = window.TRLE || {};
        autosave snapshot. That is a real cost for a feature you normally set once.
        `el.original` is deliberately left alone so Reset to Original still undoes
        it long after the undo stack has rolled past. */
-    const noiseState = { id: null, seed: 1, canvas: null, batchIds: [] };
+    const noiseState = { id: null, seed: 1, canvas: null, batchIds: [], inputs: null, edit: null };
+    const SN_IDS = ['at-sn-preset', 'at-sn-type', 'at-sn-strength', 'at-sn-scale', 'at-sn-contrast', 'at-sn-dir', 'at-sn-blend', 'at-sn-seed'];
 
     function snParams() {
         return {
@@ -21463,15 +28674,24 @@ window.TRLE = window.TRLE || {};
         return !!(el && (el.material || hasMatLayers(el)));
     }
 
-    function snApplyPreset(key) {
+    /* What a noise preset puts in the controls, as params. Both loaders use it, and
+       so do the hover previews, which render it without loading it. */
+    function noisePresetParams(key, hasMaterial) {
         const p = NOISE_PRESETS[key];
-        if (!p) return;
-        $('at-sn-type').value = p.type;
-        $('at-sn-blend').value = p.blend;
-        $('at-sn-dir').value = p.dir || 'v';
-        snSetSlider('at-sn-scale', p.scale);
-        snSetSlider('at-sn-contrast', p.contrast);
-        snSetSlider('at-sn-strength', noiseDefaultStrength(key, snHasMaterial()));
+        if (!p) return null;
+        return { type: p.type, blend: p.blend, dir: p.dir || 'v', scale: p.scale, contrast: p.contrast,
+                 strength: noiseDefaultStrength(key, hasMaterial) };
+    }
+    function snApplyPreset(key) {
+        const v = noisePresetParams(key, snHasMaterial());
+        if (!v) return;
+        $('at-sn-type').value = v.type;
+        $('at-sn-blend').value = v.blend;
+        $('at-sn-dir').value = v.dir;
+        snSetSlider('at-sn-scale', v.scale);
+        snSetSlider('at-sn-contrast', v.contrast);
+        snSetSlider('at-sn-strength', v.strength);
+        tilePickerSync($('at-sn-type')); tilePickerSync($('at-sn-blend'));   // a bare .value fires no event
     }
 
     function snSyncControls() {
@@ -21479,22 +28699,50 @@ window.TRLE = window.TRLE || {};
         $('at-sn-advice').innerHTML = noiseAdvice(snHasMaterial(), $('at-sn-preset').value);
     }
 
+    function snShow(cv) {
+        const pv = $('at-sn-preview');
+        pv.getContext('2d').clearRect(0, 0, pv.width, pv.height);
+        if (cv) pv.getContext('2d').drawImage(cv, 0, 0, pv.width, pv.height);
+    }
     function snRender() {
         const el = byId(noiseState.id);
         if (!el || !el.canvas) return;
-        const out = cloneCanvas(el.canvas);
+        const out = cloneCanvas(xin(noiseState.inputs, el));
         applySurfaceNoise(out, out.width, snParams(), null);
         noiseState.canvas = out;
-        const pv = $('at-sn-preview');
-        pv.getContext('2d').clearRect(0, 0, pv.width, pv.height);
-        pv.getContext('2d').drawImage(out, 0, 0, pv.width, pv.height);
+        snShow(out);
         snSyncControls();
+    }
+    /* Hover preview (HOVER-PREVIEW-PLAN phase 2): the controls' params with `over`
+       laid on top, drawn to the preview only. It writes no control and NOT
+       noiseState.canvas, which Apply bakes; the end just shows that canvas again. */
+    function snPreview(over) {
+        return {
+            preview(v) {
+                const el = byId(noiseState.id);
+                if (!el || !el.canvas) return;
+                const out = cloneCanvas(xin(noiseState.inputs, el));
+                applySurfaceNoise(out, out.width, Object.assign(snParams(), over(v)), null);
+                snShow(out);
+            },
+            previewEnd() { snShow(noiseState.canvas); },
+        };
     }
 
     let snTimer = null;
     function snScheduleRegen() { clearTimeout(snTimer); snTimer = setTimeout(snRender, 80); }
 
-    function openNoiseModal(ids) {
+    /* Surface Noise as a layer (LAYERS-PLAN phase 7): any number of them, in the Texture zone. The kind is the
+       noise laid over the composite below it; the recipe is the params (type, strength, scale, contrast,
+       direction, blend, seed), which fully determine the field, so every tile of a batch shares one definition. */
+    TRLE.Layers.register('noise', { zone: 'texture', mode: 'adjust', cost: (def, S) => (['pits', 'cracks'].includes(def.recipe.params.type) ? 60 : 25) * (S / 1024) ** 2,
+        apply: (input, def) => { const out = cloneCanvas(input); applySurfaceNoise(out, out.width, def.recipe.params, null); return out; },
+        edit: (el, def) => {
+            const ids = TRLE.Layers.tilesOf(def.lid, state.elements).map(e => e.id);
+            ids.sort((a, b) => (a === el.id ? -1 : b === el.id ? 1 : 0));
+            openNoiseModal(ids, { def });
+        } });
+    function openNoiseModal(ids, editing) {
         const list = Array.isArray(ids) ? ids : [ids];
         const id = list[0];
         const el = byId(id);
@@ -21509,20 +28757,32 @@ window.TRLE = window.TRLE || {};
         }
         noiseState.id = id;
         noiseState.canvas = null;
+        noiseState.edit = editing ? { lid: editing.def.lid } : null;
         // A square-tile refusal is per tile, so filter rather than bail: the rest
         // of the selection is still perfectly noisable.
         noiseState.batchIds = list.filter(i => {
             const e = byId(i);
             return e && e.canvas && e.canvas.width === e.canvas.height;
         });
+        // A new noise layer goes on top of the texture layers; an edited one is shown what is below IT.
+        noiseState.inputs = new Map();
+        noiseState.batchIds.forEach(i => {
+            const t = byId(i);
+            noiseState.inputs.set(i, !hasLayers(t) ? t.canvas
+                : editing ? TRLE.Layers.inputOf(t, state.layerDefs, editing.def.lid)
+                : TRLE.Layers.inputFor(t, state.layerDefs, { kind: 'noise', zone: 'texture' }));
+        });
         $('at-sn-tileno').textContent = numberOf(id);
         setBatchNote('at-modal-noise', noiseState.batchIds.length, numberOf(id));
         $('at-sn-newtile').checked = false;
+        $('at-sn-newtile').disabled = !!editing;   // an edit changes its layer; a new tile is a different action
+        setEditNote('at-modal-noise', editing ? '✏️ Editing this Surface Noise layer: Apply replaces it.' : '');
         const bf = $('at-sn-before');
         bf.getContext('2d').clearRect(0, 0, bf.width, bf.height);
-        bf.getContext('2d').drawImage(el.canvas, 0, 0, bf.width, bf.height);
+        bf.getContext('2d').drawImage(xin(noiseState.inputs, el), 0, 0, bf.width, bf.height);
         openModal('noise');
-        snApplyPreset($('at-sn-preset').value);
+        if (editing) { ctlRestore(editing.def.recipe.controls); noiseState.seed = editing.def.recipe.params.seed >>> 0; }
+        else snApplyPreset($('at-sn-preset').value);
         snRender();
     }
 
@@ -21542,6 +28802,9 @@ window.TRLE = window.TRLE || {};
         ps.addEventListener('change', function () { snApplyPreset(this.value); snRender(); });
         ['at-sn-type', 'at-sn-dir', 'at-sn-blend'].forEach(id =>
             $(id).addEventListener('change', snRender));
+        attachTilePicker(ps, { text: true, title: 'Preset', ...snPreview(k => noisePresetParams(k, snHasMaterial())) });
+        attachTilePicker(ts, { text: true, title: 'Type', ...snPreview(t => ({ type: t })) });
+        attachTilePicker($('at-sn-blend'), { text: true, title: 'Blend', ...snPreview(b => ({ blend: b })) });
         $('at-sn-seed').addEventListener('input', function () {
             noiseState.seed = (parseInt(this.value, 10) || 1) >>> 0;
             snScheduleRegen();
@@ -21556,23 +28819,14 @@ window.TRLE = window.TRLE || {};
             if (!base || !noiseState.canvas) return;
             const targets = noiseState.batchIds.map(byId).filter(e => e && e.kind === 'tile');
             if (!targets.length) return;
-            const p = snParams();
-            // The noise FIELD is a function of the params + seed alone, so every
-            // tile gets the same grain — but it has to be laid into each tile's
-            // own pixels. The base tile reuses the preview canvas so a single
-            // target stays byte-identical to what was on screen.
-            const noised = el => {
-                if (el.id === base.id) return cloneCanvas(noiseState.canvas);
-                const out = cloneCanvas(el.canvas);
-                applySurfaceNoise(out, out.width, p, null);
-                return out;
-            };
-            const n = targets.length;
+            const p = snParams(), n = targets.length;
             if ($('at-sn-newtile').checked) {
+                // A copy of what the tile shows now with the grain over it: a new tile has no stack.
                 // Insert each copy straight after its source, back to front, so
                 // the earlier splices don't shift the indices still to come.
                 [...targets].reverse().forEach(el => {
-                    const gen = noised(el);
+                    const gen = cloneCanvas(el.canvas);
+                    applySurfaceNoise(gen, gen.width, p, null);
                     const tile = {
                         id: state.nextId++, kind: 'tile',
                         canvas: gen, original: cloneCanvas(gen),
@@ -21589,14 +28843,48 @@ window.TRLE = window.TRLE || {};
                 showToast(n > 1 ? `Added ${n} noised copies` : 'Added a noised copy', 'success');
                 return;
             }
-            targets.forEach(el => {
-                el.canvas = noised(el);
-                el.edited = true;          // `original` untouched → Reset still works
-            });
-            closeModal(); renderGrid();
-            pushHistory(n > 1 ? `Surface noise: ${n} tiles` : 'Surface noise');
-            showToast(n > 1 ? `Surface noise applied to ${n} tiles` : 'Surface noise applied', 'success');
+            const recipe = { params: p, controls: ctlSnap(SN_IDS) }, editing = noiseState.edit, L = TRLE.Layers;
+            closeModal();
+            (async () => {
+                if (editing && state.layerDefs[editing.lid]) {
+                    // Edit in place: a new definition (never mutated); the pieces stay where they are.
+                    L.update(state.layerDefs, editing.lid, { recipe });
+                    await layersCommit(L.tilesOf(editing.lid, state.elements), 'Edit surface noise');
+                } else {
+                    L.add(state.layerDefs, targets, { kind: 'noise', name: 'Surface Noise', recipe });
+                    refreshTransitions();
+                    await layersCommit(targets, n > 1 ? `Surface noise: ${n} tiles` : 'Surface noise');
+                }
+                showToast(n > 1 ? `Surface noise applied to ${n} tiles` : 'Surface noise applied', 'success');
+            })();
         });
+    }
+
+    /* STICKERS-PLAN P5: a transition or animation frame takes its maps from its parents, not from its picture, so a
+       sticker on one would be invisible in them. Under the stickers' coverage (each at its opacity), the maps are
+       generated from the COMPOSED picture as a plain tile would be: the base's material (a border-set slot's source
+       tile, an animation's own), each preset sticker's region, raise and engrave. A sticker with its own maps is left
+       to the patches. The stand-in carries the stickers but none of their glow or own maps (those come after). */
+    function stickerLayIn(el, result, enabledMaps, cache) {
+        const T = mapParts(el).filter(t => t.kind === 'sticker' && !t.own);
+        if (!T.length) return;
+        const S = el.canvas.width;
+        const from = el.kind === 'anim' ? el : el.bset && el.bset.slotMode === 'tile' && byId(el.bset.srcId) ? byId(el.bset.srcId) : byId(el.base);
+        const stand = { id: '__stk' + el.id, kind: 'tile', canvas: el.canvas, under: el.under, layers: el.layers,
+                        material: from ? deepCopyMaterial(from.material) : null, _noLayerGlow: true, _noLivePatches: true };
+        const own = deriveMaps(stand, enabledMaps, cache);
+        const cov = document.createElement('canvas'); cov.width = cov.height = S;
+        const cg = cov.getContext('2d');
+        for (const t of T) { cg.globalAlpha = t.op; cg.drawImage(t.crop, 0, 0, S, S); }
+        for (const mt of TRLE.MapOrder) {
+            if (!enabledMaps[mt] || !own[mt] || !result[mt]) continue;
+            if (mt === 'emissive' && el.emissive) continue;   // a baked or authored glow wins, as everywhere (a frame's is darkened under its stickers)
+            const patch = cloneCanvas(own[mt]), pg = patch.getContext('2d');
+            pg.globalCompositeOperation = 'destination-in'; pg.drawImage(cov, 0, 0);
+            const c = cloneCanvas(result[mt]);
+            c.getContext('2d').drawImage(patch, 0, 0);
+            result[mt] = c;
+        }
     }
 
     /* ============ MATERIAL MAP DERIVATION ============
@@ -21606,7 +28894,7 @@ window.TRLE = window.TRLE || {};
     function deriveMaps(el, enabledMaps, cache) {
         if (cache[el.id]) return cache[el.id];
         const S = state.tileSize;
-        let result = {};
+        let result = {}, regs = null;
 
         if (el.kind === 'transition' && el.push) {
             /* Generated from the marked diffuse, never composited from the parents:
@@ -21620,35 +28908,38 @@ window.TRLE = window.TRLE || {};
             }
         } else if (el.kind === 'transition' && el.bset) {
             const b = el.bset;
-            if (b.slotMode === 'tile' && byId(b.srcId)) {
+            if (b.slotMode === 'tile' && byId(b.srcId) && !derivedLayered(el)) {
                 // Authored slot — its maps ARE the source tile's maps.
                 result = deriveMaps(byId(b.srcId), enabledMaps, cache);
                 cache[el.id] = result;
                 return result;
             }
-            const base    = deriveMaps(byId(el.base), enabledMaps, cache);
-            const overlay = deriveMaps(byId(el.overlay), enabledMaps, cache);
-            // The trim region is identical however the diffuse was derived
-            // (rot/mirror land the trim in the same place), so the union mask
-            // of the slot's own role/bits composites the material maps.
-            //
-            // That still holds with an organic contour, but only because
-            // renderBsetVariant pre-composes the displacement field with the
-            // rot/mirror transform: a rotated slot then matches the mask its OWN
-            // role builds, which is the one used here. Build it untransformed —
-            // this is already the final role.
-            const w = Math.max(2, Math.round(b.width * S));
-            const f = Math.max(1, b.soft * w);
-            const mask = bsetUnionMask(S, b.topo, b.topo === 'lines' ? b.bits : b.role, w, f,
-                                       bsetOrgFields(S, w, b.org), null, false);
-            for (const mt of TRLE.MapOrder) {
-                if (enabledMaps[mt] && base[mt] && overlay[mt]) {
-                    result[mt] = compositeTransition(base[mt], overlay[mt], mask, S);
-                    // Same reasoning as the transition branch: contact occlusion
-                    // belongs in AO for a PBR/TEN export, or the map generator
-                    // reads the darkened diffuse back out as relief.
-                    if (mt === 'ao' && b.org && b.org.shadow > 0 && shadowHitsAO(b.org))
-                        applyContactShadowAO(result[mt], mask, S, b.org.shadow, shadowOpts(b.org));
+            if (b.slotMode === 'tile' && byId(b.srcId)) result = Object.assign({}, deriveMaps(byId(b.srcId), enabledMaps, cache));   // stickered: a copy, laid over below
+            else {
+                const base    = deriveMaps(byId(el.base), enabledMaps, cache);
+                const overlay = deriveMaps(byId(el.overlay), enabledMaps, cache);
+                // The trim region is identical however the diffuse was derived
+                // (rot/mirror land the trim in the same place), so the union mask
+                // of the slot's own role/bits composites the material maps.
+                //
+                // That still holds with an organic contour, but only because
+                // renderBsetVariant pre-composes the displacement field with the
+                // rot/mirror transform: a rotated slot then matches the mask its OWN
+                // role builds, which is the one used here. Build it untransformed —
+                // this is already the final role.
+                const w = Math.max(2, Math.round(b.width * S));
+                const f = Math.max(1, b.soft * w);
+                const mask = bsetUnionMask(S, b.topo, b.topo === 'lines' ? b.bits : b.role, w, f,
+                                           bsetOrgFields(S, w, b.org), null, false);
+                for (const mt of TRLE.MapOrder) {
+                    if (enabledMaps[mt] && base[mt] && overlay[mt]) {
+                        result[mt] = compositeTransition(base[mt], overlay[mt], mask, S);
+                        // Same reasoning as the transition branch: contact occlusion
+                        // belongs in AO for a PBR/TEN export, or the map generator
+                        // reads the darkened diffuse back out as relief.
+                        if (mt === 'ao' && b.org && b.org.shadow > 0 && shadowHitsAO(b.org))
+                            applyContactShadowAO(result[mt], mask, S, b.org.shadow, shadowOpts(b.org));
+                    }
                 }
             }
         } else if (el.kind === 'transition' && el.ovParams) {
@@ -21673,11 +28964,7 @@ window.TRLE = window.TRLE || {};
         } else if (el.kind === 'transition') {
             const base    = deriveMaps(byId(el.base), enabledMaps, cache);
             const overlay = deriveMaps(byId(el.overlay), enabledMaps, cache);
-            const mask    = el.customMask
-                ? softenMask(el.customMask, S)
-                : el.wangBits != null
-                    ? buildWangMask(S, el.wangBits, el.pivot, el.hardness, el.organic)
-                    : buildTopologyMask(S, el.mode, el.pivot, el.hardness, el.organic);
+            const mask    = transitionMaskOf(el, S);
             for (const mt of TRLE.MapOrder) {
                 if (enabledMaps[mt] && base[mt] && overlay[mt]) {
                     let om = overlay[mt];
@@ -21693,8 +28980,8 @@ window.TRLE = window.TRLE || {};
                         applyContactShadowAO(result[mt], mask, S, el.organic.shadow, shadowOpts(el.organic));
                 }
             }
-        } else if (hasMatLayers(el)) {
-            result = composeLayerMaps(el.canvas, el.matLayers, enabledMaps, S);
+        } else if ((regs = effectiveMatLayers(el))) {
+            result = composeLayerMaps(mapSourceOf(el), regs, enabledMaps, S, textReliefExtra(el, mapSourceOf(el)));
             if (enabledMaps.emissive && el.emissive) result.emissive = cloneCanvas(el.emissive);
         } else {
             /* An overlaid animation generates its maps from the RAW frame, not
@@ -21711,9 +28998,9 @@ window.TRLE = window.TRLE || {};
                which contradicts the rule the UI states: the maps follow where the
                texture SHOWS, not how it is blended. */
             const mapSrc = (el.kind === 'anim' && el.anim && el.anim.overlay && el.animRaw)
-                ? el.animRaw : el.canvas;
+                ? el.animRaw : mapSourceOf(el);
             const tex  = TRLE.Engine.createTextureFromImage(mapSrc);
-            const preset = Object.assign({}, resolvePreset(el), Object.assign({ flipNormalY: state.flipNormalY, alphaFlatten: canvasHasAlpha(mapSrc) }, heightPresetOverrides(el)));
+            const preset = Object.assign({}, resolvePreset(el), Object.assign({ flipNormalY: state.flipNormalY, alphaFlatten: canvasHasAlpha(mapSrc) }, heightPresetOverrides(el)), textReliefExtra(el, mapSrc));
             const maps = TRLE.Engine.generateMaps(tex, S, S, preset, enabledMaps);
             for (const mt of TRLE.MapOrder) {
                 if (maps[mt]) {
@@ -21765,6 +29052,9 @@ window.TRLE = window.TRLE || {};
                     applyContactShadowAO(result.ao, mask, S, sh.shadow, shadowOpts(sh));
             }
         }
+        if (derivedLayered(el)) stickerLayIn(el, result, enabledMaps, cache);
+        withMapPatches(el, result, enabledMaps);   // a sticker's own maps, live or flattened (STICKERS-PLAN D7, P2)
+        if (enabledMaps.emissive && (el.kind === 'tile' || derivedLayered(el)) && layerGlowOf(el)) result.emissive = withLayerGlow(el, result.emissive || null);
         // Maps that came in from a PSD's layers beat anything we'd generate:
         // the user edited them in Photoshop on purpose. Same precedence rule as
         // authored emissive above, just applied to every map type.
@@ -22176,6 +29466,134 @@ window.TRLE = window.TRLE || {};
         if (quipEl) quipEl.classList.remove('show');
     }
 
+    /* The one list of files an atlas export is made of, shared by the ZIP and the
+       folder route (FOLDER-SYNC-PLAN phase 1). Returns [{ name, blob, role }] in the
+       order the ZIP has always had: diffuse, maps, manifest, project. `role` lets the
+       folder route reorder (project first, maps before the diffuse, D4) without a second
+       copy of this logic. The caller resolves empty slots first (emptiesPending).
+       opts: enabledMaps, prefix ('' or 'Textures/'), fmt ('png'|'tga'|'psd'), useMagenta,
+       baseName, project (add the .atlasproj.json), projectStream (the folder route: the project as a
+       streamed entry { write(w) } instead of a Blob), progress(0..80), yieldNow(). */
+    async function buildExportFiles(opts) {
+        const { enabledMaps, prefix, fmt, useMagenta, baseName, project, projectStream, progress } = opts;
+        const yieldNow = opts.yieldNow || (() => new Promise(r => setTimeout(r, 0)));
+        const yieldEvery = opts.yieldEvery || 2;
+        const S = state.tileSize;
+        const cols = state.cols;
+        syncLayout();
+        const rows = state.rows;
+        const cache = {};
+
+        // Per-element maps
+        for (let i = 0; i < state.elements.length; i++) {
+            deriveMaps(state.elements[i], enabledMaps, cache);
+            if (progress) progress((i + 1) / state.elements.length * 80);
+            if (i % yieldEvery === 0) await yieldNow();
+        }
+
+        // Assemble atlases
+        const files = [];
+        const add = (name, blob, role) => files.push({ name, blob, role });
+        const buildAtlas = (getTile) => stitchAtlas(getTile);
+
+        // Diffuse atlas — optional magenta color-key for transparent pixels.
+        let diffuse = buildAtlas(el => el.canvas);
+        if (useMagenta) diffuse = magentaKey(diffuse);
+
+        if (fmt === 'psd') {
+            // One layered PSD: diffuse + each enabled map as its own layer.
+            // Layer names match TRLE.MapOrder exactly — that is the contract
+            // readPSDAsset relies on to give the maps back on re-import.
+            const layers = [{ name: 'diffuse', canvas: diffuse }];
+            for (const mt of TRLE.MapOrder) {
+                if (!enabledMaps[mt]) continue;
+                layers.push({ name: mt, canvas: buildAtlas(el => cache[el.id][mt]) });
+            }
+            add(`${prefix}${baseName}.psd`, await TRLE.PSD.write({
+                width: cols * S, height: rows * S, composite: diffuse, layers
+            }), 'diffuse');
+        } else {
+            const ext = fmt === 'tga' ? 'tga' : 'png';
+            const encode = (canvas) => fmt === 'tga'
+                ? Promise.resolve(TRLE.Engine.encodeTGA(canvas))
+                : TRLE.Engine.canvasToBlob(canvas);
+            add(`${prefix}${baseName}.${ext}`, await encode(diffuse), 'diffuse');
+            for (const mt of TRLE.MapOrder) {
+                if (!enabledMaps[mt]) continue;
+                add(`${prefix}${baseName}${TRLE.MapSuffixes[mt]}.${ext}`, await encode(buildAtlas(el => cache[el.id][mt])), 'map');
+            }
+        }
+
+        // Manifest for reproducibility
+        const num = tileNumbers();
+        const manifest = layoutCells().map(({ el, n, col, row }) => ({
+            index: n,
+            id: el.id, row, col,
+            kind: el.kind,
+            seamless: el.seamless,
+            material: el.kind === 'transition' ? 'inherited' : materialLabel(el),
+            ...(el.kind === 'transition' ? {
+                base: num.get(el.base) || 0,
+                overlay: num.get(el.overlay) || 0,
+                mode: el.mode, pivot: el.pivot, hardness: el.hardness
+            } : {}),
+            ...(el.kind === 'anim' ? {
+                animation: {
+                    group: el.anim.group, frame: el.anim.index + 1, frames: el.anim.total,
+                    preset: el.anim.preset, gradient: el.anim.gradient || 'custom', fps: el.anim.fps,
+                    type: el.anim.single ? 'uv-rotate' : 'animated-range'
+                }
+            } : {})
+        }));
+
+        // Per-group animation summary with 1-based tile ranges + setup hints
+        // for Tomb Editor (consecutive frames = an animated range that loops).
+        const groups = {};
+        layoutCells().forEach(({ el, n }) => {
+            if (el.kind !== 'anim' || !el.anim) return;
+            (groups[el.anim.group] = groups[el.anim.group] ||
+                { preset: el.anim.preset, gradient: el.anim.gradient || 'custom', single: el.anim.single, fps: el.anim.fps, indices: [] }).indices.push(n);
+        });
+        const animations = Object.entries(groups).map(([group, g]) => {
+            const idx = g.indices.sort((a, b) => a - b);
+            const n = idx.length, fps = g.fps || 12;
+            /* Repeat is the one lever that slows an animation for nothing.
+               Verified against TombLib rather than assumed: AddTexture skips
+               the GetTexInfo dedupe for animated frames, then
+               TryToAddToExisting hits ParentTextureArea.IsPotentialParent,
+               whose first test is _area.Contains(rect) with inclusive <= / >=
+               over an area the first copy rounded OUTWARD. An identical
+               repeated frame is therefore always contained, so it attaches as
+               a CHILD and shares the parent's pixels. It costs one of the
+               engine's 256 frame slots and one TexInfo, and no atlas space. */
+            const rpt = Math.floor(256 / Math.max(1, n));
+            return {
+                group, preset: g.preset, gradient: g.gradient, fps,
+                type: g.single ? 'uv-rotate' : 'animated-range',
+                frames: g.single ? 1 : n,
+                tiles: g.single ? `${idx[0]}` : `${idx[0]}-${idx[idx.length - 1]}`,
+                ...(g.single ? {} : { secondsPerLoop: +(n / fps).toFixed(2) }),
+                note: g.single
+                    ? 'Single seamless tile, set UV-Rotate on this texture in Tomb Editor.'
+                    : `Select these consecutive tiles as an animated texture range; frames loop seamlessly (last → first). `
+                      + `At ${fps} fps the loop lasts ${(n / fps).toFixed(2)} s.`
+                      + (rpt > 1
+                          ? ` To slow it down without adding tiles, set Repeat on every frame: Repeat N holds each frame N ticks `
+                            + `and costs no extra atlas space, only frame slots. Tomb Engine allows 256 frames per sequence including `
+                            + `repeats, so this sequence can take Repeat up to ${rpt}.`
+                          : ' This sequence already fills Tomb Engine\'s 256 frame slots, so Repeat is not available on it.')
+            };
+        });
+
+        add(`${prefix}manifest.json`, new Blob([JSON.stringify({
+            tileSize: S, cols, rows, elements: manifest,
+            ...(animations.length ? { animations } : {})
+        }, null, 2)]), 'manifest');
+        if (projectStream && state.elements.length) files.push({ name: `${prefix}${baseName}.atlasproj.json`, write: streamProjectJSON, role: 'project' });
+        else if (project && state.elements.length) add(`${prefix}${baseName}.atlasproj.json`, new Blob([JSON.stringify(await buildProjectJSON())]), 'project');
+        return files;
+    }
+
     async function exportAtlas() {
         if (!state.elements.length) { showToast('Slice an atlas first!', 'error'); return; }
         if (emptiesPending(exportAtlas)) return;
@@ -22194,122 +29612,15 @@ window.TRLE = window.TRLE || {};
         startExportAnim();
 
         try {
-            const S = state.tileSize;
-            const cols = state.cols;
-            syncLayout();
-            const rows = state.rows;
-            const cache = {};
-
-            // Per-element maps
-            for (let i = 0; i < state.elements.length; i++) {
-                deriveMaps(state.elements[i], enabledMaps, cache);
-                fill.style.width = ((i + 1) / state.elements.length * 80) + '%';
-                if (i % 2 === 0) await new Promise(r => setTimeout(r, 0));
-            }
-
-            // Assemble atlases
-            const zip = new JSZip();
-            const buildAtlas = (getTile) => stitchAtlas(getTile);
-
-            // Optional TombEngine layout nests everything under Textures/.
-            const prefix = $('at-export-layout').value === 'ten' ? 'Textures/' : '';
-            const fmt = $('at-export-format').value;   // 'png' | 'tga' | 'psd'
-            const useMagenta = $('at-export-magenta').checked;
             const baseName = exportBaseName();
-
-            // Diffuse atlas — optional magenta color-key for transparent pixels.
-            let diffuse = buildAtlas(el => el.canvas);
-            if (useMagenta) diffuse = magentaKey(diffuse);
-
-            if (fmt === 'psd') {
-                // One layered PSD: diffuse + each enabled map as its own layer.
-                // Layer names match TRLE.MapOrder exactly — that is the contract
-                // readPSDAsset relies on to give the maps back on re-import.
-                const layers = [{ name: 'diffuse', canvas: diffuse }];
-                for (const mt of TRLE.MapOrder) {
-                    if (!enabledMaps[mt]) continue;
-                    layers.push({ name: mt, canvas: buildAtlas(el => cache[el.id][mt]) });
-                }
-                zip.file(`${prefix}${baseName}.psd`, await TRLE.PSD.write({
-                    width: cols * S, height: rows * S, composite: diffuse, layers
-                }));
-            } else {
-                const ext = fmt === 'tga' ? 'tga' : 'png';
-                const encode = (canvas) => fmt === 'tga'
-                    ? Promise.resolve(TRLE.Engine.encodeTGA(canvas))
-                    : TRLE.Engine.canvasToBlob(canvas);
-                zip.file(`${prefix}${baseName}.${ext}`, await encode(diffuse));
-                for (const mt of TRLE.MapOrder) {
-                    if (!enabledMaps[mt]) continue;
-                    zip.file(`${prefix}${baseName}${TRLE.MapSuffixes[mt]}.${ext}`, await encode(buildAtlas(el => cache[el.id][mt])));
-                }
-            }
-
-            // Manifest for reproducibility
-            const num = tileNumbers();
-            const manifest = layoutCells().map(({ el, n }) => ({
-                index: n,
-                kind: el.kind,
-                seamless: el.seamless,
-                material: el.kind === 'transition' ? 'inherited' : materialLabel(el),
-                ...(el.kind === 'transition' ? {
-                    base: num.get(el.base) || 0,
-                    overlay: num.get(el.overlay) || 0,
-                    mode: el.mode, pivot: el.pivot, hardness: el.hardness
-                } : {}),
-                ...(el.kind === 'anim' ? {
-                    animation: {
-                        group: el.anim.group, frame: el.anim.index + 1, frames: el.anim.total,
-                        preset: el.anim.preset, gradient: el.anim.gradient || 'custom', fps: el.anim.fps,
-                        type: el.anim.single ? 'uv-rotate' : 'animated-range'
-                    }
-                } : {})
-            }));
-
-            // Per-group animation summary with 1-based tile ranges + setup hints
-            // for Tomb Editor (consecutive frames = an animated range that loops).
-            const groups = {};
-            layoutCells().forEach(({ el, n }) => {
-                if (el.kind !== 'anim' || !el.anim) return;
-                (groups[el.anim.group] = groups[el.anim.group] ||
-                    { preset: el.anim.preset, gradient: el.anim.gradient || 'custom', single: el.anim.single, fps: el.anim.fps, indices: [] }).indices.push(n);
+            const files = await buildExportFiles({
+                enabledMaps, prefix: $('at-export-layout').value === 'ten' ? 'Textures/' : '',
+                fmt: $('at-export-format').value, useMagenta: $('at-export-magenta').checked,
+                baseName, project: !!$('at-export-project')?.checked,
+                progress: pct => { fill.style.width = pct + '%'; }
             });
-            const animations = Object.entries(groups).map(([group, g]) => {
-                const idx = g.indices.sort((a, b) => a - b);
-                const n = idx.length, fps = g.fps || 12;
-                /* Repeat is the one lever that slows an animation for nothing.
-                   Verified against TombLib rather than assumed: AddTexture skips
-                   the GetTexInfo dedupe for animated frames, then
-                   TryToAddToExisting hits ParentTextureArea.IsPotentialParent,
-                   whose first test is _area.Contains(rect) with inclusive <= / >=
-                   over an area the first copy rounded OUTWARD. An identical
-                   repeated frame is therefore always contained, so it attaches as
-                   a CHILD and shares the parent's pixels. It costs one of the
-                   engine's 256 frame slots and one TexInfo, and no atlas space. */
-                const rpt = Math.floor(256 / Math.max(1, n));
-                return {
-                    group, preset: g.preset, gradient: g.gradient, fps,
-                    type: g.single ? 'uv-rotate' : 'animated-range',
-                    frames: g.single ? 1 : n,
-                    tiles: g.single ? `${idx[0]}` : `${idx[0]}-${idx[idx.length - 1]}`,
-                    ...(g.single ? {} : { secondsPerLoop: +(n / fps).toFixed(2) }),
-                    note: g.single
-                        ? 'Single seamless tile, set UV-Rotate on this texture in Tomb Editor.'
-                        : `Select these consecutive tiles as an animated texture range; frames loop seamlessly (last → first). `
-                          + `At ${fps} fps the loop lasts ${(n / fps).toFixed(2)} s.`
-                          + (rpt > 1
-                              ? ` To slow it down without adding tiles, set Repeat on every frame: Repeat N holds each frame N ticks `
-                                + `and costs no extra atlas space, only frame slots. Tomb Engine allows 256 frames per sequence including `
-                                + `repeats, so this sequence can take Repeat up to ${rpt}.`
-                              : ' This sequence already fills Tomb Engine\'s 256 frame slots, so Repeat is not available on it.')
-                };
-            });
-
-            zip.file(`${prefix}manifest.json`, JSON.stringify({
-                tileSize: S, cols, rows, elements: manifest,
-                ...(animations.length ? { animations } : {})
-            }, null, 2));
-            await addProjectToZip(zip, prefix, baseName);
+            const zip = new JSZip();
+            for (const f of files) zip.file(f.name, f.blob);
 
             fill.style.width = '95%';
             const content = await zip.generateAsync({ type: 'blob' });
@@ -22323,6 +29634,346 @@ window.TRLE = window.TRLE || {};
         } finally {
             setBusy(btn, false);
             setTimeout(() => { progress.classList.remove('active'); stopExportAnim(); }, 600);
+        }
+    }
+
+    /* ============ WORK IN A FOLDER (FOLDER-SYNC-PLAN) ============
+       An option beside the ZIP, never instead of it. The user links a working folder once
+       (any folder: a TombIDE project's, or one of their own), and the tool writes the atlas
+       and its maps straight into it, flat (D5). The file-system half, and the scheduler that
+       decides WHEN an automatic batch runs, are TRLE.FolderSync. Nothing asks the browser
+       for permission until the user clicks Link working folder or Reconnect. */
+    const folder = { link: null, busy: false, pickerHook: null, perm: 'granted', pause: null, failed: false, syncedAt: 0 };
+    const FOLDER_UNSUPPORTED = 'This browser cannot write to a folder you pick. Chrome, Edge and Opera can, Brave has it behind a flag, and Firefox does not support it yet. Use Export Atlas (ZIP) instead.';
+    const FOLDER_PSD = 'A folder needs the maps as separate files, and a PSD is one layered file. Pick PNG or TGA to write to a folder.';
+    const folderSync = TRLE.FolderSync.createScheduler({
+        idleMs: 1500, gapMs: 10000,
+        run: () => folderAutoRun(),
+        onIdle: () => folderRender()
+    });
+
+    function folderSupported() { return !!folder.pickerHook || TRLE.FolderSync.supported(); }
+    /* Why the folder route cannot run right now, or null. */
+    function folderBlocked() {
+        if (DEMO_MODE) return 'The demo course never writes to a folder.';
+        if (!folderSupported()) return FOLDER_UNSUPPORTED;
+        if ($('at-export-format').value === 'psd') return FOLDER_PSD;
+        if (!state.elements.length) return 'Slice an atlas first.';
+        return null;
+    }
+    /* Why an AUTOMATIC batch must wait (D8). It never asks and never touches the grid, so
+       anything that would need a dialog or a change to the layout pauses it instead; a click
+       on Overwrite resolves it the normal way. */
+    function folderPauseReason() {
+        const L = folder.link;
+        const blocked = folderBlocked();
+        if (blocked) return blocked;
+        if (folder.perm !== 'granted') return 'the browser has not given this page access to the folder yet. Click Reconnect';
+        if (holeSlots().length) return 'there are empty slots between your textures. Click Overwrite to choose what goes there';
+        const baseName = exportBaseName(), ext = $('at-export-format').value === 'tga' ? 'tga' : 'png';
+        if (L && (L.baseName !== baseName || L.ext !== ext)) return `the file name changed from ${L.baseName}.${L.ext} to ${baseName}.${ext}. Click Overwrite to choose`;
+        return null;
+    }
+    /* A confirm as a promise: true on OK, false on Cancel, Esc or the corner X. */
+    function folderAsk(title, msg, okLabel) {
+        return new Promise(res => openConfirm(title, msg, okLabel, () => res(true), { danger: false, onNo: () => res(false) }));
+    }
+
+    function folderRender() {
+        const box = $('at-folder');
+        if (!box) return;
+        const L = folder.link, supported = folderSupported();
+        const psd = $('at-export-format').value === 'psd';
+        const link = $('at-folder-link'), over = $('at-folder-overwrite'), unlink = $('at-folder-unlink'), status = $('at-folder-status');
+        const reconnect = $('at-folder-reconnect'), autoRow = $('at-folder-auto-row');
+        const mark = (btn, why) => {
+            btn.classList.toggle('at-unavailable', !!why);
+            if (why) btn.setAttribute('aria-disabled', 'true'); else btn.removeAttribute('aria-disabled');
+            if (why) btn.title = why; else btn.removeAttribute('title');
+        };
+        link.style.display = L ? 'none' : '';
+        over.style.display = unlink.style.display = autoRow.style.display = L ? '' : 'none';
+        reconnect.style.display = L && folder.perm !== 'granted' ? '' : 'none';
+        mark(link, supported ? null : FOLDER_UNSUPPORTED);
+        mark(over, !supported ? FOLDER_UNSUPPORTED : psd ? FOLDER_PSD : null);
+        $('at-folder-auto').checked = !!(L && L.auto);
+        if (L) {
+            const time = ts => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            let line = `📁 ${L.handle.name} · ${L.names.length} files · written ${time(L.writtenAt)} · files are named ${L.baseName}`;
+            if (L.auto) {
+                const why = folder.pause || (folder.perm !== 'granted' ? folderPauseReason() : null);
+                line += folderSync.running ? ' · syncing…'
+                    : folder.failed ? ' · last sync failed, will retry on the next change'
+                    : why ? ` · auto-sync paused: ${why}`
+                    : ' · auto-sync on';
+            }
+            status.style.display = '';
+            status.textContent = line;
+            const x = $('at-folder-xml');
+            x.style.display = L.xml ? '' : 'none';
+            x.textContent = L.xml ? `${L.baseName}.xml in this folder wins over the sidecar maps in Tomb Editor: it lists its own map paths, so ours are ignored until you remove it. The tool never touches it.` : '';
+        } else {
+            status.style.display = 'none';
+            $('at-folder-xml').style.display = 'none';
+        }
+    }
+
+    /* Build the list the folder gets: the ZIP's own list, flat, PNG or TGA, in D4's order.
+       An automatic batch yields on a MessageChannel, every tile (D12). */
+    async function folderBuild(fill, auto) {
+        const enabledMaps = {};
+        document.querySelectorAll('#at-map-checks input[data-map]').forEach(cb => { enabledMaps[cb.dataset.map] = cb.checked; });
+        return TRLE.FolderSync.ordered(await buildExportFiles({
+            enabledMaps, prefix: '', fmt: $('at-export-format').value,
+            useMagenta: $('at-export-magenta').checked, baseName: exportBaseName(),
+            projectStream: true,   // the folder holds the project (D4): written first, every batch, one tile at a time
+            progress: pct => { if (fill) fill.style.width = pct + '%'; },
+            yieldNow: folder.yieldHook || TRLE.FolderSync.yieldNow, yieldEvery: auto ? 1 : 2
+        }));
+    }
+
+    function folderRecord(dir, baseName, ext, written, xml, since) {
+        const auto = !!(folder.link && folder.link.auto);
+        folder.link = { handle: dir, baseName, ext, writtenAt: Date.now(), names: written, xml, auto };
+        if (since != null) folderSync.wrote(since);   // not for a scheduled batch: the scheduler owns its own dirty flag
+        folderPersist();
+    }
+    function folderPersist() {
+        if (TRLE.Store && TRLE.Store.available() && folder.link) TRLE.Store.saveFolder(folder.link).catch(() => {});
+    }
+
+    /* One write into `dir`. mode: 'link' (a fresh link: D7, list what it replaces and ask),
+       'manual' (Overwrite) or 'auto' (a scheduled batch: never asks, no spinner, no toast on
+       success). Resolves true when the files are on disk. */
+    async function folderWrite(dir, mode) {
+        if (folder.busy) return false;
+        folder.busy = true;
+        const auto = mode === 'auto';
+        const since = auto ? null : folderSync.stamp();
+        const btn = mode === 'link' ? $('at-folder-link') : $('at-folder-overwrite');
+        const progress = $('at-progress'), fill = $('at-progress-fill');
+        if (!auto) {
+            setBusy(btn, true, 'Writing…');
+            progress.classList.add('active'); fill.style.width = '0%';
+        }
+        let ok = false;
+        try {
+            const files = await folderBuild(auto ? null : fill, auto);
+            const names = files.map(f => f.name);
+            const baseName = exportBaseName(), ext = $('at-export-format').value === 'tga' ? 'tga' : 'png';
+            const L = folder.link;
+            const renamed = !auto && mode !== 'link' && L && (L.baseName !== baseName || L.ext !== ext);
+            const clash = mode === 'link' || renamed ? await TRLE.FolderSync.existing(dir, names) : [];
+            if (clash.length || renamed) {
+                let msg = '';
+                if (renamed) msg += `This folder is linked as "${L.baseName}". Writing as "${baseName}" creates new files, and Tomb Editor keeps pointing at ${L.baseName}.${L.ext}.\n\n`;
+                msg += clash.length
+                    ? `Writing replaces ${clash.length} file${clash.length === 1 ? '' : 's'} already in "${dir.name}":\n${clash.join(', ')}`
+                    : `Writing adds ${names.length} new files to "${dir.name}".`;
+                if (!await folderAsk(mode === 'link' ? 'Link this folder?' : 'Write under a new name?', msg, mode === 'link' ? 'Link and write' : 'Write as new')) return false;
+            }
+            if (!auto) fill.style.width = '85%';
+            const written = await TRLE.FolderSync.writeAll(dir, files);
+            const xml = await TRLE.FolderSync.exists(dir, `${baseName}.xml`).catch(() => false);
+            folderRecord(dir, baseName, ext, written, xml, since);
+            folder.syncedAt = Date.now();
+            folder.failed = false;
+            if (!auto) {
+                fill.style.width = '100%';
+                showToast(`Wrote ${written.length} files to ${dir.name} 📁`, 'success');
+            }
+            ok = true;
+        } catch (err) {
+            console.error(err);
+            const wasFailing = folder.failed;
+            folder.failed = true;
+            if (!auto || !wasFailing) {   // an automatic batch says so once, not on every retry
+                showToast(err && err.name === 'NotAllowedError' ? 'The browser did not allow writing to that folder' : 'Writing to the folder failed, see console for details', 'error');
+            }
+        } finally {
+            folder.busy = false;
+            if (!auto) {
+                setBusy(btn, false);
+                setTimeout(() => progress.classList.remove('active'), 600);
+            }
+            folderRender();
+        }
+        return ok;
+    }
+
+    /* The scheduler's batch. Returns true when it wrote, false when it paused or failed. */
+    async function folderAutoRun() {
+        const L = folder.link;
+        if (!L || !L.auto) return true;                 // switched off meanwhile: nothing owed
+        if (folder.busy) return false;
+        // Re-read the permission without asking. A revoked grant pauses; it never prompts.
+        folder.perm = await TRLE.FolderSync.permission(L.handle, false).catch(() => 'denied');
+        folder.pause = folderPauseReason();
+        if (folder.pause) { folderRender(); return false; }
+        folderRender();
+        const ok = await folderWrite(L.handle, 'auto');
+        folderRender();
+        return ok;
+    }
+
+    async function folderLinkClick() {
+        const why = folderBlocked();
+        if (why) { showToast(why, 'info'); return; }
+        // Holes are asked about on a click, never on a timer (D8); the answer's click re-runs this.
+        if (emptiesPending(folderLinkClick)) return;
+        const dir = await folderPick();
+        if (dir) await folderWrite(dir, 'link');
+    }
+
+    /* The native picker (or a validator's stand-in). null on cancel. */
+    async function folderPick() {
+        try {
+            const dir = folder.pickerHook ? await folder.pickerHook() : await window.showDirectoryPicker({ id: 'trle-working-folder', mode: 'readwrite' });
+            if (dir) folder.perm = 'granted';
+            return dir || null;
+        } catch (e) {
+            if (e && e.name !== 'AbortError') showToast('Could not open that folder', 'error');
+            return null;
+        }
+    }
+
+    /* Start screen: Open project folder (C). Pick the working folder, read its project, load
+       it and link the folder, so the next sync lands where the project came from. */
+    let folderPickResolve = null;
+    function folderChoose(items) {
+        if (folderPickResolve) folderPickResolve(null);
+        const list = $('at-folderpick-list');
+        list.textContent = '';
+        return new Promise(res => {
+            folderPickResolve = res;
+            items.forEach(it => {
+                const b = document.createElement('button');
+                b.className = 'btn btn-secondary';
+                b.dataset.name = it.name;
+                const strong = document.createElement('strong'); strong.textContent = it.name;
+                const span = document.createElement('span');
+                span.textContent = `${new Date(it.modified).toLocaleString()} · ${fmtBytes(it.size)}`;
+                b.append(strong, span);
+                b.addEventListener('click', () => { folderPickResolve = null; closeModal(); res(it); });
+                list.appendChild(b);
+            });
+            openModal('folderpick');
+        });
+    }
+
+    async function folderOpenProject() {
+        if (DEMO_MODE) return;
+        if (!folderSupported()) { showToast(FOLDER_UNSUPPORTED, 'info'); return; }
+        const dir = await folderPick();
+        if (!dir) return;
+        const found = [];
+        try {
+            for await (const [name, h] of dir.entries()) {
+                if (h.kind !== 'file' || !/\.atlasproj\.json$/i.test(name)) continue;
+                const f = await h.getFile();
+                found.push({ name, handle: h, size: f.size, modified: f.lastModified });
+            }
+        } catch (e) { showToast('Could not read that folder', 'error'); return; }
+        if (!found.length) { showToast(`No .atlasproj.json in “${dir.name}”. Use Link working folder on an atlas to start one there.`, 'info'); return; }
+        found.sort((a, b) => b.modified - a.modified);
+        const pick = found.length === 1 ? found[0] : await folderChoose(found);
+        if (!pick) return;
+        const open = async () => {
+            let proj;
+            try { proj = JSON.parse(await (await pick.handle.getFile()).text()); }
+            catch { showToast('Could not read that project file', 'error'); return; }
+            if (!await applyProject(proj)) return;
+            const baseName = pick.name.replace(/\.atlasproj\.json$/i, '');
+            const tga = !await TRLE.FolderSync.exists(dir, `${baseName}.png`) && await TRLE.FolderSync.exists(dir, `${baseName}.tga`);
+            const ext = tga ? 'tga' : 'png';
+            $('at-export-name').value = baseName;
+            $('at-export-format').value = ext;
+            const wanted = [`${baseName}.atlasproj.json`, 'manifest.json', `${baseName}.${ext}`, ...TRLE.MapOrder.map(mt => `${baseName}${TRLE.MapSuffixes[mt]}.${ext}`)];
+            const names = await TRLE.FolderSync.existing(dir, wanted);
+            const xml = await TRLE.FolderSync.exists(dir, `${baseName}.xml`).catch(() => false);
+            folderSync.cancel();
+            folder.link = { handle: dir, baseName, ext, writtenAt: pick.modified, names, xml, auto: false };
+            folder.pause = null; folder.failed = false;
+            folderPersist();
+            folderRender();
+            showToast(`Opened “${baseName}” from ${dir.name}, and linked the folder 📁`, 'success');
+        };
+        if (state.dirty && state.elements.length) {
+            openConfirm('📁 Open project folder', 'You have unsaved changes. Opening replaces everything in the workbench, save the current project first if you want to keep it.', '📁 Open anyway', open, { danger: true });
+        } else await open();
+    }
+
+    /* Reconnect: the one place a stored handle's permission is requested, from a click. */
+    async function folderReconnectClick() {
+        const L = folder.link;
+        if (!L) return;
+        folder.perm = await TRLE.FolderSync.permission(L.handle, true).catch(() => 'denied');
+        folder.pause = null;
+        folderRender();
+        if (folder.perm === 'granted') { if (L.auto && folderSync.dirty) folderSync.leave(); }
+        else showToast('The browser did not allow writing to that folder. Link it again to continue.', 'error');
+    }
+
+    async function folderOverwriteClick() {
+        const L = folder.link;
+        if (!L) return;
+        const why = folderBlocked();
+        if (why) { showToast(why, 'info'); return; }
+        // The permission prompt belongs to this click (CLAUDE.md "Persistence").
+        folder.perm = await TRLE.FolderSync.permission(L.handle, true).catch(() => 'denied');
+        if (folder.perm !== 'granted') { folderRender(); showToast('The browser did not allow writing to that folder. Link it again to continue.', 'error'); return; }
+        if (emptiesPending(folderOverwriteClick)) return;
+        folder.pause = null;
+        await folderWrite(L.handle, 'manual');
+    }
+
+    /* The two triggers (D11), wired once. Edits come from scheduleAutosave, which every
+       history step already calls. */
+    function folderEdited() {
+        if (folder.link && folder.link.auto && !DEMO_MODE) folderSync.edit();
+    }
+    function folderLeft() {
+        if (folder.link && folder.link.auto && !DEMO_MODE) folderSync.leave();
+    }
+
+    function setupFolderSync() {
+        const box = $('at-folder');
+        if (!box) return;
+        const openBtn = $('at-open-project-folder');
+        if (DEMO_MODE) { box.style.display = 'none'; if (openBtn) openBtn.style.display = 'none'; return; }
+        if (openBtn) {
+            openBtn.addEventListener('click', folderOpenProject);
+            if (!folderSupported()) { openBtn.classList.add('at-unavailable'); openBtn.setAttribute('aria-disabled', 'true'); openBtn.title = FOLDER_UNSUPPORTED; }
+        }
+        $('at-folder-link').addEventListener('click', folderLinkClick);
+        $('at-folder-overwrite').addEventListener('click', folderOverwriteClick);
+        $('at-folder-reconnect').addEventListener('click', folderReconnectClick);
+        $('at-folder-unlink').addEventListener('click', () => {
+            folderSync.cancel();
+            folder.link = null; folder.pause = null; folder.failed = false; folder.perm = 'granted';
+            if (TRLE.Store && TRLE.Store.available()) TRLE.Store.clearFolder().catch(() => {});
+            folderRender();
+        });
+        $('at-folder-auto').addEventListener('change', e => {
+            if (!folder.link) return;
+            folder.link.auto = e.target.checked;
+            if (!folder.link.auto) folderSync.cancel();
+            folder.pause = null;
+            folderPersist();
+            folderRender();
+        });
+        $('at-export-format').addEventListener('change', folderRender);
+        window.addEventListener('blur', folderLeft);
+        document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') folderLeft(); });
+        folderRender();
+        if (folderSupported() && TRLE.Store && TRLE.Store.available()) {
+            TRLE.Store.loadFolder().then(async rec => {
+                if (!rec || !rec.handle || folder.link) return;
+                folder.link = rec;
+                // Quietly: query only. 'granted' resumes as if nothing happened; anything else shows Reconnect.
+                folder.perm = await TRLE.FolderSync.permission(rec.handle, false).catch(() => 'denied');
+                folderRender();
+            }).catch(() => {});
         }
     }
 
@@ -22386,7 +30037,8 @@ window.TRLE = window.TRLE || {};
             }
             zip.file(`${prefix}manifest.json`, JSON.stringify({
                 tileSize: state.tileSize, cols, rows: state.rows,
-                count: state.elements.length, naming: 'tile_r{row}_c{col}', format: fmt
+                count: state.elements.length, naming: 'tile_r{row}_c{col}', format: fmt,
+                tiles: cells.map(({ el, col, row }) => ({ id: el.id, row, col, file: `tile_r${row}_c${col}` }))
             }, null, 2));
             await addProjectToZip(zip, prefix, exportBaseName());
             const content = await zip.generateAsync({ type: 'blob' });
@@ -22462,79 +30114,237 @@ window.TRLE = window.TRLE || {};
        (saved files — JSON-safe strings, unchanged format) or canvasToBlob (the
        IndexedDB autosave, which stores Blobs directly and so skips base64
        entirely along with the multi-MB JSON.stringify that goes with it). */
-    async function buildProjectData(png) {
-        const elements = [];
-        for (const el of state.elements) {
-            const e = {
-                id: el.id, kind: el.kind,
-                seamless: !!el.seamless, edited: !!el.edited,
-                material: el.material || null,
-                base: el.base ?? null, overlay: el.overlay ?? null,
-                mode: el.mode ?? null, pivot: el.pivot ?? null, hardness: el.hardness ?? null,
-                blendMethod: el.blendMethod ?? null, wangBits: el.wangBits ?? null
-            };
-            if (el.bset) e.bset = el.bset;   // border-set recipe (re-rendered on load)
-            if (el.push) e.push = el.push;   // pushable-marking recipe (re-rendered on load)
-            // Its hand strokes' pixels: what is shown, whatever TRLE.Stroke.VERSION reads them later.
-            if (el.pushHandPx) e.pushHand = await png(el.pushHandPx);
-            if (el.organic) e.organic = el.organic;   // organic-edge recipe (re-rendered on load)
-            if (el.block) e.block = el.block;         // grid-block membership (shape on resize)
-            if (el.group) e.group = el.group;         // user group (phase 8): moves as one piece
-            if (el.spacer) e.spacer = true;           // auto-padding filler, strippable on reflow
-            if (el.kind === 'tile') {
-                e.original = await png(el.original);
-                if (el.seamless || el.edited) e.canvas = await png(el.canvas);
-            }
-            if (el.customMask) e.customMask = await png(el.customMask);
-            if (el.overlayGeom) e.overlayGeom = el.overlayGeom;
-            // Anim emissive is re-derived from el.anim.glow on load — don't bloat
-            // the file with per-frame PNGs; authored (non-anim) emissive is saved.
-            if (el.emissive && el.kind !== 'anim') e.emissive = await png(el.emissive);
-            // PSD-sourced maps are hand-authored pixels — they cannot be
-            // re-derived from a preset, so they have to be stored.
-            if (el.importedMaps) {
-                e.importedMaps = {};
-                for (const mt of TRLE.MapOrder) {
-                    if (el.importedMaps[mt]) e.importedMaps[mt] = await png(el.importedMaps[mt]);
-                }
-            }
-            if (hasMatLayers(el)) {
-                e.matLayers = [];
-                for (const L of el.matLayers) e.matLayers.push({
-                    name: L.name, color: L.color, feather: L.feather || 0,
-                    material: L.material || null,
-                    mask: L.mask ? await png(L.mask) : null
-                });
-            }
-            // Animations store only params — frames are regenerated on load.
-            if (el.anim) e.anim = el.anim;
-            if (el.hgParams) {
-                // Height-map recipe (re-editable). The paint mask is the only pixels,
-                // and only when a region was actually painted.
-                e.hgParams = Object.assign({}, el.hgParams);
-                e.hgParams.mask = el.hgParams.mask ? await png(el.hgParams.mask) : null;
-            }
-            if (el.htParams) e.htParams = el.htParams;   // height-transition recipe (re-editable)
-            if (el.ovParams) e.ovParams = el.ovParams;   // overlay recipe (re-editable)
-            if (el.sgParams) e.sgParams = el.sgParams;   // stained-glass recipe (re-editable)
-            elements.push(e);
+    /* The pixel encoder buildProjectData and the streamed folder write share. */
+    function projectPng(png0) {
+        // Immutable canvases (a layer stack's pixels) are encoded once per canvas:
+        // a Blob is cached against the canvas object, so an unchanged project's next
+        // autosave encodes none of them again. Data-URL strings are not cached.
+        return c => {
+            if (!c || !c.__immutable) return png0(c);
+            const hit = blobCache.get(c);
+            if (hit && hit.enc === png0) return hit.v;
+            const v = png0(c);
+            if (png0 === snapshotEncoder) blobCache.set(c, { enc: png0, v });
+            return v;
+        };
+    }
+
+    /* One element's project record. Split out of buildProjectData so the folder route can
+       write the project one tile at a time instead of holding every data URL at once. */
+    async function projectElement(el, png) {
+        const e = {
+            id: el.id, kind: el.kind,
+            seamless: !!el.seamless, edited: !!el.edited,
+            material: el.material || null,
+            base: el.base ?? null, overlay: el.overlay ?? null,
+            mode: el.mode ?? null, pivot: el.pivot ?? null, hardness: el.hardness ?? null,
+            blendMethod: el.blendMethod ?? null, wangBits: el.wangBits ?? null
+        };
+        if (el.bset) e.bset = el.bset;   // border-set recipe (re-rendered on load)
+        if (el.push) e.push = el.push;   // pushable-marking recipe (re-rendered on load)
+        // Its hand strokes' pixels: what is shown, whatever TRLE.Stroke.VERSION reads them later.
+        if (el.pushHandPx) e.pushHand = await png(el.pushHandPx);
+        if (el.organic) e.organic = el.organic;   // organic-edge recipe (re-rendered on load)
+        if (el.patch) e.patch = el.patch;         // organic patches (ORGANIC-SETS-PLAN), re-rendered on load
+        if (el.patchHint) e.patchHint = await png(el.patchHint);
+        if (el.block) e.block = el.block;         // grid-block membership (shape on resize)
+        if (el.group) e.group = el.group;         // user group (phase 8): moves as one piece
+        if (el.spacer) e.spacer = true;           // auto-padding filler, strippable on reflow
+        if (el.kind === 'tile') {
+            e.original = await png(el.original);
+            if (el.seamless || el.edited || hasLayers(el)) e.canvas = await png(el.canvas);
         }
+        // Layers (LAYERS-PLAN D3): the bottom and each piece's pixels. The composite
+        // above stays in `canvas`, so a build that ignores these keys shows the right pixels.
+        if (hasLayers(el)) {
+            // A transition's or animation frame's bottom is its recipe's render, made again on load (STICKERS-PLAN D9).
+            if (el.kind === 'tile') e.under = await png(immutable(el.under));
+            e.layers = [];
+            for (const p of el.layers) {
+                const q = { lid: p.lid };
+                if (p.mask) q.mask = await png(immutable(p.mask));
+                if (p.px) q.px = await png(immutable(p.px));
+                if (p.aux) { q.aux = {}; for (const k of Object.keys(p.aux)) q.aux[k] = await png(immutable(p.aux[k])); }
+                if (p.data != null) q.data = p.data;
+                if (p.xf != null) q.xf = p.xf;
+                if (p.xfLost) q.xfLost = true;
+                e.layers.push(q);
+            }
+        }
+        if (el.customMask) e.customMask = await png(el.customMask);
+        if (el.overlayGeom) e.overlayGeom = el.overlayGeom;
+        // Anim emissive is re-derived from el.anim.glow on load — don't bloat
+        // the file with per-frame PNGs; authored (non-anim) emissive is saved.
+        if (el.emissive && el.kind !== 'anim') e.emissive = await png(el.emissive);
+        // PSD-sourced maps are hand-authored pixels — they cannot be
+        // re-derived from a preset, so they have to be stored.
+        if (el.importedMaps) {
+            e.importedMaps = {};
+            for (const mt of TRLE.MapOrder) {
+                if (el.importedMaps[mt]) e.importedMaps[mt] = await png(el.importedMaps[mt]);
+            }
+        }
+        // Classic Look's "maps from the original": the pre-filter diffuse. Absent
+        // means maps come from the tile itself, as they always did.
+        if (el.mapSource) e.mapSource = await png(el.mapSource);
+        // 🔤 Text's relief (TEXT-PLAN D5). Absent: no lettering relief, as before.
+        if (el.textRelief) {
+            const r = el.textRelief;
+            e.textRelief = { floors: r.floors };
+            for (const k of ['up', 'down', 'hole']) if (r[k]) e.textRelief[k] = await png(r[k]);
+        }
+        if (el.mapPatches) {   // flattened stickers' own maps (STICKERS-PLAN P2 a); an optional key
+            e.mapPatches = {};
+            for (const mt of TRLE.MapOrder) if (el.mapPatches[mt]) e.mapPatches[mt] = await png(el.mapPatches[mt]);
+        }
+        if (hasMatLayers(el)) {
+            e.matLayers = [];
+            for (const L of el.matLayers) e.matLayers.push({
+                name: L.name, color: L.color, feather: L.feather || 0,
+                material: L.material || null,
+                mask: L.mask ? await png(L.mask) : null
+            });
+        }
+        // Animations store only params — frames are regenerated on load.
+        if (el.anim) e.anim = el.anim;
+        if (el.hgParams) {
+            // Height-map recipe (re-editable). The paint mask is the only pixels,
+            // and only when a region was actually painted.
+            e.hgParams = Object.assign({}, el.hgParams);
+            e.hgParams.mask = el.hgParams.mask ? await png(el.hgParams.mask) : null;
+        }
+        if (el.htParams) e.htParams = el.htParams;   // height-transition recipe (re-editable)
+        if (el.ovParams) e.ovParams = el.ovParams;   // overlay recipe (re-editable)
+        if (el.sgParams) e.sgParams = el.sgParams;   // stained-glass recipe (re-editable)
+        return e;
+    }
+
+    /* Definitions only for lids a tile still uses; null with no layers. */
+    async function projectLayerDefs(png) {
+        const used = new Set();
+        state.elements.forEach(el => (el.layers || []).forEach(p => used.add(p.lid)));
+        let layerDefs = null;
+        if (used.size) {
+            layerDefs = {};
+            for (const lid of used) {
+                const d = state.layerDefs[lid];
+                if (!d) continue;
+                const { pixels, ...rest } = d;
+                // A drawing's strokes go out compact (points, deflated), beside its pixels.
+                const strokes = rest.recipe && Array.isArray(rest.recipe.strokes) ? rest.recipe.strokes : null;
+                if (strokes) rest.recipe = Object.assign({}, rest.recipe, { strokes: undefined });
+                const o = JSON.parse(JSON.stringify(rest));
+                if (strokes) o.recipe.strokesEnc = await encodeStrokes(strokes);
+                if (pixels) { o.pixels = {}; for (const k of Object.keys(pixels)) o.pixels[k] = await png(immutable(pixels[k])); }
+                layerDefs[lid] = o;
+            }
+        }
+        return layerDefs;
+    }
+
+    /* Everything but `elements`, in the key order the saved file has always had. `stickers` is the
+       sticker library (STICKERS-PLAN D10, the whole library, A3): optional, absent when it is empty. */
+    function projectHead(layerDefs, stickers) {
         return {
             version: 1, name: exportBaseName(),
             tileSize: state.tileSize, cols: state.cols, nextId: state.nextId,
+            ...(layerDefs ? { layerDefs } : {}),
+            ...(stickers ? { stickers } : {}),
             // Where each element sits (GRID-SLOT-PLAN §2). Additive: a file
             // without them derives today's row-major placement on load.
             rows: (syncLayout(), state.rows), layout: state.layout.slice(),
             emptyFill: state.emptyFill || null,   // the saved empty-slot choice (phase 4)
-            lockCols: !!state.lockCols, lockRows: !!state.lockRows,   // push locks (phase 6)
-            elements
+            lockCols: !!state.lockCols, lockRows: !!state.lockRows   // push locks (phase 6)
         };
+    }
+
+    async function buildProjectData(png0) {
+        const png = projectPng(png0);
+        const elements = [];
+        for (const el of state.elements) elements.push(await projectElement(el, png));
+        const layerDefs = await projectLayerDefs(png);
+        return { ...projectHead(layerDefs, await TRLE.Stickers.toProject(png)), elements };
+    }
+
+    /* The project as JSON, written to `w` (a FileSystemWritableFileStream) one tile at a
+       time (FOLDER-SYNC-PLAN phase 4): the same text JSON.stringify(buildProjectJSON())
+       gives, without a multi-MB string or every tile's data URL alive at once. */
+    async function streamProjectJSON(w) {
+        const png = projectPng(canvasToPNGDataURL);
+        const head = JSON.stringify(projectHead(await projectLayerDefs(png), await TRLE.Stickers.toProject(png)));
+        await w.write(head.slice(0, -1) + ',"elements":[');
+        for (let i = 0; i < state.elements.length; i++) {
+            await w.write((i ? ',' : '') + JSON.stringify(await projectElement(state.elements[i], png)));
+        }
+        await w.write(']}');
+    }
+
+    /* A drawing layer's strokes as points (LAYERS-PLAN phase 4). Positions and times are rounded to
+       0.01 and stored as deltas in flat integer runs, the brush once per distinct brush, then
+       deflated (CompressionStream, where the browser has it; plain JSON where not). The pixels are
+       what a drawing shows; these are the record, kept for editing single strokes later. */
+    const strokesEncCache = new WeakMap();
+    const bytesToB64 = u8 => { let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); };
+    const b64ToBytes = b => Uint8Array.from(atob(b), ch => ch.charCodeAt(0));
+    async function streamBytes(bytes, stream) {
+        return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(stream)).arrayBuffer());
+    }
+    async function encodeStrokes(strokes) {
+        if (strokesEncCache.has(strokes)) return strokesEncCache.get(strokes);
+        const brushes = [], seen = new Map();
+        const items = strokes.map(st => {
+            const k = JSON.stringify(st.brush);
+            let bi = seen.get(k);
+            if (bi == null) { bi = brushes.length; seen.set(k, bi); brushes.push(st.brush); }
+            const f = []; let px = 0, py = 0, pt = 0;
+            for (const sm of st.samples) {
+                const x = Math.round(sm[0] * 100), y = Math.round(sm[1] * 100), t = Math.round(sm[2] * 100);
+                f.push(x - px, y - py, t - pt, sm[3] ? 1 : 0); px = x; py = y; pt = t;
+            }
+            return { sid: st.sid, v: st.v, b: st.bounds, br: bi, o: st.opts, s: f };
+        });
+        const json = JSON.stringify({ brushes, strokes: items });
+        let out = { enc: 'j', data: json };
+        if (typeof CompressionStream === 'function') {
+            try { out = { enc: 'dz', data: bytesToB64(await streamBytes(new TextEncoder().encode(json), new CompressionStream('deflate-raw'))) }; }
+            catch { /* stay plain */ }
+        }
+        strokesEncCache.set(strokes, out);
+        return out;
+    }
+    /* From a file: untrusted, so anything unreadable is an empty list (the pixels still show). */
+    async function decodeStrokes(e) {
+        try {
+            if (!e || typeof e.data !== 'string') return [];
+            let json = e.data;
+            if (e.enc === 'dz') json = new TextDecoder().decode(await streamBytes(b64ToBytes(e.data), new DecompressionStream('deflate-raw')));
+            else if (e.enc !== 'j') return [];
+            const o = JSON.parse(json);
+            if (!o || !Array.isArray(o.strokes) || !Array.isArray(o.brushes) || o.strokes.length > 100000) return [];
+            return o.strokes.map(it => {
+                const samples = []; let x = 0, y = 0, t = 0;
+                const f = it.s;
+                if (!Array.isArray(f) || f.length % 4 || !f.every(Number.isFinite)) throw new Error('bad samples');
+                for (let i = 0; i < f.length; i += 4) {
+                    x += f[i]; y += f[i + 1]; t += f[i + 2];
+                    samples.push(f[i + 3] ? [x / 100, y / 100, t / 100, 1] : [x / 100, y / 100, t / 100]);
+                }
+                const brush = o.brushes[it.br];
+                if (!brush || typeof brush !== 'object') throw new Error('bad brush');
+                return { sid: String(it.sid || ''), samples, brush, opts: it.o && typeof it.o === 'object' ? it.o : {}, bounds: it.b, v: it.v };
+            });
+        } catch { return []; }
     }
 
     /* Saved-file flavour: data URLs, so JSON.stringify can swallow it whole. */
     const buildProjectJSON = () => buildProjectData(canvasToPNGDataURL);
     /* Autosave flavour: Blobs, stored by structured clone with no text step. */
-    const buildProjectSnapshot = () => buildProjectData(c => TRLE.Engine.canvasToBlob(c));
+    const snapshotEncoder = c => TRLE.Engine.canvasToBlob(c);
+    const buildProjectSnapshot = () => buildProjectData(snapshotEncoder);
+    const blobCache = new WeakMap();
+    /* Marks a canvas as an immutable reference (never drawn into), which is what
+       makes caching its encoded Blob safe. Returns the canvas. */
+    const immutable = c => { if (c) c.__immutable = true; return c; };
 
     /* Save asks for a name first: the download is automatic, so an unnamed save
        silently becomes another atlas-project (3).json nobody can tell apart. The
@@ -22618,6 +30428,30 @@ window.TRLE = window.TRLE || {};
     /* Rebuild the workbench from a project object — from a file, or from the
        IndexedDB autosave. Tiles arrive as data URLs or Blobs; loadImageURL takes
        both. Returns false (having complained) if the object isn't one of ours. */
+    /* One saved stack's pieces (applyProject); a piece whose definition did not survive is dropped. Every image
+       through the loader's own `loadImg` (data:image or a Blob only). */
+    async function readSavedPieces(list, defs, loadImg) {
+        const pieces = [];
+        for (const q of list) {
+            if (!q || !defs[q.lid]) continue;
+            const p = { lid: q.lid };
+            if (q.mask) { const im = await loadImg(q.mask); if (im) p.mask = immutable(imgToCanvas(im)); }
+            if (q.px) { const im = await loadImg(q.px); if (im) p.px = immutable(imgToCanvas(im)); }
+            if (q.aux && typeof q.aux === 'object') {
+                for (const k of Object.keys(q.aux)) {
+                    if (!/^[a-z][a-z0-9]*$/.test(k)) continue;
+                    const im = await loadImg(q.aux[k]);
+                    if (im) (p.aux = p.aux || {})[k] = immutable(imgToCanvas(im));
+                }
+            }
+            if (q.data != null) p.data = q.data;
+            if (Array.isArray(q.xf)) { const xs = q.xf.map(xfEntryClean); if (xs.every(Boolean)) p.xf = xs; else p.xfLost = true; }
+            if (q.xfLost) p.xfLost = true;
+            pieces.push(p);
+        }
+        return pieces;
+    }
+
     async function applyProject(proj) {
         if (!proj || proj.version !== 1 || !Array.isArray(proj.elements)) {
             showToast('Invalid project file', 'error'); return false;
@@ -22626,6 +30460,25 @@ window.TRLE = window.TRLE || {};
         const els = [];
         const tally = { skipped: 0 };
         const loadImg = async v => { const src = projImageSrc(v, tally); return src ? loadImageURL(src) : null; };
+        // Layer definitions (LAYERS-PLAN D3): optional; a file without them loads as before.
+        // A kind this build does not know is kept (and skipped by a rebuild), not dropped.
+        const defs = {};
+        if (proj.layerDefs && typeof proj.layerDefs === 'object') {
+            for (const lid of Object.keys(proj.layerDefs)) {
+                const d = proj.layerDefs[lid];
+                if (!/^l\d+$/.test(lid) || !d || typeof d !== 'object' || typeof d.kind !== 'string') continue;
+                const { pixels, ...rest } = d;
+                const def = Object.assign(JSON.parse(JSON.stringify(rest)), { lid });
+                if (def.recipe && def.recipe.strokesEnc) { def.recipe.strokes = await decodeStrokes(def.recipe.strokesEnc); delete def.recipe.strokesEnc; }
+                if (pixels && typeof pixels === 'object') {
+                    def.pixels = {};
+                    for (const k of Object.keys(pixels)) { const im = await loadImg(pixels[k]); if (im) def.pixels[k] = immutable(imgToCanvas(im)); }
+                }
+                defs[lid] = def;
+                TRLE.Layers.seen(lid);
+            }
+        }
+        const readPieces = list => readSavedPieces(list, defs, loadImg);
         for (const e of proj.elements) {
             const el = {
                 id: e.id, kind: e.kind,
@@ -22638,6 +30491,7 @@ window.TRLE = window.TRLE || {};
                 bset: e.bset || null,
                 push: e.push || null,
                 organic: e.organic || null,
+                patch: sanitizePatch(e.patch),
                 block: e.block || null,
                 group: e.group || null,
                 spacer: !!e.spacer,
@@ -22650,6 +30504,7 @@ window.TRLE = window.TRLE || {};
                 original: null, canvas: null
             };
             if (e.customMask) { const im = await loadImg(e.customMask); if (im) el.customMask = imgToCanvas(im); }
+            if (e.patchHint && el.patch) { const im = await loadImg(e.patchHint); if (im) el.patchHint = imgToCanvas(im); }
             if (e.pushHand) { const im = await loadImg(e.pushHand); if (im) el.pushHandPx = imgToCanvas(im); }
             if (e.hgParams && e.hgParams.mask) {
                 const im = await loadImg(e.hgParams.mask);
@@ -22664,6 +30519,17 @@ window.TRLE = window.TRLE || {};
                     if (im) bag[mt] = imgToCanvas(im);
                 }
                 if (Object.keys(bag).length) el.importedMaps = bag;
+            }
+            if (e.mapSource) { const im = await loadImg(e.mapSource); if (im) el.mapSource = imgToCanvas(im); }
+            if (e.textRelief && typeof e.textRelief === 'object') {
+                const r = { floors: e.textRelief.floors === 'keep' ? 'keep' : 'smooth' };
+                for (const k of ['up', 'down', 'hole']) if (e.textRelief[k]) { const im = await loadImg(e.textRelief[k]); r[k] = im ? imgToCanvas(im) : null; }
+                if (r.up || r.down) el.textRelief = r;
+            }
+            if (e.mapPatches && typeof e.mapPatches === 'object') {
+                const P = {};
+                for (const mt of TRLE.MapOrder) if (e.mapPatches[mt]) { const im = await loadImg(e.mapPatches[mt]); if (im) P[mt] = imgToCanvas(im); }
+                if (Object.keys(P).length) el.mapPatches = P;
             }
             if (Array.isArray(e.matLayers)) {
                 el.matLayers = [];
@@ -22680,8 +30546,26 @@ window.TRLE = window.TRLE || {};
                 el.original = oim ? imgToCanvas(oim) : blankCanvas(S);
                 const cim = e.canvas ? await loadImg(e.canvas) : null;
                 el.canvas = cim ? imgToCanvas(cim) : cloneCanvas(el.original);
+                // Pieces whose definition or bottom did not survive are dropped: without
+                // `under` nothing can be rebuilt, and the saved composite is still shown.
+                if (e.under && Array.isArray(e.layers) && e.layers.length) {
+                    const uim = await loadImg(e.under);
+                    const pieces = await readPieces(e.layers);
+                    if (uim && pieces.length) {
+                        el.under = immutable(imgToCanvas(uim));
+                        el.layers = pieces;
+                        el.layerSig = TRLE.Layers.hash(el.canvas);   // the saved composite is the baseline; no rebuild
+                        el.edited = true;
+                    }
+                }
             } else {
                 el.canvas = blankCanvas(S);   // recomputed by refreshTransitions
+                /* Stickers on a transition or animation frame (STICKERS-PLAN D9): only sticker pieces are allowed there.
+                   No bottom is read: the render that follows makes it (writeDerived), the one load that rebuilds. */
+                if (Array.isArray(e.layers) && e.layers.length && (e.kind === 'transition' || e.kind === 'anim')) {
+                    const pieces = (await readPieces(e.layers)).filter(p => defs[p.lid].kind === 'sticker');
+                    if (pieces.length) el.layers = pieces;
+                }
             }
             els.push(el);
         }
@@ -22693,6 +30577,12 @@ window.TRLE = window.TRLE || {};
         nextGroupId = Math.max(1, ...els.map(e => (e.group && e.group.id) || 0)) + 1;
         state.nextId = proj.nextId || (Math.max(0, ...els.map(e => e.id)) + 1);
         state.elements = els;
+        state.layerDefs = defs;
+        TRLE.Layers.prune(state.layerDefs, state.elements);
+        // The sticker library (STICKERS-PLAN D10): replaced by the file's, through the same image route.
+        stickersLoading = true;
+        try { await TRLE.Stickers.fromProject(proj.stickers, async v => { const im = await loadImg(v); return im ? imgToCanvas(im) : null; }); }
+        finally { stickersLoading = false; }
         adoptLayout(proj.rows, proj.layout);
         state.emptyFill = ['compact', 'black', 'transparent'].includes(proj.emptyFill) ? proj.emptyFill : null;
         state.lockCols = !!proj.lockCols; state.lockRows = !!proj.lockRows;
@@ -22719,6 +30609,878 @@ window.TRLE = window.TRLE || {};
         return true;
     }
 
+
+    /* ============ 📚 STICKER GALLERY (STICKERS-PLAN phase 3, D11 / D12) ============
+       The project's sticker library (TRLE.Stickers, js/stickers.js) as a window: add images,
+       a folder, a PSD or a pack (paste and drop too), rename, delete, save a pack. Nothing
+       here touches a tile: placed stickers keep their own copy (Q1), so a delete asks
+       inline and never needs an undo (P7). */
+    const stl = { sel: null, busy: false };
+    const STL_FROM = { upload: 'uploaded', cut: 'cut from a tile', psd: 'from a PSD layer' };
+    const STL_IMAGE_RE = /\.(png|jpe?g|webp|gif|bmp|tga|psd|psb)$/i;
+    const stlOpen = () => $('at-overlay').style.display !== 'none' && $('at-modal-stickerlib').style.display !== 'none';
+    /* Draw `src` fitted into `dst`, centred; crisp when it is enlarged (pixel art stays pixel art). */
+    function stlFit(dst, src) {
+        const g = dst.getContext('2d'), k = Math.min(dst.width / src.width, dst.height / src.height);
+        const w = Math.max(1, Math.round(src.width * k)), h = Math.max(1, Math.round(src.height * k));
+        g.clearRect(0, 0, dst.width, dst.height);
+        g.imageSmoothingEnabled = k < 1; g.imageSmoothingQuality = 'high';
+        g.drawImage(src, Math.floor((dst.width - w) / 2), Math.floor((dst.height - h) / 2), w, h);
+    }
+    function openStickerGallery() {
+        stl.sel = stl.sel && TRLE.Stickers.get(stl.sel) ? stl.sel : ((TRLE.Stickers.list()[0] || {}).id || null);
+        stlRender();
+        openModal('stickerlib');
+    }
+    function stlRender() {
+        const S = TRLE.Stickers, list = S.list(), grid = $('at-stl-grid');
+        if (stl.sel && !S.get(stl.sel)) stl.sel = null;
+        $('at-stl-count').textContent = list.length ? `${list.length} sticker${list.length === 1 ? '' : 's'} in this project` : '';
+        grid.textContent = '';
+        if (!list.length) {
+            const e = document.createElement('div');
+            e.className = 'at-stl-empty';
+            e.textContent = 'No stickers yet. Add images, a folder, a PSD or a pack, paste an image, or drop files here.';
+            grid.appendChild(e);
+        }
+        for (const r of list) {
+            const b = document.createElement('button');
+            b.type = 'button'; b.className = 'at-stl-cell'; b.dataset.sid = r.id;
+            b.setAttribute('role', 'option'); b.setAttribute('aria-selected', String(r.id === stl.sel));
+            b.title = `${r.name} · ${r.canvas.width} × ${r.canvas.height} px`;
+            const c = document.createElement('canvas'); c.width = c.height = 88;
+            stlFit(c, r.canvas);
+            const n = document.createElement('span'); n.textContent = r.name;
+            b.append(c, n);
+            grid.appendChild(b);
+        }
+        stlRenderDetail();
+    }
+    function stlRenderDetail() {
+        const r = stl.sel ? TRLE.Stickers.get(stl.sel) : null;
+        $('at-stl-detail').hidden = !r;
+        $('at-stl-confirm').hidden = true; $('at-stl-delete').hidden = false;
+        if (!r) return;
+        stlFit($('at-stl-big'), r.canvas);
+        $('at-stl-name').value = r.name;
+        const maps = r.maps ? TRLE.Stickers.MAP_TYPES.filter(t => r.maps[t]) : [];
+        $('at-stl-info').textContent = `${r.canvas.width} × ${r.canvas.height} px · ${STL_FROM[r.from] || 'uploaded'}` + (maps.length ? ` · its own maps: ${maps.join(', ')}` : '');
+    }
+    function stlSelect(id) {
+        stl.sel = id;
+        $('at-stl-grid').querySelectorAll('.at-stl-cell').forEach(b => b.setAttribute('aria-selected', String(b.dataset.sid === id)));
+        stlRenderDetail();
+    }
+    /* One toast for one add, in plain words. */
+    function stlReport(sum) {
+        const parts = [];
+        if (sum.added) parts.push(`Added ${sum.added} sticker${sum.added === 1 ? '' : 's'}`);
+        if (sum.dupes) parts.push(`${sum.dupes} already in the gallery`);
+        if (sum.shrunk) parts.push(`${sum.shrunk} shrunk to 2048 px`);
+        if (sum.failed) parts.push(`${sum.failed} could not be read`);
+        if (sum.empty) parts.push(`${sum.empty} fully transparent`);
+        if (sum.full) parts.push(`${sum.full} left out, the gallery is full`);
+        if (!parts.length) { showToast('No images found there', 'info'); return; }
+        const t = parts.join(', ') + '.';
+        showToast(t.charAt(0).toUpperCase() + t.slice(1), sum.added ? 'success' : 'info', 4000);
+    }
+    async function stlAdd(files, reader) {
+        if (stl.busy) return;
+        const list = Array.from(files || []);
+        if (!list.length) return;
+        stl.busy = true;
+        if (list.length > 20) showToast(`Reading ${list.length} files…`, 'info', 2000);
+        try {
+            const sum = await (reader ? reader(list[0]) : TRLE.Stickers.addFiles(list));
+            if (sum.ids && sum.ids.length) stl.sel = sum.ids[0];
+            stlRender();
+            stlReport(sum);
+        } finally { stl.busy = false; }
+    }
+    /* A drop's files, folders walked (webkitGetAsEntry, read-only, every browser). The entries
+       are taken synchronously: a DataTransfer is emptied once the handler yields. */
+    async function stlDropFiles(dt) {
+        const items = [...(dt.items || [])].filter(i => i.kind === 'file');
+        const entries = items.map(i => (i.webkitGetAsEntry ? i.webkitGetAsEntry() : null));
+        if (!entries.length || entries.some(e => !e) || !entries.some(e => e.isDirectory)) return [...(dt.files || [])];
+        const out = [];
+        const walk = async e => {
+            if (out.length > 7000) return;
+            if (e.isFile) { const f = await new Promise(res => e.file(res, () => res(null))); if (f && (STL_IMAGE_RE.test(f.name) || /\.zip$/i.test(f.name))) out.push(f); return; }
+            if (!e.isDirectory) return;
+            const rd = e.createReader();
+            for (;;) {
+                const batch = await new Promise(res => rd.readEntries(res, () => res([])));
+                if (!batch.length) break;
+                for (const c of batch) await walk(c);
+            }
+        };
+        for (const e of entries) await walk(e);
+        return out;
+    }
+    function setupStickerGallery() {
+        const modal = $('at-modal-stickerlib');
+        TRLE.Stickers.onChange(() => { if (stlOpen()) stlRender(); });
+        $('at-stl-addfiles').addEventListener('click', () => $('at-stl-files').click());
+        $('at-stl-addfolder').addEventListener('click', () => $('at-stl-folder').click());
+        $('at-stl-loadpack').addEventListener('click', () => $('at-stl-pack').click());
+        $('at-stl-files').addEventListener('change', e => { const f = [...e.target.files]; e.target.value = ''; stlAdd(f); });
+        $('at-stl-folder').addEventListener('change', e => { const f = [...e.target.files].filter(x => STL_IMAGE_RE.test(x.name)); e.target.value = ''; if (f.length) stlAdd(f); else showToast('No images found in that folder', 'info'); });
+        $('at-stl-pack').addEventListener('change', e => { const f = [...e.target.files]; e.target.value = ''; stlAdd(f, file => TRLE.Stickers.readPack(file)); });
+        $('at-stl-savepack').addEventListener('click', async () => {
+            if (!TRLE.Stickers.list().length) { showToast('The gallery is empty, so there is nothing to save yet', 'info'); return; }
+            const raw = $('at-stl-packname').value.trim();
+            const base = raw.replace(/[^a-zA-Z0-9 _.-]/g, '').replace(/\s+/g, '_').replace(/^\.+/, '') || 'stickers';
+            const btn = $('at-stl-savepack');
+            setBusy(btn, true, 'Saving…');
+            try {
+                downloadBlob(await TRLE.Stickers.writePack(raw || base), base + TRLE.Stickers.PACK_EXT);
+                showToast(`Saved ${TRLE.Stickers.list().length} stickers as ${base}${TRLE.Stickers.PACK_EXT}`, 'success');
+            } catch (err) { showToast(`Could not save the pack: ${err.message}`, 'error'); }
+            finally { setBusy(btn, false); }
+        });
+        $('at-stl-grid').addEventListener('click', e => { const b = e.target.closest('.at-stl-cell'); if (b) stlSelect(b.dataset.sid); });
+        $('at-stl-grid').addEventListener('keydown', e => {
+            if ((e.key === 'Delete' || e.key === 'Backspace') && stl.sel) { e.preventDefault(); $('at-stl-delete').click(); }
+        });
+        $('at-stl-name').addEventListener('change', () => {
+            if (!stl.sel) return;
+            $('at-stl-name').value = TRLE.Stickers.rename(stl.sel, $('at-stl-name').value) || '';
+        });
+        $('at-stl-delete').addEventListener('click', () => { $('at-stl-delete').hidden = true; $('at-stl-confirm').hidden = false; $('at-stl-del-no').focus(); });
+        $('at-stl-del-no').addEventListener('click', () => { $('at-stl-confirm').hidden = true; $('at-stl-delete').hidden = false; });
+        $('at-stl-del-yes').addEventListener('click', () => {
+            const list = TRLE.Stickers.list(), i = list.findIndex(r => r.id === stl.sel);
+            if (i < 0) return;
+            const next = list[i + 1] || list[i - 1] || null;
+            stl.sel = next ? next.id : null;
+            TRLE.Stickers.remove(list[i].id);   // onChange re-renders
+            stlRender();
+        });
+        modal.addEventListener('dragover', e => { if (e.dataTransfer && [...e.dataTransfer.types].includes('Files')) { e.preventDefault(); modal.classList.add('drag-over'); } });
+        modal.addEventListener('dragleave', e => { if (!modal.contains(e.relatedTarget)) modal.classList.remove('drag-over'); });
+        modal.addEventListener('drop', async e => {
+            if (!e.dataTransfer) return;
+            e.preventDefault(); e.stopPropagation();
+            modal.classList.remove('drag-over');
+            stlAdd(await stlDropFiles(e.dataTransfer));
+        });
+        document.addEventListener('paste', e => {
+            if (!stlOpen()) return;
+            const ae = document.activeElement;
+            if (ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName) && ae.type !== 'file') return;   // text paste into the name field
+            const files = [...((e.clipboardData && e.clipboardData.items) || [])].filter(it => it.kind === 'file').map(it => it.getAsFile()).filter(Boolean);
+            if (!files.length) return;
+            e.preventDefault();
+            // A pasted image comes in as "image.png"; name it so it is findable.
+            stlAdd(files.map((f, i) => new File([f], /^image\.\w+$/i.test(f.name) || !f.name ? `Pasted ${i + 1}.${(f.type.split('/')[1] || 'png').replace('jpeg', 'jpg')}` : f.name, { type: f.type })));
+        });
+    }
+
+    /* ============ LAYERS PANEL (LAYERS-PLAN phase 2, D8) ============
+       One component, two hosts: `#at-layers-body` in the left rail (for the selected
+       tile) and `#at-layers-modal-body` in `#at-modal-layers` (right-click, Layers…,
+       for narrow windows and the demo frame, where the rails are hidden). Rows top to
+       bottom: the map rows, then Finish, Content, Texture, then the Original. The eye
+       and the bin act on a definition / this tile; only Content rows drag. Every
+       change is one rebuild and one pushHistory. */
+    let layersModalId = null, layersSel = null, layersPend = false;
+    /* The zones in plain words (LAYERS-PLAN phase 13, the author's call for users new to photo editors): a name and a sentence each. */
+    const LY_ZONES = {
+        finish:  ['Finish', 'Applied last, over everything'],
+        content: ['Text and drawings', 'Sit on top of the picture'],
+        texture: ['Picture edits', 'Change the texture itself'],
+    };
+
+    /* Rebuild the tiles carrying a layer, redraw, and take ONE undo step. */
+    async function layersCommit(els, label) {
+        syncSeamless(els);
+        await TRLE.Layers.rebuildMany(els, state.layerDefs);
+        afterLayersRebuilt(els);
+        // Anything built FROM these (a transition of a stickered transition, P4; a transition of a tile whose
+        // layer was hidden) is rendered again from the new pictures. It was left stale until the next edit.
+        refreshTransitions();
+        renderGrid();
+        pushHistory(label);
+    }
+    /* "Also glow in game" ships only if the Emissive export map is on: a layer Apply that glows ticks it (as Emissive and Stained
+       Glass do), and an edit that takes a layer's glow away unticks it when nothing else in the atlas emits (syncEmissiveExport;
+       a plain Apply never unticks a box the user ticked). Returns the toast's suffix. */
+    function layersGlowExport(glows, glowedBefore) {
+        const cb = emissiveExportCheckbox(), was = !!(cb && cb.checked);
+        if (glows) { enableEmissiveExport(); return !was && cb && cb.checked ? ' (Emissive export map enabled)' : ''; }
+        return glowedBefore && syncEmissiveExport() ? ' (Emissive export map off)' : '';
+    }
+    const layerPiecesGlow = lid => state.elements.some(el => el.layers && el.layers.some(q => q.lid === lid && q.aux && q.aux.glow));
+    function scheduleLayersView() {
+        if (layersPend) return;
+        layersPend = true;
+        queueMicrotask(() => { layersPend = false; renderLayersViews(); });
+    }
+    function layersTarget() {
+        return byId(state.selectedId != null ? state.selectedId : state.focusedId) || null;
+    }
+    function renderLayersViews() {
+        const rail = $('at-layers'), body = $('at-layers-body');
+        if (rail && body) {
+            rail.hidden = !state.elements.length;
+            if (state.elements.length) renderLayersInto(body, layersTarget(), state.selSet.size);
+        }
+        const mb = $('at-layers-modal-body'), md = $('at-modal-layers');
+        if (mb && md && md.style.display !== 'none') renderLayersInto(mb, byId(layersModalId), 0);
+    }
+    function lyThumb(src) {
+        const c = document.createElement('canvas');
+        c.width = c.height = 28; c.className = 'at-ly-thumb';
+        if (src) { const x = c.getContext('2d'); x.imageSmoothingEnabled = false; x.drawImage(src, 0, 0, 28, 28); }
+        return c;
+    }
+    function lyRow(cls, thumb, name, extra) {
+        const r = document.createElement('div');
+        r.className = 'at-ly-row ' + cls;
+        r.appendChild(thumb);
+        const n = document.createElement('span'); n.className = 'at-ly-name'; n.textContent = name;
+        r.appendChild(n);
+        if (extra) { const e = document.createElement('span'); e.className = 'at-ly-note'; e.textContent = extra; r.appendChild(e); }
+        return r;
+    }
+    function renderLayersInto(host, el, selCount) {
+        const L = TRLE.Layers;
+        host.textContent = '';
+        host.dataset.tile = el ? el.id : '';
+        const hint = t => { const d = document.createElement('div'); d.className = 'at-ly-hint'; d.textContent = t; host.appendChild(d); };
+        if (!el) { hint('Select a tile to see its layers.'); return; }
+        const head = document.createElement('div');
+        head.className = 'at-ly-head'; head.textContent = `Tile ${numberOf(el.id)}`;
+        host.appendChild(head);
+        if (selCount > 1) hint(`${selCount} tiles selected, showing this one.`);
+        if (el.kind !== 'tile' && !derivedLayered(el)) { hint('Transitions and animation frames are rebuilt from their settings. They take stickers only (Overlay, Add Stickers).'); return; }
+        // The map rows: settings that change no pixels, kept on the tile already.
+        // Shown only once a tile has one of them: many users work for engines with no material maps (the author's call).
+        const hasMapSettings = el.kind === 'tile' && !!(el.material || effectiveMatLayers(el) || el.hgParams || el.emissive);   // effectiveMatLayers: a text or drawing layer's own material counts
+        const maps = hasMapSettings ? [
+            ['material', '🎨 Material', el.material || effectiveMatLayers(el) ? materialLabel(el) : 'none'],
+            ['heightmap', '⛰ Height map', el.hgParams ? 'set' : 'off'],
+            ['emissive', '✨ Glow', el.emissive ? 'set' : 'off'],
+        ] : [];
+        if (maps.length) {
+            const sl = document.createElement('div'); sl.className = 'at-ly-maps-label'; sl.textContent = 'Settings, no pixels';
+            host.appendChild(sl);
+        }
+        for (const [action, name, val] of maps) {
+            const b = document.createElement('button');
+            b.type = 'button'; b.className = 'at-ly-row at-ly-map'; b.dataset.map = action;
+            b.innerHTML = '<span class="at-ly-name"></span><span class="at-ly-note"></span>';
+            b.firstChild.textContent = name; b.lastChild.textContent = val;
+            b.title = `Open ${name.replace(/^\S+\s/, '')} for this tile`;
+            host.appendChild(b);
+        }
+        // The stack, top to bottom, one tinted card per zone.
+        let zone = null, card = null;
+        const pieces = hasLayers(el) ? el.layers.slice().reverse() : [];
+        const contentHere = hasContentLayers(el);   // a picture edit can only cross text that is there (phase 14)
+        for (const p of pieces) {
+            const def = state.layerDefs[p.lid];
+            if (!def) continue;
+            const z = L.zoneOf(def);
+            if (z !== zone) {
+                zone = z;
+                card = document.createElement('div'); card.className = 'at-ly-zonecard'; card.dataset.zone = z;
+                const [zn, zd] = LY_ZONES[z] || [z, ''];
+                const h = document.createElement('b'); h.className = 'at-ly-zone'; h.textContent = zn;
+                const d = document.createElement('span'); d.className = 'at-ly-zdesc'; d.textContent = zd;
+                const mb = document.createElement('button');   // the group menu, also on right-click (phase 16)
+                mb.type = 'button'; mb.className = 'at-ly-zmenu'; mb.textContent = '⋯'; mb.setAttribute('aria-haspopup', 'menu');
+                mb.title = `${zn}: move or flatten this group (or right-click the group)`; mb.setAttribute('aria-label', `${zn} group actions`);
+                card.append(h, d, mb);
+                host.appendChild(card);
+            }
+            const n = L.tilesOf(p.lid, state.elements).length;
+            const row = lyRow('at-ly-layer' + (def.visible === false ? ' at-ly-off' : '') + (layersSel === p.lid ? ' at-ly-sel' : ''),
+                lyThumb(p.px || p.mask || null), def.name || def.kind, n > 1 ? `shared by ${n} tiles` : '');
+            row.dataset.lid = p.lid; row.dataset.zone = z; row.dataset.kind = def.kind;
+            /* Movable: text and drawings among themselves, and a picture edit over or under them (phase 14),
+               which needs text or a drawing on the tile to cross. */
+            const crosses = z !== 'content' && contentHere && TRLE.Layers.movable(def);
+            if (z === 'content' || crosses) {
+                row.classList.add('at-ly-drag');
+                const grip = document.createElement('span'); grip.className = 'at-ly-grip'; grip.textContent = '⠿';
+                grip.title = z === 'content' ? 'Drag to reorder' : 'Drag over or under the text and drawings';
+                row.insertBefore(grip, row.firstChild);
+            }
+            // The eye is the whole left part of the row: users aiming for it opened the tool instead (author, 2026-10-06).
+            const eye = document.createElement('button');
+            eye.type = 'button'; eye.className = 'at-ly-eye'; eye.textContent = def.visible === false ? '🚫' : '👁';
+            eye.setAttribute('aria-pressed', def.visible === false ? 'false' : 'true');
+            eye.title = def.visible === false ? 'Show this layer' : 'Hide this layer';
+            eye.setAttribute('aria-label', eye.title);
+            const bin = document.createElement('button');
+            bin.type = 'button'; bin.className = 'at-ly-bin'; bin.textContent = '🗑'; bin.title = 'Delete this layer from this tile';
+            row.insertBefore(eye, row.firstChild);
+            if (crosses) {   // the drag's keyboard twin
+                const mv = document.createElement('button');
+                mv.type = 'button'; mv.className = 'at-ly-move'; mv.dataset.to = z === 'finish' ? 'texture' : 'finish';
+                mv.textContent = z === 'finish' ? '↓' : '↑';
+                mv.title = z === 'finish' ? 'Move under the text and drawings' : 'Move over the text and drawings';
+                mv.setAttribute('aria-label', mv.title);
+                row.appendChild(mv);
+            }
+            row.appendChild(bin);
+            card.appendChild(row);
+        }
+        const orig = lyRow('at-ly-orig', lyThumb(hasLayers(el) ? el.under : el.canvas),
+            el.kind === 'tile' ? 'Original' : el.kind === 'anim' ? 'The animation frame' : 'The transition');
+        const od = document.createElement('span'); od.className = 'at-ly-zdesc'; od.textContent = el.kind === 'tile' ? 'The picture underneath' : 'Rebuilt from its settings';
+        const on = orig.querySelector('.at-ly-name'); on.style.display = 'flex'; on.style.flexDirection = 'column'; on.style.whiteSpace = 'normal';
+        on.appendChild(od);
+        host.appendChild(orig);
+    }
+    async function layersToggleVisible(lid) {
+        const d = state.layerDefs[lid]; if (!d) return;
+        const hide = d.visible !== false;
+        TRLE.Layers.update(state.layerDefs, lid, { visible: !hide });
+        await layersCommit(TRLE.Layers.tilesOf(lid, state.elements), hide ? 'Hide layer' : 'Show layer');
+    }
+    async function layersDeleteFromTile(el, lid) {
+        if (el.kind === 'anim') {   // a sticker sits on every frame of the group, so it leaves every frame (Q9d)
+            const group = animGroupOf(el).filter(m => m.layers && m.layers.some(p => p.lid === lid));
+            group.forEach(m => TRLE.Layers.remove(m, lid, state.layerDefs, true));
+            TRLE.Layers.prune(state.layerDefs, state.elements);
+            await layersSettle(group);
+            afterLayersRebuilt(group);
+            refreshTransitions();
+            renderGrid();
+            pushHistory('Delete layer');
+            return;
+        }
+        // A layer that decides the seamless flag may hold the value it had before them all: hand that to the next, or give it back.
+        const dps = decidingPieces(el), gone = dps.find(p => p.lid === lid), rest = dps.filter(p => p !== gone);
+        if (gone && gone.data && gone.data.was !== undefined) {
+            if (rest.length) rest[0].data = Object.assign({}, rest[0].data, { was: gone.data.was });
+            else el.seamless = !!gone.data.was;
+        }
+        const glowed = layerGlows(el);
+        TRLE.Layers.remove(el, lid, state.layerDefs, true);
+        TRLE.Layers.prune(state.layerDefs, state.elements);
+        syncSeamless([el]);
+        await layersSettle([el]);   // through the dim when slow (decision 20), as a move does
+        refreshTransitions();       // what is built from this tile follows (as layersCommit)
+        renderGrid();
+        const unticked = glowed && !layerGlows(el) && syncEmissiveExport();
+        pushHistory('Delete layer');
+        if (unticked) showToast('Layer deleted (Emissive export map off)', 'success');
+    }
+    async function layersMoveOver(el, lid, overLid) {
+        const els = animGroupOf(el);   // an animation's frames keep one order (Q9d)
+        if (!els.map(m => TRLE.Layers.reorder(m, state.layerDefs, lid, overLid)).some(Boolean)) return;
+        await layersCommit(els, 'Reorder layers');
+    }
+
+    /* Move a picture edit over ('finish') or under ('texture') the text and drawings (LAYERS-PLAN phase 14).
+       The SELECTION decides the tiles (author, 2026-10-06): one tile selected moves it there only; several
+       move it on each selected tile that carries it, or, for a one-per-tile kind, that tile's own layer of
+       the kind (applied separately, it is still "the Classic Look" of that tile). A move that leaves part
+       of a batch behind splits the definition (`Layers.moveToZone`). One rebuild, one undo step. */
+    const ONE_PER_TILE = new Set(['coloradj', 'recolor', 'delight', 'classic', 'hdlook', 'seamless']);
+    function layersMoveTargets(el, lid) {
+        const def = state.layerDefs[lid];
+        if (!def || !TRLE.Layers.movable(def)) return [];
+        const ids = state.selSet.size > 1 && state.selSet.has(el.id) ? [...state.selSet] : [el.id];
+        const out = [];
+        for (const t of ids.map(byId)) {
+            if (!t || t.kind !== 'tile' || !hasLayers(t)) continue;
+            let p = t.layers.find(q => q.lid === lid);
+            if (!p && ONE_PER_TILE.has(def.kind)) { const o = kindLayerOf(t, def.kind); p = o && o.piece; }
+            if (p) out.push({ el: t, lid: p.lid });
+        }
+        return out;
+    }
+    async function layersMoveZone(el, lid, zone) {
+        const L = TRLE.Layers, byLid = new Map();
+        for (const h of layersMoveTargets(el, lid)) {
+            if (L.zoneOf(state.layerDefs[h.lid]) === zone || L.zoneOf(state.layerDefs[h.lid]) === 'content') continue;
+            if (!byLid.has(h.lid)) byLid.set(h.lid, []);
+            byLid.get(h.lid).push(h.el);
+        }
+        if (!byLid.size) return false;
+        const moved = [];
+        for (const [l, els] of byLid) {
+            const to = L.moveToZone(state.layerDefs, state.elements, l, zone, els);
+            if (to && l === lid) layersSel = to;
+            if (to) moved.push(...els);
+        }
+        if (!moved.length) return false;
+        refreshTransitions();
+        const over = zone === 'finish', n = moved.length;
+        await layersCommit(moved, `Move layer ${over ? 'over' : 'under'} the text${n > 1 ? `: ${n} tiles` : ''}`);
+        showToast(`Moved ${over ? 'over' : 'under'} the text and drawings${n > 1 ? ` on ${n} tiles` : ''}`, 'info');
+        return true;
+    }
+
+    /* ---- a group's menu: right-click a zone card, or its ⋯ (LAYERS-PLAN phase 16) ----
+       A group is one zone card. Picture edits can move over the text as a group and Finish under it (the
+       text stays in the middle); any group can be flattened, which bakes it AND every group below it into
+       the Original, since the picture underneath can only take in what sits directly on it. The selection
+       decides the tiles, as for a single move (phase 14). Every action is one undo step. */
+    const LY_GROUP_WORDS = { texture: 'picture edit', content: 'text and drawing layer', finish: 'Finish layer' };
+    const lyRank = def => Math.max(0, TRLE.Layers.ZONES.indexOf(TRLE.Layers.zoneOf(def)));
+    function layersGroupTiles(el) {
+        const ids = state.selSet.size > 1 && state.selSet.has(el.id) ? [...state.selSet] : [el.id];
+        return ids.map(byId).filter(t => t && t.kind === 'tile' && hasLayers(t));
+    }
+    /* How many layers of each group (and hidden among them) a flatten of `zone` would take, over `tiles`. */
+    function layersFlattenCount(tiles, zone) {
+        const top = TRLE.Layers.ZONES.indexOf(zone), n = { texture: 0, content: 0, finish: 0, hidden: 0, tiles: 0 };
+        for (const t of tiles) {
+            let any = false;
+            for (const p of t.layers) {
+                const d = state.layerDefs[p.lid];
+                if (!d || lyRank(d) > top) continue;
+                any = true;
+                if (d.visible === false) n.hidden++; else n[TRLE.Layers.zoneOf(d)]++;
+            }
+            if (any) n.tiles++;
+        }
+        return n;
+    }
+    /* Bake one tile's layers up to and including `zone` into its bottom. The composite does not change, so
+       nothing rebuilds. What the baked text and drawings fed to the maps (material regions, relief, glow,
+       "Maps from the original") becomes the tile's own, so the export does not change either (author,
+       2026-10-06). Hidden layers in the group are deleted. */
+    function layersFlattenTile(el, zone) {
+        const L = TRLE.Layers, defs = state.layerDefs, top = L.ZONES.indexOf(zone);
+        const k = el.layers.filter(p => defs[p.lid] && lyRank(defs[p.lid]) <= top).length;
+        if (!k || el.layers.slice(0, k).some(p => !defs[p.lid] || lyRank(defs[p.lid]) > top)) return false;   // the stack is sorted by zone: a prefix
+        const B = el.layers.slice(0, k), part = Object.assign({}, el, { layers: B });
+        const regs = textRegions(part).length ? effectiveMatLayers(part) : null;
+        const hasText = mapParts(part).length > 0, rel = hasText ? effectiveTextRelief(part) : undefined;
+        const glow = layerGlowOf(part), patches = stickerPatches(part);   // a sticker's own maps (P2 a: into el.mapPatches)
+        const om = originalMapLayer(el), mapSrc = om != null && om < k && !el.mapSource ? cloneCanvas(mapSourceOf(el)) : null;
+        // The tile's seamless value with only these layers on it: what the remaining ones are now built on.
+        const dps = decidingPieces(el), holder = dps.find(p => p.data && p.data.was !== undefined);
+        let seam = holder ? !!holder.data.was : !!el.seamless;
+        for (const p of dps) {
+            if (!B.includes(p)) continue;
+            const d = defs[p.lid];
+            if (d.visible === false) continue;
+            if (d.kind === 'seamless') seam = true; else if (d.recipe.edge !== 'wrap') seam = false;
+        }
+        const under = L.inputAt(el, defs, k);
+        if (k === el.layers.length) { drawReplace(el.canvas, under); el.under = null; el.layers = null; el.layerSig = null; }
+        else { el.under = L.imm(under); el.layers = el.layers.slice(k); }
+        if (regs) el.matLayers = regs;
+        if (hasText) el.textRelief = rel;
+        if (mapSrc) el.mapSource = mapSrc;
+        /* A sticker's own maps become the tile's map patches, merged over any it has; an own EMISSIVE goes into the
+           emissive below with the glow instead, because deriveMaps lightens the glow in after the patches. */
+        const pe = patches && patches.emissive;
+        if (patches) {
+            const rest = Object.assign({}, patches); delete rest.emissive;
+            if (Object.keys(rest).length) {
+                const P = Object.assign({}, el.mapPatches || {});
+                for (const [mt, c] of Object.entries(rest)) {
+                    if (P[mt]) { const m = cloneCanvas(P[mt]); m.getContext('2d').drawImage(c, 0, 0); P[mt] = m; } else P[mt] = c;
+                }
+                el.mapPatches = P;
+            }
+        }
+        if (glow || pe) {
+            /* Lightened into the emissive the export makes now WITHOUT any layer glow (an authored glow, an
+               imported one, or the one the material generates), as deriveMaps does at map time. */
+            const bare = Object.assign({}, el, { _noLayerGlow: true, _noLivePatches: true });
+            const base = deriveMaps(bare, { emissive: true }, {}).emissive || null;
+            const S = el.canvas.width, c = document.createElement('canvas'); c.width = c.height = S;
+            const g = c.getContext('2d');
+            g.fillStyle = '#000'; g.fillRect(0, 0, S, S);
+            if (base) g.drawImage(base, 0, 0, S, S);
+            if (pe) g.drawImage(pe, 0, 0, S, S);
+            g.globalCompositeOperation = 'lighten'; if (glow) g.drawImage(glow, 0, 0);
+            if (el.importedMaps && el.importedMaps.emissive) el.importedMaps = Object.assign({}, el.importedMaps, { emissive: c });   // an imported map wins over el.emissive
+            else el.emissive = c;
+        }
+        setBaseSeamless(el, seam);
+        return true;
+    }
+    function layersFlattenGroup(el, zone) {
+        const tiles = layersGroupTiles(el), n = layersFlattenCount(tiles, zone);
+        if (!n.tiles) return false;
+        const s = (k, w) => `${k} ${w}${k === 1 ? '' : 's'}`;
+        const what = zone === 'texture' ? `The ${s(n.texture, 'picture edit')}`
+            : zone === 'content' ? `The ${s(n.content, 'text and drawing layer')}` + (n.texture ? ` and the ${s(n.texture, 'picture edit')} under them` : '')
+            : `All ${n.texture + n.content + n.finish} layers`;
+        const on = n.tiles > 1 ? `${n.tiles} tiles` : `tile ${numberOf(tiles.find(t => layersFlattenCount([t], zone).tiles).id)}`;
+        const keep = zone === 'finish' ? '' : zone === 'content' ? (tiles.some(t => t.layers.some(p => lyRank(state.layerDefs[p.lid]) > 1)) ? ' The Finish layers above stay editable.' : '')
+            : (tiles.some(t => t.layers.some(p => lyRank(state.layerDefs[p.lid]) > 0)) ? ' The layers above stay editable.' : '');
+        const one = (zone === 'texture' ? n.texture : zone === 'content' ? n.content + n.texture : n.texture + n.content + n.finish) === 1;
+        const msg = `${what} on ${on} become${one ? 's' : ''} part of the Original picture. After that ${one ? 'it' : 'they'} can no longer be edited, hidden or moved.`
+            + (n.hidden ? ` ${s(n.hidden, 'hidden layer')} in the group will be deleted.` : '')
+            + keep
+            + (n.content ? ' The material, relief and glow of the text and drawings are kept.' : '')
+            + ' Undo brings the layers back.';
+        openConfirm('Flatten into the Original?', msg, 'Flatten', () => {
+            const done = tiles.filter(t => layersFlattenTile(t, zone));
+            if (!done.length) return;
+            TRLE.Layers.prune(state.layerDefs, state.elements);
+            layersSel = null;
+            renderGrid();
+            const label = { texture: 'Flatten picture edits', content: 'Flatten text and drawings', finish: 'Flatten all layers' }[zone];
+            pushHistory(done.length > 1 ? `${label}: ${done.length} tiles` : label);
+            showToast(done.length > 1 ? `Flattened into the Original on ${done.length} tiles` : 'Flattened into the Original', 'success');
+        });
+        return true;
+    }
+    /* Move a whole group across the text: Picture edits over it, Finish under it. Order inside the group is
+       kept (the top one goes first over, the bottom one first under, each landing at the boundary), and a
+       shared layer moves on all the chosen tiles at once, so a batch only splits when part of it stays. */
+    /* The layers a group move would carry: the movable ones of `from`, in the order they move (the top one goes first over,
+       the bottom one first under). A kind that cannot move (HD Look) stays; `stay` names those. */
+    function layersGroupMoveOrder(el, from) {
+        const L = TRLE.Layers, tiles = layersGroupTiles(el).filter(hasContentLayers), order = [], stay = new Set();
+        for (const t of [el, ...tiles]) if (tiles.includes(t)) for (const p of t.layers) {
+            const d = state.layerDefs[p.lid];
+            if (L.zoneOf(d) !== from) continue;
+            if (!L.movable(d)) { stay.add(d.name || d.kind); continue; }
+            if (!order.includes(p.lid)) order.push(p.lid);
+        }
+        if (from === 'texture') order.reverse();
+        return { tiles, order, stay: [...stay] };
+    }
+    async function layersMoveGroup(el, from) {
+        const L = TRLE.Layers, to = from === 'texture' ? 'finish' : 'texture';
+        const { tiles, order, stay } = layersGroupMoveOrder(el, from);
+        if (!order.length) return false;
+        const moved = new Set();
+        for (const lid of order) {
+            const els = tiles.filter(t => t.layers.some(q => q.lid === lid));
+            if (L.moveToZone(state.layerDefs, state.elements, lid, to, els)) els.forEach(t => moved.add(t));
+        }
+        if (!moved.size) return false;
+        refreshTransitions();
+        const over = to === 'finish', n = moved.size, what = over ? 'picture edits' : 'Finish layers';
+        await layersCommit([...moved], `Move ${what} ${over ? 'over' : 'under'} the text${n > 1 ? `: ${n} tiles` : ''}`);
+        showToast(`Moved the ${what} ${over ? 'over' : 'under'} the text and drawings${n > 1 ? ` on ${n} tiles` : ''}` + (stay.length ? `. ${stay.join(' and ')} stays under the text.` : ''), 'info');
+        return true;
+    }
+    let lyMenu = null;
+    function layersMenuClose(refocus) {
+        if (!lyMenu) return;
+        const back = lyMenu.back;
+        lyMenu.node.remove(); lyMenu = null;
+        if (back) back.setAttribute('aria-expanded', 'false');
+        if (refocus && back && back.isConnected) back.focus({ preventScroll: true });
+    }
+    function layersMenuOpen(el, zone, x, y, back) {
+        layersMenuClose(false);
+        const tiles = layersGroupTiles(el), here = el.layers.filter(p => TRLE.Layers.zoneOf(state.layerDefs[p.lid]) === zone).length;
+        const m = document.createElement('div');
+        m.className = 'at-ly-menu'; m.id = 'at-ly-menu'; m.setAttribute('role', 'menu');
+        const head = document.createElement('div'); head.className = 'at-ly-menu-head';
+        head.textContent = `${LY_ZONES[zone][0]} · ${here} layer${here === 1 ? '' : 's'}` + (tiles.length > 1 ? ` · ${tiles.length} tiles` : '');
+        m.appendChild(head);
+        const item = (act, text, title) => {
+            const b = document.createElement('button');
+            b.type = 'button'; b.className = 'at-ly-menu-item'; b.setAttribute('role', 'menuitem'); b.dataset.lyAct = act;
+            b.textContent = text; if (title) b.title = title;
+            m.appendChild(b);
+        };
+        const canMove = zone !== 'content' && hasContentLayers(el) && layersGroupMoveOrder(el, zone).order.length > 0;
+        if (zone === 'texture' && canMove) item('over', '⬆ Move group over the text and drawings');
+        if (zone === 'finish' && canMove) item('under', '⬇ Move group under the text and drawings');
+        if (el.kind !== 'tile') {   // P1: a rebuilt element has no Original to bake into
+            item('flatten-no', '🧱 Flatten: not on a rebuilt tile', 'Transitions and animation frames are rebuilt from their settings, so the stickers stay layers');
+            m.lastChild.disabled = true;
+        } else item('flatten', '🧱 Flatten into the Original…', zone === 'texture' ? 'Bake these layers into the picture underneath'
+            : 'Bake these layers, and every group below them, into the picture underneath');
+        m.addEventListener('click', e => {
+            const b = e.target.closest('.at-ly-menu-item'); if (!b) return;
+            layersMenuClose(false);
+            if (b.dataset.lyAct === 'flatten') layersFlattenGroup(el, zone);
+            else layersMoveGroup(el, zone);
+        });
+        m.addEventListener('keydown', e => {
+            const items = [...m.querySelectorAll('.at-ly-menu-item')], i = items.indexOf(document.activeElement);
+            if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); layersMenuClose(true); }
+            else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); items[(i + (e.key === 'ArrowDown' ? 1 : items.length - 1)) % items.length].focus({ preventScroll: true }); }
+            else if (e.key === 'Tab') layersMenuClose(false);
+        });
+        document.body.appendChild(m);
+        const r = m.getBoundingClientRect();
+        m.style.left = Math.max(4, Math.min(x, innerWidth - r.width - 4)) + 'px';
+        m.style.top = Math.max(4, Math.min(y, innerHeight - r.height - 4)) + 'px';
+        lyMenu = { node: m, back, tile: el.id, zone };
+        if (back) back.setAttribute('aria-expanded', 'true');
+        m.querySelector('.at-ly-menu-item').focus({ preventScroll: true });
+    }
+
+    /* The panel's drag (LAYERS-PLAN phase 14), dressed like the texture grid's (setupGridDrag): a floating
+       thumbnail at the pointer (`.at-drag-ghost`), the dragged row faded, a dashed accent landing slot and,
+       after the grid's short dwell, the rows sliding to make room (transforms only, no re-render, nothing
+       committed until the drop). With Animations off nothing slides: the landing is an insert bar. Hit-testing
+       uses the geometry captured when the drag starts (the grid's rule: sliding rows must not move the
+       target out from under the pointer). Text and drawings reorder among themselves; a picture edit drops
+       over or under them, decided by which side of the text card the pointer is on. */
+    const LY_DWELL = 90;
+    function setupLayersPanel() {
+        let drag = null, suppress = false;
+        const still = () => !!(TRLE.Motion && TRLE.Motion.reduced());
+        const clearPreview = d => {
+            clearTimeout(d.timer);
+            d.host.querySelectorAll('[data-lypv]').forEach(n => { n.style.transform = ''; delete n.dataset.lypv; });
+            if (d.slot) { d.slot.remove(); d.slot = null; }
+            d.key = null;
+        };
+        const start = d => {
+            const hr = d.host.getBoundingClientRect();
+            const rel = r => ({ top: r.top - hr.top + d.host.scrollTop, bottom: r.bottom - hr.top + d.host.scrollTop, h: r.height });
+            d.rows = [...d.host.querySelectorAll('.at-ly-drag')].map(n => ({ n, lid: n.dataset.lid, zone: n.dataset.zone, ...rel(n.getBoundingClientRect()) }));
+            const cc = d.host.querySelector('.at-ly-zonecard[data-zone="content"]');
+            d.content = cc ? rel(cc.getBoundingClientRect()) : null;
+            d.flow = [...d.host.children].map(n => ({ n, ...rel(n.getBoundingClientRect()) }));
+            d.hostTop = hr.top - d.host.scrollTop;
+            const ghost = document.createElement('canvas');
+            ghost.width = ghost.height = 40;
+            ghost.className = 'at-drag-ghost at-ly-ghost';
+            const th = d.row.querySelector('.at-ly-thumb');
+            if (th) { const g = ghost.getContext('2d'); g.imageSmoothingEnabled = false; g.drawImage(th, 0, 0, 40, 40); }
+            document.body.appendChild(ghost);
+            d.ghost = ghost;
+            d.row.classList.add('at-ly-src');
+            d.host.classList.add('at-ly-dragging');
+            document.body.classList.add('at-ly-body-dragging');
+            d.moved = true;
+        };
+        // Where a drop at clientY would go: { zone } for a picture edit, { over: lid } for text or a drawing; null for no move.
+        const targetAt = (d, clientY) => {
+            const y = clientY - d.hostTop;
+            if (d.zone !== 'content') {
+                if (!d.content) return null;
+                const to = y < (d.content.top + d.content.bottom) / 2 ? 'finish' : 'texture';
+                return to === d.zone ? null : { zone: to };
+            }
+            const hit = d.rows.find(r => r.zone === 'content' && y >= r.top && y < r.bottom);
+            return hit && hit.lid !== d.lid ? { over: hit.lid } : null;
+        };
+        const preview = d => {
+            const t = d.target, key = t ? (t.zone || t.over) : null;
+            if (key === d.key) return;
+            clearPreview(d);
+            d.key = key;
+            if (!t) return;
+            if (t.zone) {
+                // A slot at the text card's edge: over it (its top) or under it (its bottom).
+                const edge = t.zone === 'finish' ? d.content.top - 2 : d.content.bottom + 2, H = d.row.offsetHeight + 4;
+                const slot = document.createElement('div');
+                slot.className = still() ? 'at-ly-insert' : 'at-ly-landing';
+                slot.textContent = still() ? '' : (t.zone === 'finish' ? 'Over the text and drawings' : 'Under the text and drawings');
+                slot.style.top = (still() ? edge - 2 : (t.zone === 'finish' ? edge - H + 2 : edge)) + 'px';
+                if (!still()) slot.style.height = (H - 4) + 'px';
+                d.host.appendChild(slot);
+                d.slot = slot;
+                if (still()) return;
+                d.timer = setTimeout(() => {
+                    // Make room: what sits at or below the slot slides down by its height (the grid's slide).
+                    const from = t.zone === 'finish' ? d.content.top - 1 : d.content.bottom + 1;
+                    d.flow.forEach(f => { if (f.top >= from && f.n !== slot) { f.n.style.transform = `translateY(${H}px)`; f.n.dataset.lypv = '1'; } });
+                    if (t.zone === 'finish') slot.style.transform = `translateY(${H}px)`;
+                }, LY_DWELL);
+                return;
+            }
+            // Text and drawings: the rows between the two slide one place; the dragged row lands where the other was.
+            const rs = d.rows.filter(r => r.zone === 'content');
+            const a = rs.findIndex(r => r.lid === d.lid), b = rs.findIndex(r => r.lid === t.over);
+            const src = rs[a], dst = rs[b];
+            src.n.classList.add('at-ly-landing-row');
+            if (still()) return;
+            d.timer = setTimeout(() => {
+                const step = (a < b ? -1 : 1) * src.h + (a < b ? -3 : 3);
+                rs.forEach((r, i) => { if ((a < b && i > a && i <= b) || (a > b && i >= b && i < a)) { r.n.style.transform = `translateY(${step}px)`; r.n.dataset.lypv = '1'; } });
+                src.n.style.transform = `translateY(${dst.top - src.top}px)`; src.n.dataset.lypv = '1';
+            }, LY_DWELL);
+        };
+        const finish = (commit, clientY) => {
+            const d = drag; drag = null;
+            if (!d) return;
+            if (!d.moved) return;
+            suppress = true; setTimeout(() => { suppress = false; }, 0);
+            const t = commit ? targetAt(d, clientY) : null;
+            d.ghost.remove();
+            d.host.classList.remove('at-ly-dragging');
+            document.body.classList.remove('at-ly-body-dragging');
+            d.host.querySelectorAll('.at-ly-landing-row').forEach(n => n.classList.remove('at-ly-landing-row'));
+            d.row.classList.remove('at-ly-src');
+            clearPreview(d);
+            const el = byId(Number(d.host.dataset.tile));
+            if (!t || !el) return;
+            if (t.zone) layersMoveZone(el, d.lid, t.zone);
+            else layersMoveOver(el, d.lid, t.over);
+        };
+        for (const id of ['at-layers-body', 'at-layers-modal-body']) {
+            const host = $(id); if (!host) continue;
+            host.addEventListener('click', e => {
+                if (suppress) { suppress = false; return; }
+                const el = byId(Number(host.dataset.tile)); if (!el) return;
+                const map = e.target.closest('.at-ly-map');
+                if (map) { if (host.id === 'at-layers-modal-body') closeModal(); runCtxAction(map.dataset.map, el.id); return; }
+                const zm = e.target.closest('.at-ly-zmenu');
+                if (zm) {
+                    if (lyMenu && lyMenu.back === zm) { layersMenuClose(true); return; }
+                    const r = zm.getBoundingClientRect();
+                    layersMenuOpen(el, zm.closest('.at-ly-zonecard').dataset.zone, r.left, r.bottom + 2, zm);
+                    return;
+                }
+                const row = e.target.closest('.at-ly-layer'); if (!row) return;
+                const lid = row.dataset.lid;
+                if (e.target.closest('.at-ly-eye')) { layersToggleVisible(lid); return; }
+                if (e.target.closest('.at-ly-bin')) { layersDeleteFromTile(el, lid); return; }
+                const mv = e.target.closest('.at-ly-move');
+                if (mv) { layersMoveZone(el, lid, mv.dataset.to); return; }
+                layersSel = lid;
+                const def = state.layerDefs[lid], k = TRLE.Layers.kindOf(def);
+                if (k && k.edit) k.edit(el, def);
+                renderLayersViews();
+            });
+            host.addEventListener('contextmenu', e => {
+                const card = e.target.closest('.at-ly-zonecard'), el = byId(Number(host.dataset.tile));
+                if (!card || !el || !hasLayers(el)) return;
+                e.preventDefault();
+                layersMenuOpen(el, card.dataset.zone, e.clientX, e.clientY, card.querySelector('.at-ly-zmenu'));
+            });
+            host.addEventListener('pointerdown', e => {
+                const row = e.target.closest('.at-ly-drag');
+                if (!row || e.target.closest('button') || e.button > 0) return;
+                drag = { host, row, lid: row.dataset.lid, zone: row.dataset.zone, x: e.clientX, y: e.clientY, moved: false, key: null, timer: 0, slot: null };
+            });
+        }
+        window.addEventListener('pointermove', e => {
+            if (!drag) return;
+            if (!drag.moved) { if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) <= 4) return; start(drag); }
+            drag.ghost.style.transform = `translate(${e.clientX + 14}px, ${e.clientY - 20}px)`;   // beside the pointer, off the landing slot's words
+            drag.target = targetAt(drag, e.clientY);
+            preview(drag);
+        });
+        window.addEventListener('pointerup', e => finish(true, e.clientY));
+        window.addEventListener('pointercancel', () => finish(false));
+        window.addEventListener('keydown', e => { if (drag && drag.moved && e.key === 'Escape') { e.stopPropagation(); finish(false); } }, true);
+        // The group menu closes on a press anywhere else and when the window resizes; never on scroll (the Firefox focus-scroll trap).
+        window.addEventListener('pointerdown', e => { if (lyMenu && !lyMenu.node.contains(e.target) && e.target !== lyMenu.back) layersMenuClose(false); }, true);
+        window.addEventListener('resize', () => layersMenuClose(false));
+        renderLayersViews();
+    }
+
+    /* ============ LAYERS: probe kinds and the validator's driver (phase 1) ============ */
+    function layersProbes() {
+        const L = TRLE.Layers;
+        if (!L.kinds['probe-adjust']) {
+            L.register('probe-adjust', {
+                zone: 'texture', mode: 'adjust',
+                apply(input, def, piece) {
+                    const out = cloneCanvas(input), x = out.getContext('2d');
+                    const id = x.getImageData(0, 0, out.width, out.height), d = id.data;
+                    let m = null;
+                    if (piece.mask) m = piece.mask.getContext('2d').getImageData(0, 0, out.width, out.height).data;
+                    const amt = (def.recipe && def.recipe.amount) || 0;
+                    for (let i = 0; i < d.length; i += 4) {
+                        if (m && m[i + 3] === 0) continue;
+                        d[i] = Math.max(0, Math.min(255, d[i] + amt));
+                        d[i + 1] = Math.max(0, Math.min(255, d[i + 1] + amt));
+                        d[i + 2] = Math.max(0, Math.min(255, d[i + 2] + amt));
+                    }
+                    x.putImageData(id, 0, 0);
+                    return out;
+                }
+            });
+            L.register('probe-content', { zone: 'content', mode: 'content', apply: (input, def, piece) => piece.px });
+        }
+        const ids = a => (Array.isArray(a) ? a : [a]).map(byId);
+        const rect = (S, r, color) => {
+            const c = document.createElement('canvas'); c.width = c.height = S;
+            const x = c.getContext('2d'); x.fillStyle = color || '#000';
+            x.fillRect(r.x, r.y, r.w, r.h);
+            return c;
+        };
+        const commit = layersCommit;
+        return {
+            layersStats: () => L.stats,
+            layersEl: id => byId(id),
+            layersDefs: () => state.layerDefs,
+            async layersAddAdjust(tiles, o) {
+                const els = ids(tiles), S = state.tileSize;
+                const lid = L.add(state.layerDefs, els, { kind: 'probe-adjust', name: 'Probe adjust', recipe: { amount: o.amount, estimateMs: o.estimateMs },
+                    opacity: o.opacity, visible: true }, els.map(() => o.maskRect ? { mask: rect(S, o.maskRect) } : {}));
+                await commit(els, 'Add layer'); return lid;
+            },
+            async layersAddContent(tiles, o) {
+                const els = ids(tiles), S = state.tileSize;
+                const lid = L.add(state.layerDefs, els, { kind: 'probe-content', name: 'Probe content', opacity: o.opacity, blend: o.blend },
+                    els.map(() => ({ px: rect(S, o.rect, o.color) })));
+                await commit(els, 'Add layer'); return lid;
+            },
+            async layersEdit(lid, patch) {
+                L.update(state.layerDefs, lid, patch);
+                await commit(L.tilesOf(lid, state.elements), 'Edit layer'); 
+            },
+            async layersDelete(tile, lid) {
+                await layersDeleteFromTile(byId(tile), lid);   // the panel's own path
+            },
+            /* Phase 14: the panel's move over / under the text (the selection decides the tiles), and "make seamless afterwards". */
+            layersMoveZone: (tile, lid, zone) => layersMoveZone(byId(tile), lid, zone),
+            layersMoveGroup: (tile, from) => layersMoveGroup(byId(tile), from),
+            layersGroupMoveOrder: (tile, from) => layersGroupMoveOrder(byId(tile), from).order,
+            layersSeamAfter(tile) { seamAfterMove(byId(tile)); pushHistory('Seam'); return true; },
+            /* Phase 15 test: a text layer with no pixels of its own, carrying a material over `rect` ([x, y, w, h]) and/or a glow
+               of `glow` (grey level) over it, so a reader of the layer material or the layer glow can be checked without the modal. */
+            async layersTestText(tile, o) {
+                const el = byId(tile), S = el.canvas.width, r = o.rect || [0, 0, S, S];
+                const blank = document.createElement('canvas'); blank.width = blank.height = S;
+                const aux = {};
+                if (o.material) aux.cover = L.imm(rect(S, { x: r[0], y: r[1], w: r[2], h: r[3] }, '#fff'));
+                if (o.glow) aux.glow = L.imm(rect(S, { x: r[0], y: r[1], w: r[2], h: r[3] }, `rgb(${o.glow},${o.glow},${o.glow})`));
+                const lid = L.add(state.layerDefs, [el], { kind: 'text', name: 'Text: test', recipe: { material: o.material || null } }, [{ px: L.imm(blank), aux }]);
+                await commit([el], 'Test text');
+                return lid;
+            },
+            elementEmits: id => elementEmits(byId(id)),
+            /* Phase 16: a group's flatten (confirmed) and move, through the same functions as the menu. */
+            layersFlatten(tile, zone) { const ok = layersFlattenGroup(byId(tile), zone); if (ok) $('at-confirm-ok').click(); return ok; },
+            layersMoveGroup: (tile, zone) => layersMoveGroup(byId(tile), zone),
+            emissiveExportOn: () => !!(emissiveExportCheckbox() || {}).checked,
+            setEmissiveExport(on) { const cb = emissiveExportCheckbox(); cb.checked = !!on; cb.dispatchEvent(new Event('change')); return true; },
+            layersAsyncProbe: () => ({ dims: L.stats.dims, dimVisible: L.dimVisible() }),
+            layersUndo: () => undo(),
+            layersRedo: () => redo(),
+            layersPush: label => pushHistory(label),
+            layersRefs(id) {
+                const snap = history.stack[history.index].elements.find(e => e.id === id), el = byId(id);
+                return {
+                    under: !!snap.under && snap.under === el.under,
+                    pieces: (el.layers || []).every((p, i) => snap.layers[i] && snap.layers[i].mask === p.mask && snap.layers[i].px === p.px),
+                    defs: Object.keys(state.layerDefs).every(k => history.stack[history.index].layerDefs[k] === state.layerDefs[k])
+                };
+            },
+            layersTransform(tiles, kind) {
+                const fn = kind === 'rotate' ? c => rotateTile90(c) : kind === 'offset' ? c => offsetTileHalf(c) : c => flipTile(c, kind === 'fliph');
+                return applyTileTransform(ids(tiles).map(e => e.id), fn, 'Transform', kind === 'rotate' ? TURN_ROT90 : null, { rotate: 'rot', offset: 'off', fliph: 'fh', flipv: 'fv' }[kind]);
+            },
+            layersFlatTransform: (c, kind) => kind === 'rotate' ? rotateTile90(c) : kind === 'offset' ? offsetTileHalf(c) : flipTile(c, kind === 'fliph'),
+            layersDuplicate: (tiles, original) => duplicateElements(Array.isArray(tiles) ? tiles : [tiles], !!original),
+            layersDeleteTiles: tiles => { performDelete(Array.isArray(tiles) ? tiles : [tiles]); pushHistory('Delete'); },
+            layersReplaceImage(id, canvas) {
+                const el = byId(id); drawReplace(el.canvas, canvas); el.original = cloneCanvas(canvas);
+                rebaseLayers(el);
+                pushHistory('Replace image');
+            },
+            layersReset(id) {
+                const t = byId(id); drawReplace(t.canvas, t.original);
+                dropLayers(t); t.edited = false;
+                L.prune(state.layerDefs, state.elements); pushHistory('Reset tile');
+            },
+            layersStray(id) { const el = byId(id), x = el.canvas.getContext('2d'); x.fillStyle = '#f0f'; x.fillRect(0, 0, 8, 8); },
+            async layersSnapshotProject() { return buildProjectSnapshot(); },
+            async layersRebuild(tiles, opts) { return L.rebuildMany(ids(tiles), state.layerDefs, opts); },
+            layersNoLayerSaveProbe: async () => JSON.stringify(await buildProjectJSON())
+        };
+    }
+
     /* ============ AUTOSAVE (IndexedDB session) ============
        A crash net, nothing more: one slot, overwritten as you work, offered back
        on the next boot. Files remain the way projects are kept — see js/store.js.
@@ -22737,6 +31499,7 @@ window.TRLE = window.TRLE || {};
     const storageView = { savedAt: 0, suffix: '' };
 
     function scheduleAutosave() {
+        folderEdited();
         if (!TRLE.Store || !TRLE.Store.available()) return;
         clearTimeout(autosave.timer);
         autosave.timer = setTimeout(runAutosave, AUTOSAVE_DELAY);
@@ -22800,7 +31563,8 @@ window.TRLE = window.TRLE || {};
         let n = 0;
         const add = v => { if (v instanceof Blob) n += v.size; };
         for (const e of proj.elements) {
-            add(e.original); add(e.canvas); add(e.customMask); add(e.emissive);
+            add(e.original); add(e.canvas); add(e.customMask); add(e.emissive); add(e.under);
+            if (Array.isArray(e.layers)) for (const p of e.layers) { add(p.mask); add(p.px); if (p.aux) Object.values(p.aux).forEach(add); }
             if (Array.isArray(e.matLayers)) for (const L of e.matLayers) add(L.mask);
         }
         return n;
@@ -22968,9 +31732,11 @@ window.TRLE = window.TRLE || {};
         const bar = $('at-restore');
         if (!bar) return;
         if (!meta || !meta.count || state.elements.length) { hideRestoreOffer(); return; }
+        const linked = await TRLE.Store.loadFolder().catch(() => null);
         $('at-restore-detail').textContent =
             `“${meta.name}”, ${meta.count} element${meta.count === 1 ? '' : 's'}, `
-            + `autosaved ${relativeTime(meta.savedAt)}. It stays here either way until you clear it.`;
+            + `autosaved ${relativeTime(meta.savedAt)}. It stays here either way until you clear it.`
+            + (linked && linked.handle ? ` Linked folder: ${linked.handle.name}.` : '');
         bar.hidden = false;
         // After the strip is up: it costs an IndexedDB read, and the offer
         // should not wait on one to become clickable.
@@ -23019,7 +31785,7 @@ window.TRLE = window.TRLE || {};
         const S = state.tileSize;
         const canvas = document.createElement('canvas');
         canvas.width = S; canvas.height = S;
-        canvas.getContext('2d').drawImage(img, 0, 0, S, S);
+        importToTile(canvas.getContext('2d'), img, S);
         return { id: state.nextId++, kind: 'tile', canvas, original: cloneCanvas(canvas),
                  seamless: false, edited: false, material: null,
                  importedMaps: scaleImportedMaps(maps, S) };
@@ -23029,7 +31795,7 @@ window.TRLE = window.TRLE || {};
     function makeTileFromRegion(img, sx, sy, sw, sh, S, maps) {
         const canvas = document.createElement('canvas');
         canvas.width = S; canvas.height = S;
-        canvas.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, S, S);
+        importToTile(canvas.getContext('2d'), img, S, [sx, sy, sw, sh]);
         // The same sub-rectangle out of each PSD map layer, resampled to match.
         let importedMaps = null;
         if (maps) {
@@ -23038,13 +31804,134 @@ window.TRLE = window.TRLE || {};
                 if (!maps[mt]) continue;
                 const c = document.createElement('canvas');
                 c.width = S; c.height = S;
-                c.getContext('2d').drawImage(maps[mt], sx, sy, sw, sh, 0, 0, S, S);
+                importToTile(c.getContext('2d'), maps[mt], S, [sx, sy, sw, sh]);
                 bag[mt] = c;
             }
             if (Object.keys(bag).length) importedMaps = bag;
         }
         return { id: state.nextId++, kind: 'tile', canvas, original: cloneCanvas(canvas),
                  seamless: false, edited: false, material: null, importedMaps };
+    }
+
+    /* ============ IMPORT ADVICE (HD-LOOK-PLAN phase 9, D3 and D4) ============
+       One dialog per import action (add, replace, Import from Atlas) when a source's size differs from the tile: smaller
+       offers HD Look or the default upscale, bigger offers Classic Look or the default downscale, each with the result and a
+       2 x 2 tiling, and Make Seamless when the result's seam is more visible than the source's. The choice is BAKED (D8): into
+       el.original for a new tile, into the new bottom for Replace. "Use the defaults" (or Esc) is phase 2's import.
+       `items` is [{ img, src? }] (src = a cell rect of img). `plan` is { up, down } or null. */
+    const ia = { S: 0, items: [], cb: null, timer: 0, up: null, down: null };
+    const iaDims = it => it.src ? [it.src[2], it.src[3]] : [it.img.naturalWidth || it.img.width, it.img.naturalHeight || it.img.height];
+    const iaSmall = (it, S) => { const [w, h] = iaDims(it); return w < S || h < S; };
+    const iaBig = (it, S) => { const [w, h] = iaDims(it); return !(w < S || h < S) && (w > S || h > S); };
+    /* HD Look needs a square source at 2, 4 or 8 times smaller than the tile. */
+    function iaHdFactor(it, S) {
+        const [w, h] = iaDims(it), f = Math.round(S / w);
+        return Math.abs(w - h) < 0.5 && [2, 4, 8].includes(f) && Math.round(w) * f === S ? f : 0;
+    }
+    function iaCell(it) {
+        const [w, h] = iaDims(it), c = document.createElement('canvas');
+        c.width = Math.max(1, Math.round(w)); c.height = Math.max(1, Math.round(h));
+        if (it.src) c.getContext('2d').drawImage(it.img, it.src[0], it.src[1], w, h, 0, 0, c.width, c.height);
+        else c.getContext('2d').drawImage(it.img, 0, 0);
+        return c;
+    }
+    function iaDefaultTile(it, S) {
+        const c = document.createElement('canvas'); c.width = c.height = S;
+        importToTile(c.getContext('2d'), it.img, S, it.src);
+        return c;
+    }
+    /* The tile an item becomes under `plan`: the default import, then the chosen look, then Make Seamless. */
+    function importBake(tile, it, S, plan) {
+        if (!plan) return tile;
+        let out = tile;
+        if (iaSmall(it, S) && plan.up) {
+            const f = iaHdFactor(it, S);
+            if (plan.up.mode === 'hd' && f) out = hdLook(out, Object.assign({}, HD_DEFAULTS, hdClassOver(plan.up.cls), { factor: f, wrap: seamRatio(iaCell(it)) < IMPORT_TILES_BELOW }));
+            if (plan.up.seam) out = seamlessCanvas(out);
+        } else if (iaBig(it, S) && plan.down) {
+            const d = plan.down;
+            if (d.mode === 'classic') out = classicLook(out, { factor: d.factor, shrink: d.shrink, colours: d.colours, dither: d.dither, wrap: seamRatio(iaCell(it)) < IMPORT_TILES_BELOW });
+            if (d.seam) out = seamlessCanvas(out);
+        }
+        return out;
+    }
+    /* Bake into a freshly made tile: its pixels and its original (Reset to Original returns what was imported). */
+    function importBakeEl(el, it, S, plan) {
+        const out = importBake(el.canvas, it, S, plan);
+        if (out !== el.canvas) { drawReplace(el.canvas, out); el.original = cloneCanvas(el.canvas); }
+        const g = plan && (iaSmall(it, S) ? plan.up : iaBig(it, S) ? plan.down : null);
+        if (g && g.seam) el.seamless = true;
+        return !!(g && g.seam);
+    }
+    /* Ask once if any item differs from S, then call cb(plan); with nothing to ask, cb(null) runs at once. */
+    function withImportAdvice(items, S, cb) {
+        const ups = items.filter(it => iaSmall(it, S)), downs = items.filter(it => iaBig(it, S));
+        // `?importadvice=off` is script-only: a validator that imports images of other sizes is testing something else.
+        if ((!ups.length && !downs.length) || new URLSearchParams(location.search).get('importadvice') === 'off') { cb(null); return; }
+        ia.S = S; ia.items = items; ia.cb = cb;
+        ia.up = ups.length ? { first: ups[0], n: ups.length, hd: ups.filter(it => iaHdFactor(it, S)).length } : null;
+        ia.down = downs.length ? { first: downs[0], n: downs.length } : null;
+        const [w0, h0] = iaDims((ia.up || ia.down).first), many = items.length > 1;
+        $('at-ia-intro').textContent = `${many ? `${items.length} images are being added. ` : ''}The tile is ${S} px. Pick how ${ia.up && ia.down ? 'each group' : 'they are'} should be resized, or use the defaults.`;
+        for (const k of ['up', 'down']) {
+            const g = ia[k]; $(`at-ia-${k}`).style.display = g ? '' : 'none';
+            if (!g) continue;
+            const [w, h] = iaDims(g.first);
+            $(`at-ia-${k}-info`).textContent = `${g.n} ${g.n === 1 ? 'image' : 'images'}, ${Math.round(w)} x ${Math.round(h)} px${g.n > 1 ? ' (the first is shown)' : ''}.`;
+            $(`at-ia-${k}-mode`).value = 'default'; $(`at-ia-${k}-seam`).checked = false;
+        }
+        const sel = $('at-ia-up-cls');
+        if (!sel.options.length) sel.innerHTML = Object.entries(HD_CLASSES).map(([key, c]) => `<option value="${key}">${c.label}</option>`).join('');
+        if (ia.up && !iaHdFactor(ia.up.first, S)) $('at-ia-up-mode').querySelector('option[value=hd]').disabled = true;
+        else if (ia.up) $('at-ia-up-mode').querySelector('option[value=hd]').disabled = false;
+        iaSync(); openModal('importadvice'); iaRender();
+    }
+    function iaPlan() {
+        const up = ia.up ? { mode: $('at-ia-up-mode').value, cls: $('at-ia-up-cls').value, seam: $('at-ia-up-seam').checked } : null;
+        const down = ia.down ? { mode: $('at-ia-down-mode').value, factor: parseInt($('at-ia-down-factor').value, 10) || 2, shrink: $('at-ia-down-shrink').value,
+                                 colours: parseInt($('at-ia-down-colours').value, 10) || 0, dither: $('at-ia-down-dither').value, seam: $('at-ia-down-seam').checked } : null;
+        return { up, down };
+    }
+    function iaSync() {
+        $('at-ia-up-clsrow').style.display = $('at-ia-up-mode').value === 'hd' ? '' : 'none';
+        $('at-ia-down-clrows').style.display = $('at-ia-down-mode').value === 'classic' ? '' : 'none';
+    }
+    function iaRender() {
+        const S = ia.S;
+        for (const k of ['up', 'down']) {
+            const g = ia[k]; if (!g) continue;
+            const plan = iaPlan(), noSeam = { up: plan.up && Object.assign({}, plan.up, { seam: false }), down: plan.down && Object.assign({}, plan.down, { seam: false }) };
+            const base = iaDefaultTile(g.first, S), look = importBake(base, g.first, S, noSeam);
+            // The seam offer: the look's seam against the source's own (1 is invisible).
+            const rs = seamRatio(iaCell(g.first)), ra = seamRatio(look), offer = ra > rs * 1.15 && ra > 1.3;
+            $(`at-ia-${k}-seamrow`).style.display = offer ? '' : 'none';
+            $(`at-ia-${k}-seamhint`).textContent = offer ? `The seam reads ${ra.toFixed(1)} after resizing, ${rs.toFixed(1)} in the source (1 is invisible).` : '';
+            const seamOn = offer && $(`at-ia-${k}-seam`).checked;
+            const out = seamOn ? seamlessCanvas(look) : look;
+            const P = $(`at-ia-${k}-after`).width;
+            drawReplace($(`at-ia-${k}-after`), out, P, P);
+            const t = $(`at-ia-${k}-tile`), g2 = t.getContext('2d'), h = t.width / 2;
+            g2.clearRect(0, 0, t.width, t.height);
+            for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) g2.drawImage(out, x * h, y * h, h, h);
+        }
+    }
+    function iaCleanup() {
+        clearTimeout(ia.timer);
+        const cb = ia.cb; ia.cb = null;
+        if (cb) queueMicrotask(() => cb(null));   // closing without choosing is the default import
+    }
+    function setupImportAdviceModal() {
+        const sched = () => { clearTimeout(ia.timer); ia.timer = setTimeout(iaRender, 60); };
+        ['up-mode', 'up-cls', 'up-seam', 'down-mode', 'down-factor', 'down-shrink', 'down-colours', 'down-dither', 'down-seam'].forEach(k => $(`at-ia-${k}`).addEventListener('change', () => { iaSync(); sched(); }));
+        $('at-ia-ok').addEventListener('click', () => {
+            const cb = ia.cb, plan = iaPlan();
+            if (!cb) return;
+            ia.cb = null;
+            // a seam box that was hidden when the look changed does not apply
+            for (const k of ['up', 'down']) if (plan[k] && $(`at-ia-${k}-seamrow`).style.display === 'none') plan[k].seam = false;
+            closeModal();
+            cb(plan);
+        });
     }
 
     /* ============ IMPORT MODAL (grid + cell selection) ============
@@ -23106,6 +31993,8 @@ window.TRLE = window.TRLE || {};
             if (imp.sel.has(impKey(r, c))) ctx.strokeRect(c * cw + 1, r * ch + 1, cw - 2, ch - 2);
         }
         $('at-import-cellsize').textContent = `${Math.round(iw / cols)}×${Math.round(ih / rows)} px`;
+        const cs = Math.round(iw / cols), T = imp.targetSize;
+        $('at-import-plan').textContent = cs < T ? `Each ${cs} px tile is upscaled to ${T} px.` : cs > T ? `Each ${cs} px tile is shrunk to ${T} px.` : `Tiles are imported at ${T} px as they are.`;
         $('at-import-count').textContent = imp.sel.size;
         $('at-import-addcount').textContent = imp.sel.size;
 
@@ -23122,6 +32011,60 @@ window.TRLE = window.TRLE || {};
         else warn.style.display = 'none';
     }
 
+    /* ---- the grid by SOURCE tile size (HD-LOOK-PLAN phase 8b) ----
+       The grid used to be guessed from the ATLAS tile size, so a sheet of 64 px tiles into a 256 atlas came in as
+       256 px cells holding four tiles each. The size of ONE source tile is now a control beside Columns and Rows. */
+    const IMP_SIZES = [8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048];
+    /* Square sizes that cut the image into whole cells, 2 to 128 per side. */
+    function impSizesFor(iw, ih) { return IMP_SIZES.filter(c => iw % c === 0 && ih % c === 0 && iw / c <= 128 && ih / c <= 128 && (iw / c) * (ih / c) >= 2); }
+    /* A sheet of independent tiles steps at every tile edge: the brightness difference across a cell border is
+       that of two unrelated pixels, far above the one between neighbours inside a tile. For each size that cuts the
+       image evenly, the mean step across its borders over the mean step elsewhere; the size with the clearest
+       ratio (at least 1.5) wins, and a single texture reads as no grid. Only a SUGGESTION: the control is set,
+       never applied without the user. */
+    function impDetectSize(img) {
+        const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height, sizes = impSizesFor(iw, ih);
+        if (!sizes.length) return null;
+        const cv = document.createElement('canvas'); cv.width = iw; cv.height = ih;
+        const g = cv.getContext('2d'); g.drawImage(img, 0, 0);
+        const d = g.getImageData(0, 0, iw, ih).data, lum = new Float32Array(iw * ih);
+        for (let i = 0; i < iw * ih; i++) lum[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+        const cx = new Float64Array(iw), cy = new Float64Array(ih);   // mean step across column x (x-1 | x) and row y
+        for (let y = 0; y < ih; y++) for (let x = 1; x < iw; x++) cx[x] += Math.abs(lum[y * iw + x] - lum[y * iw + x - 1]) / ih;
+        for (let y = 1; y < ih; y++) for (let x = 0; x < iw; x++) cy[y] += Math.abs(lum[y * iw + x] - lum[(y - 1) * iw + x]) / iw;
+        let best = null; const table = [];
+        for (const c of sizes) {
+            let b = 0, nb = 0, o = 0, no = 0;
+            for (let x = 1; x < iw; x++) { if (x % c === 0) { b += cx[x]; nb++; } else { o += cx[x]; no++; } }
+            for (let y = 1; y < ih; y++) { if (y % c === 0) { b += cy[y]; nb++; } else { o += cy[y]; no++; } }
+            if (!nb || !no || !o) continue;
+            const ratio = (b / nb) / (o / no);
+            table.push([c, ratio]);
+        }
+        // Sizes that are multiples of the true one also read as a grid (their borders are real borders), so the answer is the
+        // SMALLEST size that gets within 15% of the clearest. A single texture tops out at 2.0 (a grate with strong bars), a
+        // sheet of unrelated tiles at 4.6 and up, so 2.5 is the bar.
+        const top = Math.max(0, ...table.map(t => t[1]));
+        if (top >= 2.5) { const hit = table.find(t => t[1] >= 0.85 * top); best = { size: hit[0], ratio: hit[1], table }; }
+        impDetectSize.table = table;
+        return best;
+    }
+    /* The size control: the atlas guess, every size that cuts the sheet evenly, and "by columns and rows" when the
+       user types a grid that is none of those. */
+    function impFillSizes() {
+        const sel = $('at-import-src'), iw = imp.img.naturalWidth, ih = imp.img.naturalHeight;
+        const opts = [`<option value="auto">As the atlas: ${imp.targetSize} px</option>`]
+            .concat(impSizesFor(iw, ih).map(c => `<option value="${c}">${c} px tiles</option>`), ['<option value="custom">By columns and rows</option>']);
+        sel.innerHTML = opts.join('');
+        impSyncSize();
+    }
+    /* Show the control as the grid stands: the size when cols and rows give a whole square cell in the list. */
+    function impSyncSize() {
+        const sel = $('at-import-src'), iw = imp.img.naturalWidth, ih = imp.img.naturalHeight, cw = iw / imp.cols, ch = ih / imp.rows;
+        const guess = imp.cols === Math.max(1, Math.round(iw / imp.targetSize)) && imp.rows === Math.max(1, Math.round(ih / imp.targetSize));
+        const same = [...sel.options].find(o => o.value === String(cw) && cw === ch);
+        sel.value = guess ? 'auto' : same ? same.value : 'custom';
+    }
     function openImportModal(img, targetSize, isFirst, maps) {
         imp.img = img; imp.targetSize = targetSize; imp.isFirst = isFirst;
         // PSD map layers, if the source was a PSD — cut on the same cells.
@@ -23131,6 +32074,7 @@ window.TRLE = window.TRLE || {};
         $('at-import-cols').value = imp.cols;
         $('at-import-rows').value = imp.rows;
         $('at-import-size').textContent = targetSize;
+        impFillSizes();
         impSelectAll();
         openModal('import');
         impRender();
@@ -23140,9 +32084,26 @@ window.TRLE = window.TRLE || {};
         ['at-import-cols', 'at-import-rows'].forEach(id => $(id).addEventListener('input', function () {
             const v = Math.max(1, Math.min(128, parseInt(this.value) || 1));
             if (id === 'at-import-cols') imp.cols = v; else imp.rows = v;
+            impSyncSize();
             impSelectAll();   // cell layout changed → reselect everything
             impRender();
         }));
+        // The size of one source tile sets the grid; columns and rows follow.
+        $('at-import-src').addEventListener('change', function () {
+            if (!imp.img || this.value === 'custom') return;
+            const iw = imp.img.naturalWidth, ih = imp.img.naturalHeight, c = this.value === 'auto' ? imp.targetSize : parseInt(this.value, 10);
+            imp.cols = Math.max(1, Math.min(128, Math.round(iw / c))); imp.rows = Math.max(1, Math.min(128, Math.round(ih / c)));
+            $('at-import-cols').value = imp.cols; $('at-import-rows').value = imp.rows;
+            impSelectAll(); impRender();
+        });
+        $('at-import-detect').addEventListener('click', () => {
+            if (!imp.img) return;
+            const r = impDetectSize(imp.img);
+            if (!r) { showToast('No tile grid found: this reads as one texture. Set Columns and Rows by hand if it is a sheet.', 'info'); return; }
+            $('at-import-src').value = String(r.size);
+            $('at-import-src').dispatchEvent(new Event('change'));
+            showToast(`Looks like ${r.size} px tiles. Check the grid before importing.`, 'info');
+        });
         $('at-import-all').addEventListener('click', () => { impSelectAll(); impRender(); });
         $('at-import-none').addEventListener('click', () => { imp.sel.clear(); impRender(); });
         $('at-import-invert').addEventListener('click', () => {
@@ -23163,33 +32124,40 @@ window.TRLE = window.TRLE || {};
         });
         $('at-import-add').addEventListener('click', () => {
             if (!imp.img || imp.sel.size === 0) { showToast('Select at least one cell to import', 'error'); return; }
-            const S = imp.targetSize;
-            const iw = imp.img.naturalWidth, ih = imp.img.naturalHeight;
-            const cw = iw / imp.cols, ch = ih / imp.rows;
-            const firstSetup = imp.isFirst || !state.elements.length;
-            if (firstSetup) {
-                state.tileSize = S;
-                state.cols = imp.cols;
-                state.elements = [];
-                state.nextId = 1;
-                state.emptyFill = null;   // a new atlas asks about its own empty slots
-                state.selectedId = null; state.selSet.clear(); state.selAnchor = null;
-                state.focusedId = null;
-                exitPickMode();
-                $('at-grid-card').style.display = 'block';
-                $('at-export-card').style.display = 'block';
-            }
+            // Snapshot: the advice dialog closes this one, and closing clears `imp`.
+            const S = imp.targetSize, img = imp.img, maps = imp.maps, cols = imp.cols, rows = imp.rows, isFirst = imp.isFirst;
+            const iw = img.naturalWidth, ih = img.naturalHeight;
+            const cw = iw / cols, ch = ih / rows;
             const cells = [...imp.sel].map(k => k.split('_').map(Number)).sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-            for (const [r, c] of cells) {
-                state.elements.push(makeTileFromRegion(imp.img, c * cw, r * ch, cw, ch, S, imp.maps));
-            }
-            const n = cells.length;
-            closeModal();
-            renderGrid();
-            if (firstSetup) collapseUploadCard(`${state.elements.length} elements · click to start a different atlas`);
-            if (firstSetup) resetHistory(`Imported ${n} tile${n !== 1 ? 's' : ''}`);
-            else pushHistory(`Imported ${n} tile${n !== 1 ? 's' : ''}`);
-            showToast(`Imported ${n} tile${n !== 1 ? 's' : ''}`, 'success');
+            const items = cells.map(([r, c]) => ({ img, src: [c * cw, r * ch, cw, ch] }));
+            withImportAdvice(items, S, plan => {
+                const firstSetup = isFirst || !state.elements.length;
+                if (firstSetup) {
+                    state.tileSize = S;
+                    state.cols = cols;
+                    state.elements = [];
+                    state.nextId = 1;
+                    state.emptyFill = null;   // a new atlas asks about its own empty slots
+                    TRLE.Stickers.clear();   // a new atlas is a new project, and the library is the project's (STICKERS-PLAN Q3)
+                    state.selectedId = null; state.selSet.clear(); state.selAnchor = null;
+                    state.focusedId = null;
+                    exitPickMode();
+                    $('at-grid-card').style.display = 'block';
+                    $('at-export-card').style.display = 'block';
+                }
+                cells.forEach(([r, c], i) => {
+                    const el = makeTileFromRegion(img, c * cw, r * ch, cw, ch, S, maps);
+                    importBakeEl(el, items[i], S, plan);
+                    state.elements.push(el);
+                });
+                const n = cells.length;
+                closeModal();
+                renderGrid();
+                if (firstSetup) collapseUploadCard(`${state.elements.length} elements · click to start a different atlas`);
+                if (firstSetup) resetHistory(`Imported ${n} tile${n !== 1 ? 's' : ''}`);
+                else pushHistory(`Imported ${n} tile${n !== 1 ? 's' : ''}`);
+                showToast(`Imported ${n} tile${n !== 1 ? 's' : ''}`, 'success');
+            });
         });
     }
 
@@ -23280,6 +32248,7 @@ window.TRLE = window.TRLE || {};
         state.elements = [];
         state.nextId = 1;
         state.emptyFill = null;   // a new atlas asks about its own empty slots
+        TRLE.Stickers.clear();   // a new atlas is a new project, and the library is the project's (STICKERS-PLAN Q3)
         state.selectedId = null; state.selSet.clear(); state.selAnchor = null;
         state.focusedId = null;
         // One row of empty slots to add into (there is no "+" cell any more).
@@ -23301,12 +32270,15 @@ window.TRLE = window.TRLE || {};
     /* `slot`: the empty slot the tiles start at (then the empty slots after
        it), or null to append after the last occupied slot. */
     function commitImageTiles(assets, slot = null, verb = 'Add') {
-        if (slot != null) pendingSlot = slot;
-        assets.forEach(a => state.elements.push(makeTileFromImage(a.img, a.maps)));
-        renderGrid();
-        const n = assets.length;
-        pushHistory(`${verb} ${n} image${n !== 1 ? 's' : ''}`);
-        showToast(verb === 'Paste' ? 'Pasted into the slot' : `Added ${n} tile${n !== 1 ? 's' : ''}`, 'success');
+        const S = state.tileSize, items = verb === 'Paste' ? [] : assets.map(a => ({ img: a.img }));   // a paste has its own resize question
+        withImportAdvice(items, S, plan => {
+            if (slot != null) pendingSlot = slot;
+            assets.forEach((a, i) => { const el = makeTileFromImage(a.img, a.maps); importBakeEl(el, items[i], S, plan); state.elements.push(el); });
+            renderGrid();
+            const n = assets.length;
+            pushHistory(`${verb} ${n} image${n !== 1 ? 's' : ''}`);
+            showToast(verb === 'Paste' ? 'Pasted into the slot' : `Added ${n} tile${n !== 1 ? 's' : ''}`, 'success');
+        });
     }
 
     /* Heuristic: does a single dropped image look like a whole atlas sheet rather
@@ -23413,6 +32385,7 @@ window.TRLE = window.TRLE || {};
             state.elements = [];
             state.nextId = 1;
             state.emptyFill = null;   // a new atlas asks about its own empty slots
+            TRLE.Stickers.clear();   // a new atlas is a new project, and the library is the project's (STICKERS-PLAN Q3)
             state.selectedId = null; state.selSet.clear(); state.selAnchor = null;
             exitPickMode();
 
@@ -23454,6 +32427,12 @@ window.TRLE = window.TRLE || {};
             banner.querySelector('.compat-message').textContent =
                 'WebGL 2.0 is not supported by this browser, the Atlas Tool cannot run.';
             banner.style.display = 'flex';
+            // Wired here, not as an inline onclick: the CSP allows no inline
+            // handlers (SECURITY-PLAN phase 5). The banner only ever shows on this path.
+            banner.querySelector('.compat-dismiss').addEventListener('click', () => {
+                banner.style.display = 'none';
+                try { sessionStorage.setItem('webgl-compat-dismissed', '1'); } catch { /* storage blocked */ }
+            });
             return;
         }
 
@@ -23498,6 +32477,7 @@ window.TRLE = window.TRLE || {};
                 openBsetModal(state.pickBaseId, state.pickBaseId);
         });
         $('at-export-btn').addEventListener('click', exportAtlas);
+        setupFolderSync();
         $('at-export-tiles').addEventListener('click', exportTilesIndividually);
         const whiteCb = document.getElementById('at-export-height-white');
         if (whiteCb) whiteCb.addEventListener('change', () => { syncHeightWhiteNote(); renderGrid(); });
@@ -23606,7 +32586,19 @@ window.TRLE = window.TRLE || {};
         setupOrganicModal();
         setupAnimModal();
         setupColorAdjModal();
+        setupClassicModal();
+        setupHdModal();
+        setupImportAdviceModal();
+        setupSlopeModal();
+        setupScatterModal();
+        setupXformModal();
+        setupPerspModal();
+        setupDistortModal();
+        setupLiquifyModal();
+        setupOilModal();
+        setupToneModal();
         setupDrawModal();
+        setupTextModal();
         setupRecolorModal();
         setupDelightModal();
         setupImportModal();
@@ -23614,6 +32606,10 @@ window.TRLE = window.TRLE || {};
         applyPrefs();
         setupAccessibility();
         setupLogoHome();
+        setupLayersPanel();
+        setupStickerGallery();
+        setupStickers();
+        setupStickerCut();
         setupAccordions();
 
         // Tutorial-asset capture hook — only active with ?capture in the URL, so
@@ -23645,6 +32641,233 @@ window.TRLE = window.TRLE || {};
             return (h >>> 0).toString(16);
         };
         window.TRLE._cap = {
+            /* LAYERS-PLAN phase 1: two PROBE kinds stand in for real tools until
+               they are converted, and a thin driver over TRLE.Layers for
+               validate-layers. Both kinds are pure and CPU-only, so a rebuild is
+               byte-identical on one machine. recipe.estimateMs fakes a cost. */
+            ...layersProbes(),
+            // The import resize (CLASSIC-LOOK-PLAN phase 1), for the Firefox check.
+            resizeImported: (img, S) => resizeImported(img, S),
+            // The import upscale (HD-LOOK-PLAN phase 2): the function, the seam measure, and the two tile makers the real import paths call.
+            importToTile: (img, S, src, wrap) => { const c = document.createElement('canvas'); c.width = c.height = S; importToTile(c.getContext('2d'), img, S, src, wrap); return c; },
+            seamRatio: cv => seamRatio(cv),
+            // HD Look (HD-LOOK-PLAN phase 3): the pure filter and the factor estimator, for validate-hdlook.
+            hdLook: (src, opts) => hdLook(src, opts),
+            hdLookRegions: (src, opts, regs) => hdLookRegions(src, opts, regs),
+            hdPaintTest: (i, rect) => { const r = hd.regs[i]; if (!r) return false; const g = r.mask.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(...rect); hdSchedule(); return true; },
+            hdMaskCoverage: (i, [x, y, w, h]) => { const r = hd.regs[i]; if (!r) return 0; const d = r.mask.getContext('2d').getImageData(x, y, w, h).data; let n = 0; for (let k = 3; k < d.length; k += 4) if (d[k] > 127) n++; return n; },
+            hdExpected: id => { const el = byId(id), r = hdRecipeNow(), inp = xin(hd.inputs, el); return TRLE.Layers.hash(hdLookRegions(inp, Object.assign({}, r, { ref: hdRefFor(el, r, inp) }), hdRegionsNow())); },
+            commitImagesForTest: async (urls, verb) => { const assets = []; for (const u of urls) assets.push({ img: await loadImg(u), maps: {} }); commitImageTiles(assets, null, verb || 'Add'); return assets.length; },
+            replaceTileForTest: async (id, url) => { replaceTileAsset(byId(id), await loadImg(url), {}); return true; },
+            iaState: () => ({ up: !!ia.up, down: !!ia.down, open: !!ia.cb, upN: ia.up && ia.up.n, downN: ia.down && ia.down.n }),
+            importBake: (img, S, plan, src) => { const it = { img, src }, t = iaDefaultTile(it, S); return importBake(t, it, S, plan); },
+            hdState: () => ({ regs: hd.regs.map(r => ({ name: r.name, cls: r.cls, feather: r.feather, mi: r.mi })), active: hd.active }),
+            hdContourMap: (src, f, n, wrap) => { const dbg = {}; hdLook(src, { factor: f, contours: n, wrap: wrap !== false, _dbg: dbg }); return dbg; },
+            hdPalette: (src, f, n) => { const S = src.width, d = src.getContext('2d').getImageData(0, 0, S, S).data, L = hdShrink(hdPremult(d, null), S, f, 4), s = S / f, px = new Float32Array(s * s * 4); for (let q = 0; q < s * s; q++) { const a = L[q * 4 + 3], k = a > 0.5 ? 255 / a : 0; px[q * 4] = L[q * 4] * k; px[q * 4 + 1] = L[q * 4 + 1] * k; px[q * 4 + 2] = L[q * 4 + 2] * k; px[q * 4 + 3] = a; } return classicPalette([{ s, px }], n); },
+            hdEstimate: (src, tol) => hdEstimate(src, tol),
+            hdShockIters: (f, amount) => hdShockIters(f, amount),
+            hdClasses: () => ({ classes: HD_CLASSES, table: HD_MATERIAL_CLASS, keys: Object.keys(TRLE.SolidPresets) }),
+            groupTiles: ids => groupSelection(ids),
+            hdFft: (re, im, n, inv) => { const r = Float64Array.from(re), i = Float64Array.from(im); hdFft(r, i, n, inv); return { re: Array.from(r), im: Array.from(i) }; },
+            tileFromRegion: (img, sx, sy, sw, sh, S) => makeTileFromRegion(img, sx, sy, sw, sh, S, null).canvas,
+            // Classic Look (CLASSIC-LOOK-PLAN phase 2): the pure filter, for validate-classic.
+            classicLook: (src, opts) => classicLook(src, opts),
+            classicSharedPalette: (canvases, opts) => classicSharedPalette(canvases, opts),
+            // Transforms (TRANSFORMS-PLAN phase 1): the resampler, the tile
+            // helpers it is checked against, the live element (so a validator
+            // can seed and read its masks and imported maps in the page), and
+            // the maps the real deriveMaps would export for it.
+            warpCanvas: (src, w, h, inv, opts) => warpCanvas(src, w, h, inv, opts),
+            slopeBlur: (src, driver, opts) => slopeBlurCanvas(src, driver, opts),
+            scatterPlan: (S, w, h, o) => scatterPlan(S, w, h, o),
+            scatterCanvas: (base, src, o, plan) => scatterCanvas(base, src, o, plan),
+            rotateTile90: c => rotateTile90(c),
+            turnNormals: (c, m) => turnNormals(c, m),
+            TURN: { rot90: TURN_ROT90, flipH: TURN_FLIPH },
+            elementRef: i => state.elements[i] || null,
+            openDistort: ids => openDistortModal(ids),
+            liquify: () => ({ lq, open: openLiquifyModal, apply: () => $('at-lq-apply').click() }),
+            tone: () => ({ tn, open: openToneModal }),
+            /* The demo course's strokes, without a pointer: a soft Dodge blob, and a drag with Forward Warp. */
+            toneDemo() {
+                if (tn.id === null) return false;
+                const g = tnGroupFor(tnRecipe('dodge')), x = g.mask.getContext('2d'), M = tn.M;
+                const rg = x.createRadialGradient(M * 0.35, M * 0.45, 0, M * 0.35, M * 0.45, M * 0.3);
+                rg.addColorStop(0, '#fff'); rg.addColorStop(1, '#000'); x.fillStyle = rg; x.fillRect(0, 0, M, M);
+                tn.touched = true; tnSchedule(); return true;
+            },
+            liquifyDemo() {
+                if (lq.id === null || !lq.field) return false;
+                const S = lq.field.S;
+                TRLE.Liquify.applyStroke(lq.field, { tool: 'forward', size: Math.round(S * 0.3), density: 55, pressure: 100, rate: 80,
+                    points: [[S * 0.2, S * 0.4], [S * 0.35, S * 0.43], [S * 0.5, S * 0.5], [S * 0.65, S * 0.58]] });
+                lqSchedule(); return true;
+            },
+            xfEntryClean: o => xfEntryClean(o),
+            /* Text as a layer (phase 3): the open modal's arrangement, and the preview crop of a cell
+               (what Apply must reproduce), for validate-text-layer. */
+            strokesRoundTrip: async strokes => decodeStrokes(await encodeStrokes(strokes)),
+            /* The colour tools as layers (phase 5): open a tool, open a tile's layer for editing, and what the
+               OLD Apply would have produced for a tile from the modal's current state. */
+            colourOpen(kind, ids, refId) {
+                if (kind === 'coloradj') openColorAdjModal(ids);
+                else if (kind === 'delight') openDelightModal(ids);
+                else { setSelection(ids, false); openRecolorModal(ids[0], refId); }
+                return true;
+            },
+            colourEdit(id, kind) { const el = byId(id), k = kindLayerOf(el, kind); if (!k) return false; TRLE.Layers.kindOf(k.def).edit(el, k.def); return true; },
+            colourExpected(kind, id) {
+                const el = byId(id), S = state.tileSize;
+                const out = kind === 'coloradj' ? caApplyTo(xin(ca.inputs, el), S)
+                    : kind === 'recolor' ? rcApplyTo(xin(rc.inputs, el), S, rcStatsFor(el))
+                    : dlMode() === 'whole' ? delightWhole(xin(dl.inputs, el), S, parseInt($('at-dl-strength').value) / 100)
+                    : (dl.resultCanvas || healPatchFill(xin(dl.inputs, el), dl.maskCanvas, S));
+                return TRLE.Layers.hash(out);
+            },
+            colourPaintMask(kind, x, y, w, h) {
+                const m = kind === 'coloradj' ? ca.maskCanvas : dl.maskCanvas, g = m.getContext('2d');
+                g.fillStyle = '#fff'; g.fillRect(x, y, w, h);
+            },
+            /* Classic Look and Fade as layers (phase 6): open a tool (or a layer of it for editing), what the OLD
+               Apply would have made from the modal's current state ('flat': on the tile as it is now; 'under': on the
+               stack below its content, with the content composited back over), and a tile's derived map source. */
+            finishOpen(kind, ids, editLid) {
+                const el = byId(ids[0]);
+                if (editLid) { const d = state.layerDefs[editLid]; TRLE.Layers.kindOf(d).edit(el, d); }
+                else if (kind === 'classic') openClassicModal(ids);
+                else if (kind === 'hdlook') openHdModal(ids);
+                else openFadeModal(ids[0]);
+                return true;
+            },
+            finishExpected(kind, id, mode) {
+                const el = byId(id), L = TRLE.Layers, S = state.tileSize;
+                const run = src => kind === 'classic' ? classicLook(src, Object.assign(clOpts(), { palette: null })) : applyAlphaFade(src, fadeBuildMask(S));
+                if (mode === 'flat') return L.hash(run(el.canvas));
+                let cur = run(L.inputFor(el, state.layerDefs, { kind, zone: 'texture' }));
+                for (const p of el.layers) {
+                    const d = state.layerDefs[p.lid];
+                    if (L.zoneOf(d) !== 'content') continue;
+                    const c = cloneCanvas(cur), g = c.getContext('2d'); g.globalAlpha = d.opacity == null ? 1 : d.opacity; g.drawImage(p.px, 0, 0); cur = c;
+                }
+                return L.hash(cur);
+            },
+            fadePaintMask(x, y, w, h) { const g = fade.maskCanvas.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(x, y, w, h); fadePreview(); return true; },
+            /* Surface Noise, Heal and Make Seamless as layers (phase 7): open one (or a layer of it for editing), what the
+               OLD Apply would have written for a tile from the modal's current state, and a mask painted as a brush would. */
+            /* Free Transform, Perspective and Distort over a tile with layers (phase 9). */
+            moveOpen(kind, ids) { if (kind === 'xform') openXformModal(ids); else if (kind === 'persp') openPerspModal(ids[0]); else openDistortModal(ids); return true; },
+            /* How far two tiles' canvases are from each other: max and mean absolute channel difference, and the share of channels that differ. */
+            canvasDiff(ia, ib) {
+                const a = byId(ia).canvas, b = byId(ib).canvas, S = a.width;
+                const x = a.getContext('2d').getImageData(0, 0, S, S).data, y = b.getContext('2d').getImageData(0, 0, S, S).data;
+                let max = 0, sum = 0, n = 0;
+                for (let i = 0; i < x.length; i++) { const d = Math.abs(x[i] - y[i]); if (d) n++; sum += d; if (d > max) max = d; }
+                return { max, mean: sum / x.length, share: n / x.length };
+            },
+            /* Layer effects (phase 11): the sums of a tile's content-layer material region (red channel) and text relief, to compare with and without effects. */
+            layerRegionSum(id) {
+                const el = byId(id), regs = textRegions(el);
+                if (!regs.length) return 0;
+                const m = regs[0].mask, d = m.getContext('2d').getImageData(0, 0, m.width, m.height).data; let s = 0;
+                for (let i = 0; i < d.length; i += 4) s += d[i] / 255;
+                return s;
+            },
+            /* Phase 12: the emissive map the export would carry for a tile (deriveMaps, emissive only): its hash, its sum of channels, and the sum of the layers' own glow. */
+            /* Phase 12 test: a tile's authored glow (el.emissive) as a flat grey, so the max with a layer's glow can be told from a replacement. */
+            authoredEmissive(id, v) {
+                const el = byId(id), c = document.createElement('canvas'); c.width = c.height = el.canvas.width;
+                const g = c.getContext('2d'); g.fillStyle = `rgb(${v},${v},${v})`; g.fillRect(0, 0, c.width, c.height); el.emissive = c; return true;
+            },
+            layerGlowCanvas: id => layerGlowOf(byId(id)),
+            matOpen(id) { openMatModal(id); return true; },
+            emissiveOut(id) {
+                const el = byId(id), r = deriveMaps(el, { emissive: true }, {}).emissive;
+                const sum = c => { if (!c) return 0; const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let t = 0; for (let i = 0; i < d.length; i += 4) t += d[i] + d[i + 1] + d[i + 2]; return t; };
+                return { has: !!r, hash: r ? TRLE.Layers.hash(r) : null, sum: sum(r), glow: sum(layerGlowOf(el)), canvas: r ? r.toDataURL() : null };
+            },
+            layerReliefSum(id) {
+                const r = effectiveTextRelief(byId(id)); if (!r) return null;
+                const sum = c => { if (!c) return 0; const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let s = 0; for (let i = 0; i < d.length; i += 4) s += d[i] / 255; return s; };
+                return { up: sum(r.up), down: sum(r.down), hole: sum(r.hole) };
+            },
+            texOpen(kind, ids, editLid) {
+                const el = byId(ids[0]);
+                if (editLid) { const d = state.layerDefs[editLid]; TRLE.Layers.kindOf(d).edit(el, d); return true; }
+                if (kind === 'noise') openNoiseModal(ids);
+                else if (kind === 'slope') openSlopeModal(ids);
+                else if (kind === 'hdlook') openHdModal(ids);
+                else if (kind === 'scatter') openScatterModal(ids);
+                else if (kind === 'oil') openOilModal(ids);
+                else if (kind === 'heal') openHealModal(ids[0]);
+                else openSeamlessModal(ids);
+                return true;
+            },
+            textureExpected(kind, id) {
+                const L = TRLE.Layers;
+                if (kind === 'hdlook') { const el = byId(id), r = hdRecipeNow(), inp = xin(hd.inputs, el); return L.hash(hdLookRegions(inp, Object.assign({}, r, { ref: hdRefFor(el, r, inp) }), hdRegionsNow())); }
+                if (kind === 'noise') return L.hash(noiseState.canvas);
+                if (kind === 'slope') { const el = byId(id); return L.hash(sbRun(el, xin(sb.inputs, el), el.canvas.width)); }
+                if (kind === 'oil') { const el = byId(id); return L.hash(oilCanvas(xin(oil.inputs, el), oilRecipeNow())); }
+                if (kind === 'scatter') { const el = byId(id), r = scRecipeNow(), inp = xin(sc.inputs, el); return L.hash(scatterCanvas(inp, scPatchAt(scPatchFor(el, r), inp.width) || inp, scOptsFrom(r, 0))); }
+                if (kind === 'heal') return L.hash(healComputeFill(state.tileSize));
+                return L.hash(TRLE.Engine.fboToCanvas(sm.resultFBO));
+            },
+            /* What a batch Slope Blur / Scatter must give each tile: made from every tile's pixels as they are NOW, before any is written. */
+            weatherBatchExpected(kind, ids) {
+                const r = kind === 'slope' ? sbRecipeNow() : scRecipeNow();
+                return ids.map((id, i) => {
+                    const el = byId(id), inp = xin((kind === 'slope' ? sb : sc).inputs, el), W = inp.width;
+                    if (kind === 'slope') return TRLE.Layers.hash(slopeBlurCanvas(inp, sbDriverFrom(r, inp, W, sbSourceFor(el, r, W)), sbOptsFrom(r, W)));
+                    const t = byId(r.tileId), patch = r.from === 'tile' && t && t !== el ? t.canvas : null;
+                    return TRLE.Layers.hash(scatterCanvas(inp, scPatchAt(patch, W) || inp, scOptsFrom(r, i)));
+                });
+            },
+            healPaintMask(x, y, w, h) { const g = heal.maskCanvas.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(x, y, w, h); healRenderPaint(); return true; },
+            mapSourceHash: id => TRLE.Layers.hash(mapSourceOf(byId(id))),
+            mapSourceIsCanvas: id => mapSourceOf(byId(id)) === byId(id).canvas,
+            drawEdit: id => { runCtxAction('editdrawing', id); return !!draw.edit; },
+            drawPreviewHash(id) {
+                const cell = draw.cells.find(c => c.id === id), c = document.createElement('canvas'); c.width = c.height = draw.S;
+                drawCompose();
+                c.getContext('2d').drawImage(draw.comp, cell.x, cell.y, draw.S, draw.S, 0, 0, draw.S, draw.S);
+                return TRLE.Layers.hash(c);
+            },
+            txOpen: ids => { openTextModal(ids); return !!tx.cells; },
+            txEdit: id => { runCtxAction('edittext', id); return !!tx.edit; },
+            txArea: () => tx.cells ? { W: tx.W, H: tx.H, S: tx.S, edit: !!tx.edit, cells: tx.cells.map(c => ({ id: c.id, x: c.x, y: c.y, editable: c.editable })) } : null,
+            txPreviewHash(id) {
+                const cell = tx.cells.find(c => c.id === id), c = document.createElement('canvas'); c.width = c.height = tx.S;
+                c.getContext('2d').drawImage(tx.comp, cell.x, cell.y, tx.S, tx.S, 0, 0, tx.S, tx.S);
+                return TRLE.Layers.hash(c);
+            },
+            effectiveTextRelief: i => effectiveTextRelief(state.elements[i]),   // el.textRelief plus its text layers' (LAYERS-PLAN D7)
+            // Free Transform (phase 2): the map the modal's controls describe right now.
+            xfInverse: S => xfInverse(S),
+            xfResample: (inv, k) => xfResample(inv, k),
+            // Perspective (phase 3): set the four corners (source px) as a drag would,
+            // and the solver itself.
+            psSetCorners(c) { ps.corners = c.map(p => p.slice()); psRender(); return true; },
+            psCorners: () => ps.corners && ps.corners.map(p => p.slice()),
+            psSetPhoto(canvas, name) { ps.photo = { canvas, name }; $('at-ps-mode').value = 'straighten'; $('at-ps-source').value = 'photo'; ps.corners = psDefaultCorners(); psSync(); psRender(); return true; },
+            psPreview: () => $('at-ps-after'),
+            dsPreview: () => $('at-ds-after'),
+            dsNoiseMap: () => dsNoiseMap(),
+            // 🔤 Text's online fonts (TEXT-PLAN phase 4), for validate-csp: the real
+            // catalogue fetch and the real jsDelivr load, under the enforced policy.
+            async textOnlineFont(id, weight) {
+                const cat = await txCatalogue(), f = cat.find(x => x.id === id);
+                if (!f) return { err: 'not in the catalogue (' + cat.length + ' families)' };
+                const fam = await txLoadOnline(f, weight || 400, false);
+                return { families: cat.length, family: fam, available: TRLE.Text.fontAvailable(fam, weight || 400) };
+            },
+            homography: (from, to) => homography(from, to),
+            deriveMapsOf(i) {
+                const enabled = {}; for (const mt of TRLE.MapOrder) enabled[mt] = true;
+                return deriveMaps(state.elements[i], enabled, {});
+            },
+            // The named relief band settings (HEIGHT-BANDS-PLAN.md), for the
+            // validator and the old-vs-new comparison capture.
+            bandPresets: () => JSON.parse(JSON.stringify(MAT_BAND_PRESETS)),
             // Structure introspection for the CDP validators (no pixel data).
             inspect(i) {
                 const el = state.elements[i];
@@ -23652,9 +32875,11 @@ window.TRLE = window.TRLE || {};
                 return {
                     id: el.id, kind: el.kind, seamless: !!el.seamless, edited: !!el.edited,
                     material: el.material ? el.material.key : null,
-                    matLayers: hasMatLayers(el) ? el.matLayers.map(L => L.material && L.material.key) : null,
+                    matLayers: (() => { const m = effectiveMatLayers(el); return m ? m.map(L => L.material && L.material.key) : null; })(),
                     emissive: !!el.emissive,
                     importedMaps: el.importedMaps ? Object.keys(el.importedMaps) : null,
+                    mapSource: hasMapSource(el),   // Classic Look: maps from the pre-filter diffuse
+                    textRelief: (() => { const r = effectiveTextRelief(el); return r ? { up: !!r.up, down: !!r.down, floors: r.floors } : null; })(),
                     sgParams: el.sgParams ? JSON.parse(JSON.stringify(el.sgParams)) : null,
                     htParams: !!el.htParams,
                     ovParams: el.ovParams ? JSON.parse(JSON.stringify(el.ovParams)) : null,
@@ -23752,6 +32977,7 @@ window.TRLE = window.TRLE || {};
             // `original`, so a destructive edit can be shown to change one and
             // leave the other intact (which is what keeps Reset to Original honest).
             tileSig(i) { return capSig(state.elements[i] && state.elements[i].canvas); },
+            animPreviewFrames() { return an.frames.slice(); },            // the animated modal's regenerated preview frames (hover-preview validator)
             tileRegionSig(i, x, y, w, h) {
                 const el = state.elements[i]; if (!el) return null;
                 const c = document.createElement('canvas'); c.width = w; c.height = h;
@@ -23836,6 +33062,16 @@ window.TRLE = window.TRLE || {};
             // deriveMaps actually hands the exporter. Equal values are the proof
             // that an imported layer survives all the way to export instead of
             // being regenerated from the preset.
+            // test-only: the whole red channel of a PSD-imported map (the import
+            // resize check, validate-import-resize).
+            importedMapRed(i, mt) {
+                const el = state.elements[i];
+                const c = el && el.importedMaps && el.importedMaps[mt];
+                if (!c) return null;
+                const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data, out = [];
+                for (let k = 0; k < d.length; k += 4) out.push(d[k]);
+                return out;
+            },
             importedMapPixel(i, mt) {
                 const el = state.elements[i];
                 const c = el && el.importedMaps && el.importedMaps[mt];
@@ -23879,6 +33115,12 @@ window.TRLE = window.TRLE || {};
                          layerSig: draw.layer ? capSig(draw.layer) : null,
                          renderMs: draw.renderMs.slice().sort((a, b) => a - b) };
             },
+            /* test-only (validate-handles): the Text view's handle frame in client px, so a
+               validator can aim real pointer events at a handle. */
+            txHandleProbe() {
+                const v = $('at-tx-view'), r = v.getBoundingClientRect(), b = txHandleBox(), k = r.width / v.width;
+                return b && { box: b, left: r.left, top: r.top, k, rot: txVal('rot'), size: txVal('size'), sx: txVal('sx'), sy: txVal('sy'), x: txVal('x'), y: txVal('y') };
+            },
             drawBrushProbe() { return drawBrush(); },
             drawDynTable() { return JSON.parse(JSON.stringify(DRAW_DYN)); },
             drawPickerProbe() { return { slot: drawPk.slot, h: drawPk.h, s: drawPk.s, v: drawPk.v, recent: drawRecent.slice(),
@@ -23908,7 +33150,7 @@ window.TRLE = window.TRLE || {};
                 const m = pushMaps(r.canvas, src, r, q, en, S, mk), lit = litCanvas(r.canvas, m);
                 const u = c => c ? c.toDataURL() : null;
                 return { diffuse: u(r.canvas), lit: u(lit), height: u(m.height), normal: u(m.normal), ao: u(m.ao),
-                         roughness: u(m.roughness), specular: u(m.specular), mask: u(r.slot.mask), painted: r.slot.painted };
+                         roughness: u(m.roughness), specular: u(m.specular), emissive: u(m.emissive), mask: u(r.slot.mask), painted: r.slot.painted };
             },
             pushSurfaces() { return JSON.parse(JSON.stringify(PUSH_SURFACES)); },
             /* test-only (phase 7): Draw's layer and recorded strokes in set mode; a
@@ -23952,7 +33194,7 @@ window.TRLE = window.TRLE || {};
             drawLastBrush() { return draw.lastStroke ? JSON.parse(JSON.stringify(draw.lastStroke.brush)) : null; },
             // test-only (2c.3): Make Height Map's recipe on a tile, as that modal leaves it.
             setHgParams(i, p) { const el = state.elements[i]; if (!el) return false; el.hgParams = p; return true; },
-            matLayersOf(i) { const el = state.elements[i]; return el && Array.isArray(el.matLayers) ? el.matLayers.map(L => ({ name: L.name, material: L.material, hasMask: !!L.mask, color: L.color })) : null; },
+            matLayersOf(i) { const el = state.elements[i], eff = el ? effectiveMatLayers(el) : null; return eff ? eff.map(L => ({ name: L.name, material: L.material, hasMask: !!L.mask, color: L.color })) : null; },
             drawCompPx(x, y) { if (!draw.comp) return null; drawCompose(); return [...draw.comp.getContext('2d').getImageData(x, y, 1, 1).data]; },
             tilePx(i, x, y) { const el = state.elements[i]; return el ? [...el.canvas.getContext('2d').getImageData(x, y, 1, 1).data] : null; },
             drawResetRenderTimes() { draw.renderMs = []; },
@@ -24250,6 +33492,7 @@ window.TRLE = window.TRLE || {};
             captureDownloads() { const got = []; downloadHook = (b, name) => got.push({ name, size: b.size, blob: b }); this._downloads = got; return true; },
             /* Sprites (SPRITE-PLAN phase 2). */
             spriteOpen() { openSpriteModal(); return true; },
+            origamiFold(canvas, S, opts) { return makeOrigamiFrame(canvas, S, opts); },
             spriteParams() { return spReadParams(); },
             spriteFrames() { return sp.frames; },
             spriteFrameAt(i) { return TRLE.SpriteGen.frameAt(spReadParams(), i); },
@@ -24266,6 +33509,15 @@ window.TRLE = window.TRLE || {};
                 return `${sp.frames.length}:${h.toString(16)}`;
             },
             downloads() { return this._downloads || []; },
+            // FOLDER-SYNC-PLAN: the native picker cannot be driven headless, so a validator hands in a directory handle.
+            setFolderPicker(fn) { folder.pickerHook = fn; folderRender(); return true; },
+            folderState() { const L = folder.link; return { linked: !!L, name: L && L.handle.name, names: L ? L.names : [], baseName: L && L.baseName, xml: !!(L && L.xml), busy: folder.busy || folderSync.running, auto: !!(L && L.auto), perm: folder.perm, dirty: folderSync.dirty, pause: folder.pause, writtenAt: L && L.writtenAt }; },
+            // Auto-sync timing and the yield, for validate-folder-sync (defaults are D11's 1.5 s and 10 s).
+            setSyncTiming(idleMs, gapMs) { folderSync.timing.idleMs = idleMs; folderSync.timing.gapMs = gapMs; return true; },
+            setFolderYield(fn) { folder.yieldHook = fn; return true; },
+            folderEdit() { folderEdited(); return true; },
+            // The edit hook every history step ends in (autosave, then folder sync), for a validator that needs an edit that moves nothing.
+            markDirty() { markDirty(); return true; },
             holes() { return holeSlots(); },
             /* Drive a drop without a pointer: the same plan and commit the drag uses. */
             dropAt(ids, zone, target) {
@@ -24314,6 +33566,69 @@ window.TRLE = window.TRLE || {};
             },
             async projectJSON() { return JSON.parse(JSON.stringify(await buildProjectJSON())); },
             async loadProjectJSON(json) { return applyProject(json); },
+            /* STICKERS-PLAN phase 2: the two other paths the library must ride, Folder Sync's streamed file and the
+               autosave snapshot (Blobs), and whether a library change marked the project unsaved. */
+            async projectStreamed() { let t = ''; await streamProjectJSON({ write: async x => { t += x; } }); return JSON.parse(t); },
+            async projectSnapshotStickers() {
+                const p = await buildProjectSnapshot();
+                return p.stickers ? p.stickers.map(e => ({ id: e.id, name: e.name, blob: e.src instanceof Blob, maps: Object.keys(e.maps || {}).filter(k => e.maps[k] instanceof Blob) })) : null;
+            },
+            stickersDirty() { return !!state.dirty; },
+            stlBusy() { return stl.busy; },
+            /* STICKERS-PLAN phase 4: the Add Stickers window, for real pointer events (view px → client px) and its state. */
+            stProbe() {
+                const v = $('at-st-view'), r = v.getBoundingClientRect();
+                return { open: stOpen(), items: st.items.map(it => Object.assign({}, it)), sel: st.sel, W: st.W, H: st.H, S: st.S, wrap: st.wrap,
+                         left: r.left, top: r.top, k: r.width / v.width, fit: st.fit, box: stBox(stCur()), undo: st.undo.length,
+                         discard: stOpen() && stDiscardShown(), chips: document.querySelectorAll('#at-st-strip .at-st-chip').length,
+                         title: $('at-st-title').textContent, edit: st.edit ? st.edit.lid : null };
+            },
+            stEdit(id) { runCtxAction('editstickers', id); return stOpen(); },
+            /* STICKERS-PLAN phase 9: Make Sticker's state (the canvas's client rect for real pointer events). */
+            stcMask: () => stc.mask,
+            /* The demo course (lesson 4): a selection on the open Make Sticker surface, as the Rect or Ellipse tool makes
+               one (mask px), with the window's own redraw; and a rivet cut from tile `from` into the gallery if it is not
+               there yet, so a step can be reached from the dots. */
+            stcSelect(shape, x0, y0, x1, y1) {
+                if (!stcOpen()) return false;
+                const g = stc.mask.getContext('2d');
+                stcEditor.snapshot();
+                g.fillStyle = '#fff'; g.beginPath();
+                if (shape === 'ellipse') g.ellipse((x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2, 0, 0, Math.PI * 2); else g.rect(x0, y0, x1 - x0, y1 - y0);
+                g.fill();
+                stcRenderPaint(); stcRenderPreview();
+                return true;
+            },
+            stickerSeed(from) {
+                const have = TRLE.Stickers.list().find(r => r.from === 'cut');
+                if (have) return have.id;
+                const el = byId(from);
+                if (!el) return null;
+                const S = el.canvas.width, k = S / 256, c = document.createElement('canvas'); c.width = c.height = S;
+                const g = c.getContext('2d');
+                g.beginPath(); g.ellipse(24 * k, 122 * k, 14 * k, 14 * k, 0, 0, Math.PI * 2); g.clip(); g.drawImage(el.canvas, 0, 0);
+                const enabled = {}; for (const mt of TRLE.MapOrder) enabled[mt] = true;
+                const r = TRLE.Stickers.add({ canvas: c, name: 'Rivet', maps: deriveMaps(el, enabled, {}), from: 'cut' });
+                return r ? r.rec.id : null;
+            },
+            stcProbe() {
+                const v = $('at-stcut-canvas'), r = v.getBoundingClientRect();
+                return { open: stcOpen(), id: stc.id, S: v.width, left: r.left, top: r.top, w: r.width, h: r.height, lift: !$('at-stcut-liftwrap').hidden,
+                         liftNote: $('at-stcut-liftnote').textContent, size: $('at-stcut-size').textContent, name: $('at-stcut-name').value, canSave: !$('at-stcut-save').disabled };
+            },
+            /* STICKERS-PLAN phase 7: an element's export maps (deriveMaps, every map), or with `plain` those of a tile with the
+               same pixels and material and no layers (what "Follow the tile" must equal). Canvases, for in-page checks. */
+            stMaps(id, plain) {
+                const el = byId(id), enabled = {}; for (const mt of TRLE.MapOrder) enabled[mt] = true;
+                return deriveMaps(plain ? Object.assign({}, el, { id: '__plain' + id, layers: null, under: null }) : el, enabled, {});
+            },
+            stOpenFor(ids) { openStickersModal(ids); return stOpen(); },
+            stlProbe() {
+                return { open: stlOpen(), count: $('at-stl-count').textContent, cells: [...document.querySelectorAll('#at-stl-grid .at-stl-cell')].map(b => b.querySelector('span').textContent),
+                         sel: stl.sel, selName: $('at-stl-detail').hidden ? null : $('at-stl-name').value, info: $('at-stl-info').textContent,
+                         empty: !!document.querySelector('#at-stl-grid .at-stl-empty') };
+            },
+            markSavedForTest() { markSaved(); },
             stitchSize() { const c = stitchAtlas(el => el.canvas); return { w: c.width, h: c.height }; },
             // test-only: fingerprint one mask, so "all sliders at 0 changes
             // nothing" can be asserted as byte-equality rather than eyeballed.
@@ -24790,7 +34105,7 @@ window.TRLE = window.TRLE || {};
             // screenshots: build a 2-tile atlas and open a modal
             async setupTwoTiles(aSrc, bSrc, S) {
                 const A = toC(await loadImg(aSrc), S), B = toC(await loadImg(bSrc), S);
-                state.tileSize = S; state.cols = 2; state.nextId = 3; state.emptyFill = null;
+                state.tileSize = S; state.cols = 2; state.nextId = 3; state.emptyFill = null; atlasFromEarlierSession = false;
                 state.elements = [tile(A, 1), tile(B, 2)];
                 $('at-grid-card').style.display = 'block';
                 renderGrid();
@@ -24844,7 +34159,7 @@ window.TRLE = window.TRLE || {};
                `setupTilesFrom` cannot do the second: it scales each whole image
                down to one tile, which would squash a 4x4 sheet into a thumbnail. */
             async setupFrom(entries, S) {
-                state.tileSize = S; state.cols = 4; state.elements = []; state.nextId = 1;
+                state.tileSize = S; state.cols = 4; state.elements = []; state.nextId = 1; atlasFromEarlierSession = false;
                 state.selectedId = null; state.selSet.clear(); state.selAnchor = null;
                 for (const e of entries) {
                     const spec = typeof e === 'string' ? { src: e } : e;
@@ -24868,7 +34183,7 @@ window.TRLE = window.TRLE || {};
                 return state.elements.length;
             },
             async setupTilesFrom(srcs, S) {
-                state.tileSize = S; state.cols = 4; state.elements = []; state.nextId = 1; state.emptyFill = null;
+                state.tileSize = S; state.cols = 4; state.elements = []; state.nextId = 1; state.emptyFill = null; atlasFromEarlierSession = false;
                 for (const u of srcs) {
                     const c = toC(await loadImg(u), S);
                     state.elements.push(tile(c, state.nextId++));
@@ -24879,7 +34194,7 @@ window.TRLE = window.TRLE || {};
             },
             async setupManyTiles(src, S, n, cols) {
                 const A = toC(await loadImg(src), S);
-                state.tileSize = S; state.cols = cols || 4; state.nextId = n + 1; state.emptyFill = null;
+                state.tileSize = S; state.cols = cols || 4; state.nextId = n + 1; state.emptyFill = null; atlasFromEarlierSession = false;
                 state.elements = [];
                 for (let i = 0; i < n; i++) state.elements.push(tile(cloneCanvas(A), i + 1));
                 $('at-grid-card').style.display = 'block';
@@ -24911,6 +34226,12 @@ window.TRLE = window.TRLE || {};
                layer did anything, `holes` the control that layer 2 HAS empty
                pixels. `frames` is how many the composite produced, and `sigs`
                lets a caller compare two builds. */
+            /* The real two-layer path (animGenerateComposite), frames out, so a
+               validator can composite a layer over a known layer 1. */
+            animCompositeFrames(p1, l2) { return animGenerateComposite(p1, l2, false); },
+            // Draw preview frame i synchronously (the playback loop is timed), so a
+            // validator can read #at-anim-preview for a known frame.
+            animPreviewDraw(i) { anDrawPreviewFrame(i); return an.frames.length; },
             animLayerProbe(p1, l2, k) {
                 const comp = animGenerateComposite(p1, l2, false);
                 const base = TRLE.AnimGen.generateFrames(p1);
@@ -25345,6 +34666,46 @@ window.TRLE = window.TRLE || {};
                 return { W: c.width, H: c.height, px, ms };
             },
             openOrganic(a, b) { openOrganicModal(a || 1, b || 2); return true; },
+            // ORGANIC-SETS-PLAN: the mask builders, hashed or read back, for validate-organic-sets.
+            organicMaskHash(S, opts) { return TRLE.Layers.hash(buildOrganicMask(S, S, opts)); },
+            /* Border bytes against the plain mask, and patches on each side of the
+               contour (a px counts when it sits 3+ px from the contour and crossed). */
+            patchCheck(S, spec, opts) {
+                const plain = !spec ? null : spec.wang != null ? buildWangMask(S, spec.wang, 0.5, spec.hardness ?? 0, spec.org || null)
+                    : buildTopologyMask(S, spec.mode, 0.5, spec.hardness ?? 0, spec.org || null);
+                const t0 = performance.now(), m = patchMask(plain, S, opts), ms = performance.now() - t0;
+                const px = c => c ? c.getContext('2d').getImageData(0, 0, S, S).data : null;
+                const a = px(plain), b = px(m);
+                const sgn = plain ? maskSignedDistance(plain, S, S).sgn : null;
+                let borderMax = 0, changed = 0, aIsl = 0, bIsl = 0, hi = 0;
+                for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+                    const i = y * S + x, pv = a ? a[i * 4] : 0, ov = b[i * 4];
+                    if (pv !== ov) changed++;
+                    if (pv > 127) hi++;
+                    if (x === 0 || y === 0 || x === S - 1 || y === S - 1) borderMax = Math.max(borderMax, Math.abs(pv - ov));
+                    const s = sgn ? sgn[i] : -9;
+                    if (s < -3 && ov > 127) aIsl++;
+                    if (s > 3 && ov < 128) bIsl++;
+                }
+                return { borderMax, changed, aIsl, bIsl, ms, hash: TRLE.Layers.hash(m), mixed: hi > 0 && hi < S * S };
+            },
+            wangXBusy() { return !!wangXBuilding; },
+            transModeNames() { return TRANS_MODES.map(m => m.mode).concat(Object.keys(CORNER_BITS)); },
+            /* An element's four border rows (red channel) and each row's max, plus its
+               recipe, so seams between real tiles can be compared exactly. */
+            elEdges(i) {
+                const el = state.elements[i]; if (!el) return null;
+                const S = el.canvas.width, d = el.canvas.getContext('2d').getImageData(0, 0, S, S).data, px = k => d[k * 4];
+                const top = [], bot = [], lef = [], rig = [], rowMax = [];
+                for (let k = 0; k < S; k++) { top.push(px(k)); bot.push(px((S - 1) * S + k)); lef.push(px(k * S)); rig.push(px(k * S + S - 1)); }
+                for (let y = 0; y < S; y++) { let m = 0; for (let x = 0; x < S; x++) m = Math.max(m, px(y * S + x)); rowMax.push(m); }
+                return { S, top, bot, lef, rig, rowMax };
+            },
+            elRecipe(i) {
+                const el = state.elements[i]; if (!el) return null;
+                return { mode: el.mode ?? null, wangBits: el.wangBits ?? null, patch: el.patch ? { ...el.patch } : null,
+                         custom: !!el.customMask, hint: !!el.patchHint, base: el.base, overlay: el.overlay, block: el.block ? { ...el.block } : null };
+            },
             openTrans(baseId, overlayId) { openTransModal(baseId || 1, overlayId || 2); return true; },
             /* Recolor normally arrives through the two-click pick flow (right-click
                a tile, then click the reference). A lesson wants the modal open on
@@ -25359,6 +34720,7 @@ window.TRLE = window.TRLE || {};
                modal, which a script cannot drive and a lesson should not try to:
                a file dialog over a course is hostile. This is the same modal on a
                named image. */
+            importDetect: async src => { const r = impDetectSize(await loadImg(src)); return { best: r && { size: r.size, ratio: r.ratio }, table: impDetectSize.table }; },
             async openImport(src, size) {
                 openImportModal(await loadImg(src), size || state.tileSize || 256, !state.elements.length);
                 return true;

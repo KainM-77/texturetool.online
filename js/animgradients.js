@@ -57,7 +57,16 @@ TRLE.AnimGradients = {
     /* ---- glitch gradients: hard jumps between saturated bands, so a block
        re-rolled to a new value reads as a different colour, not a shade ---- */
     glitch_neon: { label: 'Glitch Neon',   stops: [[0,[4,3,10]], [0.45,[30,12,62]], [0.6,[255,0,140]], [0.76,[0,225,255]], [0.9,[170,255,80]], [1,[255,255,255]]] },
-    glitch_vhs:  { label: 'Glitch VHS',    stops: [[0,[10,18,22]], [0.22,[20,90,100]], [0.42,[210,40,120]], [0.6,[245,200,60]], [0.8,[90,200,230]], [1,[240,236,225]]] }
+    glitch_vhs:  { label: 'Glitch VHS',    stops: [[0,[10,18,22]], [0.22,[20,90,100]], [0.42,[210,40,120]], [0.6,[245,200,60]], [0.8,[90,200,230]], [1,[240,236,225]]] },
+
+    /* ---- caustic gradients (WATER-CAUSTICS-PLAN): stop 0 is PURE BLACK on
+       every one, because under Additive black adds nothing and the floor shows
+       through; any colour at stop 0 lifts the whole floor. Bands taken from the
+       classic reference collage (§3.1) for Teal; Aqua for open water, Sun for
+       warm shallows. ---- */
+    caustic_teal: { label: 'Caustic Teal', stops: [[0,[0,0,0]], [0.15,[13,17,21]], [0.35,[24,34,40]], [0.7,[110,122,122]], [1,[225,232,228]]] },
+    caustic_aqua: { label: 'Caustic Aqua', stops: [[0,[0,0,0]], [0.15,[6,18,24]], [0.35,[12,40,52]], [0.7,[70,150,160]], [1,[200,245,240]]] },
+    caustic_sun:  { label: 'Caustic Sun',  stops: [[0,[0,0,0]], [0.15,[18,16,10]], [0.35,[40,36,24]], [0.7,[170,160,120]], [1,[255,248,220]]] }
 };
 
 /* Order for the gradient picker. */

@@ -90,7 +90,7 @@ TRLE.DemoGenerateSet = [
     { src: 'Examples/ExampleAtlas.png', cell: [3, 1], cellSize: 256 }, // 2 - planks
     { src: 'Examples/ExampleAtlas.png', cell: [0, 0], cellSize: 256 }, // 3 - roof tiles, for shingles
     { src: 'Examples/ExampleAtlas.png', cell: [2, 0], cellSize: 256 }, // 4 - stone floor, for Variations
-    { src: 'Examples/ExampleAtlas.png', cell: [2, 3], cellSize: 256 }, // 5 - roman artwork, for Origami
+    'Examples/Stonetiles.png',                                         // 5 - cobble, for Origami
     { src: 'Examples/ExampleAtlas.png', cell: [2, 1], cellSize: 256 }  // 6 - grass, colour for the glass
 ];
 
@@ -210,6 +210,11 @@ TRLE.DemoDepthSet = [
 /* First element carrying an overlay recipe, or -1. Built out of `inspect` rather
    than a new capture hook, because `inspect` already reports ovParams and the
    only caller needs it once. */
+/* Does element `id` carry a sticker layer? (lesson 4's Edit Stickers step builds one when it does not.) */
+async function findSticker(api, id) {
+    const el = await api.cap('layersEl', id), defs = await api.cap('layersDefs');
+    return !!(el && el.layers && defs && el.layers.some(p => defs[p.lid] && defs[p.lid].kind === 'sticker'));
+}
 async function findOverlay(api) {
     const n = await api.cap('count');
     for (let i = 0; i < (n || 0); i++) {
@@ -225,6 +230,32 @@ TRLE.DemoAtlasTiles = [
     'checkered tiles', 'ladder on wall', 'metal pipes', 'metal grate (real alpha)',
     'metal door, red frame', 'metal skylight (white holes)', 'roman artwork', 'forklift door'
 ];
+
+
+/* Lesson 12 (Layers) helpers. Each step may be reached from any other, so each one makes sure the layers it talks about exist
+   (idempotent: a tile that already carries one is left alone). Text and Adjust Colours go through their real modals. */
+async function layerKinds(api) {
+    const id = await api.tileId(0);
+    const el = await api.cap('layersEl', id), defs = await api.cap('layersDefs');
+    return ((el && el.layers) || []).map(p => defs && defs[p.lid] && defs[p.lid].kind);
+}
+async function layersEnsureText(api) {
+    await api.closeMenu(); await api.cap('closeModal');
+    if ((await layerKinds(api)).includes('text')) return;
+    await api.cap('openCtx', await api.tileId(0)); await api.wait(240);
+    await api.click('#at-ctx button[data-action="text"]'); await api.wait(900);
+    await api.setValue('at-tx-text', 'EXIT'); await api.setValue('at-tx-size-num', 84); await api.setValue('at-tx-size', 84);
+    await api.wait(500);
+    await api.click('#at-tx-apply'); await api.wait(900);
+}
+async function layersEnsureGrade(api) {
+    await layersEnsureText(api);
+    if ((await layerKinds(api)).includes('coloradj')) return;
+    await api.cap('openCtx', await api.tileId(0)); await api.wait(240);
+    await api.click('#at-ctx button[data-action="coloradj"]'); await api.wait(900);
+    await api.setValue('at-ca-bright', -30); await api.wait(500);
+    await api.click('#at-ca-apply'); await api.wait(900);
+}
 
 TRLE.DemoLessons = [
     {
@@ -334,7 +365,7 @@ TRLE.DemoLessons = [
                 covers: ['ui:selection', 'ui:bulk-bar'],
                 say: `Tiles select like icons on a desktop. <strong>Click</strong> one,
  <strong>Ctrl/Cmd+click</strong> to add or remove, <strong>Shift+click</strong>
- for a range, or <strong>drag a box</strong> across the grid background.
+ for a run in atlas order, or <strong>drag a box</strong> from any empty spot in the grid's card.
  <strong>Ctrl/Cmd+A</strong> takes everything and <strong>Esc</strong> clears.<br><br>
  With two or more selected, a <em>bulk bar</em> appears. Right-clicking any
  selected tile then acts on the whole selection, and every menu entry that can
@@ -785,6 +816,76 @@ TRLE.DemoLessons = [
  preset list. <strong>Make a new tile</strong> keeps the original alongside.`
             },
             {
+                id: 'oil',
+                title: 'Oil Paint',
+                covers: ['action:oil', 'modal:oil'],
+                requires: { tiles: TRLE.DemoCleanupSet },
+                say: `<strong>Oil Paint</strong> is in the <strong>Filter</strong> category. It smears the
+ colours along the texture's own edges into brush strokes. <strong>Stylization</strong> is how long
+ the strokes are, <strong>Cleanliness</strong> smooths the picture first and <strong>Scale</strong>
+ sets how big the shapes are that the strokes follow.<br><br>
+ <strong>Lighting</strong> is off. Ticking it bakes shading into the colour, which
+ <strong>De-light</strong> would then have to take out again, so leave it off for textures you
+ export. The result is a layer, so you can hide it later.`,
+                setup: async api => {
+                    await api.closeMenu();
+                    await api.cap('openCtx', await api.tileId(5)); await api.wait(220);
+                    await api.click('#at-ctx button[data-action="oil"]'); await api.wait(1200);
+                },
+                spotlight: '#at-oil-rows',
+                sweep: { id: 'at-oil-stylization', from: 1, to: 10, ms: 1800 },
+                preview: '#at-oil-after',
+                handoff: `Tick <strong>Show 2 × 2</strong> to check that it still tiles, then
+ <strong>💾 Apply</strong>.`
+            },
+            {
+                id: 'tone',
+                title: 'Dodge & Burn',
+                covers: ['action:tone', 'modal:tone'],
+                requires: { tiles: TRLE.DemoCleanupSet },
+                say: `<strong>Dodge &amp; Burn</strong> is in the <strong>Edit</strong> category, right
+ after <strong>Heal</strong>. You paint over the texture with Draw's brush: <strong>Dodge</strong>
+ lightens, <strong>Burn</strong> darkens, <strong>Sponge</strong> adds or takes away colour, and
+ <strong>Blur</strong> and <strong>Sharpen</strong> soften and crisp up. The soft blob here is a
+ Dodge stroke.<br><br>
+ <strong>Range</strong> picks shadows, midtones or highlights, and <strong>Protect tones</strong>
+ keeps the hue from shifting. Each tool you paint with becomes its own layer when you press
+ <strong>Apply</strong>.`,
+                setup: async api => {
+                    await api.closeMenu();
+                    await api.cap('openCtx', await api.tileId(5)); await api.wait(220);
+                    await api.click('#at-ctx button[data-action="tone"]'); await api.wait(900);
+                    await api.cap('toneDemo'); await api.wait(400);
+                },
+                spotlight: '#at-tn-tools',
+                sweep: { id: 'at-tn-exposure', from: 10, to: 100, ms: 1800 },
+                preview: '#at-tn-surface',
+                handoff: `Pick <strong>Burn</strong> and paint a second blob, then <strong>💾 Apply</strong>:
+ two layers appear.`
+            },
+            {
+                id: 'liquify',
+                title: 'Liquify',
+                covers: ['action:liquify', 'modal:liquify'],
+                requires: { tiles: TRLE.DemoCleanupSet },
+                say: `<strong>Liquify</strong> is in the <strong>Transform</strong> category. Paint on
+ the texture to push it around: <strong>Forward Warp</strong> drags, the twirl tools turn,
+ <strong>Pucker</strong> pinches in and <strong>Bloat</strong> pushes out. The drag here is a Forward
+ Warp.<br><br>
+ Strokes wrap across the tile edges, so a bent tile still tiles. Anything on the tile (text,
+ drawings, glow) moves with it. It works on one tile at a time.`,
+                setup: async api => {
+                    await api.closeMenu();
+                    await api.cap('openCtx', await api.tileId(5)); await api.wait(220);
+                    await api.click('#at-ctx button[data-action="liquify"]'); await api.wait(900);
+                    await api.cap('liquifyDemo'); await api.wait(500);
+                },
+                spotlight: '#at-lq-tools',
+                preview: '#at-lq-surface',
+                handoff: `Switch to <strong>Pucker</strong> and hold the button down on the picture, then
+ <strong>💾 Apply</strong>.`
+            },
+            {
                 id: 'draw',
                 title: 'Draw on it',
                 covers: ['action:draw', 'modal:draw'],
@@ -935,23 +1036,29 @@ TRLE.DemoLessons = [
             },
             {
                 id: 'origami',
-                title: 'Origami Frame: fold a texture into rings',
+                title: 'Origami Frame: fold a texture like paper',
                 covers: ['action:origami', 'modal:origami'],
                 requires: { tiles: TRLE.DemoGenerateSet },
-                say: `<strong>Origami Frame</strong> mirrors a texture in on itself to build nested
-                      rings, which is how you get a carved panel or a framed inset out of a flat one.<br><br>
-                      <strong>Ring shape</strong> picks square, diamond or circle. <strong>Detail
-                      axis</strong> tells it which way the source's ridges run, and Auto usually gets
-                      it right. <strong>Repeats</strong> folds the source into more rings.`,
+                say: `<strong>Origami Frame</strong> folds a texture like paper and adds the result as a
+                      new tile. <strong>Fold type</strong> picks the fold: <strong>Frame</strong> wraps it
+                      into nested rings, <strong>Pleats</strong> fold it in parallel strips,
+                      <strong>Kaleidoscope</strong> mirrors it into a grid and <strong>Fan</strong> folds
+                      it around a point.<br><br>
+                      On Frame, <strong>Ring size</strong> set to <strong>Keep texture size</strong> lays
+                      the cobble down at its own scale, so <strong>Repeats</strong> gives more, narrower
+                      rings and the stones stay stones. <strong>Fit whole texture</strong> squeezes all of
+                      it into every ring instead.`,
                 setup: async api => {
                     await api.closeMenu();
                     await api.cap('openCtx', await api.tileId(4)); await api.wait(240);
                     await api.click('#at-ctx button[data-action="origami"]'); await api.wait(900);
+                    await api.setValue('at-origami-size', 'keep', 'change'); await api.wait(300);
                 },
-                spotlight: '#at-origami-shape',
+                spotlight: '#at-origami-type',
                 sweep: { id: 'at-origami-repeats', from: 1, to: 4, ms: 1400 },
                 preview: '#at-origami-preview',
-                handoff: `Switch <strong>Ring shape</strong> to Circle and watch it become a medallion.`
+                handoff: `Switch <strong>Fold type</strong> to Pleats and set <strong>Spacing</strong> to
+                          Irregular, or try Fan and raise <strong>Crease shading</strong>.`
             },
             {
                 id: 'stainedglass',
@@ -1120,9 +1227,9 @@ TRLE.DemoLessons = [
                 requires: { tiles: TRLE.DemoBlendSet },
                 say: `Every tool so far in this lesson blends two terrains <em>into</em> each other.
                       <strong>🖼 Overlay Texture</strong> does the other thing: it lays one texture on
-                      top of another and leaves the base alone underneath. It is in the same
-                      <strong>Transitions</strong> category for that reason, and it is the one you want
-                      for grates, decals, posters, grime and moss rather than for a shoreline.<br><br>
+                      top of another and leaves the base alone underneath. That is why it has a
+                      category of its own, <strong>Overlay</strong>, just after Transitions, and it is the
+                      one you want for grates, decals, posters, grime and moss rather than for a shoreline.<br><br>
                       Right-click the base, then click the texture to put over it. Here that is tile
                       6's metal grate over tile 3's brick. The grate already has transparency, so
                       <strong>What shows through</strong> stays on <strong>Whole overlay</strong> and
@@ -1193,6 +1300,113 @@ TRLE.DemoLessons = [
                 handoff: `Open it, change the blend to <strong>Screen</strong> and press
                           <strong>Update</strong>. The tile in the grid changes, and the recipe is still
                           there next time.`
+            },
+            {
+                id: 'sticker-cut',
+                title: 'Make Sticker: a piece of one tile',
+                covers: ['action:stickercut', 'modal:stickercut'],
+                requires: { tiles: TRLE.DemoBlendSet },
+                say: `Overlay Texture stacks a whole texture. A <em>sticker</em> is something smaller you
+                      place by hand: a rivet, a plaque, a crack, a sign. Stickers live in the project's
+                      gallery, and one way to fill it is to cut a piece out of a tile you already have.<br><br>
+                      <strong>✂️ Make Sticker…</strong> is in the same <strong>Overlay</strong> category.
+                      Select what to cut with the mask tools; here an <strong>Ellipse</strong> round one
+                      rivet on tile 4's pipes. The preview on the right is the sticker, trimmed to what you
+                      selected.<br><br>
+                      <strong>Keep its maps</strong> brings the pipes' material maps along, so the rivet can
+                      keep its own relief wherever you put it. <strong>Lift it off and heal the hole</strong>
+                      also takes it off this tile, as a Heal layer you can hide later. Left unticked, the
+                      tile does not change.`,
+                setup: async api => {
+                    await api.closeMenu(); await api.cap('closeModal'); await api.cap('selectIdx', []);
+                    await api.cap('openCtx', await api.tileId(3)); await api.wait(240);
+                    await api.click('#at-ctx button[data-action="stickercut"]'); await api.wait(600);
+                    await api.cap('stcSelect', 'ellipse', 10, 108, 38, 136); await api.wait(300);
+                },
+                spotlight: '#at-stcut-preview',
+                handoff: `Tick <strong>Keep its maps</strong> and press <strong>➕ Add to the gallery</strong>.`
+            },
+            {
+                id: 'sticker-gallery',
+                title: 'The Sticker Gallery',
+                covers: ['action:stickerlib', 'modal:stickerlib'],
+                requires: { tiles: TRLE.DemoBlendSet },
+                say: `<strong>📚 Sticker Gallery…</strong> holds every sticker in the project. Besides cuts,
+                      <strong>➕ Add images…</strong> takes PNG, JPG, WebP and TGA files, <strong>📁 Add a
+                      folder…</strong> a whole folder, and a PSD gives one sticker per layer. An image with
+                      a file beside it named like <em>bolt_normal.png</em> gets that file as its normal
+                      map.<br><br>
+                      The gallery is saved with the project. To use the same stickers in another project,
+                      <strong>💾 Save pack</strong> writes them all to one file and <strong>📦 Load
+                      pack…</strong> reads it there.`,
+                setup: async api => {
+                    await api.closeMenu(); await api.cap('closeModal');
+                    await api.cap('stickerSeed', await api.tileId(3));
+                    await api.cap('openCtx', await api.tileId(2)); await api.wait(240);
+                    await api.click('#at-ctx button[data-action="stickerlib"]'); await api.wait(500);
+                },
+                spotlight: '#at-stl-grid',
+                handoff: `Click the rivet to see its size and the maps it carries, and to rename it.`
+            },
+            {
+                id: 'stickers',
+                title: 'Add Stickers: place, size, recolour',
+                covers: ['action:stickers', 'modal:stickers'],
+                requires: { tiles: TRLE.DemoBlendSet },
+                say: `<strong>🏷️ Add Stickers…</strong> puts gallery images on the tile. Click one in the
+                      strip, or drag it onto the texture, then drag it where you want it. A corner resizes
+                      it and keeps its shape, <strong>Shift</strong> stretches it, just outside a corner
+                      turns it, and <strong>Alt</strong>-drag makes a copy. The sweep fades the rivet in
+                      with <strong>Opacity</strong>.<br><br>
+                      Each sticker has its own settings, in four tabs. <strong>Colour</strong> recolours it.
+                      <strong>Maps</strong> decides what it does to the material maps: <strong>Follow the
+                      tile</strong>, <strong>A material preset</strong>, or <strong>Its own maps</strong>,
+                      the ones it was cut with. <strong>Effects</strong> adds a shadow, a glow or an
+                      outline.<br><br>
+                      Nothing changes until <strong>💾 Apply</strong>, which adds one layer to the tile
+                      with every sticker in it.`,
+                setup: async api => {
+                    await api.closeMenu(); await api.cap('closeModal'); await api.cap('selectIdx', []);
+                    await api.cap('stickerSeed', await api.tileId(3));
+                    await api.cap('openCtx', await api.tileId(2)); await api.wait(240);
+                    await api.click('#at-ctx button[data-action="stickers"]'); await api.wait(600);
+                    await api.click('#at-st-strip .at-st-chip'); await api.wait(300);
+                    await api.setValue('at-st-w', 56, 'change'); await api.setValue('at-st-h', 56, 'change'); await api.wait(300);
+                },
+                spotlight: '#at-st-view',
+                sweep: { id: 'at-st-op', from: 0, to: 100, ms: 1800 },
+                preview: '#at-st-view',
+                handoff: `Open the <strong>Effects</strong> tab, tick <strong>Drop shadow</strong>, and press
+                          <strong>💾 Apply</strong>.`
+            },
+            {
+                id: 'edit-stickers',
+                title: 'Stickers stay editable',
+                covers: ['action:editstickers'],
+                requires: { tiles: TRLE.DemoBlendSet },
+                say: `The stickers become a layer on the tile, in its <strong>Text and drawings</strong>
+                      group, so hiding, moving and deleting them work as for any layer.
+                      <strong>Edit Stickers…</strong> reopens the window with every sticker where you left
+                      it. The gallery image was copied into the layer, so deleting it from the gallery later
+                      changes no tile.<br><br>
+                      Stickers are also the one layer that goes on a transition or an animation frame. On
+                      an animation they appear on every frame, at the same place.`,
+                setup: async api => {
+                    await api.closeMenu(); await api.cap('closeModal'); await api.cap('selectIdx', []);
+                    const brick = await api.tileId(2);
+                    if (!(await findSticker(api, brick))) {
+                        await api.cap('stickerSeed', await api.tileId(3));
+                        await api.cap('openCtx', brick); await api.wait(240);
+                        await api.click('#at-ctx button[data-action="stickers"]'); await api.wait(600);
+                        await api.click('#at-st-strip .at-st-chip'); await api.wait(300);
+                        await api.click('#at-st-apply'); await api.wait(1200);
+                        await api.closeMenu();
+                    }
+                    await api.cap('openCtx', brick); await api.wait(400);
+                },
+                spotlight: '#at-ctx button[data-action="editstickers"]',
+                handoff: `Open it, drag the rivet somewhere else and press <strong>💾 Apply</strong>. The
+                          layer changes in place.`
             }
         ]
     },
@@ -1784,7 +1998,7 @@ TRLE.DemoLessons = [
                       Match it to the size of the feature. Darkness is the next slider.<br><br>
                       Watch the <strong>Ao</strong> thumbnail, where the ring is. AO is a quiet map in a
                       lit view: this sweep moves the preview by about 2 levels out of 255 and the AO map
-                      itself by about 37, so the thumbnail is where you can see it.`,
+                      itself by about 32, so the thumbnail is where you can see it.`,
                 setup: async api => { await matOpen(api, 0, 'brick'); await matAdvanced(api); },
                 spotlight: '#at-mat-previews [data-map="ao"]',
                 sweep: { id: 'at-mat-p-aoRadius', from: 1, to: 30, ms: 2800 },
@@ -1967,9 +2181,9 @@ TRLE.DemoLessons = [
                       overlays, not a tier.<br><br>
                       A tier is mostly an <em>ambient occlusion</em> decision, which is why the ring is
                       on that thumbnail. Watch it, not the lit preview. On this brick, Realistic to
-                      Dramatic moves the AO map by 59 levels out of 255 and the lit preview by 4.<br><br>
+                      Dramatic moves the AO map by 74 levels out of 255.<br><br>
                       It also only does anything to materials that have relief to push.
-                      <strong>Chrome</strong> between Realistic and Dramatic moves the AO map by 1 and
+                      <strong>Chrome</strong> between Realistic and Dramatic moves the AO map by 2 and
                       the normal map by <em>zero</em>. Nothing is broken, a mirror simply has nothing
                       to deepen.<br><br>
                       Tier is per tile, so a Dramatic stone wall can sit next to a Realistic metal door.`,
@@ -2113,13 +2327,13 @@ TRLE.DemoLessons = [
                       frame wants the roughness of paint and the door wants the sheen of metal, and
                       whichever you pick is wrong for half the tile.<br><br>
                       <strong>🎭 Multiple materials</strong> paints them separately. The modal widens
-                      into a layer list: the <strong>Base</strong> covers the whole tile, and each layer
+                      into a Material Layer list: the <strong>Base</strong> covers the whole tile, and each Material Layer
                       above it paints its own material over a region you select. Order matters, bottom
-                      to top, exactly like layers anywhere else.<br><br>
+                      to top, like layers in a photo editor.<br><br>
                       The selection tools are the same ones lesson 2 used for Heal and De-light, so the
                       <strong>Wand</strong> is usually the quickest start here: the frame is a different
                       colour from the door, so one click takes most of it.<br><br>
-                      The maps are composited per layer at generation time, so what exports is one
+                      The maps are composited per Material Layer at generation time, so what exports is one
                       normal map and one roughness map for the tile, with both materials in them.`,
                 setup: async api => {
                     await matOpen(api, 4, 'metal');
@@ -2129,7 +2343,7 @@ TRLE.DemoLessons = [
                     if (box && !box.checked) { await api.click('#at-mm-enable'); await api.wait(1200); }
                 },
                 spotlight: '#at-mat-multi',
-                handoff: `Press <strong>＋ Add layer</strong>, give it a different material, then wand
+                handoff: `Press <strong>＋ Add Material Layer</strong>, give it a different material, then wand
                           the red frame on the canvas. The lit preview updates as you paint.`
             },
             {
@@ -2246,7 +2460,7 @@ TRLE.DemoLessons = [
                       it is worth nothing. Watch the preview swing: the stones slide across the joints,
                       the joints disappear behind them at a grazing angle, and the outline of the tile
                       never changes.<br><br>
-                      That last part is not a limitation of the preview, it is what the engine does. The
+                      The engine does exactly that: the
                       geometry stays a flat quad. Relief is an illusion painted inside the polygon, so a
                       parallax wall seen edge on is still dead flat, which is why the tool previews it
                       with this shader instead of a bumpy 3D mesh that would promise something the
@@ -2599,8 +2813,7 @@ TRLE.DemoLessons = [
                 title: 'The second generator: particles',
                 requires: { tiles: TRLE.DemoDepthSet },
                 say: `A noise field churns. It cannot draw a straight streak, count its own raindrops
-                      or fall at an angle, so rain is not a preset of it, it is a different
-                      generator.<br><br>
+                      or fall at an angle, so rain has a generator of its own.<br><br>
                       Pick anything from the <strong>Particles</strong> group and the
                       <strong>Shape</strong> tab swaps over: <strong>Amount</strong>,
                       <strong>Direction</strong> on a ladder of fixed slants, <strong>Speed</strong>,
@@ -2739,8 +2952,8 @@ TRLE.DemoLessons = [
                 sweep: { id: 'at-anim-lv-cycles', from: 1, to: 4, ms: 1800 },
                 preview: '#at-anim-preview',
                 handoff: `Watch the readout while you drag <strong>Preview speed</strong>: that fps
-                          is not preview-only, it is written into the export manifest and is what
-                          you set on the range in Tomb Editor.`
+                          is also written into the export manifest, and it is what you set on the
+                          range in Tomb Editor.`
             },
             {
                 id: 'anim-depth-mode',
@@ -3115,8 +3328,8 @@ TRLE.DemoLessons = [
                       <strong>💾 Save Project</strong> writes it. It holds every tile, every material,
                       every recipe. <strong>📂 Load Project</strong> opens one, and it also accepts an
                       export ZIP that has one inside, so the ZIP the tool handed you is reopenable.<br><br>
-                      The <strong>● unsaved changes</strong> dot appears when you have edits that are
-                      not in a saved file yet. It is the honest signal: the tool autosaves, but autosave
+                      The <strong>● unsaved changes</strong> dot appears when you have edits made
+                      since you last saved a file. It is the honest signal: the tool autosaves, but autosave
                       is <em>crash recovery</em>, one slot, overwritten, not a project library. If the
                       tab dies you are offered it back when you return. That is all it promises, and the
                       filesystem is where your work actually lives.<br><br>
@@ -3132,6 +3345,171 @@ TRLE.DemoLessons = [
                 spotlight: '#at-save-project',
                 handoff: `Press <strong>💾 Save Project</strong> and it asks for a name before it writes
                           anything, so you can look and cancel. Then go and build something.`
+            }
+        ]
+    }
+
+    ,{
+        id: 'layers',
+        icon: '\u{1F5C2}',
+        title: 'Layers',
+        blurb: 'Every edit stays editable: text, colour grades and effects you can reopen, hide and reorder.',
+        steps: [
+            {
+                id: 'what-is-a-layer',
+                title: 'An edit you can still change',
+                covers: ['ui:layers-panel'],
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `Tile 1 now has the word EXIT on it. In most tools that would be pixels and nothing
+ more. Here it is a <em>layer</em>: the tool kept the words, the font and the size, so
+ you can change them later.<br><br>
+ The <strong>Layers</strong> panel in the left rail lists them for the selected tile.
+ <strong>Text and drawings</strong> sit on top of the picture. <strong>Original</strong>
+ at the bottom is the picture underneath everything.`,
+                setup: async api => {
+                    await layersEnsureText(api);
+                    await api.cap('selectIds', [await api.tileId(0)]); await api.wait(300);
+                },
+                rails: 'left',
+                spotlight: '#at-layers',
+                handoff: `Click another tile and the panel follows it. Click back, and the layer is still there.`
+            },
+            {
+                id: 'edit-a-layer',
+                title: 'Change it later',
+                covers: ['action:edittext', 'action:editdrawing'],
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `Right-click the tile and choose <strong>Edit Text…</strong>, or click the layer's row in
+ the panel. The text tool reopens with the words and settings exactly as you left them.
+ <strong>Apply</strong> replaces that layer, and nothing else on the tile moves.<br><br>
+ A drawing works the same way through <strong>Edit Drawing…</strong>. The menu shows
+ whichever of the two the tile carries.`,
+                setup: async api => {
+                    await layersEnsureText(api);
+                    await api.cap('selectIds', [await api.tileId(0)]);
+                },
+                act: async api => {
+                    await api.cap('openCtx', await api.tileId(0)); await api.wait(240);
+                    await api.click('#at-ctx button[data-action="edittext"]'); await api.wait(900);
+                    await api.setValue('at-tx-text', 'WAY OUT'); await api.wait(600);
+                },
+                spotlight: '#at-tx-text',
+                handoff: `Change the words and press <strong>Apply</strong>. Closing the window instead leaves the tile as it was.`
+            },
+            {
+                id: 'hide-and-delete',
+                title: 'Hide, show, delete',
+                covers: ['ui:layers-eye'],
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `The 👁 on a row hides that layer, and the tile redraws as if it had never been added.
+ Click it again and the layer comes back, with every setting intact.<br><br>
+ The 🗑 that shows when you point at a row deletes the layer from this tile. Both
+ are one <strong>Undo</strong>.`,
+                setup: async api => {
+                    await layersEnsureText(api);
+                    await api.cap('selectIds', [await api.tileId(0)]); await api.wait(300);
+                },
+                act: async api => {
+                    await api.click('#at-layers-body .at-ly-eye'); await api.wait(900);
+                    await api.click('#at-layers-body .at-ly-eye'); await api.wait(900);
+                },
+                rails: 'left',
+                spotlight: '#at-layers-body .at-ly-layer',
+                handoff: `Hide the text yourself and look at the tile, then show it again.`
+            },
+            {
+                id: 'picture-edits',
+                title: 'Edits to the picture sit underneath',
+                covers: ['ui:layers-zones'],
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `A colour grade belongs to the picture, so it runs <em>under</em> the lettering. Adjust
+ Colours was just applied to this tile after the text, and the text kept its colour.<br><br>
+ The panel groups layers by what they do, and the tool puts each one in its group:
+ <strong>Picture edits</strong> (colour tools, Noise, Heal, Make Seamless, Slope Blur,
+ Scatter, HD Look), <strong>Text and drawings</strong>, then <strong>Finish</strong> (Fade to
+ Transparent, Classic Look), which goes over everything. Text and drawings drag above or
+ below each other by their ⠿ grip. A picture edit or a Finish layer drags over or under
+ the text and drawings (or click its ↑ or ↓), for the times you want a grade on the
+ lettering too. HD Look is the exception: it always stays under the text.<br><br>
+ Right-click a group, or click its ⋯, to move the whole group at once or to
+ <strong>Flatten into the Original…</strong>, which bakes that group and everything under
+ it into the picture. It asks first, and <strong>Undo</strong> brings the layers back.`,
+                setup: async api => {
+                    await layersEnsureGrade(api);
+                    await api.cap('selectIds', [await api.tileId(0)]); await api.wait(300);
+                },
+                rails: 'left',
+                spotlight: '#at-layers',
+                handoff: `Hide <strong>Adjust Colours</strong> and watch the brick brighten while the text stays put.`
+            },
+            {
+                id: 'effects-and-glow',
+                title: 'Effects, and glowing in game',
+                covers: ['ui:layer-effects'],
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `Text and Draw both have a <strong>✨ Layer effects</strong> panel on the Style tab:
+ drop and inner shadows, outer and inner glows, a stroke, a colour overlay. They are part
+ of the layer, so editing the text later keeps them.<br><br>
+ The two glows have <strong>Also glow in game</strong>. Ticked, the glow is also added to
+ the tile's emissive map, but only where the glow is, so the rest of the map stays as it
+ was. A glow on the picture alone never shines in the engine, and this makes it shine.
+ Apply also ticks the <strong>Emissive</strong> export map, so the glow ships.`,
+                setup: async api => {
+                    await layersEnsureText(api);
+                    await api.cap('openCtx', await api.tileId(0)); await api.wait(240);
+                    await api.click('#at-ctx button[data-action="edittext"]'); await api.wait(900);
+                    await api.click('#at-modal-text [data-tx-tab="style"]'); await api.wait(400);
+                    const d = api.doc();
+                    const acc = d && d.getElementById('at-tx-fxacc');
+                    if (acc && !acc.open) { await api.click('#at-tx-fxacc summary'); await api.wait(700); }
+                    const on = d && d.getElementById('at-txfx-outerGlow-on');
+                    if (on && !on.checked) { await api.click('#at-txfx-outerGlow-on'); await api.wait(500); }
+                    const em = d && d.getElementById('at-txfx-outerGlow-emit');
+                    if (em && !em.checked) { await api.click('#at-txfx-outerGlow-emit'); await api.wait(500); }
+                    await api.reveal('#at-txfx-outerGlow-emit');
+                },
+                expectState: { 'at-txfx-outerGlow-on': true, 'at-txfx-outerGlow-emit': true },
+                spotlight: '#at-txfx-outerGlow-emit',
+                handoff: `Press <strong>Apply</strong>, then open <strong>Set Material</strong> on this tile: the glow is in
+ the Emissive thumbnail.`
+            },
+            {
+                id: 'moves-with-the-tile',
+                title: 'Layers turn with the tile',
+                covers: ['ui:layers-transform'],
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `Rotate, Flip, Offset and the free transforms move the whole stack. The text turns with
+ the brick, and it stays editable: open <strong>Edit Text…</strong> afterwards and the
+ words come up turned the same way.<br><br>
+ Besides <strong>Flatten into the Original…</strong>, two things end a layer's editability.
+ <strong>Reset to Original</strong> removes every layer on the tile. A Distort driven by
+ another tile turns text and drawings into plain pixels.`,
+                setup: async api => {
+                    await layersEnsureText(api);
+                    await api.cap('selectIds', [await api.tileId(0)]); await api.closeMenu();
+                },
+                act: async api => {
+                    await api.cap('openCtx', await api.tileId(0)); await api.wait(220);
+                    await api.click('#at-ctx button[data-action="rotate"]'); await api.wait(800);
+                },
+                spotlight: { grid: 0 },
+                handoff: `Rotate it three more times to bring it back. The layer never moves out of the list.`
+            },
+            {
+                id: 'layers-menu',
+                title: 'Layers… when the rail is hidden',
+                covers: ['modal:layers', 'action:layers'],
+                requires: { tiles: TRLE.DemoDepthSet },
+                say: `On a narrow window the side rails are hidden. Right-click a tile and choose
+ <strong>🗂 Layers…</strong> for the same list in a window. Clicking a layer there opens its
+ tool, the eye and the bin work the same way, and nothing differs from the rail.`,
+                setup: async api => { await layersEnsureText(api); await api.closeMenu(); await api.cap('selectIds', [await api.tileId(0)]); },
+                act: async api => {
+                    await api.cap('openCtx', await api.tileId(0)); await api.wait(220);
+                    await api.click('#at-ctx button[data-action="layers"]'); await api.wait(700);
+                },
+                spotlight: '#at-layers-modal-body',
+                handoff: `Close it with <strong>Close</strong>. Layers are saved with the project, so they are here when you load it again.`
             }
         ]
     }
@@ -3189,10 +3567,53 @@ TRLE.DemoPlanned = {
        that teaches it is SPRITE-PLAN phase 7, and this entry comes out then. */
     sprites: ['modal:sprite', 'action:addsprite'],
 
+    /* 🕹️ Classic Look (CLASSIC-LOOK-PLAN, 2026-10-01): Edit > Classic Look…, an HD
+       texture made to look low-res at the same tile size. Belongs with the colour
+       lesson's in-place edits (Adjust Colours, Recolor); comes out when its step
+       lands. */
+    classic: ['modal:classic', 'action:classic'],
+    /* 🔎 HD Look (HD-LOOK-PLAN, 2026-10-06): Edit > HD Look…, a low-res tile made to
+       look HD at the same tile size. Phase 10 left it here. The author decided on
+       2026-10-07 that it gets a step, placed right after Classic Look's; both come
+       out of this table when those steps land. */
+    hdlook: ['modal:hdlook', 'action:hdlook', 'modal:importadvice'],
+    /* ⤡ Free Transform (TRANSFORMS-PLAN, 2026-10-02): Transform > Free Transform…,
+       any-angle rotate, scale, skew and move. Belongs with the transforms in the
+       first lesson that turns a tile; comes out when its step lands. */
+    xform: ['modal:xform', 'action:xform'],
+    /* ⬚ Perspective (TRANSFORMS-PLAN, 2026-10-02): straighten a photographed
+       wall or distort a tile's corners. Same lesson as Free Transform. */
+    persp: ['modal:persp', 'action:persp'],
+    /* 〰️ Distort (TRANSFORMS-PLAN, 2026-10-02): Wave, Ripple, Displace by a
+       tile. Same lesson as Free Transform. */
+    distort: ['modal:distort', 'action:distort'],
+    /* 🔤 Text (TEXT-PLAN, 2026-10-02): lettering below Draw…, spanning a selection
+       like Draw. Belongs with Draw's lesson; comes out when its step lands. */
+    text: ['modal:text', 'action:text'],
+
+    /* 💧 Slope Blur (WEATHERING-PLAN, 2026-10-02): Edit > Slope Blur…, wear and
+       erosion along a slope. Belongs with the in-place edits; comes out when its
+       step lands. */
+    slope: ['modal:slope', 'action:slope'],
+    /* 🍂 Scatter (WEATHERING-PLAN, 2026-10-02): Edit > Scatter…, soft patches of a
+       tile stamped over another. Same lesson as Slope Blur. */
+    scatter: ['modal:scatter', 'action:scatter'],
+
+    /* 📚 Stickers (STICKERS-PLAN, 2026-10-08): the Sticker Gallery in the new Overlay
+       category (phase 3); Add Stickers and Make Sticker join it in phases 4 and 9.
+       Belongs with Overlay Texture's step; comes out when its step lands (phase 10). */
+
+    /* NOT VISIBLE TO THE COVERAGE WALK (new controls inside a known modal, see
+       above): the Material modal's Relief detail bands (HEIGHT-BANDS-PLAN) and
+       Cavity and edges sliders (CAVITY-PLAN), both 2026-10-01. The tuning lesson
+       (advanced editor) does not teach them yet. Written down here so the gap is
+       not invisible; no registry key is needed for them. */
+
 };
 
 TRLE.DemoExclusions = {
     'action:editanim':   'Reached from an animation frame, which only exists after the anim lesson builds one; the anim lesson covers editing in place.',
     'action:delete':     'One click and a confirm. Lesson 1 teaches the menu; a step that deletes the sample is worse than a sentence.',
+    'modal:folderpick':  'Native folder picker and a chooser behind it: neither can run inside the course frame, and the course never writes to a folder.',
     'modal:confirm':     'Infrastructure. It is the dialog other features ask questions with, not a feature.'
 };

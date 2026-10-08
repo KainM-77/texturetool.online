@@ -145,6 +145,20 @@ TRLE.Engine = (function() {
         return createTexture(img.width || img.naturalWidth, img.height || img.naturalHeight, img, options);
     }
 
+    /* A float32 data texture for Liquify's field: RGBA32F, N x N, row 0 first, NEAREST (it is read with
+       texelFetch and filtered in the shader, so wrapping is exact). Not flipped, unlike an image. */
+    function createFieldTexture(n, data) {
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, n, n, 0, gl.RGBA, gl.FLOAT, data);
+        tex._width = n; tex._height = n;
+        return tex;
+    }
+
     function deleteTexture(tex) {
         if (tex) gl.deleteTexture(tex);
     }
@@ -178,6 +192,73 @@ TRLE.Engine = (function() {
         if (fboObj.fbo) gl.deleteFramebuffer(fboObj.fbo);
     }
 
+    /* ---- Uniforms, shared by blit() and splatPoints() ----
+       Every call sets what it is given and nothing else: values from an
+       earlier call STAY SET (CLAUDE.md "Transforms"), so a caller binds every
+       uniform and sampler its shader declares. `{ vec4array: Float32Array }`
+       sets a vec4 ARRAY uniform (`uniform vec4 u_x[N]`), tagged rather than
+       inferred so a 16-float array still means a mat4. */
+    function setUniforms(prog, uniforms) {
+        let texUnit = 0;
+        for (const [name, value] of Object.entries(uniforms)) {
+            const loc = gl.getUniformLocation(prog, name);
+            if (loc === null) continue;
+
+            if (value instanceof WebGLTexture) {
+                gl.activeTexture(gl.TEXTURE0 + texUnit);
+                gl.bindTexture(gl.TEXTURE_2D, value);
+                gl.uniform1i(loc, texUnit);
+                texUnit++;
+            } else if (typeof value === 'number') {
+                gl.uniform1f(loc, value);
+            } else if (value && value.vec4array) {
+                gl.uniform4fv(loc, value.vec4array);
+            } else if (Array.isArray(value) || value instanceof Float32Array) {
+                if (value.length === 2) gl.uniform2fv(loc, value);
+                else if (value.length === 3) gl.uniform3fv(loc, value);
+                else if (value.length === 4) gl.uniform4fv(loc, value);
+                else if (value.length === 16) gl.uniformMatrix4fv(loc, false, value);
+            }
+        }
+    }
+
+    /* ---- Point splat (WATER-CAUSTICS-PLAN phase 5a) ----
+       Draws `count` points with NO vertex buffer (the vertex shader works from
+       gl_VertexID) and ADDITIVE blending (ONE, ONE) into `target`, cleared
+       first unless opts.clear === false. For photon splatting: each point is a
+       packet of light landing somewhere on the target. Use a float target
+       (createFBO(w, h, { float: true }) is RGBA16F, blendable in WebGL2 with
+       EXT_color_buffer_float). One draw call blends in primitive order, so the
+       result is deterministic. Blending is switched off again before return;
+       nothing else in the engine blends. */
+    let pointsVAO = null;
+    function splatPoints(shaderName, uniforms, target, count, opts = {}) {
+        const prog = programs[shaderName];
+        if (!prog) { console.error('Unknown shader:', shaderName); return; }
+        if (!pointsVAO) pointsVAO = gl.createVertexArray();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo || target);
+        gl.viewport(0, 0, target.width, target.height);
+        if (opts.clear !== false) { gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); }
+        gl.useProgram(prog);
+        setUniforms(prog, uniforms);
+        gl.enable(gl.BLEND);
+        gl.blendEquation(gl.FUNC_ADD);
+        gl.blendFunc(gl.ONE, gl.ONE);
+        gl.bindVertexArray(pointsVAO);
+        gl.drawArrays(gl.POINTS, 0, count);
+        gl.bindVertexArray(null);
+        gl.disable(gl.BLEND);
+    }
+
+    /* Read a float target back as RGBA float32 (test and diagnostics only). */
+    function readPixelsFloat(fboObj) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fboObj.fbo);
+        const px = new Float32Array(fboObj.width * fboObj.height * 4);
+        gl.readPixels(0, 0, fboObj.width, fboObj.height, gl.RGBA, gl.FLOAT, px);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        return px;
+    }
+
     /* ---- Blit (core operation — replaces Unity Graphics.Blit) ---- */
     function blit(shaderName, uniforms, target, width, height) {
         const prog = programs[shaderName];
@@ -192,27 +273,7 @@ TRLE.Engine = (function() {
         }
 
         gl.useProgram(prog);
-
-        // Set uniforms
-        let texUnit = 0;
-        for (const [name, value] of Object.entries(uniforms)) {
-            const loc = gl.getUniformLocation(prog, name);
-            if (loc === null) continue;
-
-            if (value instanceof WebGLTexture) {
-                gl.activeTexture(gl.TEXTURE0 + texUnit);
-                gl.bindTexture(gl.TEXTURE_2D, value);
-                gl.uniform1i(loc, texUnit);
-                texUnit++;
-            } else if (typeof value === 'number') {
-                gl.uniform1f(loc, value);
-            } else if (Array.isArray(value) || value instanceof Float32Array) {
-                if (value.length === 2) gl.uniform2fv(loc, value);
-                else if (value.length === 3) gl.uniform3fv(loc, value);
-                else if (value.length === 4) gl.uniform4fv(loc, value);
-                else if (value.length === 16) gl.uniformMatrix4fv(loc, false, value);
-            }
-        }
+        setUniforms(prog, uniforms);
 
         // Draw fullscreen quad
         gl.bindVertexArray(quadVAO);
@@ -548,6 +609,102 @@ TRLE.Engine = (function() {
         return out;
     }
 
+    /* ---- The shared resampler (TRANSFORMS-PLAN D1) ----
+       `inv` maps an OUTPUT image pixel to a SOURCE image pixel (y down, pixel
+       centres at i + 0.5): { m0, m1 } rows for an affine map, plus m2 for a
+       homography. Returns an RGBA8 FBO of outW x outH; the caller deletes it.
+       Options: filter 'nearest' | 'bilinear' | 'bicubic' | 'lanczos', edge
+       'wrap' | 'clamp' (stretch outward, see the shader) | 'transparent' | 'mirror', ss (1..4), normal (turn the
+       encoded vectors), nflip (-1 = the tool's normal convention). */
+    const WARP_FILTERS = { nearest: 0, bilinear: 1, bicubic: 2, lanczos: 3 };
+    const WARP_EDGES = { wrap: 0, clamp: 1, transparent: 2, mirror: 3 };
+    /* Distort's displacement (opts.disp): { mode: 'wave', amp: [x, y],
+       cycles: [x, y], phase, shape } or { mode: 'map', mapTexture, strength } or
+       { mode: 'radial', type: twirl|pinch|spherize|zigzag|polar, sub, amount, ridges,
+       cx, cy, radius } or { mode: 'field', fieldTexture, fieldN } (Liquify: RGBA32F offsets as fractions of
+       the tile) (FILTERS-PLAN phase 2; fractions of the period, amount in
+       radians for twirl, -1..1 otherwise), amplitudes in tile px; period (default the output size) and ampScale
+       (default 1) restate the tile for a canvas of another size. Every uniform
+       is set even when off: blit() leaves a program's uniforms as the last
+       call set them. */
+    const WAVE_SHAPES = { sine: 0, triangle: 1, square: 2 };
+    const RADIAL_TYPES = { twirl: 0, pinch: 1, spherize: 2, zigzag: 3, polar: 4 };
+    function warpDispUniforms(d, outW, outH) {
+        const radial = !!d && d.mode === 'radial', field = !!d && d.mode === 'field' && !!d.fieldTexture;
+        const on = d && (d.mode === 'wave' || radial || field || (d.mode === 'map' && d.mapTexture));
+        return {
+            u_radType: radial ? RADIAL_TYPES[d.type] || 0 : 0,
+            u_radSub: radial ? d.sub || 0 : 0,
+            u_radAmount: radial ? d.amount || 0 : 0,
+            u_radRidges: radial ? d.ridges || 6 : 6,
+            u_radRadius: radial ? (d.radius != null ? d.radius : 1) : 1,
+            u_radCentre: radial ? [d.cx != null ? d.cx : 0.5, d.cy != null ? d.cy : 0.5] : [0.5, 0.5],
+            u_fieldN: field ? d.fieldN : 1,
+            u_dispMode: !on ? 0 : d.mode === 'wave' ? 1 : radial ? 3 : field ? 4 : 2,
+            u_dispPeriod: on && d.period ? [d.period, d.period] : [outW, outH],
+            u_dispAmpScale: on && !radial && !field && d.ampScale != null ? d.ampScale : 1,
+            u_waveAmp: on && d.amp ? d.amp : [0, 0],
+            u_waveCycles: on && d.cycles ? d.cycles : [1, 1],
+            u_wavePhase: on && d.phase || 0,
+            u_waveShape: on ? WAVE_SHAPES[d.shape] || 0 : 0,
+            u_dispStrength: on && d.strength || 0,
+            u_dispMapSize: on && d.mapTexture ? [d.mapTexture._width, d.mapTexture._height] : [1, 1],
+        };
+    }
+    function warp(srcTexture, srcW, srcH, outW, outH, inv, opts = {}) {
+        const out = createFBO(outW, outH);
+        blit('warpResample', {
+            u_src: srcTexture,
+            u_srcSize: [srcW, srcH],
+            u_dstSize: [outW, outH],
+            u_map: inv.m2 ? 1 : 0,
+            u_m0: inv.m0, u_m1: inv.m1, u_m2: inv.m2 || [0, 0, 1],
+            u_filter: WARP_FILTERS[opts.filter] ?? 2,
+            u_edge: WARP_EDGES[opts.edge] ?? 0,
+            u_ss: opts.ss || 1,
+            u_normal: opts.normal ? 1 : 0,
+            u_nflip: opts.nflip ?? -1,
+            ...warpDispUniforms(opts.disp, outW, outH),
+            /* ALWAYS bound, to the source when there is no map. Left unset, the
+               sampler keeps the unit an earlier map call gave it, and the new
+               output texture (created while that unit was active) can be bound
+               there: a feedback loop, so WebGL refuses the draw and the result
+               is fully transparent. Measured: a Wave right after a Ripple. */
+            u_dispMap: (opts.disp && opts.disp.mode === 'map' && opts.disp.mapTexture) || srcTexture,
+            u_dispField: (opts.disp && opts.disp.mode === 'field' && opts.disp.fieldTexture) || srcTexture,
+        }, out);
+        return out;
+    }
+
+    /* ---- Slope Blur (WEATHERING-PLAN phase 1) ----
+       `driver` is a grey texture the same size as the source; it is smoothed
+       (a wrapping Gaussian, `smooth` px) in float before its slope is read, so
+       the direction is the relief's and not the noise's. o: { amount px,
+       samples, mode 'blur'|'min'|'max', dir 1 downhill / -1 uphill, follow,
+       gain, strength 0..1, edge 'wrap'|'clamp', smooth }. Returns an RGBA8 FBO
+       the caller deletes. Every sampler is bound on every call. */
+    const SLOPE_MODES = { blur: 0, min: 1, max: 2 };
+    function slopeBlur(srcTexture, driverTexture, w, h, o = {}) {
+        const r = Math.max(0, Math.min(64, o.smooth != null ? o.smooth : 2));
+        let drv = driverTexture, ta = null, tb = null;
+        if (r >= 0.5) {
+            ta = createFBO(w, h, { float: true }); tb = createFBO(w, h, { float: true });
+            blit('gaussianBlur', { u_texture: driverTexture, u_direction: [1 / w, 0], u_radius: r }, ta);
+            blit('gaussianBlur', { u_texture: ta.texture, u_direction: [0, 1 / h], u_radius: r }, tb);
+            drv = tb.texture;
+        }
+        const out = createFBO(w, h);
+        blit('slopeBlur', {
+            u_src: srcTexture, u_driver: drv, u_size: [w, h],
+            u_amount: o.amount || 0, u_samples: o.samples || 16,
+            u_mode: SLOPE_MODES[o.mode] || 0, u_dir: o.dir === -1 ? -1 : 1,
+            u_follow: o.follow ? 1 : 0, u_gain: o.gain != null ? o.gain : 20,
+            u_strength: o.strength != null ? o.strength : 1, u_edge: o.edge === 'clamp' ? 1 : 0,
+        }, out);
+        if (ta) { deleteFBO(ta); deleteFBO(tb); }
+        return out;
+    }
+
     /* ---- Multigrid V-cycle solver (coarse → fine) ----
        Plain Jacobi needs O(N²) iterations to converge across an N-pixel domain,
        so it never fills large regions in a practical budget. This solves the
@@ -737,6 +894,53 @@ TRLE.Engine = (function() {
         return out;
     }
 
+    /* ---- Relief detail bands (HEIGHT-BANDS-PLAN.md) ----
+       Six octave bands of a grey image, each scaled by its weight (1 = as is),
+       recombined by the `combineHeight` shader. At every weight 1 the result is
+       the input to within float rounding; generateMaps never gets that far,
+       because it skips the pass at neutral (`bandWeightsOf` returns null), which
+       is what keeps every existing material byte-identical.
+       Every level samples with REPEAT, so the result is translation-equivariant
+       and a seamless tile stays seamless. Returns an RGBA8 FBO; caller deletes. */
+    /* Six à trous levels (`atrousBlur`), each from the previous one with its holes
+       doubled: 60 taps a pixel for all six, at full resolution. The first cut used
+       gaussianBlur at radii 2..64, whose 129-tap loop made generateMaps ~3x slower
+       with bands on (408 -> 1304 ms at 1024 px in SwiftShader). */
+    function bandEqualise(srcTexture, width, height, weights) {
+        const levels = [];
+        let prev = srcTexture;
+        for (let k = 0; k < 6; k++) {
+            const d = 1 << k;   // hole size: 1, 2, 4, ... 32 texels
+            const tmp = createFBO(width, height, { float: true });
+            blit('atrousBlur', { u_texture: prev, u_step: [d / width, 0] }, tmp);
+            const lvl = createFBO(width, height, { float: true });
+            blit('atrousBlur', { u_texture: tmp.texture, u_step: [0, d / height] }, lvl);
+            deleteFBO(tmp);
+            levels.push(lvl);
+            prev = lvl.texture;
+        }
+        const u = { u_blur0: srcTexture };
+        levels.forEach((f, i) => { u['u_blur' + (i + 1)] = f.texture; });
+        for (let k = 0; k < 6; k++) u['u_w' + k] = weights[k] != null ? weights[k] : 1;
+        const out = createFBO(width, height);
+        blit('combineHeight', u, out);
+        levels.forEach(deleteFBO);
+        return out;
+    }
+    /* The preset's band weights as fractions, or null when all six are neutral
+       (absent counts as neutral: 100 %). */
+    /* Cavity and edges: how many units of crevice a unit of relief dip is worth.
+       A dip of 1/4 of the relief range below its surroundings counts as a full
+       crevice (CAVITY-PLAN.md D1). */
+    const CURVATURE_GAIN = 4.0;
+    function bandWeightsOf(preset) {
+        const w = [1, 2, 3, 4, 5, 6].map(i => {
+            const v = preset['reliefBand' + i];
+            return (typeof v === 'number' && isFinite(v)) ? v / 100 : 1;
+        });
+        return w.every(x => x === 1) ? null : w;
+    }
+
     function generateMaps(diffuseTexture, width, height, preset, enabledMaps) {
         const results = {};
         const texel = 1.0 / Math.max(width, height);
@@ -763,6 +967,17 @@ TRLE.Engine = (function() {
             u_alphaFlatten: flatten ? 1.0 : 0.0
         }, grayFBO);
 
+        /* Step 1a: relief detail bands (HEIGHT-BANDS-PLAN.md). The equalised grey is
+           the SHAPE signal: everything that reads the relief below (normal, AO,
+           height) reads it, so the three move together. Roughness and specular keep
+           the plain `grayFBO`: they read finish, not shape (the reliefPaint rule).
+           Equalised BEFORE any carve, so a pushed mark keeps its exact depth.
+           Neutral (every band 100 %, or absent) skips the pass outright, so
+           `shapeGray === grayFBO` and every existing material is byte-identical. */
+        const bandW = bandWeightsOf(preset);
+        const eqOf = fbo => bandW ? bandEqualise(fbo.texture, width, height, bandW) : fbo;
+        const shapeGray = eqOf(grayFBO);
+
         /* Step 1b: carved relief (PUSH-MARKINGS-PLAN phase 3). A mark pushed into a
            surface is a GROOVE whatever its colour, but everything below reads relief
            from luminance, so a pale scrape on dark stone came out a ridge (+118 in the
@@ -779,7 +994,7 @@ TRLE.Engine = (function() {
            same heightPaint blit, one pass each way. Absent or at lift 0, nothing
            changes (the carve-only path is still one blit). */
         const rp = preset.reliefPaint;
-        let reliefFBO = grayFBO, reliefMask = null, unmarkedGray = null, fieldUp = null, fieldDown = null;
+        let reliefFBO = shapeGray, reliefMask = null, unmarkedGray = null, fieldUp = null, fieldDown = null;
         // `src` with `lift` laid in under `mask` (one heightPaint blit).
         const paintIn = (src, mask, lift) => {
             const out = createFBO(width, height);
@@ -813,8 +1028,11 @@ TRLE.Engine = (function() {
                 unmarkedGray = createFBO(width, height);
                 blit('desaturate', { u_texture: bTex, u_gamma: 0.8, u_alphaFlatten: flatten ? 1.0 : 0.0 }, unmarkedGray);
                 deleteTexture(bTex);
+                // The unmarked grey is the relief's source here, so it takes the bands too.
+                const eqd = eqOf(unmarkedGray);
+                if (eqd !== unmarkedGray) { deleteFBO(unmarkedGray); unmarkedGray = eqd; }
             }
-            reliefFBO = relief(unmarkedGray || grayFBO, 1);
+            reliefFBO = relief(unmarkedGray || shapeGray, 1);
         }
 
         /* Step 2: what the relief is READ FROM, then blur it.
@@ -853,7 +1071,7 @@ TRLE.Engine = (function() {
            relief carved with the opposite sign, from its own base. */
         let heightReliefFBO = null;
         if ((hasCarve || fld) && (heightInvert || heightSelFBO)) {
-            heightReliefFBO = relief(heightSelFBO || unmarkedGray || grayFBO, heightInvert ? -1 : 1);
+            heightReliefFBO = relief(heightSelFBO || unmarkedGray || shapeGray, heightInvert ? -1 : 1);
             heightBase = heightReliefFBO;
         }
         const heightBlurred = gaussianBlur(heightBase.texture, width, height, preset.heightBlur);
@@ -997,6 +1215,25 @@ TRLE.Engine = (function() {
             }
         }
 
+        /* Cavity and edges (CAVITY-PLAN.md): one curvature measure, blur(relief) -
+           relief, folded into AO, roughness and specular after each is built. Each
+           amount at 0 (or absent) skips its pass, so existing materials are
+           byte-identical. Read from `reliefFBO`, the same shape signal as normal and
+           AO, so the relief bands and pushed marks shape it too. */
+        const cavAmt = k => { const v = preset[k]; return (typeof v === 'number' && v > 0) ? Math.min(1, v / 100) : 0; };
+        const cavSize = (typeof preset.cavitySize === 'number' && preset.cavitySize > 0) ? preset.cavitySize : 4;
+        let curvBlur = null;
+        const withCurvature = (fbo, mode, amount) => {
+            if (!curvBlur) curvBlur = gaussianBlur(reliefFBO.texture, width, height, cavSize);
+            const out = createFBO(width, height);
+            blit('curvatureApply', {
+                u_map: fbo.texture, u_relief: reliefFBO.texture, u_reliefBlur: curvBlur.texture,
+                u_amount: amount, u_mode: mode, u_scale: CURVATURE_GAIN
+            }, out);
+            deleteFBO(fbo);
+            return out;
+        };
+
         // Step 6: AO from height
         // No pre-blur: blurring before AO was smearing mortar-joint edges.
         // The shader now uses max-per-direction to keep shadows sharp.
@@ -1040,7 +1277,7 @@ TRLE.Engine = (function() {
                 u_aoDepth: preset.aoDepth ?? 0.5,
                 u_aoCurve: preset.aoCurve ?? 0.85
             }, aoFBO);
-            results.ao = aoFBO;
+            results.ao = cavAmt('cavityAO') ? withCurvature(aoFBO, 0, cavAmt('cavityAO')) : aoFBO;
             deleteFBO(aoHeightFBO);
             if (aoNormalFBO) deleteFBO(aoNormalFBO);
         }
@@ -1056,7 +1293,7 @@ TRLE.Engine = (function() {
                 u_contrast:  preset.roughnessContrast / 30.0
             }, roughFBO);
             deleteFBO(roughBlurred);
-            results.roughness = roughFBO;
+            results.roughness = cavAmt('cavityRough') ? withCurvature(roughFBO, 1, cavAmt('cavityRough')) : roughFBO;
         }
 
         // Step 8: Specular map
@@ -1068,7 +1305,7 @@ TRLE.Engine = (function() {
                 u_baseValue: preset.specularBase / 255.0,
                 u_contrast: preset.specularContrast / 30.0
             }, specFBO);
-            results.specular = specFBO;
+            results.specular = cavAmt('edgeSpec') ? withCurvature(specFBO, 2, cavAmt('edgeSpec')) : specFBO;
         }
 
         // Step 9: Emissive map
@@ -1086,7 +1323,8 @@ TRLE.Engine = (function() {
         // Cleanup temporary FBOs
         deleteFBO(grayFBO);
         if (heightSelFBO) deleteFBO(heightSelFBO);   // the colour/hue height source
-        if (reliefFBO !== grayFBO) deleteFBO(reliefFBO);   // phase 3's carved relief
+        if (reliefFBO !== grayFBO) deleteFBO(reliefFBO);   // phase 3's carved relief, or the banded grey
+        if (shapeGray !== grayFBO && shapeGray !== reliefFBO) deleteFBO(shapeGray);
         if (unmarkedGray) deleteFBO(unmarkedGray);
         if (heightReliefFBO) deleteFBO(heightReliefFBO);
         if (reliefMask) deleteTexture(reliefMask);
@@ -1094,6 +1332,7 @@ TRLE.Engine = (function() {
         if (fieldDown) deleteTexture(fieldDown);
         deleteFBO(heightBlurred);
         deleteFBO(normalBlurred);
+        if (curvBlur) deleteFBO(curvBlur);
 
         return results;
     }
@@ -1360,14 +1599,20 @@ TRLE.Engine = (function() {
         gl: () => gl,
         createTexture,
         createTextureFromImage,
+        createFieldTexture,
         deleteTexture,
         createFBO,
         deleteFBO,
         blit,
+        splatPoints,
         readPixels,
+        readPixelsFloat,
         fboToCanvas,
         blitToScreen,
         gaussianBlur,
+        warp,
+        slopeBlur,
+        bandEqualise,
         seamlessMultiBand,
         poissonBlend,
         inpaintDiffusion,

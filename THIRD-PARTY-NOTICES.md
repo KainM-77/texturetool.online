@@ -166,6 +166,22 @@ SOFTWARE.
 
 ---
 
+## PhotoCraft: reference for ported filters (MIT OR Apache-2.0)
+
+- Author: ArtCraft Team and the PhotoCraft contributors
+- Source: https://github.com/storytold/photocraft (read at commit `5896f0b`)
+- License: MIT OR Apache-2.0. Copyright (c) 2026 ArtCraft Team and the PhotoCraft contributors.
+
+Maths and parameter sets for several filters were rewritten from its CPU Rust (`crates/algo/src/`)
+into this tool's GLSL and JavaScript, with wrap-around at the tile edges added: the Twirl, Pinch,
+Spherize, ZigZag and Polar Coordinates maps in Transform › Distort (`distort.rs`, `distort2.rs`),
+and later Liquify, Oil Paint and the Dodge, Burn and Sponge curves (see
+`AtlasTool/docs/FILTERS-PLAN.md`). No source file is copied; each port carries this credit in a
+comment. PhotoCraft's content-aware fill (PatchMatch) is deliberately NOT ported: it is covered by
+Adobe patents US8285055 and US8571328.
+
+---
+
 ## Runtime dependencies (loaded from CDN, not bundled in this repo)
 
 These libraries are fetched at runtime from a CDN and are **not redistributed**
@@ -180,3 +196,10 @@ are credited for transparency:
 
 The Babylon studio `.env` IBL is loaded from `assets.babylonjs.com` (Babylon.js
 asset host) for preview lighting only.
+
+## Example artwork: Temple of Karnak tiles
+
+`AtlasTool/Examples/Karnak/` contains nine 64 px tiles cut from the Temple of Karnak textures of
+*Tomb Raider: The Last Revelation* (Core Design, Eidos Interactive). They are included as HD Look
+test material and remain the rights holders' artwork. They are not under this repository's MIT
+licence. See `AtlasTool/Examples/Karnak/README.md`.
